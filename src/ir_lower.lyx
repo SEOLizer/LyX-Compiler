@@ -1370,6 +1370,9 @@ pub type IRLower = class {
   irLyuSeen:     int64;
   irLyuSeenN:    int64;
   irLyuSeenCap:  int64;
+  // #2270: Satz der physischen Slots der Funktion, die gerade entsteht
+  // (_slotRecNeu; 0 = keiner). Wird wie tempCount je Funktion gesichert.
+  slotRec:       int64;
 
   // ------------------------------------------------------------------
   // Initialization
@@ -1388,6 +1391,7 @@ pub type IRLower = class {
     self.paramCount := 0;
     self.labelCount := 0;
     self.tempCount := 0;
+    self.slotRec := 0;   // #2270
     self.localNameCap := 32;
     self.localNameBuf := alloc(32 * 24);
     self.localTypeBuf := alloc(32 * 8);
@@ -1832,6 +1836,7 @@ pub type IRLower = class {
     var t: int64 := self.tempCount;
     self.tempCount += 1;
     if (t >= self.localCount) { self.localCount := t + 1; }
+    self._slotBelegt(t);   // #2270
     return t;
   }
   
@@ -1846,8 +1851,98 @@ pub type IRLower = class {
     var p: int64 := self.tempCount;
     self.tempCount += 1;
     if (p >= self.localCount) { self.localCount := p + 1; }
+    self._slotBelegt(p);   // #2270
     self.paramCount += 1;
     return p;
+  }
+
+  // ------------------------------------------------------------------
+  // #2270: physische Slots
+  // ------------------------------------------------------------------
+  //
+  // Jeder Temp bekam einen eigenen Slot fuer die ganze Funktion; nichts
+  // wurde wiederverwendet. Im IR-Erzeugnis des Compilers selbst hatte
+  // cg_genCall damit 382 KB Rahmen (x86: 3 KB), cg_genStmt 107 KB — jede
+  // Ebene einer `else if`-Kette rekursiert dort hindurch, und nach rund 70
+  // Ebenen war der 8-MiB-Stapel voll (#2270: der arm64-/riscv-Compiler
+  // stuerzte an parser.lyx und std/string.lyx ab).
+  //
+  // Die virtuelle Nummer bleibt eindeutig — ir_optimize verlaesst sich
+  // darauf, dass ein Temp genau EINE Definition hat. Daneben bekommt jeder
+  // Temp einen PHYSISCHEN Slot von einem Stapelzaehler. Am Ende einer
+  // Anweisung (lowerBlock) und nach dem Bedingungssprung von if/while
+  // (lowerIf/lowerWhile) faellt der Zaehler auf die Marke vom Anfang zurueck:
+  // was in der Anweisung entstand, ist danach tot — Deklarationen
+  // ausgenommen (_slotFreigebbar). Der Befehlsindex der Freigabe steht in
+  // rel; ir_optimize darf einen Temp nicht ueber ihn hinaus verwenden
+  // (Kopienweitergabe, CSE). Das Backend bildet in slotOff virtuell auf
+  // physisch ab; ohne Satz (.lyu, Backend ohne Umstellung) bleibt es beim
+  // eigenen Slot je Temp.
+  fn _slotRecNeu(): int64 {
+    var r: int64 := alloc(48);
+    poke64(r + IR_SLOT_OFF_TOP, 0);
+    poke64(r + IR_SLOT_OFF_ANZ, 0);
+    poke64(r + IR_SLOT_OFF_CAP, 64);
+    poke64(r + IR_SLOT_OFF_MAP, alloc(64 * 8));
+    poke64(r + IR_SLOT_OFF_REL, alloc(64 * 8));
+    poke64(r + IR_SLOT_OFF_VIRT, 0);
+    return r;
+  }
+
+  fn _slotBelegt(t: int64) {
+    var r: int64 := self.slotRec;
+    if r == 0 { return; }
+    var cap: int64 := peek64(r + IR_SLOT_OFF_CAP);
+    if t >= cap {
+      var nc: int64 := cap * 2;
+      while nc <= t { nc := nc * 2; }
+      var nm: int64 := alloc(nc * 8);
+      var nr: int64 := alloc(nc * 8);
+      memcpy(nm, peek64(r + IR_SLOT_OFF_MAP), cap * 8);
+      memcpy(nr, peek64(r + IR_SLOT_OFF_REL), cap * 8);
+      poke64(r + IR_SLOT_OFF_MAP, nm);
+      poke64(r + IR_SLOT_OFF_REL, nr);
+      poke64(r + IR_SLOT_OFF_CAP, nc);
+    }
+    var ph: int64 := peek64(r + IR_SLOT_OFF_TOP);
+    poke64(peek64(r + IR_SLOT_OFF_MAP) + t * 8, ph);
+    poke64(peek64(r + IR_SLOT_OFF_REL) + t * 8, 0 - 1);
+    poke64(r + IR_SLOT_OFF_TOP, ph + 1);
+    if ph + 1 > peek64(r + IR_SLOT_OFF_ANZ) { poke64(r + IR_SLOT_OFF_ANZ, ph + 1); }
+    if t + 1 > peek64(r + IR_SLOT_OFF_VIRT) { poke64(r + IR_SLOT_OFF_VIRT, t + 1); }
+  }
+
+  fn _slotTop(): int64 {
+    if self.slotRec == 0 { return 0; }
+    return peek64(self.slotRec + IR_SLOT_OFF_TOP);
+  }
+
+  // Alles, was seit der Marke (vMarke virtuell, pMarke physisch) belegt
+  // wurde, ist ab dem naechsten Befehl tot.
+  fn _slotsFrei(vMarke: int64, pMarke: int64) {
+    var r: int64 := self.slotRec;
+    if r == 0 { return; }
+    var jetzt: int64 := peek64(self.ir + IR_MOD_OFF_INSTRLEN);
+    var rel: int64 := peek64(r + IR_SLOT_OFF_REL);
+    var v: int64 := vMarke;
+    while v < self.tempCount {
+      if peek64(rel + v * 8) < 0 { poke64(rel + v * 8, jetzt); }
+      v := v + 1;
+    }
+    poke64(r + IR_SLOT_OFF_TOP, pMarke);
+  }
+
+  // Nach welchen Anweisungen ihre Temps tot sind. Eine POSITIVLISTE: eine
+  // Art, die hier fehlt, gibt nichts frei — das kostet Stapel, nicht
+  // Korrektheit. Deklarationen fehlen absichtlich, ihr Slot lebt bis zum
+  // Blockende weiter.
+  fn _slotFreigebbar(k: int64): int64 {
+    if (k == NK_EXPR_STMT || k == NK_ASSIGN || k == NK_IF || k == NK_WHILE) { return 1; }
+    if (k == NK_REPEAT_UNTIL || k == NK_FOR || k == NK_FOR_RANGE || k == NK_FOR_C) { return 1; }
+    if (k == NK_BLOCK || k == NK_SWITCH || k == NK_MATCH || k == NK_TRY) { return 1; }
+    if (k == NK_RETURN || k == NK_BREAK || k == NK_CONTINUE || k == NK_ASSERT) { return 1; }
+    if (k == NK_PANIC || k == NK_THROW || k == NK_DISPOSE || k == NK_POOL) { return 1; }
+    return 0;
   }
   
   // ------------------------------------------------------------------
@@ -9112,6 +9207,12 @@ pub type IRLower = class {
   fn lowerBlock(block: int64) {
     // WP-2.2-B: save the defer-stack depth for this scope
     var scopeStart: int64 := self.deferCount;
+    // #2270: Namen dieses Blocks gelten nur bis zu seinem Ende. Die Suche
+    // laeuft vom neuesten Eintrag rueckwaerts; ohne das Abraeumen fand ein
+    // `x` NACH dem Block noch das innere `x` des Blocks — `var x := 1;
+    // if c { var x := 7; } PrintLn(x)` gab auf den IR-Zielen 7 statt 1 (x86:
+    // 1). Mit wiederverwendeten Slots laege dort sogar ein fremder Wert.
+    var namenStart: int64 := self.localNameCnt;
     var stmt: int64 := self.nodeC0(block);
     if (stmt < 0) {
       // empty block — still need to restore scope (no defers to emit)
@@ -9119,7 +9220,16 @@ pub type IRLower = class {
       return;
     }
     while (stmt >= 0) {
+      // #2270: nach der Anweisung ist tot, was in ihr entstand — Slots wie
+      // Namen (eine for-Variable gilt nur in ihrer Schleife).
+      var vMarke: int64 := self.tempCount;
+      var pMarke: int64 := self._slotTop();
+      var nMarke: int64 := self.localNameCnt;
       self.lowerStmt(stmt);
+      if self._slotFreigebbar(self.nodeKind(stmt)) != 0 {
+        self._slotsFrei(vMarke, pMarke);
+        self.localNameCnt := nMarke;
+      }
       stmt := self.nodeNext(stmt);
     }
     // WP-2.2-B: emit this block's deferred stmts in LIFO order (normal exit path)
@@ -9131,6 +9241,7 @@ pub type IRLower = class {
     }
     // Pop this scope's entries from the stack
     self.deferCount := scopeStart;
+    self.localNameCnt := namenStart;   // #2270
   }
   
   // ------------------------------------------------------------------
@@ -9138,6 +9249,11 @@ pub type IRLower = class {
   // ------------------------------------------------------------------
   
   fn lowerIf(stmt: int64) {
+    // #2270: die Bedingung ist nach dem Sprung tot; Dann- und Sonst-Zweig
+    // fangen wieder bei derselben Marke an. Eine `else if`-Kette belegt so
+    // nicht je Glied neue Slots.
+    var vMarke: int64 := self.tempCount;
+    var pMarke: int64 := self._slotTop();
     var cond: int64 := self.nodeC0(stmt);
     var condTemp: int64 := self.lowerExpr(cond);
 
@@ -9146,11 +9262,13 @@ pub type IRLower = class {
 
     // if not condTemp goto elseLbl
     self.irEmitBrFalse(condTemp, elseLbl);
+    self._slotsFrei(vMarke, pMarke);   // #2270
 
     // Then block
     if (self.nodeC1(stmt) >= 0) {
       self.lowerBlock(self.nodeC1(stmt));
     }
+    self._slotsFrei(vMarke, pMarke);   // #2270
 
     // goto endLbl (skip else)
     self.irEmitJmp(endLbl);
@@ -9200,11 +9318,14 @@ pub type IRLower = class {
     self.irEmitLabel(loopLbl);
 
     // Condition
+    var vMarke: int64 := self.tempCount;   // #2270: wie lowerIf
+    var pMarke: int64 := self._slotTop();
     var cond: int64 := self.nodeC0(stmt);
     var condTemp: int64 := self.lowerExpr(cond);
 
     // if not condTemp goto exitLbl
     self.irEmitBrFalse(condTemp, exitLbl);
+    self._slotsFrei(vMarke, pMarke);   // #2270
 
     // Loop body
     if (self.nodeC1(stmt) >= 0) {
@@ -10179,6 +10300,7 @@ pub type IRLower = class {
     self.localCount := 0;
     self.paramCount := 0;
     self.tempCount := 0;
+    self.slotRec := self._slotRecNeu();   // #2270
     self.localNameCnt := 0;
     self._volSlotN := 0;   // WP-VOLATILE: volatile-Slot-Liste pro Funktion zurücksetzen
     self.curFunc := funcNode;
@@ -11314,6 +11436,27 @@ pub type IRLower = class {
     var off: int64 := funcIdx * 80;
     poke64(funcBuf2 + off + IR_FUNC_OFF_INSTRSOFF, self.funcInstrStart);
     poke64(funcBuf2 + off + IR_FUNC_OFF_INSTRCOUNT, instrLen - self.funcInstrStart);
+    self._slotRecAblegen(funcIdx);   // #2270
+  }
+
+  // #2270: Slot-Satz der eben fertigen Funktion unter ihrem Index ablegen.
+  fn _slotRecAblegen(funcIdx: int64) {
+    if self.slotRec == 0 || funcIdx < 0 { return; }
+    var pb: int64 := peek64(self.ir + IR_MOD_OFF_PHYSBUF);
+    var pc: int64 := peek64(self.ir + IR_MOD_OFF_PHYSCAP);
+    if funcIdx >= pc {
+      var nc: int64 := 64;
+      if pc > 0 { nc := pc * 2; }
+      while nc <= funcIdx { nc := nc * 2; }
+      var nb: int64 := alloc(nc * 8);
+      var z: int64 := 0;
+      while z < nc { poke64(nb + z * 8, 0); z := z + 1; }
+      if pc > 0 { memcpy(nb, pb, pc * 8); }
+      poke64(self.ir + IR_MOD_OFF_PHYSBUF, nb);
+      poke64(self.ir + IR_MOD_OFF_PHYSCAP, nc);
+      pb := nb;
+    }
+    poke64(pb + funcIdx * 8, self.slotRec);
   }
 
   // ------------------------------------------------------------------
@@ -11443,6 +11586,7 @@ pub type IRLower = class {
     var sLocal: int64 := self.localCount;
     var sParam: int64 := self.paramCount;
     var sTemp:  int64 := self.tempCount;
+    var sSlotRec: int64 := self.slotRec;   // #2270
     var sRet:   int64 := self.retValTemp;
     var sCur:   int64 := self.curFunc;
     var sExit:  int64 := self.funcExitLabel;
@@ -11456,6 +11600,7 @@ pub type IRLower = class {
     self.localCount := 0;
     self.paramCount := 0;
     self.tempCount := 0;
+    self.slotRec := self._slotRecNeu();   // #2270
     self.localNameCnt := 0;
     self._volSlotN := 0;
     self.methodParamBase := 0;
@@ -11572,6 +11717,7 @@ pub type IRLower = class {
     self.localCount := sLocal;
     self.paramCount := sParam;
     self.tempCount := sTemp;
+    self.slotRec := sSlotRec;   // #2270
     self.retValTemp := sRet;
     self.curFunc := sCur;
     self.funcExitLabel := sExit;
@@ -11593,6 +11739,7 @@ pub type IRLower = class {
     var sLocal: int64 := self.localCount;
     var sParam: int64 := self.paramCount;
     var sTemp:  int64 := self.tempCount;
+    var sSlotRec: int64 := self.slotRec;   // #2270
     var sRet:   int64 := self.retValTemp;
     var sExit:  int64 := self.funcExitLabel;
     var sStart: int64 := self.funcInstrStart;
@@ -11601,6 +11748,7 @@ pub type IRLower = class {
     self.localCount := 0;
     self.paramCount := 0;
     self.tempCount := 0;
+    self.slotRec := self._slotRecNeu();   // #2270
     var bargRsv: int64 := 0;
     while bargRsv < IR_BARG_SLOTS { self.allocTemp(); bargRsv := bargRsv + 1; }
     self.retValTemp := self.allocTemp();
@@ -11630,6 +11778,7 @@ pub type IRLower = class {
     self.localCount := sLocal;
     self.paramCount := sParam;
     self.tempCount := sTemp;
+    self.slotRec := sSlotRec;   // #2270
     self.retValTemp := sRet;
     self.funcExitLabel := sExit;
     self.funcInstrStart := sStart;
@@ -11857,6 +12006,7 @@ pub type IRLower = class {
     var sLocal: int64 := self.localCount;
     var sParam: int64 := self.paramCount;
     var sTemp:  int64 := self.tempCount;
+    var sSlotRec: int64 := self.slotRec;   // #2270
     var sRet:   int64 := self.retValTemp;
     var sExit:  int64 := self.funcExitLabel;
     var sStart: int64 := self.funcInstrStart;
@@ -11865,6 +12015,7 @@ pub type IRLower = class {
     self.localCount := 0;
     self.paramCount := 0;
     self.tempCount := 0;
+    self.slotRec := self._slotRecNeu();   // #2270
     var bargRsv: int64 := 0;
     while bargRsv < IR_BARG_SLOTS { self.allocTemp(); bargRsv := bargRsv + 1; }
     self.retValTemp := self.allocTemp();
@@ -11937,6 +12088,7 @@ pub type IRLower = class {
     self.localCount := sLocal;
     self.paramCount := sParam;
     self.tempCount := sTemp;
+    self.slotRec := sSlotRec;   // #2270
     self.retValTemp := sRet;
     self.funcExitLabel := sExit;
     self.funcInstrStart := sStart;
@@ -15730,6 +15882,7 @@ pub type IRLower = class {
     var sLoc: int64 := self.localCount;
     var sPar: int64 := self.paramCount;
     var sTmp: int64 := self.tempCount;
+    var sSlotRec: int64 := self.slotRec;   // #2270
     var sLnc: int64 := self.localNameCnt;
     var sRet: int64 := self.retValTemp;
     var sExit: int64 := self.funcExitLabel;
@@ -15750,6 +15903,7 @@ pub type IRLower = class {
     self.localCount := 0;
     self.paramCount := 0;
     self.tempCount := 0;
+    self.slotRec := self._slotRecNeu();   // #2270
     self.localNameCnt := 0;
     self._volSlotN := 0;
     // Das Lambda ist keine Methode: ein `self` im Rumpf ist eine Erfassung.
@@ -15792,6 +15946,7 @@ pub type IRLower = class {
     self.localCount := sLoc;
     self.paramCount := sPar;
     self.tempCount := sTmp;
+    self.slotRec := sSlotRec;   // #2270
     self.localNameCnt := sLnc;
     self.retValTemp := sRet;
     self.funcExitLabel := sExit;

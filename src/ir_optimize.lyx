@@ -36,6 +36,8 @@ pub type IROptimize = class {
   defConst:  int64;
   defFloat:  int64;
   defMove:   int64;
+  // #2270: Slot-Satz der aktuellen Funktion (ir_lower._slotRecNeu, 0 = keiner).
+  slotRec:   int64;
 
   fn init(irMod: IRModule) {
     self.ir := irMod;
@@ -47,6 +49,33 @@ pub type IROptimize = class {
     self.optLevel  := 2;  // WP-AS-06: default = O2
     self.fnStart := 0;
     self.fnEnd := 0;
+    self.slotRec := 0;
+  }
+
+  // #2270: Darf `temp` am Befehl `idx` verwendet werden? Die Backends legen
+  // Temps, deren Anweisung vorbei ist, auf denselben physischen Slot
+  // (ir_lower._slotsFrei). Eine Umformung, die einen Temp hinter seine
+  // Freigabe zieht, laese dort einen fremden Wert — ebenso eine, die ihn VOR
+  // seine Definition zieht (dort steht in einer Schleife der Wert eines
+  // anderen Temps). Erlaubt ist also nur (erste Definition, Freigabe).
+  // `def` ist die erste Definition von temp (-1 = unbekannt), der Aufrufer
+  // rechnet sie einmal (_ersteDef).
+  fn _darfNutzen(temp: int64, idx: int64, def: int64): bool {
+    if self.slotRec == 0 || temp < 0 { return true; }
+    if temp >= peek64(self.slotRec + IR_SLOT_OFF_VIRT) { return true; }
+    var rel: int64 := peek64(peek64(self.slotRec + IR_SLOT_OFF_REL) + temp * 8);
+    if rel >= 0 && idx >= rel { return false; }
+    if def >= 0 && idx <= def { return false; }
+    return true;
+  }
+
+  fn _ersteDef(temp: int64): int64 {
+    var i: int64 := self.fnStart;
+    while (i < self.fnEnd) {
+      if self.getInstrDest(i) == temp { return i; }
+      i += 1;
+    }
+    return -1;
   }
 
   // ------------------------------------------------------------------
@@ -70,6 +99,8 @@ pub type IROptimize = class {
       var fBase: int64 := funcBuf + fi * IR_FUNC_SIZE;
       self.fnStart := peek64(fBase + IR_FUNC_OFF_INSTRSOFF);
       self.fnEnd   := self.fnStart + peek64(fBase + IR_FUNC_OFF_INSTRCOUNT);
+      self.slotRec := 0;   // #2270
+      if fi < self.ir.physCap { self.slotRec := peek64(self.ir.physBuf + fi * 8); }
 
       var pass: int64 := 0;
       while (pass < maxPass) {
@@ -356,11 +387,14 @@ pub type IROptimize = class {
       var src2: int64 := self.getInstrSrc2(i);
 
       // Replace src1 if it's a copy from another instruction
+      // #2270: nur innerhalb der Lebensdauer des Originals (_darfNutzen).
       if (src1 >= 0) {
         var src1Orig: int64 := self.traceCopy(src1);
         if (src1Orig != src1) {
-          self.setInstrSrc1(i, src1Orig);
-          self.changed += 1;
+          if self._darfNutzen(src1Orig, i, self._ersteDef(src1Orig)) {
+            self.setInstrSrc1(i, src1Orig);
+            self.changed += 1;
+          }
         }
       }
 
@@ -368,8 +402,10 @@ pub type IROptimize = class {
       if (src2 >= 0) {
         var src2Orig: int64 := self.traceCopy(src2);
         if (src2Orig != src2) {
-          self.setInstrSrc2(i, src2Orig);
-          self.changed += 1;
+          if self._darfNutzen(src2Orig, i, self._ersteDef(src2Orig)) {
+            self.setInstrSrc2(i, src2Orig);
+            self.changed += 1;
+          }
         }
       }
 
@@ -576,8 +612,9 @@ pub type IROptimize = class {
                 self.getInstrSrc1(j) == src1 &&
                 self.getInstrSrc2(j) == src2) {
               var replaceDest: int64 := self.getInstrDest(j);
-              self.replaceUses(dest, replaceDest);
-              self.changed += 1;
+              // #2270: nur zaehlen, was wirklich ersetzt wurde — sonst lief
+              // jeder abgelehnte Fund bis zur Durchlaufgrenze weiter.
+              if self.replaceUses(dest, replaceDest) > 0 { self.changed += 1; }
             }
             j += 1;
           }
@@ -593,21 +630,28 @@ pub type IROptimize = class {
   // Replace all uses of oldTemp with newTemp
   fn replaceUses(oldTemp: int64, newTemp: int64): int64 {
     var i: int64 := self.fnStart;
+    // #2270: nur Verwendungen in der Lebensdauer von newTemp. Ohne Slot-Satz
+    // (slotRec 0) wie bisher jede.
+    var nDef: int64 := -1;
+    if self.slotRec != 0 { nDef := self._ersteDef(newTemp); }
 
+    var n: int64 := 0;
     while (i < self.fnEnd) {
-      if (self.getInstrSrc1(i) == oldTemp) {
-        self.setInstrSrc1(i, newTemp);
-      }
-      if (self.getInstrSrc2(i) == oldTemp) {
-        self.setInstrSrc2(i, newTemp);
-      }
-      if (self.getInstrSrc3(i) == oldTemp) {
-        self.setInstrSrc3(i, newTemp);
+      if self._darfNutzen(newTemp, i, nDef) {
+        if (self.getInstrSrc1(i) == oldTemp) {
+          self.setInstrSrc1(i, newTemp); n += 1;
+        }
+        if (self.getInstrSrc2(i) == oldTemp) {
+          self.setInstrSrc2(i, newTemp); n += 1;
+        }
+        if (self.getInstrSrc3(i) == oldTemp) {
+          self.setInstrSrc3(i, newTemp); n += 1;
+        }
       }
       i += 1;
     }
 
-    return 0;
+    return n;
   }
   
   // ------------------------------------------------------------------

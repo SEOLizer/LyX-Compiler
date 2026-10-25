@@ -136,8 +136,9 @@ for z in $ZIELE; do
 done
 
 # 4. Selbstbau: lyxc fuer arm64 und riscv, das Erzeugnis uebersetzt unter qemu
-# ein Programm. riscv (#2271): eine Funktion des Compilers liegt ueber 1 MiB —
-# JAL reichte nicht, und main(argc, argv) bekam kein argc.
+# ein Programm und eine Unit des Compilers (#2270). riscv (#2271): eine
+# Funktion des Compilers liegt ueber 1 MiB — JAL reichte nicht, und
+# main(argc, argv) bekam kein argc.
 printf 'import std.io;\nfn main(): int64 {\n  var s: int64 := 0; var i: int64 := 1;\n  while (i <= 10) { s := s + i * i; i += 1; }\n  PrintLn(s);\n  return 0;\n}\n' > "$TMP/h.lyx"
 for z in arm64 riscv; do
   q="$QEMU_ARM64"; em_soll=183
@@ -152,6 +153,13 @@ for z in arm64 riscv; do
     got=$( [ -x "$TMP/h" ] && "$TMP/h" )
     if [ "$got" = "385" ]; then ok "$z-Compiler uebersetzt ein Programm (Ergebnis 385)"
     else no "$z-Compiler" "Ergebnis '$got' ($(grep -m1 -iE 'error|signal|Verwendung' "$TMP/h.log"))"; fi
+    # #2270: src/parser.lyx (ueber std/string -> std/map -> src/ir: dumpOp,
+    # eine `else if`-Kette mit ~115 Gliedern) lief in den Stapelueberlauf —
+    # jede Ebene rekursiert durch cg_genStmt, das 107 KB Rahmen hatte. Die
+    # Unit hat kein main; erwartet ist dieselbe Meldung wie auf x86.
+    ( cd "$ROOT" && ulimit -v 8000000 && timeout 600 "$q" "$TMP/lyxc_$z" src/parser.lyx --std-path="$ROOT" -o "$TMP/pu" >"$TMP/pu.log" 2>&1 ); prc=$?
+    if [ "$prc" = 1 ] && grep -q "undefined function 'main'" "$TMP/pu.log"; then ok "$z-Compiler uebersetzt src/parser.lyx (meldet fehlendes main wie x86)"
+    else no "$z-Compiler an src/parser.lyx" "rc $prc ($(grep -m1 -iE 'error|signal' "$TMP/pu.log"))"; fi
   else no "Selbstbau $z" "rc $sbRc: $(grep -v '^ \|^=\|^$' "$TMP/sb.log" | tail -2 | tr '\n' ' ')"; fi
 done
 
