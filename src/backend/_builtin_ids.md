@@ -502,6 +502,10 @@ stilles Nichts.
 | 260 | Rechtsrotation, Weite mod 64 | `rotr(x, n)` | lyxos (ROR), arm64 (ROR), riscv (SRL/SLL/OR); arm-cm4/esp32 laut abgewiesen | #2190 |
 | 261 | Linksrotation der unteren 32 Bit, Weite mod 32, Ergebnis null-erweitert | `rotl32(x, n)` | lyxos (ROL r32), arm64 (NEG+ROR w), riscv (SLL/SRL/OR, auf 32 Bit gekuerzt), arm-cm4 (NEG+ROR), esp32 (SSL+SRC) | #2177 |
 | 262 | Rechtsrotation der unteren 32 Bit, Weite mod 32 | `rotr32(x, n)` | lyxos (ROR r32), arm64 (ROR w), riscv (SRL/SLL/OR), arm-cm4 (ROR), esp32 (SSR+SRC) | #2177 |
+| 263 | f64 aus dem Speicher (Bitmuster, 8 Byte) | `peekf64(adr)` | lyxos; andere IR-Ziele senken auf peek64 (202) | #2265 — bis 1.2.20J 253, Kollision mit cpu_id |
+| 264 | f64 in den Speicher | `pokef64(adr, wert)` | lyxos; andere IR-Ziele senken auf poke64 (205) | #2265 — bis 1.2.20J 254, Kollision mit cpu_xgetbv |
+| 265 | f32 laden, auf f64 weiten | `peek32f(adr)` | lyxos; andere IR-Ziele: peek32 (201) + IRO_F32_ZU_F64 | #2265 — bis 1.2.20J 255, Kollision mit popcount |
+| 266 | f64 auf f32 kuerzen, speichern | `poke32f(adr, wert)` | lyxos; andere IR-Ziele: IRO_F64_ZU_F32 + poke32 (204) | #2265 — bis 1.2.20J 256, Kollision mit clz |
 
 Auf x86 sind 255 … 257 an die CPU-Stufe gebunden (`--target-cpu`, `@cpu`):
 ohne Zusage wird gerechnet statt `POPCNT`/`LZCNT`/`TZCNT` zu emittieren, weil
