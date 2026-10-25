@@ -503,6 +503,8 @@ test: lyxc
 	@bash tests/ir_selbstbau_2266_test.sh
 	@echo "--- Builtin-IDs ohne Doppelbelegung, Float-Speicher auf allen Zielen (#2265) ---"
 	@bash tests/builtin_kollision_2265_test.sh
+	@echo "--- IR-Ziele: Slots wiederverwendet, Namen blockweise (#2270) ---"
+	@bash tests/ir_slots_2270_test.sh
 	@echo "--- keine Spruenge ueber 32-Byte-Grenzen (#2244) ---"
 	@bash tests/sprung_ausrichtung_2244_test.sh
 	@echo "--- Vektordaten auf 64 Byte, Vektorschleifen unten geprueft (#2215) ---"
