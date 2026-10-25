@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.21B
+VERSION   := 1.2.21C
 VERSION_DATE := 2026-10-25
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -503,6 +503,8 @@ test: lyxc
 	@bash tests/ir_selbstbau_2266_test.sh
 	@echo "--- Builtin-IDs ohne Doppelbelegung, Float-Speicher auf allen Zielen (#2265) ---"
 	@bash tests/builtin_kollision_2265_test.sh
+	@echo "--- IR-Ziele: FileSize aus Bausteinen, ArgvGet als Text (#2258, #2274) ---"
+	@bash tests/filesize_argvget_ir_2258_2274_test.sh
 	@echo "--- IR-Ziele: Slots wiederverwendet, Namen blockweise (#2270) ---"
 	@bash tests/ir_slots_2270_test.sh
 	@echo "--- keine Spruenge ueber 32-Byte-Grenzen (#2244) ---"

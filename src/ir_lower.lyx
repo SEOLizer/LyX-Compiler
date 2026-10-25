@@ -10,6 +10,7 @@ import src.std.alloc;
 import src.wildcard_import;   // #1736: IncludePfadTeil
 import src.backend.linux_syscalls;   // #2021: LSC_* + Nummern/Stelligkeit
 import src.lyu_reader;   // #2014 Deklarationen, #1971/#2142 Ressourcen, Anhang, LYU_MAX_BYTES
+import src.backend.builtin_typen;   // #2274: eine Liste "liefert pchar"
 
 // AST node field offsets (node size = 88 bytes)
 con NODE_OFF_C0:     int64 := 8;
@@ -4644,6 +4645,14 @@ pub type IRLower = class {
     // haeufigste fehlende Name ueberhaupt.
     if (self.seq(fname, fnlen, "FileSize", 8) && arg0 >= 0) {
       var fsP: int64 := self.lowerExpr(arg0);
+      // #2258: arm64 und riscv kannten die ID 406 nicht und wiesen sie laut
+      // ab — damit war std.csv dort gar nicht uebersetzbar und der Dateiweg
+      // von std.nn_io ebenso. Ausserhalb von lyxos aus IR-Bausteinen.
+      if self.target != 14 {
+        var fsR: int64 := self._fileSizeIR(fsP);
+        self.irAddInstrDirect(IRO_STORE_LOCAL, dest, fsR, -1, 0);
+        return dest;
+      }
       self.irAddInstrDirect(IRO_STORE_LOCAL, 0, fsP, -1, 0);
       self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 406);
       return dest;
@@ -14116,10 +14125,11 @@ pub type IRLower = class {
         // stdlib-Funktionen, die eine Zeichenkette liefern.
         var pnCn: pchar := self.nodeSVal(nd);
         var pnCl: int64 := self.nodeSLen(nd);
-        if (self.seq(pnCn, pnCl, "IntToStr", 8) || self.seq(pnCn, pnCl, "StrFromInt", 10)
-            || self.seq(pnCn, pnCl, "FloatToStr", 10) || self.seq(pnCn, pnCl, "StrConcat", 9)
-            || self.seq(pnCn, pnCl, "StrCopy", 7) || self.seq(pnCn, pnCl, "StrSub", 6)
-            || self.seq(pnCn, pnCl, "StrTrim", 7) || self.seq(pnCn, pnCl, "StrNew", 6)) {
+        // #2274: dieselbe Liste wie der x86-Weg (src/backend/builtin_typen.lyx).
+        // Bis 1.2.21B war das eine eigene Aufzaehlung; `ArgvGet` fehlte in
+        // ihr, und `PrintLn(ArgvGet(argv, 1))` wurde deshalb hier abgewiesen,
+        // waehrend x86 still die Adresse als Zahl ausgab.
+        if (BuiltinLiefertPchar(pnCn, pnCl) != 0) {
           pnArt := 1;
         } else {
           // Nutzerfunktion: Rueckgabetyp steht in c1 des NK_FUNC_DECL.
@@ -15368,6 +15378,32 @@ pub type IRLower = class {
     self._rufArg(203, ende, self._konst(0), 0 - 1);
     self.irAddInstrDirect(IRO_STORE_LOCAL, res, buf, -1, 0);
     self.irEmitLabel(lZu);
+    self._rufArg(221, fd, 0 - 1, 0 - 1);
+    self.irEmitLabel(lEnde);
+    return res;
+  }
+
+  // #2258: FileSize(pfad) aus IR-Bausteinen — open (220), lseek (228),
+  // close (221). Dieselbe Bedeutung wie der x86-Schnellweg (cg_genCall,
+  // "FileSize"): Groesse in Bytes, -1 wenn sich die Datei nicht oeffnen
+  // laesst. -1 und nicht 0, weil 0 eine GUELTIGE Dateigroesse ist.
+  //
+  // WARUM HIER UND NICHT IN DEN BACKENDS: dieselbe Abwaegung wie bei
+  // FileReadAll (#2266) und peek32f (#2265). Die drei Systemaufrufe und der
+  // Vergleich liegen alle schon als IR-Bausteine vor; in arm64 UND riscv
+  // waeren es zwei handgeschriebene Assemblerfolgen mit Sprung, die
+  // uebereinstimmen muessen — genau die Klasse "zweite Stelle laeuft
+  // auseinander". lyxos behaelt seine eigene ID 406 (ein Kernelaufruf).
+  fn _fileSizeIR(pfad: int64): int64 {
+    var res: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_STORE_LOCAL, res, self._konst(0 - 1), -1, 0);
+    var lEnde: int64 := self.genLabel();
+    var fd: int64 := self._rufArg(220, pfad, self._konst(0), self._konst(0));   // O_RDONLY
+    var fdNeg: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_CMP_LT, fdNeg, fd, self._konst(0), 0);
+    self.irAddInstrDirect(IRO_BR_TRUE, -1, fdNeg, -1, lEnde);
+    var gr: int64 := self._rufArg(228, fd, self._konst(0), self._konst(2));     // SEEK_END
+    self.irAddInstrDirect(IRO_STORE_LOCAL, res, gr, -1, 0);
     self._rufArg(221, fd, 0 - 1, 0 - 1);
     self.irEmitLabel(lEnde);
     return res;
