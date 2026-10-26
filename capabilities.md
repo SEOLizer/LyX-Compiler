@@ -118,6 +118,15 @@ Zwei Festlegungen, die sich nicht aus der Tabelle ergeben:
 * **Metadaten lesen und schreiben sind getrennt.** `chmod` und `chown` hängen
   an `fs.perm`, nicht an `fs.meta` — wer nur ein Verzeichnis auflisten will,
   soll nicht stillschweigend Rechte umschreiben dürfen (#1188).
+* **Eine Dateidatenbank braucht `fs.delete`.** `std.db.sqlite` mit einem Pfad
+  (nicht `:memory:`) entfernt am Ende jeder Transaktion die Journaldatei;
+  ohne `fs.delete` stirbt der Lauf an `unlink`, und zwar erst beim ersten
+  Schreiben, nicht beim Öffnen. Das ist die Grenze, nicht eine Lücke: Löschen
+  ist genau das Recht, das `fs.delete` beschreibt. Der gemessene Nachweis
+  (`--seccomp-trap`, #1348) nennt `si_syscall=__NR_unlink` — ohne diesen
+  Schalter ist die verworfene Nummer von aussen nicht bestimmbar (#2279).
+  Nötig ist also: `fs.read, fs.write, fs.create, fs.delete`, dazu
+  `system.rand` und `fs.meta`.
 
 Immer erlaubt, ohne Capability: `exit_group`, `exit`, `brk`, `mmap(anon)`,
 `munmap`, `write`, `prctl`, `prlimit64`, `futex`, Signal-Rueckkehr,
