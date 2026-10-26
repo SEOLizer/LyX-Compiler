@@ -495,6 +495,8 @@ test: lyxc
 	@bash tests/ffi_herkunft_2202_test.sh
 	@echo "--- --profile laesst Argumentregister in Ruhe (#2180) ---"
 	@bash tests/profile_argumente_2180_test.sh
+	@echo "--- --profile: Bericht nach Gesamttakten sortiert (#2259) ---"
+	@bash tests/profile_sortierung_2259_test.sh
 	@echo "--- --profile: Rekursion inklusive, keine 0-calls-Zeilen (#2249) ---"
 	@bash tests/profile_rekursion_2249_test.sh
 	@echo "--- IR-Ziele: Array-Kopf wie x86, Struct-Elemente, lseek (#2262, #2260) ---"
