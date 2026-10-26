@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.22C
+VERSION   := 1.2.22D
 VERSION_DATE := 2026-10-26
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -507,6 +507,8 @@ test: lyxc
 	@bash tests/builtin_kollision_2265_test.sh
 	@echo "--- IR-Ziele: FileSize aus Bausteinen, ArgvGet als Text (#2258, #2274) ---"
 	@bash tests/filesize_argvget_ir_2258_2274_test.sh
+	@echo "--- f64-Typherleitung ohne Typangabe (peekf64) auf allen Zielen (#2287) ---"
+	@bash tests/f64_typherleitung_2287_test.sh
 	@echo "--- Canary nur bei Rahmenpuffer, Ueberlauf loest weiter aus (#2245) ---"
 	@bash tests/canary_rahmenpuffer_2245_test.sh
 	@echo "--- for: Laufvariable blockweise, auf allen Zielen gleich (#2277) ---"

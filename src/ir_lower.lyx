@@ -1062,6 +1062,11 @@ pub type IRLower = class {
   // ARM64-OOP: parallel zu localNameBuf — type-name-Node pro Local (oder -1).
   // Erlaubt Instanz-Feldzugriff `p.x`: p's Typ → Feld-Offset.
   localTypeBuf: int64;
+  // #2287: je Local ein Merkwert "ist Gleitkomma", fuer die Faelle OHNE
+  // Typangabe (`var v := peekf64(p)`). Ein Typknoten laesst sich hier nicht
+  // erzeugen — die Knotenarena gehoert dem Parser —, deshalb eine Spalte
+  // neben localTypeBuf. Sie waechst MIT ihr (siehe _regLocal).
+  localF64Buf: int64;
   // ARM64-OOP statische Methoden: in einer Methode = 1 (self belegt Slot 0, explizite
   // Params verschieben sich um +1), sonst 0. curMethodClassType = NK_TYPE_NAME-Node der
   // umgebenden Klasse (für `self.field`-Auflösung) oder -1.
@@ -1396,6 +1401,7 @@ pub type IRLower = class {
     self.localNameCap := 32;
     self.localNameBuf := alloc(32 * 24);
     self.localTypeBuf := alloc(32 * 8);
+    self.localF64Buf := alloc(32 * 8);   // #2287
     self.localNameCnt := 0;
     self.methodParamBase    := 0;
     self.curMethodClassType := 0 - 1;
@@ -2560,7 +2566,11 @@ pub type IRLower = class {
     if k == NK_IDENT {
       var tn: int64 := self._localTypeNode(self.nodeSVal(expr), self.nodeSLen(expr));
       if tn >= 0 { return self._istGleitTypName(self.nodeSVal(tn), self.nodeSLen(tn)); }
-      return 0;
+      // #2287: OHNE Typangabe gibt es keinen Typknoten. `var v := peekf64(p)`
+      // galt deshalb als Ganzzahl, und jede Rechnung lief auf dem Bitmuster:
+      // `v * v` ergab 0.0, eine laufende Summe 9.24e18. Der Merkwert steht
+      // beim Eintragen des Locals (lowerVarDecl), wo der Startwert bekannt ist.
+      return self._localIstF64(self.nodeSVal(expr), self.nodeSLen(expr));
     }
     if k == NK_CAST {
       var tt: int64 := self.nodeC1(expr);
@@ -7930,7 +7940,10 @@ pub type IRLower = class {
   }
 
   // ARM64-OOP: type-name-Node eines Locals per Name (-1 wenn nicht local/kein Typ).
-  fn _localTypeNode(idp: pchar, idl: int64): int64 {
+  // #2287: Welches Local traegt diesen Namen? Von hinten, also die innerste
+  // Deklaration. EINE Suche fuer _localTypeNode und _localIstF64 — zwei
+  // getrennte Fassungen derselben Suche laufen auseinander (vgl. #1787/#1806).
+  fn _localIdx(idp: pchar, idl: int64): int64 {
     var idPtrL: int64 := (idp) as int64;
     var li: int64 := self.localNameCnt - 1;
     while li >= 0 {
@@ -7942,10 +7955,30 @@ pub type IRLower = class {
         var m: int64 := 1;
         var j: int64 := 0;
         while j < idl { if m != 0 { if peek8(nptr + j) != peek8(idPtrL + j) { m := 0; } } j := j + 1; }
-        if m != 0 { return self._genSubst(peek64(self.localTypeBuf + li * 8)); }   // #2125
+        if m != 0 { return li; }
       }
       li -= 1;
     }
+    return 0 - 1;
+  }
+
+  // #2287: Ist dieses Local ohne Typangabe als Gleitkomma vermerkt?
+  fn _localIstF64(idp: pchar, idl: int64): int64 {
+    var li: int64 := self._localIdx(idp, idl);
+    if li < 0 { return 0; }
+    return peek64(self.localF64Buf + li * 8);
+  }
+
+  // #2287: den Merkwert fuer das ZULETZT eingetragene Local setzen.
+  fn _regLocalF64() {
+    if self.localNameCnt <= 0 { return; }
+    poke64(self.localF64Buf + (self.localNameCnt - 1) * 8, 1);
+  }
+
+  fn _localTypeNode(idp: pchar, idl: int64): int64 {
+    var idPtrL: int64 := (idp) as int64;
+    var liT: int64 := self._localIdx(idp, idl);
+    if liT >= 0 { return self._genSubst(peek64(self.localTypeBuf + liT * 8)); }   // #2125
     // ARM64-OOP: nicht local → Params durchsuchen (NK_PARAM.c0 = Typ-Node).
     if self.curFunc >= 0 {
       var pn: int64 := self.nodeC0(self.curFunc);
@@ -9192,6 +9225,13 @@ pub type IRLower = class {
         else if self.nodeKind(vdInit) == NK_CALL { vdTyp := self._clErgebnisTyp(vdInit); }
       }
       self._regLocal(peek64(self.nodeOff(stmt) + NODE_OFF_SVAL), self.nodeSLen(stmt), vdSlot, vdTyp);
+      // #2287: Ohne Typangabe den Gleitkommafall vermerken. _isF64Expr kennt
+      // die eingebauten Quellen (sqrt, peekf64, peek32f, fAdd…) schon; ohne
+      // diesen Vermerk war die Auskunft fuer den NAMEN danach nicht mehr zu
+      // bekommen, weil es keinen Typknoten gibt.
+      if (vdTyp < 0 && vdInit >= 0) {
+        if (self._isF64Expr(vdInit) != 0) { self._regLocalF64(); }
+      }
       self._clVarMerken(stmt, vdSlot);   // #2108: Satz oder duenner Zeiger?
     }
     // #2020: eine verschachtelte `fn` als Anweisung. Hier entsteht NICHTS —
@@ -9552,6 +9592,9 @@ pub type IRLower = class {
       var tb: int64 := alloc(nc * 8);
       memcpy(tb, self.localTypeBuf, self.localNameCnt * 8);
       self.localTypeBuf := tb;
+      var fb: int64 := alloc(nc * 8);        // #2287: dieselbe Groesse, dasselbe Wachsen
+      memcpy(fb, self.localF64Buf, self.localNameCnt * 8);
+      self.localF64Buf := fb;
       self.localNameCap := nc;
     }
     var rec: int64 := self.localNameBuf + self.localNameCnt * 24;
@@ -9559,6 +9602,7 @@ pub type IRLower = class {
     poke64(rec +  8, nameLen);
     poke64(rec + LOCAL_REC_OFF_SLOT, slot);
     poke64(self.localTypeBuf + self.localNameCnt * 8, typNi);
+    poke64(self.localF64Buf + self.localNameCnt * 8, 0);   // #2287: Vorgabe "kein f64"
     self.localNameCnt += 1;
   }
 
