@@ -507,6 +507,8 @@ test: lyxc
 	@bash tests/builtin_kollision_2265_test.sh
 	@echo "--- IR-Ziele: FileSize aus Bausteinen, ArgvGet als Text (#2258, #2274) ---"
 	@bash tests/filesize_argvget_ir_2258_2274_test.sh
+	@echo "--- f64-Typherleitung ohne Typangabe (peekf64) auf allen Zielen (#2287) ---"
+	@bash tests/f64_typherleitung_2287_test.sh
 	@echo "--- Canary nur bei Rahmenpuffer, Ueberlauf loest weiter aus (#2245) ---"
 	@bash tests/canary_rahmenpuffer_2245_test.sh
 	@echo "--- for: Laufvariable blockweise, auf allen Zielen gleich (#2277) ---"
