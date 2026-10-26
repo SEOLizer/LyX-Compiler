@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.22B
+VERSION   := 1.2.22C
 VERSION_DATE := 2026-10-26
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -495,6 +495,8 @@ test: lyxc
 	@bash tests/ffi_herkunft_2202_test.sh
 	@echo "--- --profile laesst Argumentregister in Ruhe (#2180) ---"
 	@bash tests/profile_argumente_2180_test.sh
+	@echo "--- --profile: Bericht nach Gesamttakten sortiert (#2259) ---"
+	@bash tests/profile_sortierung_2259_test.sh
 	@echo "--- --profile: Rekursion inklusive, keine 0-calls-Zeilen (#2249) ---"
 	@bash tests/profile_rekursion_2249_test.sh
 	@echo "--- IR-Ziele: Array-Kopf wie x86, Struct-Elemente, lseek (#2262, #2260) ---"

@@ -31524,12 +31524,106 @@ pub type Codegen = class {
         self.cg_edata(99);  self.cg_edata(108); self.cg_edata(101); // "cle"
         self.cg_edata(115); self.cg_edata(32);  self.cg_edata(97);  // "s a"
         self.cg_edata(118); self.cg_edata(103); self.cg_edata(10);  // "vg\n"
+        // #2259: Der Bericht wird nach GESAMTTAKTEN sortiert ausgegeben.
+        //
+        // Die Druckbloecke bleiben ausgerollt (einer je Eintrag, Datenadressen
+        // zur Uebersetzungszeit bekannt) — sortieren laesst sich daran nichts,
+        // denn die Takte stehen erst zur Laufzeit fest. Darum liegt jetzt eine
+        // Schleife herum, die je Runde den groessten noch nicht gedruckten
+        // Eintrag auswaehlt und nur dessen Block ausfuehrt. O(n^2) ist bei
+        // Berichtsgroesse unerheblich.
+        //
+        // KEINE MERKSPALTE: als "schon gedruckt" dient die Aufrufzahl selbst,
+        // die nach dem Druck auf 0 gesetzt wird. Eintraege mit 0 Aufrufen sind
+        // seit #2249 ohnehin uebersprungen, der Filter steht also schon da.
+        // Der Bericht ist das Letzte, was laeuft (main-Epilog) — danach liest
+        // die Zahl niemand mehr.
+        //
+        // ALLE SCHLEIFENZUSTAENDE LIEGEN IN DATENZELLEN, nicht in Registern:
+        // zwischen Auswahl und Druck laufen die vorhandenen Druckblöcke, die
+        // rax/rcx/rdx/rdi/rsi frei benutzen. r11 traegt nur kurzzeitig die
+        // Adresse einer Zelle.
+        //
+        // Adressen werden ueber `lea r11,[rip+d]` geladen und NICHT ueber eine
+        // rip-relative Form mit angehaengtem Immediate: CG_PATCH_STR rechnet
+        // den Abstand ab dem Ende des disp32-Feldes (cg_applyPatches:
+        // `codeLen - codeOff - 4 + dataOff`), ein nachfolgendes imm32 wuerde
+        // das Ziel um vier Byte verschieben.
+        var prCurOff: int64 := self.dataLen;     // Index des Siegers, -1 = keiner
+        var prC2: int64 := 0; while prC2 < 8 { self.cg_edata(0); prC2 += 1; }
+        var prBestOff: int64 := self.dataLen;    // groesste Taktzahl der Runde
+        var prB2: int64 := 0; while prB2 < 8 { self.cg_edata(0); prB2 += 1; }
+
+        var prOben: int64 := self.codeLen;       // Marke: Anfang jeder Runde
+        // mov qword [cur], -1
+        self.cg_e8(0x4C); self.cg_e8(0x8D); self.cg_e8(0x1D);
+        var prL1: int64 := self.codeLen; self.cg_e32(0);
+        self.cg_addPatch(prL1, prCurOff, 0, CG_PATCH_STR);
+        self.cg_e8(0x49); self.cg_e8(0xC7); self.cg_e8(0x03); self.cg_e32(0 - 1);
+        // mov qword [best], 0
+        self.cg_e8(0x4C); self.cg_e8(0x8D); self.cg_e8(0x1D);
+        var prL2: int64 := self.codeLen; self.cg_e32(0);
+        self.cg_addPatch(prL2, prBestOff, 0, CG_PATCH_STR);
+        self.cg_e8(0x49); self.cg_e8(0xC7); self.cg_e8(0x03); self.cg_e32(0);
+
+        // Auswahl: je Eintrag pruefen, ob er die bisher groesste Taktzahl hat.
+        var prSel: int64 := 0;
+        while (prSel < self.profEntryCount) {
+          var prSB: int64 := self.profEntries + prSel * 32;
+          var prSD: int64 := peek64(prSB + CG_PR_OFF_DOFF);
+          // lea r11,[count]; mov rax,[r11]; test rax,rax; jz weiter
+          self.cg_e8(0x4C); self.cg_e8(0x8D); self.cg_e8(0x1D);
+          var prS1: int64 := self.codeLen; self.cg_e32(0);
+          self.cg_addPatch(prS1, prSD + 8, 0, CG_PATCH_STR);
+          self.cg_e8(0x49); self.cg_e8(0x8B); self.cg_e8(0x03);
+          self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC0);
+          self.cg_e8(0x0F); self.cg_e8(0x84);
+          var prSW: int64 := self.codeLen; self.cg_e32(0);
+          // lea r11,[total]; mov rax,[r11]
+          self.cg_e8(0x4C); self.cg_e8(0x8D); self.cg_e8(0x1D);
+          var prS2: int64 := self.codeLen; self.cg_e32(0);
+          self.cg_addPatch(prS2, prSD + 16, 0, CG_PATCH_STR);
+          self.cg_e8(0x49); self.cg_e8(0x8B); self.cg_e8(0x03);
+          // lea r11,[best]; cmp rax,[r11]; jbe weiter
+          self.cg_e8(0x4C); self.cg_e8(0x8D); self.cg_e8(0x1D);
+          var prS3: int64 := self.codeLen; self.cg_e32(0);
+          self.cg_addPatch(prS3, prBestOff, 0, CG_PATCH_STR);
+          self.cg_e8(0x49); self.cg_e8(0x3B); self.cg_e8(0x03);
+          self.cg_e8(0x0F); self.cg_e8(0x86);
+          var prSW2: int64 := self.codeLen; self.cg_e32(0);
+          // mov [r11],rax  (best := total)
+          self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0x03);
+          // lea r11,[cur]; mov qword [r11], prSel
+          self.cg_e8(0x4C); self.cg_e8(0x8D); self.cg_e8(0x1D);
+          var prS4: int64 := self.codeLen; self.cg_e32(0);
+          self.cg_addPatch(prS4, prCurOff, 0, CG_PATCH_STR);
+          self.cg_e8(0x49); self.cg_e8(0xC7); self.cg_e8(0x03); self.cg_e32(prSel);
+          poke32(self.code + prSW,  self.codeLen - prSW - 4);
+          poke32(self.code + prSW2, self.codeLen - prSW2 - 4);
+          prSel += 1;
+        }
+        // lea r11,[cur]; cmp qword [r11], -1; je ende
+        self.cg_e8(0x4C); self.cg_e8(0x8D); self.cg_e8(0x1D);
+        var prL3: int64 := self.codeLen; self.cg_e32(0);
+        self.cg_addPatch(prL3, prCurOff, 0, CG_PATCH_STR);
+        self.cg_e8(0x49); self.cg_e8(0x83); self.cg_e8(0x3B); self.cg_e8(0xFF);
+        self.cg_e8(0x0F); self.cg_e8(0x84);
+        var prEnde: int64 := self.codeLen; self.cg_e32(0);
+
         var prIdx: int64 := 0;
         while (prIdx < self.profEntryCount) {
           var prEBase: int64 := self.profEntries + prIdx * 32;
           var prNLen:  int64 := peek64(prEBase + CG_PR_OFF_NAMELEN);
           var prDOff:  int64 := peek64(prEBase + CG_PR_OFF_DOFF);
           var prNDOff: int64 := peek64(prEBase + CG_PR_OFF_NDOFF);
+          // #2259: nur der Sieger dieser Runde druckt.
+          // lea r11,[cur]; cmp qword [r11], prIdx; jne weiter
+          self.cg_e8(0x4C); self.cg_e8(0x8D); self.cg_e8(0x1D);
+          var prG1: int64 := self.codeLen; self.cg_e32(0);
+          self.cg_addPatch(prG1, prCurOff, 0, CG_PATCH_STR);
+          self.cg_e8(0x49); self.cg_e8(0x81); self.cg_e8(0x3B); self.cg_e32(prIdx);
+          self.cg_e8(0x0F); self.cg_e8(0x85);
+          var prGW: int64 := self.codeLen; self.cg_e32(0);
           // #2249: Eintraege ohne Aufruf weglassen — sonst listete jedes
           // Programm alle Funktionen der importierten std mit „0 calls“.
           self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x05);
@@ -31616,9 +31710,19 @@ pub type Codegen = class {
           self.cg_e8(0xBF); self.cg_e8(2); self.cg_e8(0); self.cg_e8(0); self.cg_e8(0);    // mov edi, 2
           self.cg_e8(0xB8); self.cg_e8(1); self.cg_e8(0); self.cg_e8(0); self.cg_e8(0);    // mov eax, 1
           self.cg_e8(0x0F); self.cg_e8(0x05);                                                // syscall
+          // #2259: gedruckt — Aufrufzahl auf 0, damit dieser Eintrag in der
+          // naechsten Runde nicht wieder gewinnt.
+          self.cg_e8(0x4C); self.cg_e8(0x8D); self.cg_e8(0x1D);
+          var prZ1: int64 := self.codeLen; self.cg_e32(0);
+          self.cg_addPatch(prZ1, prDOff + 8, 0, CG_PATCH_STR);
+          self.cg_e8(0x49); self.cg_e8(0xC7); self.cg_e8(0x03); self.cg_e32(0);
           poke32(self.code + prSkip, self.codeLen - prSkip - 4);   // #2249: weiter
+          poke32(self.code + prGW,   self.codeLen - prGW - 4);     // #2259: nicht der Sieger
           prIdx += 1;
         }
+        // Naechste Runde.
+        self.cg_e8(0xE9); self.cg_e32(prOben - self.codeLen - 4);
+        poke32(self.code + prEnde, self.codeLen - prEnde - 4);     // #2259: kein Kandidat mehr
       }
       self.cg_zeroRax();
 
