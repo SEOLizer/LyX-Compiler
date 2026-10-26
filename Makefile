@@ -505,6 +505,8 @@ test: lyxc
 	@bash tests/builtin_kollision_2265_test.sh
 	@echo "--- IR-Ziele: FileSize aus Bausteinen, ArgvGet als Text (#2258, #2274) ---"
 	@bash tests/filesize_argvget_ir_2258_2274_test.sh
+	@echo "--- for: Laufvariable blockweise, auf allen Zielen gleich (#2277) ---"
+	@bash tests/for_laufvariable_2277_test.sh
 	@echo "--- IR-Ziele: Slots wiederverwendet, Namen blockweise (#2270) ---"
 	@bash tests/ir_slots_2270_test.sh
 	@echo "--- keine Spruenge ueber 32-Byte-Grenzen (#2244) ---"
