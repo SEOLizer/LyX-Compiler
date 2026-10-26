@@ -1174,6 +1174,11 @@ pub type Codegen = class {
   fnWertFnCap:           int64;
   curFnRetFnWert:        int64;   // 1 = die gerade erzeugte Funktion gibt einen Funktionswert zurueck
   satzLocalJe:           int64;   // 1 = irgendein Local wurde schon als Satz vermerkt (Abkuerzung)
+  // #2245: 1 = diese Funktion traegt einen Stack-Canary. Gesetzt VOR dem
+  // Prolog aus cg_funcBrauchtCanary(ni); Prolog und Epilog lesen dasselbe
+  // Feld — die beiden muessen uebereinstimmen, sonst prueft der Epilog einen
+  // Slot, den der Prolog nie beschrieben hat.
+  canaryAn:              int64;
   localBase:             int64;   // cg_findLocal searches [localBase, localCount) only
 
   // Per-local array flag (WP-10b): byte buffer parallel to locals, 1 = array type
@@ -1784,6 +1789,107 @@ pub type Codegen = class {
     if (classIdx < 0) { return 0; }
     if (peek64(self.classLayouts + classIdx * CG_CLASS_SZ + CG_CLASS_OFF_ISSTRUCT) == 0) { return 0; }
     return 1;
+  }
+
+  // #2245: Braucht DIESE Funktion einen Stack-Canary?
+  //
+  // Regel wie `-fstack-protector-strong`: nur Funktionen, deren Rahmen
+  // ueberhaupt ueberschrieben werden KANN, pruefen ihn. Das sind die mit
+  // einem Aggregat im Rahmen (Feld, festes Feld, Wert-Struct, Tupel,
+  // Ringpuffer, parallel Array, Feld-Literal), die, von deren Local jemand
+  // die ADRESSE nimmt (`@x` — danach schreibt beliebiger Code dorthin), und
+  // die mit einem asm-Block. Eine Funktion, die nur Skalare in Registern und
+  // Rahmen-Slots haelt, kann ihren Rueckkehrpunkt nicht ueber einen
+  // Pufferueberlauf zerschreiben: es gibt keinen Puffer.
+  //
+  // Bis 1.2.21D trug JEDE Funktion einen: 13 215 Pruefungen bei 3 430
+  // Funktionen, rund 11 % der Proben im Selbstbau (#2228).
+  //
+  // DIE RICHTUNG DES IRRTUMS IST ENTSCHEIDEND. Ein falsches "kein Canary" bei
+  // einer Funktion MIT Puffer waere eine Sicherheitsregression; ein falsches
+  // "Canary" kostet fuenf Befehle. Deshalb ist die Antwort hier 1, sobald
+  // etwas nicht eindeutig als Skalar erkennbar ist: unbekannter Knoten, zu
+  // tiefe Verschachtelung, Deklaration ohne Typangabe mit einem Startwert,
+  // der kein Literal und kein Aufruf ist.
+  fn cg_funcBrauchtCanary(body: int64): int64 {
+    if (body < 0) { return 1; }
+    return self.cg_canaryScan(body, 0);
+  }
+
+  // Ist dieser Typknoten eindeutig ein SKALAR (etwas, das in ein
+  // Maschinenwort passt und keinen Inhalt im Rahmen hat)? Dieselbe
+  // Unterscheidung wie cg_rlTypOk (#2228) trifft, nur weiter: dort ging es um
+  // "passt in ein Register", hier um "ist kein Puffer". Ein Wert-Struct liegt
+  // im Rahmen selbst und zaehlt deshalb NICHT als Skalar.
+  fn cg_canarySkalarTyp(tn: int64): int64 {
+    if (tn < 0) { return 0; }
+    if (self.cg_nkind(tn) != 60) { return 0; }   // nur ein benannter Typ
+    var p: pchar := self.cg_nsval(tn);
+    var l: int64 := self.cg_nslen(tn);
+    if (l <= 0) { return 0; }
+    var ci: int64 := self.cg_findClass(p, l);
+    if (ci >= 0) {
+      // Klasse: Referenz auf den Haufen, also ein Zeiger. Wert-Struct: Inhalt
+      // im Rahmen.
+      if (self.cg_istWertStruct(ci) != 0) { return 0; }
+      return 1;
+    }
+    // Generische Namen (Array, Map, Set, RingBuffer, Vec, Box …) sind keine
+    // Skalare; sie tragen ihren Inhalt mit. Eindeutig skalar sind die
+    // Grundtypen und der Zeiger auf Zeichen.
+    if (self.cg_seq(p, l, "int64"c, 5) || self.cg_seq(p, l, "uint64"c, 6)) { return 1; }
+    if (self.cg_seq(p, l, "int32"c, 5) || self.cg_seq(p, l, "uint32"c, 6)) { return 1; }
+    if (self.cg_seq(p, l, "int16"c, 5) || self.cg_seq(p, l, "uint16"c, 6)) { return 1; }
+    if (self.cg_seq(p, l, "int8"c, 4)  || self.cg_seq(p, l, "uint8"c, 5))  { return 1; }
+    if (self.cg_seq(p, l, "i64"c, 3) || self.cg_seq(p, l, "u64"c, 3)) { return 1; }
+    if (self.cg_seq(p, l, "i32"c, 3) || self.cg_seq(p, l, "u32"c, 3)) { return 1; }
+    if (self.cg_seq(p, l, "i16"c, 3) || self.cg_seq(p, l, "u16"c, 3)) { return 1; }
+    if (self.cg_seq(p, l, "i8"c, 2)  || self.cg_seq(p, l, "u8"c, 2))  { return 1; }
+    if (self.cg_seq(p, l, "f64"c, 3) || self.cg_seq(p, l, "f32"c, 3)) { return 1; }
+    if (self.cg_seq(p, l, "bool"c, 4) || self.cg_seq(p, l, "char"c, 4)) { return 1; }
+    if (self.cg_seq(p, l, "byte"c, 4) || self.cg_seq(p, l, "pchar"c, 5)) { return 1; }
+    if (self.cg_seq(p, l, "void"c, 4)) { return 1; }
+    return 0;
+  }
+
+  // Ein Startwert OHNE Typangabe: nur offensichtliche Skalarwerte gelten als
+  // harmlos. Ein Feld-Literal (Knotenart 100) liegt im Rahmen, `parallel`
+  // ebenso; alles Unbekannte faellt auf die sichere Seite.
+  fn cg_canarySkalarWert(ni: int64): int64 {
+    if (ni < 0) { return 1; }   // keine Angabe, kein Wert: nichts im Rahmen
+    var k: int64 := self.cg_nkind(ni);
+    if (k == CGN_LIT_INT || k == CGN_LIT_FLOAT || k == CGN_LIT_STR) { return 1; }
+    if (k == CGN_LIT_CHAR || k == CGN_LIT_BOOL || k == CGN_LIT_NULL) { return 1; }
+    return 0;
+  }
+
+  fn cg_canaryScan(ni: int64, tiefe: int64): int64 {
+    if (ni < 0) { return 0; }
+    if (tiefe > 64) { return 1; }   // nicht mehr zu ueberblicken → Canary
+    var cur: int64 := ni;
+    while (cur >= 0) {
+      var k: int64 := self.cg_nkind(cur);
+      // Adresse eines Locals: danach schreibt beliebiger Code in den Rahmen.
+      if (k == CGN_UNOP && self.cg_nival(cur) == 111) { return 1; }
+      // asm-Block: was er tut, steht nicht im AST.
+      if (k == CGN_ASM) { return 1; }
+      // Feld-Literal und parallel Array legen im Rahmen an.
+      if (k == 100 || k == CGN_SIMD_NEW || k == CGN_MAP_LIT) { return 1; }
+      if (k == CGN_VAR_DECL || k == CGN_CON_DECL) {
+        var tn: int64 := self.cg_nc0(cur);
+        if (tn >= 0) {
+          if (self.cg_canarySkalarTyp(tn) == 0) { return 1; }
+        } else {
+          if (self.cg_canarySkalarWert(self.cg_nc1(cur)) == 0) { return 1; }
+        }
+      }
+      if (self.cg_canaryScan(self.cg_nc0(cur), tiefe + 1) != 0) { return 1; }
+      if (self.cg_canaryScan(self.cg_nc1(cur), tiefe + 1) != 0) { return 1; }
+      if (self.cg_canaryScan(self.cg_nc2(cur), tiefe + 1) != 0) { return 1; }
+      if (self.cg_canaryScan(self.cg_nc3(cur), tiefe + 1) != 0) { return 1; }
+      cur := self.cg_nnext(cur);
+    }
+    return 0;
   }
 
   fn cg_reserveFrame(bytes: int64): int64 {
@@ -5716,16 +5822,25 @@ pub type Codegen = class {
     var patchPos: int64 := self.codeLen;
     self.cg_e32(0);
     // WP-18: reserve [rbp-8] for canary before any locals
+    //
+    // #2245: Der SLOT bleibt in jedem Fall reserviert, auch wenn diese
+    // Funktion keinen Canary traegt. Gespart werden die drei Befehle, nicht
+    // die acht Bytes: rbx liegt fest bei [rbp-16] (#2081) und r12..r15
+    // darunter (#2114), beides an mehreren Stellen fest verdrahtet. Den
+    // Rahmen zu verschieben waere eine zweite, viel groessere Aenderung mit
+    // demselben Ertrag von acht Byte je Rahmen.
     self.frameSize += 8;
-    // mov rax, [rip+CG_CANARY]  (load canary from global; patched by CG_PATCH_STR)
-    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x05);
-    var pCanaryLoad: int64 := self.codeLen;
-    self.cg_e32(0);
-    self.cg_addPatch(pCanaryLoad, CG_CANARY, 0, CG_PATCH_STR);
-    // mov [rbp-8], rax
-    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x45); self.cg_e8(0xF8);
-    // xor rax, rax  (clear canary from register)
-    self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xC0);
+    if (self.canaryAn != 0) {
+      // mov rax, [rip+CG_CANARY]  (load canary from global; patched by CG_PATCH_STR)
+      self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x05);
+      var pCanaryLoad: int64 := self.codeLen;
+      self.cg_e32(0);
+      self.cg_addPatch(pCanaryLoad, CG_CANARY, 0, CG_PATCH_STR);
+      // mov [rbp-8], rax
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x45); self.cg_e8(0xF8);
+      // xor rax, rax  (clear canary from register)
+      self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xC0);
+    }
     // #2081: rbx sichern. Nach SysV muss der GERUFENE rbx erhalten; der Codegen
     // benutzt es aber als Arbeitsregister (linker Operand jeder Binaeroperation,
     // Zieladresse indirekter Aufrufe). Fuer Lyx→Lyx war das unschaedlich, fuer
@@ -5800,6 +5915,13 @@ pub type Codegen = class {
     // deshalb genuegt diese eine Stelle.
     if (self.fcActive != 0) { self.cg_fcDisarm(); }
     // WP-18: canary check — r10/r11 are caller-saved scratch, do not affect rax
+    //
+    // #2245: nur wenn diese Funktion ueberhaupt einen traegt. canaryAn setzt
+    // die Aufrufstelle VOR dem Prolog (cg_funcBrauchtCanary); Prolog und
+    // Epilog muessen dieselbe Antwort benutzen, sonst prueft der Epilog
+    // einen Slot, den der Prolog nie beschrieben hat — und das waere ein
+    // Abbruch bei JEDER Rueckkehr.
+    if (self.canaryAn != 0) {
     // mov r11, [rbp-8]
     self.cg_e8(0x4C); self.cg_e8(0x8B); self.cg_e8(0x5D); self.cg_e8(0xF8);
     // mov r10, [rip+CG_CANARY]  (expected canary from global)
@@ -5820,6 +5942,7 @@ pub type Codegen = class {
     var failPatch: int64 := self.codeLen;
     self.cg_e32(0);
     self.cg_addPatch(failPatch, "__lyx_stack_fail" as int64, 16, CG_PATCH_CALL);
+    }
     // #2081: rbx des Aufrufers zurueck (gesichert im Prolog bei [rbp-16])
     self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x5D); self.cg_e8(0xF0);  // mov rbx, [rbp-16]
     // #2114: r12..r15 des Aufrufers zurueck (cg_emitPrologue)
@@ -12808,6 +12931,8 @@ pub type Codegen = class {
     // Emit prologue
     self.rlSelfKnoten := ni;   // #2228: `self` ist Kandidat dieser Methode
     self.cg_rlWaehlen(ni);   // #2114
+    // #2245: vor dem Prolog entscheiden — der Epilog liest dasselbe Feld.
+    self.canaryAn := self.cg_funcBrauchtCanary(self.cg_nc2(ni));
     var prologuePatch: int64 := self.cg_emitPrologue();
     // #1140: @flight_crit an einer METHODE. Ohne diese Stelle gaelte die
     // Zusicherung fuer freie Funktionen und nicht fuer Methoden — sie haenge
@@ -14166,6 +14291,12 @@ pub type Codegen = class {
       var savedEnvOff:     int64 := self.closureEnvPtrOff;
       var savedStaticLink: int64 := self.staticLinkOffset;
       var savedCapCount:   int64 := self.closureCapturedCount;
+      // #2245: Ein Lambda behaelt seinen Canary. Es wird MITTEN in der
+      // aeusseren Funktion erzeugt, deshalb wird der Wert der aeusseren
+      // gesichert und unten zurueckgesetzt — sonst entschiede die innere
+      // Funktion ueber den Epilog der aeusseren.
+      var savedCanary:     int64 := self.canaryAn;
+      self.canaryAn := 1;
 
       // 6. Reset for inner function (locals start after outer)
       self.localBase  := savedLocalCount;
@@ -14294,6 +14425,7 @@ pub type Codegen = class {
       self.closureEnvPtrOff  := savedEnvOff;
       self.staticLinkOffset  := savedStaticLink;
       self.closureCapturedCount := savedCapCount;
+      self.canaryAn := savedCanary;   // #2245
 
       // 14. Heap-allocate env (numCap * 8 bytes) via mmap
       if (numCap > 0) {
@@ -24472,6 +24604,8 @@ pub type Codegen = class {
 
     self.rlSelfKnoten := 0 - 1;   // #2228: freie Funktion, kein `self`
     self.cg_rlWaehlen(ni);   // #2114: vor dem Prolog, der die Register sichert
+    // #2245: vor dem Prolog entscheiden — der Epilog liest dasselbe Feld.
+    self.canaryAn := self.cg_funcBrauchtCanary(self.cg_nc2(ni));
 
     // Emit prologue, capture patch position for sub rsp imm32
     var prologuePatch: int64 := self.cg_emitPrologue();
@@ -27915,6 +28049,9 @@ pub type Codegen = class {
     self.locals    := alloc(self.localCap * CG_LOCAL_SZ);
     self.localCount := 0;
     self.frameSize  := 0;
+    // #2245: Vorgabe 1 — wer die Entscheidung vor dem Prolog zu setzen
+    // vergisst, bekommt den Canary, nicht keinen.
+    self.canaryAn  := 1;
 
     self.labelCap  := 128;
     self.labels    := alloc(self.labelCap * CG_LABEL_SZ);
@@ -29154,7 +29291,7 @@ pub type Codegen = class {
     } else {
       EPrintStrLn("  o Userspace Proxy (nicht aktiv)"c);
     }
-    EPrintStrLn("  + Stack Canaries (WP-18: fs:getrandom, TMR-Slot rbp-8)"c);
+    EPrintStrLn("  + Stack Canaries (WP-18, #2245: getrandom-Init, Slot rbp-8;\n    gepruefen in Funktionen mit Rahmenpuffer, genommener Adresse oder asm)"c);
     EPrintStrLn(""c);
 
     // Score — WP-18 adds +5 for stack canaries
@@ -29193,7 +29330,7 @@ pub type Codegen = class {
     } else {
       EPrintStrLn("  + 0: landlock fehlt"c);
     }
-    EPrintStrLn("  + 5: Stack Canaries (WP-18: getrandom-Init + fs-freier rbp-8-Slot)"c);
+    EPrintStrLn("  + 5: Stack Canaries (WP-18/#2245: getrandom-Init, rbp-8-Slot; Pruefung\n         in Funktionen mit Rahmenpuffer, @-Adresse eines Locals oder asm-Block)"c);
     if self.lcbsFastpathCount > 0 {
       EPrintStr("  -"c); EPrintInt(self.lcbsFastpathCount * 3);
       EPrintStr(": @fastpath x"c); EPrintInt(self.lcbsFastpathCount); EPrintStrLn(""c);
@@ -29993,6 +30130,9 @@ pub type Codegen = class {
     self.funcHasTupleReturn := 0;
     self.profCurName := nb as pchar;
     self.profCurLen  := 0;          // nicht messen (--profile), wie der Bericht
+    // #2245: erzeugte Helferfunktion ohne AST — hier ist nicht zu pruefen, was
+    // im Rahmen liegt, also bleibt der Canary (sichere Seite).
+    self.canaryAn := 1;
     var prologuePatch: int64 := self.cg_emitPrologue();
     self.fnRetStructBytes := 0;
     self.fnRetSlotOff     := 0;
