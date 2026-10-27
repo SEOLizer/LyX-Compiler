@@ -5029,6 +5029,77 @@ pub type Codegen = class {
     self.cg_e8(0x48); self.cg_e8(0xB8); self.cg_e64(n);
   }
 
+  // #2247: In welchem Register liegt dieser Bezeichner — 12..15 fuer r12..r15,
+  // sonst -1. Gefragt wird dieselbe Auskunft wie cg_loadRax/cg_storeRax
+  // benutzen (cg_rlReg, #2114); hier nur fuer die Adressrechnung von
+  // peek*/poke*, damit dafuer kein Register materialisiert werden muss.
+  fn cg_adrRegVon(ni: int64): int64 {
+    if (ni < 0) { return 0 - 1; }
+    if (self.cg_nkind(ni) != CGN_IDENT) { return 0 - 1; }
+    var off: int64 := self.cg_findLocal(self.cg_nsval(ni), self.cg_nslen(ni));
+    if (off == 0) { return 0 - 1; }
+    var r: int64 := self.cg_rlReg(off);
+    if (r < 0) { return 0 - 1; }
+    return 12 + r;
+  }
+
+  // #2247: Zerlegt die Adresse eines peek*/poke* in `basis + index * k`.
+  //
+  // Erkannt werden `A + B` und `A + B * k` mit k aus {1,2,4,8} (die Formen,
+  // die x86 im Operanden traegt). Geliefert wird ueber die drei Kaestchen:
+  // Basisknoten, Indexregister (12..15) und k. Rueckgabe 1 = erkannt.
+  //
+  // Der INDEX muss in einem Register liegen (cg_rlReg, #2114) — ihn zu laden
+  // wuerde den Gewinn wieder aufheben. Die BASIS darf auch im Rahmen liegen;
+  // der Aufrufer laedt sie dann einmal, was immer noch kuerzer ist als
+  // Adresse rechnen, retten und zurueckholen.
+  fn cg_adrZerlegen(adrNi: int64, basisBox: int64, idxBox: int64, kBox: int64): int64 {
+    if (adrNi < 0) { return 0; }
+    if (self.cg_nkind(adrNi) != CGN_BINOP) { return 0; }
+    if (self.cg_nival(adrNi) != CGT_PLUS) { return 0; }
+    var li: int64 := self.cg_nc0(adrNi);
+    var ri: int64 := self.cg_nc1(adrNi);
+    if (li < 0 || ri < 0) { return 0; }
+    // Form 1: A + B   (B im Register)
+    var rr: int64 := self.cg_adrRegVon(ri);
+    if (rr >= 12) {
+      poke64(basisBox, li); poke64(idxBox, rr); poke64(kBox, 1);
+      return 1;
+    }
+    // Form 2: A + B * k   (B im Register, k Literal 1/2/4/8)
+    if (self.cg_nkind(ri) == CGN_BINOP && self.cg_nival(ri) == CGT_STAR) {
+      var fi: int64 := self.cg_nc0(ri);
+      var ki: int64 := self.cg_nc1(ri);
+      var fr: int64 := self.cg_adrRegVon(fi);
+      if (fr >= 12 && self.cg_tryFold(ki) != 0) {
+        var kv: int64 := self.foldBuf;
+        if (kv == 1 || kv == 2 || kv == 4 || kv == 8) {
+          poke64(basisBox, li); poke64(idxBox, fr); poke64(kBox, kv);
+          return 1;
+        }
+      }
+    }
+    return 0;
+  }
+
+  // #2247: `[basis + index * k]` als Speicheroperand, ModRM/SIB ohne
+  // Verschiebung. reg ist das Registerfeld (0..7, hier immer rax = 0).
+  //
+  // Zwei Fallen, beide aus #2205 bekannt: mit mod = 00 heisst Basis 101
+  // (rbp/r13) "32-Bit-Verschiebung ohne Basis", und Index 100 ist ohne REX.X
+  // "kein Index". Der Aufrufer dreht die beiden deshalb so, dass r13 als
+  // INDEX steht (dort ist 101 gueltig) — Addition ist kommutativ. Beide
+  // Register liegen in r12..r15, REX.X und REX.B sind also immer gesetzt und
+  // Index 100 bedeutet r12, nicht rsp.
+  fn cg_memBasisIndex(reg: int64, basis: int64, index: int64, k: int64) {
+    var sc: int64 := 0;
+    if (k == 2) { sc := 1; }
+    if (k == 4) { sc := 2; }
+    if (k == 8) { sc := 3; }
+    self.cg_e8(0x04 | ((reg & 7) << 3));          // ModRM: mod=00, rm=100 (SIB)
+    self.cg_e8((sc * 64) | ((index & 7) << 3) | (basis & 7));
+  }
+
   // mov [rbp+off], rax  (store rax at rbp-relative offset)
   fn cg_storeRax(off: int64) {
     var rlR: int64 := self.cg_rlReg(off);   // #2114
@@ -8449,10 +8520,44 @@ pub type Codegen = class {
   // dann `op rax, [rbp+off]` — kein push/pop, keine zweite Ladung. Dieselbe
   // Auswertungsreihenfolge wie der allgemeine Weg (erst links, dann das Local
   // lesen). Nur Ganzzahl; liefert 0, wenn der Fall nicht passt.
+  // #2247: Ist die Operation kommutativ, darf das einfache Local auch LINKS
+  // stehen — getauscht stellt es denselben Speicheroperanden. Nicht fuer
+  // MINUS/PERCENT/Schiebungen (nicht kommutativ) und nicht fuer LT/LE/GT/GE
+  // (ein Tausch kehrt den Vergleich um); EQ2/NEQ sind symmetrisch.
+  fn cg_binOpKommutativ(op: int64): int64 {
+    if (op == CGT_PLUS || op == CGT_STAR) { return 1; }
+    if (op == CGT_BITAND || op == CGT_BITOR || op == 89) { return 1; }
+    if (op == CGT_EQ2 || op == CGT_NEQ) { return 1; }
+    return 0;
+  }
+
   fn cg_binOpLocalRechts(op: int64, lhsNi: int64, rhsNi: int64): int64 {
-    var off: int64 := self.cg_einfachesLocalOff(rhsNi);
+    var lN: int64 := lhsNi;
+    var rN: int64 := rhsNi;
+    var off: int64 := self.cg_einfachesLocalOff(rN);
+    // #2247: `local + <Ausdruck>` ist der Akkumulator einer Schleife
+    // (`sum += peek32(...)`). Ungetauscht rettet der allgemeine Weg das Local
+    // mit push/pop ueber die Auswertung der rechten Seite und haengt damit an
+    // einer Store->Load-Weiterleitung je Glied; getauscht bleibt `add rax,
+    // local` uebrig. Gemessen am Kern sum32 aus bench/arr_int.lyx: 12 Befehle
+    // je Element auf 2.
+    //
+    // Der Tausch zieht die Auswertung der rechten Seite VOR das Lesen des
+    // Locals. Das ist nur dann folgenlos, wenn die rechte Seite das Local
+    // nicht schreiben kann — deshalb ausschliesslich fuer ein Local im
+    // Register (#2114): dessen Slot wird nirgends als Speicher benutzt, es
+    // ist also nicht ueber eine Adresse erreichbar. Ein Local im Rahmen,
+    // dessen Adresse genommen wurde, bliebe angreifbar.
+    if (off == 0 && self.cg_binOpKommutativ(op) != 0) {
+      var offL: int64 := self.cg_einfachesLocalOff(lN);
+      if (offL != 0 && self.cg_rlReg(offL) >= 0) {
+        lN := rhsNi;
+        rN := lhsNi;
+        off := offL;
+      }
+    }
     if (off == 0) { return 0; }
-    if (self.cg_isF64Expr(lhsNi) != 0 || self.cg_isF64Expr(rhsNi) != 0) { return 0; }
+    if (self.cg_isF64Expr(lN) != 0 || self.cg_isF64Expr(rN) != 0) { return 0; }
     var opc: int64 := -1;
     if (op == CGT_PLUS)   { opc := 0x03; }
     if (op == CGT_MINUS)  { opc := 0x2B; }
@@ -8463,7 +8568,7 @@ pub type Codegen = class {
     var istMul: int64 := 0;
     if (op == CGT_STAR) { istMul := 1; }
     if (opc < 0 && istMul == 0) { return 0; }
-    self.cg_genExpr(lhsNi);
+    self.cg_genExpr(lN);
     self.cmpAnfang := self.codeLen;   // #2228: Anfang eines moeglichen cmp
     var rlR: int64 := self.cg_rlReg(off);
     if (rlR >= 0) {
@@ -8479,7 +8584,7 @@ pub type Codegen = class {
     if (off >= -128 && off <= 127) { self.cg_e8(0x45); self.cg_e8(off & 255); }
     else                           { self.cg_e8(0x85); self.cg_e32(off); }
     }
-    var cmpU: int64 := self.cg_isUnsignedExpr(lhsNi) | self.cg_isUnsignedExpr(rhsNi);
+    var cmpU: int64 := self.cg_isUnsignedExpr(lN) | self.cg_isUnsignedExpr(rN);
     if (opc == 0x3B) {
       self.cg_emitSetccRax(op, cmpU);
     } else if ((op == CGT_PLUS || op == CGT_MINUS || op == CGT_STAR) && self.overflowCheckEnabled != 0) {
@@ -16125,6 +16230,135 @@ pub type Codegen = class {
     // usw.) — die beiden muessen uebereinstimmen: die Weite zaehlt mod 32 bzw.
     // mod 64, die 32-Bit-Formen nehmen die unteren 32 Bit und liefern
     // null-erweitert. Dieselben Verdeckungsregeln wie dort (#1311, #2082).
+    // #2247: peek*/poke* mit der Adresse `A + B`, beide in Registern.
+    //
+    // Der allgemeine Weg materialisiert jede Adresse: `mov base,rax; add
+    // idx,rax; mov rax,rdi` und beim Schreiben zusaetzlich `push`/`pop`, um
+    // die Zieladresse ueber die Auswertung des Wertes zu retten. Gemessen am
+    // Kern aus bench/arr_int.lyx (i5-8250U, 1.2.23B) kostete `add32` so 29,1
+    // Befehle je Element gegen 1,8 bei gcc -O2 — bei IPC 3,76, die Maschine
+    // stockt also nicht, es sind einfach zu viele Befehle (#2247).
+    //
+    // x86 kann die Summe im Operanden: `movsxd rax,(%r14,%r13)`. Beide Werte
+    // liegen bereits in Registern (die Auswahl aus #2114 legt Laufvariable,
+    // Versatz und Basiszeiger dorthin), es ist also nichts zu laden.
+    //
+    // NICHT unter --runtime-checks: peek8/peek64/poke8/poke64 tragen dort
+    // eine Nullzeigerpruefung, die der Schnellweg nicht hat. Dann bleibt der
+    // allgemeine Weg, und die Pruefung bleibt wirksam.
+    //
+    // Dieselben Verdeckungsregeln wie die Builtin-Kette unten (#1311, #2082):
+    // eine Funktion der eigenen Unit oder eine abweichende Argumentzahl
+    // gewinnt. Bedeutung und Vorzeichen bleiben wie dort — peek32
+    // VORZEICHENERWEITERT, peek8/peek16 null-erweitern, poke* liefert 0.
+    if (isMethod == 0 && nestDecl < 0 && self.runtimeChecks == 0
+        && self.cg_findLocalIdx(fname, fnlen) < 0
+        && self.cg_eigeneUnitDefiniert(fname, fnlen) == 0) {
+      var pkArt: int64 := 0;
+      if (self.cg_seq(fname, fnlen, "peek8", 5))  { pkArt := 1; }
+      if (self.cg_seq(fname, fnlen, "peek16", 6)) { pkArt := 2; }
+      if (self.cg_seq(fname, fnlen, "peek32", 6)) { pkArt := 3; }
+      if (self.cg_seq(fname, fnlen, "peek64", 6)) { pkArt := 4; }
+      if (self.cg_seq(fname, fnlen, "poke8", 5))  { pkArt := 5; }
+      if (self.cg_seq(fname, fnlen, "poke16", 6)) { pkArt := 6; }
+      if (self.cg_seq(fname, fnlen, "poke32", 6)) { pkArt := 7; }
+      if (self.cg_seq(fname, fnlen, "poke64", 6)) { pkArt := 8; }
+      if (pkArt != 0) {
+        var pkAdr: int64 := self.cg_nc0(ni);
+        var pkWert: int64 := 0 - 1;
+        if (pkAdr >= 0) { pkWert := self.cg_nnext(pkAdr); }
+        var pkArgOk: int64 := 0;
+        if (pkArt <= 4 && pkAdr >= 0 && pkWert < 0) { pkArgOk := 1; }
+        if (pkArt >= 5 && pkAdr >= 0 && pkWert >= 0 && self.cg_nnext(pkWert) == -1) { pkArgOk := 1; }
+        if (pkArgOk != 0) {
+          var pkBB: int64 := alloc(24);
+          var pkOk: int64 := self.cg_adrZerlegen(pkAdr, pkBB, pkBB + 8, pkBB + 16);
+          var pkBasisNi: int64 := peek64(pkBB);
+          var pkIndex: int64 := peek64(pkBB + 8);
+          var pkK: int64 := peek64(pkBB + 16);
+          free(pkBB, 24);
+          if (pkOk != 0) {
+            // Liegt die Basis selbst in einem Register, wird nichts geladen.
+            // Sonst kommt sie EINMAL in ein Arbeitsregister: rax beim Lesen,
+            // rbx beim Schreiben (dort traegt rax schon den Wert). Beides ist
+            // kuerzer als Adresse rechnen, retten und zurueckholen.
+            var pkBasisReg: int64 := self.cg_adrRegVon(pkBasisNi);
+            // Basis 101 (rbp/r13) ginge mit mod=00 als "ohne Basis" durch; in
+            // dem Fall bleibt es beim allgemeinen Weg (#2205). Index 101 ist
+            // dagegen gueltig, Tauschen ist hier aber nicht moeglich, weil die
+            // Skalierung am Index haengt.
+            var pkGeht: int64 := 1;
+            if (pkBasisReg == 13) { pkGeht := 0; }
+            if (pkBasisReg >= 12 && pkBasisReg == pkIndex) { pkGeht := 0; }
+            // Beim SCHREIBEN muss die Basis VORHER tragfaehig sein: sobald der
+            // Wert in rax steht, ist der allgemeine Weg nicht mehr erreichbar.
+            // Tragfaehig heisst: im Register, oder ein Local mit Rahmenplatz.
+            var pkBasisOff: int64 := 0;
+            if (pkArt >= 5 && pkBasisReg < 12) {
+              if (self.cg_nkind(pkBasisNi) == CGN_IDENT) {
+                pkBasisOff := self.cg_findLocal(self.cg_nsval(pkBasisNi), self.cg_nslen(pkBasisNi));
+              }
+              if (pkBasisOff == 0) { pkGeht := 0; }
+            }
+            if (pkGeht != 0 && pkArt <= 4) {
+              var pkB: int64 := pkBasisReg;
+              if (pkB < 12) {
+                // Basis in rax laden; rax ist Basisregister 0, REX.B = 0.
+                self.cg_genExpr(pkBasisNi);
+                pkB := 0;
+              }
+              var pkRexR: int64 := 0x40;
+              if (pkB >= 8) { pkRexR := pkRexR | 1; }
+              if (pkIndex >= 8) { pkRexR := pkRexR | 2; }
+              if (pkArt == 1) {        // movzx rax, byte [b + i*k]
+                self.cg_e8(pkRexR | 8); self.cg_e8(0x0F); self.cg_e8(0xB6);
+              } else if (pkArt == 2) { // movzx rax, word
+                self.cg_e8(pkRexR | 8); self.cg_e8(0x0F); self.cg_e8(0xB7);
+              } else if (pkArt == 3) { // movsxd rax, dword — Vorzeichen wie bisher
+                self.cg_e8(pkRexR | 8); self.cg_e8(0x63);
+              } else {                 // mov rax, qword
+                self.cg_e8(pkRexR | 8); self.cg_e8(0x8B);
+              }
+              self.cg_memBasisIndex(0, pkB, pkIndex, pkK);
+              return;
+            }
+            if (pkGeht != 0) {
+              // Schreiben: erst der WERT nach rax — danach ist die Adresse
+              // ohne Umweg erreichbar, das push/pop-Paar entfaellt.
+              self.cg_genExpr(pkWert);
+              var pkB2: int64 := pkBasisReg;
+              if (pkB2 < 12) {
+                // Basis nach rbx (rax traegt den Wert). rbx ist das
+                // Arbeitsregister der Binaeroperationen und hier frei. Der
+                // Rahmenplatz steht fest, oben geprueft.
+                if (pkBasisOff >= -128 && pkBasisOff <= 127) {
+                  self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x5D); self.cg_e8(pkBasisOff);
+                } else {
+                  self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x9D); self.cg_e32(pkBasisOff);
+                }
+                pkB2 := 3;   // rbx
+              }
+              var pkRexR2: int64 := 0x40;
+              if (pkB2 >= 8) { pkRexR2 := pkRexR2 | 1; }
+              if (pkIndex >= 8) { pkRexR2 := pkRexR2 | 2; }
+              if (pkArt == 5) {          // mov [b+i*k], al
+                self.cg_e8(pkRexR2); self.cg_e8(0x88);
+              } else if (pkArt == 6) {   // mov [b+i*k], ax
+                self.cg_e8(0x66); self.cg_e8(pkRexR2); self.cg_e8(0x89);
+              } else if (pkArt == 7) {   // mov [b+i*k], eax
+                self.cg_e8(pkRexR2); self.cg_e8(0x89);
+              } else {                   // mov [b+i*k], rax
+                self.cg_e8(pkRexR2 | 8); self.cg_e8(0x89);
+              }
+              self.cg_memBasisIndex(0, pkB2, pkIndex, pkK);
+              self.cg_zeroRax();
+              return;
+            }
+          }
+        }
+      }
+    }
+
     if (isMethod == 0 && nestDecl < 0 && self.cg_findLocalIdx(fname, fnlen) < 0) {
       var rkArt: int64 := 0;
       if (self.cg_seq(fname, fnlen, "rotl", 4)) { rkArt := 1; }

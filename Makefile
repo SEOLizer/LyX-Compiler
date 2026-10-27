@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.23B
+VERSION   := 1.2.23C
 VERSION_DATE := 2026-10-27
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -515,6 +515,8 @@ test: lyxc
 	@bash tests/f64_typherleitung_2287_test.sh
 	@echo "--- Canary nur bei Rahmenpuffer, Ueberlauf loest weiter aus (#2245) ---"
 	@bash tests/canary_rahmenpuffer_2245_test.sh
+	@echo "--- kommutative Operation: einfaches Local links als Operand (#2247) ---"
+	@bash tests/binop_local_links_2247_test.sh
 	@echo "--- for: Laufvariable blockweise, auf allen Zielen gleich (#2277) ---"
 	@bash tests/for_laufvariable_2277_test.sh
 	@echo "--- IR-Ziele: Slots wiederverwendet, Namen blockweise (#2270) ---"
