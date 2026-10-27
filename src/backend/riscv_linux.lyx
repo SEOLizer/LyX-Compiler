@@ -384,14 +384,41 @@ pub type EmitRISCV64 = class {
       self.rv_ADDI(rd, RV_ZERO, imm);
       return;
     }
+    // #2292: Der Schnellweg LUI+ADDI gilt nur, wenn er den Wert WIRKLICH
+    // trifft. LUI schreibt auf RV64 das 20-Bit-Feld um zwoelf verschoben und
+    // VORZEICHENERWEITERT; ADDI liest sein Immediate ebenfalls
+    // vorzeichenbehaftet. Fuer die obersten 2048 Werte des positiven
+    // 32-Bit-Bereichs geht das schief:
+    //
+    //   imm  = 0x7FFFFFFF
+    //   lo12 = 0xFFF -> vorzeichenbehaftet -1
+    //   hi20 = (0x7FFFFFFF + 1) >> 12 = 0x80000
+    //   LUI  rd, 0x80000  ->  0xFFFFFFFF80000000   (Bit 19 gesetzt!)
+    //   ADDI rd, rd, -1   ->  0xFFFFFFFF7FFFFFFF   statt 0x7FFFFFFF
+    //
+    // Gemessen: `2147483647` war auf riscv -2147483649, und damit war
+    // `1073741824 <= 2147483647` FALSCH. Im Compiler selbst ist das genau die
+    // Grenzkonstante von cg_emitBinOpImm — der riscv-gebaute lyxc hat deshalb
+    // keinen Konstantenvergleich mehr ins Immediate gefaltet und ein 53 KiB
+    // groesseres Abbild erzeugt (#2276 Rest). Bei NEGATIVEN Werten ist die
+    // Vorzeichenerweiterung gerade richtig, deshalb stimmte `0 - 2147483648`.
+    //
+    // Gepruefft wird deshalb nicht der Bereich, sondern das ERGEBNIS: hi20 als
+    // vorzeichenbehaftete 20 Bit gelesen, zusammengesetzt, verglichen. Trifft
+    // es nicht, geht der Wert den sechsteiligen Weg unten — der traegt jeden
+    // 64-Bit-Wert und kostet hier nur fuer 2048 Werte etwas mehr Code.
     if imm >= 0 - 2147483648 && imm <= 2147483647 {
       var lo12: int64 := imm & 0xFFF;
       if (lo12 & 0x800) != 0 { lo12 := lo12 - 0x1000; }
       var hi20: int64 := (imm - lo12) >> 12;
-      // LUI rd, hi20
-      self.rv_e32(0x37 | (rd<<7) | ((hi20 & 0xFFFFF)<<12));
-      if lo12 != 0 { self.rv_ADDI(rd, rd, lo12); }
-      return;
+      var hiS: int64 := hi20 & 0xFFFFF;
+      if (hiS & 0x80000) != 0 { hiS := hiS - 0x100000; }   // 20-Bit-Zweierkomplement
+      if ((hiS * 4096) + lo12) == imm {
+        // LUI rd, hi20
+        self.rv_e32(0x37 | (rd<<7) | ((hi20 & 0xFFFFF)<<12));
+        if lo12 != 0 { self.rv_ADDI(rd, rd, lo12); }
+        return;
+      }
     }
     self.rv_ADDI(rd, RV_ZERO, (imm >> 55) & 0x1FF);
     var sh: int64 := 44;

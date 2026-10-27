@@ -507,6 +507,8 @@ test: lyxc
 	@bash tests/builtin_kollision_2265_test.sh
 	@echo "--- IR-Ziele: FileSize aus Bausteinen, ArgvGet als Text (#2258, #2274) ---"
 	@bash tests/filesize_argvget_ir_2258_2274_test.sh
+	@echo "--- Ganzzahlkonstanten gleich auf allen Zielen, riscv LUI+ADDI (#2292) ---"
+	@bash tests/riscv_konstanten_2292_test.sh
 	@echo "--- && und || werten bedingt aus, auf allen Zielen (#2276) ---"
 	@bash tests/kurzschluss_2276_test.sh
 	@echo "--- f64-Typherleitung ohne Typangabe (peekf64) auf allen Zielen (#2287) ---"
