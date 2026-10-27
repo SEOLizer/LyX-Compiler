@@ -2869,6 +2869,44 @@ pub type IRLower = class {
     // selbst aus, und zweimal darf keiner laufen.
     var ovDest: int64 := self._opUeberladen(expr, op);
     if ovDest >= 0 { return ovDest; }
+    // #2276: `&&` (85) und `||` (86) sind BEDINGTE Auswertungen und muessen
+    // VOR dem Senken der Operanden abgefangen werden — zwei Zeilen weiter
+    // unten sind beide Seiten schon berechnet.
+    //
+    // Bis 1.2.22D wurden sie als bitweises Und/Oder gesenkt ("treat as
+    // bitwise for now"), also beide Seiten immer ausgewertet. Das ist nicht
+    // nur die falsche Semantik fuer Seiteneffekte — es bringt jede WACHE zum
+    // Absturz:
+    //
+    //   if (p != 0 && peek64(p) == 1) { … }     // arm64/riscv: SIGSEGV
+    //   if (i >= 0 && i < n && kind(i) == X)    // liest bei i >= n daneben
+    //
+    // Der Compiler selbst ist voll solcher Wachen: der arm64-gebaute lyxc
+    // starb an der ersten `extern fn ... link`, weil die Grenze in
+    // _fnRecordSig (#2134) nicht kurzgeschlossen wurde und sn_kind() auf den
+    // gepackten link-String losging (#2276). Dieselbe Klasse wie #1023, das
+    // es fuer den x86-Weg behoben hat; der IR-Weg wurde nie nachgezogen.
+    if op == 85 || op == 86 {
+      var kzRes: int64 := self.allocTemp();
+      var kzEnde: int64 := self.genLabel();
+      // Vorbelegung ist das Ergebnis des ABBRUCHS: bei `&&` falsch, bei `||` wahr.
+      var kzVor: int64 := 0;
+      if op == 86 { kzVor := 1; }
+      self.irAddInstrDirect(IRO_STORE_LOCAL, kzRes, self._konst(kzVor), -1, 0);
+      var kzL: int64 := self.lowerExpr(self.nodeC0(expr));
+      // `&&` bricht ab, wenn links FALSCH ist; `||`, wenn links WAHR ist.
+      if op == 85 { self.irAddInstrDirect(IRO_BR_FALSE, -1, kzL, -1, kzEnde); }
+      else        { self.irAddInstrDirect(IRO_BR_TRUE,  -1, kzL, -1, kzEnde); }
+      var kzR: int64 := self.lowerExpr(self.nodeC1(expr));
+      // Auf 0/1 normieren: der rechte Operand darf jeden Wert ungleich 0
+      // tragen, das Ergebnis eines logischen Operators ist aber ein Wahrwert
+      // (dieselbe Form wie die Vergleiche darunter).
+      var kzN: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_CMP_NEQ, kzN, kzR, self._konst(0), 0);
+      self.irAddInstrDirect(IRO_STORE_LOCAL, kzRes, kzN, -1, 0);
+      self.irEmitLabel(kzEnde);
+      return kzRes;
+    }
     var t1: int64 := self.lowerExpr(self.nodeC0(expr));
     var t2: int64 := self.lowerExpr(self.nodeC1(expr));
     var dest: int64 := self.allocTemp();
@@ -2898,8 +2936,8 @@ pub type IRLower = class {
       iro := IRO_SAR;
       if self._irVorzeichenlos(self.nodeC0(expr)) != 0 { iro := IRO_SHR; }
     }
-    else if op == 85  { iro := IRO_AND; }   // TK_AND (&&; treat as bitwise for now)
-    else if op == 86  { iro := IRO_OR;  }   // TK_OR (||)
+    // #2276: 85/86 (&&/||) sind oben als bedingte Auswertung behandelt und
+    // kommen hier nicht mehr an. Die frueheren Zeilen senkten sie bitweise.
     if iro >= 0 {
       // WP-F64: f64-Operanden → Float-Ops (sonst Integer-Bit-Arithmetik der IEEE-Muster = Garbage).
       if iro == IRO_ADD || iro == IRO_SUB || iro == IRO_MUL || iro == IRO_DIV {
