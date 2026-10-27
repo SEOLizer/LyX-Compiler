@@ -160,6 +160,46 @@ for z in arm64 riscv; do
     ( cd "$ROOT" && ulimit -v 8000000 && timeout 600 "$q" "$TMP/lyxc_$z" src/parser.lyx --std-path="$ROOT" -o "$TMP/pu" >"$TMP/pu.log" 2>&1 ); prc=$?
     if [ "$prc" = 1 ] && grep -q "undefined function 'main'" "$TMP/pu.log"; then ok "$z-Compiler uebersetzt src/parser.lyx (meldet fehlendes main wie x86)"
     else no "$z-Compiler an src/parser.lyx" "rc $prc ($(grep -m1 -iE 'error|signal' "$TMP/pu.log"))"; fi
+
+    # #2276/#2292: DIFFERENZTEST — dasselbe Programm, einmal nativ und einmal
+    # durch den $z-gebauten Compiler nach x86 uebersetzt. Der Codegen ist
+    # deterministisch, also muessen beide Erzeugnisse BYTEGLEICH sein. Weicht
+    # etwas ab, rechnet der IR-gebaute Compiler anders als der native — genau
+    # so sind #2276 (&& nicht kurzgeschlossen) und #2292 (Konstante 0x7FFFFFFF
+    # auf riscv falsch geladen) sichtbar geworden.
+    #
+    # Die Probe ist ABSICHTLICH klein: es braucht nicht die Compilerquelle
+    # (20 Minuten unter qemu), sondern nur Konstantenvergleiche und Wachen —
+    # beide Defekte haben schon an diesem Programm abgewichen, waehrend
+    # Beispiele mit 500 KB Erzeugnis bytegleich blieben. Billiger Test,
+    # derselbe Nachweis.
+    cat > "$TMP/d.lyx" <<'DIFF'
+import std.io;
+con GRENZE: int64 := 169;
+fn lies(p: int64): int64 { return peek64(p); }
+fn pruef(k: int64): int64 {
+  if (k == 169) { return 1; }
+  if (k == GRENZE) { return 2; }
+  if (k >= 0 - 2147483648 && k <= 2147483647) { return 3; }
+  return 0;
+}
+fn main(): int64 {
+  var p: int64 := 0;
+  if (p != 0 && lies(p) == 1) { PrintLn("nie"); }
+  PrintLn(pruef(169) + pruef(5000000000));
+  return 0;
+}
+DIFF
+    rm -f "$TMP/d_nativ" "$TMP/d_$z"
+    ( cd "$ROOT" && ulimit -v 8000000 && timeout 200 "$LYXC" --std-path="$ROOT" "$TMP/d.lyx" -o "$TMP/d_nativ" >"$TMP/dn.log" 2>&1 )
+    ( cd "$ROOT" && ulimit -v 8000000 && timeout 600 "$q" "$TMP/lyxc_$z" "$TMP/d.lyx" --std-path="$ROOT" -o "$TMP/d_$z" >"$TMP/dz.log" 2>&1 )
+    if [ ! -s "$TMP/d_nativ" ]; then no "Differenztest $z" "nativ kein Erzeugnis: $(grep -m1 -iE 'error' "$TMP/dn.log")"
+    elif [ ! -s "$TMP/d_$z" ]; then no "Differenztest $z" "$z-Compiler kein Erzeugnis: $(grep -m1 -iE 'error|signal' "$TMP/dz.log")"
+    elif cmp -s "$TMP/d_nativ" "$TMP/d_$z"; then
+      ok "Differenztest $z: x86-Erzeugnis bytegleich mit dem nativen ($(stat -c%s "$TMP/d_nativ") B)"
+    else
+      no "Differenztest $z" "x86-Erzeugnis weicht ab: $(cmp "$TMP/d_nativ" "$TMP/d_$z" 2>&1 | head -1)"
+    fi
   else no "Selbstbau $z" "rc $sbRc: $(grep -v '^ \|^=\|^$' "$TMP/sb.log" | tail -2 | tr '\n' ' ')"; fi
 done
 
