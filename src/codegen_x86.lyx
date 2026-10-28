@@ -8524,6 +8524,51 @@ pub type Codegen = class {
   // stehen — getauscht stellt es denselben Speicheroperanden. Nicht fuer
   // MINUS/PERCENT/Schiebungen (nicht kommutativ) und nicht fuer LT/LE/GT/GE
   // (ein Tausch kehrt den Vergleich um); EQ2/NEQ sind symmetrisch.
+  // #2247: Traegt dieses Local GENAU den Typ int64? Die Frage ist die
+  // Eintrittskarte fuer den Schnellweg der Schleifenverwaltung.
+  //
+  // Gefragt wird nach dem Typnamen und nicht nach den acht Haken, die der
+  // allgemeine Zuweisungsweg abarbeitet (Bereichspruefung, Verschmaelerung,
+  // Einheitentyp, f64-Angleichung, Vektorablage, Satz, Methodentyp,
+  // Struct-Kopie). Eine Aufzaehlung dieser Haken waere genau die Fehlerart,
+  // die in diesem Uebersetzer dreimal belegt ist: einer fehlt, und der
+  // Schnellweg laesst ihn still ausfallen. `int64` schliesst alle acht auf
+  // einmal aus — ein breiter, vorzeichenbehafteter Ganzzahltyp ohne Bereich,
+  // ohne Einheit, ohne Ablage.
+  //
+  // Ohne aufgezeichneten Typ (`var i := 0`) lautet die Antwort NEIN, nicht
+  // "wahrscheinlich int64": der Typ koennte hergeleitet f64 sein.
+  fn cg_lokalIstInt64(ni: int64): int64 {
+    if (ni < 0 || self.cg_nkind(ni) != CGN_IDENT) { return 0; }
+    var li: int64 := self.cg_findLocalIdx(self.cg_nsval(ni), self.cg_nslen(ni));
+    if (li < 0) { return 0; }
+    var tb: int64 := self.localTypes + li * CG_LOCTYPE_SZ;
+    var tp: pchar := peek64(tb) as pchar;
+    var tl: int64 := peek64(tb + CG_LOCTYPE_OFF_LEN);
+    if (tp == 0 as pchar || tl <= 0) { return 0; }
+    if (self.cg_seq(tp, tl, "int64", 5) == 0) { return 0; }
+    if (peek8(self.localIsSimd + li) != 0) { return 0; }
+    if (peek8(self.localIsFnPtr + li) != 0) { return 0; }
+    return 1;
+  }
+
+  // #2247: `add`/`sub` mit Direktoperand UNMITTELBAR auf r12+i.
+  // rlR ist 0..3 (r12..r15), op CGT_PLUS oder CGT_MINUS, k passt in 32 Bit.
+  fn cg_regAddImm(rlR: int64, op: int64, k: int64) {
+    var ext: int64 := 0;                       // ModRM-reg: /0 = add, /5 = sub
+    if (op == CGT_MINUS) { ext := 5; }
+    self.cg_e8(0x49);                          // REX.W | REX.B
+    if (k >= -128 && k <= 127) {
+      self.cg_e8(0x83);
+      self.cg_e8(0xC0 | (ext << 3) | (4 + rlR));
+      self.cg_e8(k & 255);
+    } else {
+      self.cg_e8(0x81);
+      self.cg_e8(0xC0 | (ext << 3) | (4 + rlR));
+      self.cg_e32(k);
+    }
+  }
+
   fn cg_binOpKommutativ(op: int64): int64 {
     if (op == CGT_PLUS || op == CGT_STAR) { return 1; }
     if (op == CGT_BITAND || op == CGT_BITOR || op == 89) { return 1; }
@@ -8568,21 +8613,41 @@ pub type Codegen = class {
     var istMul: int64 := 0;
     if (op == CGT_STAR) { istMul := 1; }
     if (opc < 0 && istMul == 0) { return 0; }
-    self.cg_genExpr(lN);
+    // #2247: Steht LINKS ebenfalls ein Local im Register und ist die
+    // Operation ein VERGLEICH, braucht die linke Seite kein rax: `cmp r15,
+    // r12` statt `mov r12,rax ; cmp r15,rax`. Das ist der Schleifentest
+    // `i < n` und spart dort einen von drei Befehlen je Durchlauf.
+    //
+    // Nur fuer den Vergleich. Die Rechenoperationen schreiben ihren linken
+    // Operanden (`add rax, X` legt das Ergebnis in rax ab) — mit dem Local
+    // als Ziel wuerde die Variable selbst ueberschrieben. `cmp` setzt nur
+    // Flaggen und laesst beide Operanden stehen.
+    var lReg: int64 := 0 - 1;
+    if (opc == 0x3B && istMul == 0) {
+      var lOff: int64 := self.cg_einfachesLocalOff(lN);
+      if (lOff != 0) { lReg := self.cg_rlReg(lOff); }
+    }
+    if (lReg < 0) { self.cg_genExpr(lN); }
     self.cmpAnfang := self.codeLen;   // #2228: Anfang eines moeglichen cmp
+    // Registerfeld des Befehls: rax (0) oder das Local links (r12+i -> 4+i,
+    // dann REX.R). Die Richtung bleibt dieselbe wie auf dem allgemeinen Weg
+    // — opcode 0x3B rechnet reg MINUS rm, also links minus rechts.
+    var regF: int64 := 0;
+    var rexR: int64 := 0;
+    if (lReg >= 0) { regF := 4 + lReg; rexR := 4; }
     var rlR: int64 := self.cg_rlReg(off);
     if (rlR >= 0) {
       // Local im Register: dieselbe Operation mit Registeroperand (r12+i).
-      self.cg_e8(0x49);
+      self.cg_e8(0x48 | rexR | 1);                               // REX.W|R?|B
       if (istMul != 0) { self.cg_e8(0x0F); self.cg_e8(0xAF); }   // imul rax, r12+i
       else             { self.cg_e8(opc); }
-      self.cg_e8(0xC4 + rlR);
+      self.cg_e8(0xC0 | ((regF & 7) << 3) | (4 + rlR));
     } else {
-    self.cg_e8(0x48);
+    self.cg_e8(0x48 | rexR);
     if (istMul != 0) { self.cg_e8(0x0F); self.cg_e8(0xAF); }     // imul rax, [rbp+off]
     else             { self.cg_e8(opc); }
-    if (off >= -128 && off <= 127) { self.cg_e8(0x45); self.cg_e8(off & 255); }
-    else                           { self.cg_e8(0x85); self.cg_e32(off); }
+    if (off >= -128 && off <= 127) { self.cg_e8(0x40 | ((regF & 7) << 3) | 5); self.cg_e8(off & 255); }
+    else                           { self.cg_e8(0x80 | ((regF & 7) << 3) | 5); self.cg_e32(off); }
     }
     var cmpU: int64 := self.cg_isUnsignedExpr(lN) | self.cg_isUnsignedExpr(rN);
     if (opc == 0x3B) {
@@ -8968,6 +9033,29 @@ pub type Codegen = class {
       i -= 1;
     }
     self.cg_nopsSchreiben(anfang, pad);
+  }
+
+  // #2247: Den naechsten Befehl auf eine 32-Byte-Grenze legen.
+  //
+  // Gedacht fuer die handgeschriebenen Bausteine, deren innere Spruenge NICHT
+  // einzeln ausgerichtet werden koennen: ihre rel8-Weiten stehen fest und
+  // ihre Flickstellen sind als Versatz vermerkt, eine Fuellung MITTEN im
+  // Baustein wuerde beides verschieben. Ausgerichtet wird deshalb der
+  // Baustein als GANZES — dann liegt sein Inneres immer gleich, und die
+  // Pruefung in tests/sprung_ausrichtung_2244_test.sh haelt es fest.
+  //
+  // Ohne das entscheidet die Laenge des davorstehenden Codes darueber, ob ein
+  // innerer Sprung eine Grenze kreuzt: beim IntToStr-Baustein endete `jmp
+  // .itsdone` je nach Lage genau auf einer Grenze (JCC-Erratum, #2244).
+  // Gemessen am Testprogramm von #2244 traf das 120 von 1056 jmp, allein
+  // weil die Schleifenverwaltung (#2247) ein paar Befehle kuerzer wurde.
+  fn cg_auf32() {
+    var pad: int64 := 32 - ((self.codeLen + 0xb0) & 31);
+    if (pad == 32) { return; }
+    var pos: int64 := self.codeLen;
+    var i: int64 := 0;
+    while (i < pad) { self.cg_e8(0x90); i += 1; }
+    self.cg_nopsSchreiben(pos, pad);
   }
 
   // Mehrbyte-NOPs (Intel-Empfehlung) in [pos, pos+n) schreiben.
@@ -19579,6 +19667,13 @@ pub type Codegen = class {
       // Ueberschreibt rcx/rdx und im langsamen Weg die Syscall-Register — n
       // liegt schon auf dem Stapel.
       self.cg_emitBumpAtomar(32, 65536);  // → rax=buf
+      // #2247: ab hier liegt der Baustein fest (rel8-Spruenge mit vermerkten
+      // Flickstellen) — er wird als Ganzes an eine 32-Byte-Grenze gelegt,
+      // sonst entscheidet die Laenge des Codes davor, ob `jmp .itsdone` auf
+      // einer Grenze endet (#2244). Die Fuellung laeuft mit; gegen eine
+      // Arena-Anforderung und die Ziffernschleife darunter faellt sie nicht
+      // ins Gewicht.
+      self.cg_auf32();
       self.cg_e8(0x50);  // push rax (buf); [rsp]=buf [rsp+8]=n
       // rsi = buf+22; null-term; dec rsi; rax = n
       self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x74); self.cg_e8(0x24); self.cg_e8(0x00);  // mov rsi, [rsp] = buf
@@ -20879,6 +20974,40 @@ pub type Codegen = class {
     } else if (k == CGN_ASSIGN) {
       var lhs: int64 := self.cg_nc0(ni);
       var rhs: int64 := self.cg_nc1(ni);
+      // #2247: `i := i + K` auf einem Local im Register — ein Befehl.
+      //
+      // Der allgemeine Weg unten wertet rechts aus, legt das Ergebnis in rax
+      // ab und speichert von dort: `mov r12,rax ; add $1,rax ; mov rax,r12`.
+      // Drei Befehle je Durchlauf, zwei davon nur Transport. x86 kann das
+      // unmittelbar: `add $1,r12`.
+      //
+      // Der Schnellweg gilt nur fuer die Form `x := x <+|-> Konstante` mit
+      // GENAU demselben Local auf beiden Seiten und dem Typ int64 (siehe
+      // cg_lokalIstInt64 — die eine Pruefung ersetzt die Haken des
+      // allgemeinen Weges). Ohne Ueberlaufpruefung: die braucht das Ergebnis
+      // in rax und ihren eigenen Zweig.
+      //
+      // Hier wird KEIN Wert in rax hinterlassen. Das ist zulaessig, weil
+      // CGN_ASSIGN nur als Anweisung erzeugt wird; als Ausdruck kommt die
+      // Zuweisung in Lyx nicht vor.
+      if (self.cg_nkind(lhs) == CGN_IDENT && rhs >= 0
+          && self.cg_nkind(rhs) == CGN_BINOP
+          && self.overflowCheckEnabled == 0) {
+        var inkOp: int64 := self.cg_nival(rhs);
+        if (inkOp == CGT_PLUS || inkOp == CGT_MINUS) {
+          var inkOff: int64 := self.cg_einfachesLocalOff(lhs);
+          if (inkOff != 0 && inkOff == self.cg_einfachesLocalOff(self.cg_nc0(rhs))
+              && self.cg_rlReg(inkOff) >= 0
+              && self.cg_lokalIstInt64(lhs) != 0
+              && self.cg_tryFold(self.cg_nc1(rhs)) != 0) {
+            var inkV: int64 := self.foldBuf;
+            if (inkV >= 0 - 2147483648 && inkV <= 2147483647) {
+              self.cg_regAddImm(self.cg_rlReg(inkOff), inkOp, inkV);
+              return;
+            }
+          }
+        }
+      }
       if (self.cg_nkind(lhs) == CGN_IDENT) {
         // #1106: `m := f.Handle;` bei `var m: TM;` — dieselbe Bindung wie bei
         // der Initialisierung. Ohne diesen Zweig traf es der getrennt
@@ -32010,6 +32139,12 @@ pub type Codegen = class {
     // sondern zwei weitere Syscalls in einer Datei, die keine haben darf.
     if (self.msAbi != 0) { return; }
 
+    // #2244: cmp und jb verschmelzen zu einem Paar und duerfen zusammen
+    // keine 32-Byte-Grenze kreuzen. Bis 1.2.23C fehlte das hier — der Sprung
+    // allein wurde nicht ausgerichtet, und ob das PAAR guenstig lag,
+    // entschied die Laenge des Codes davor (8 Treffer im Testprogramm).
+    // 6 Byte cmp + 6 Byte jb rel32 = 12.
+    self.cg_paarAusrichten(self.codeLen, 12);
     // cmp rax, -4095   (imm32 wird vorzeichenerweitert)
     self.cg_e8(0x48); self.cg_e8(0x3D);
     self.cg_e8(0x01); self.cg_e8(0xF0); self.cg_e8(0xFF); self.cg_e8(0xFF);
