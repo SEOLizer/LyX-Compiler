@@ -30,15 +30,10 @@
 # Dieselben Werte auf arm64 und riscv: die Aenderung sitzt im x86-Codegen,
 # die beiden anderen Ziele sind der unveraenderte Gegenstand.
 #
-# AUSNAHME, #2300: `peek32` OHNE Maske erweitert nur auf x86 mit Vorzeichen;
-# arm64 und riscv erweitern mit Null (Builtin 201 im jeweiligen Backend,
-# vorbestehend und unabhaengig von dieser Aenderung). Die beiden Faelle, die
-# den unmaskierten Wert messen, laufen deshalb NUR auf x86 — ein Test darf
-# nicht an einem fremden offenen Defekt haengen, und er darf auch nicht
-# voraussetzen, dass die Luecke offen bleibt: nach dem Fix von #2300 gehoert
-# die Einschraenkung hier weg und die Faelle laufen auf allen drei Zielen.
-# Alles andere in dieser Datei wird weiter auf allen drei Zielen geprueft —
-# die MASKIERTE Form stimmt ueberall ueberein, und genau sie aendert sich.
+# Die unmaskierte Form lief bis 1.2.24C nur auf x86, weil arm64 und riscv
+# dort mit Null erweiterten (#2300). Seit dem Fix von #2300 stimmen alle drei
+# Ziele ueberein, und die Einschraenkung ist weg — die Breiten selbst haelt
+# tests/peek_breiten_2300_test.sh fest.
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LYXC="${LYXC:-$ROOT/lyxc}"
@@ -125,7 +120,7 @@ fi
 #    der zweiten Zeile auf.
 #    0xFFFFFFFF = 4294967295, als int32 gelesen -1.
 #    0x80000000 = 2147483648, als int32 gelesen -2147483648.
-fall vorzeichen "4294967295 -1 2147483648 -2147483648 7 7" "" "x86" <<'LYX'
+fall vorzeichen "4294967295 -1 2147483648 -2147483648 7 7" <<'LYX'
 unit main;
 import std.io;
 fn main(): int64 {
@@ -216,7 +211,7 @@ LYX
 
 # 6. Mit --runtime-checks traegt peek32 eine Nullzeigerpruefung und nimmt den
 #    Schnellweg nicht. Derselbe Wert.
-fall runtime_checks "4294967295 -1" "--runtime-checks" "x86" <<'LYX'
+fall runtime_checks "4294967295 -1" "--runtime-checks" <<'LYX'
 unit main;
 import std.io;
 fn main(): int64 {
