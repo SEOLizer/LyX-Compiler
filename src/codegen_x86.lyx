@@ -1224,6 +1224,22 @@ pub type Codegen = class {
   // dieselbe Kodierung wie bei der Marke aus #2206, wo `slot < 0` als
   // "nicht gesetzt" die Stelle immer abgewuergt hat.
   simdZielOff:       int64;
+  // #2247: `peek32(adr) & 0xFFFFFFFF` ist der vorzeichenLOSE 32-Bit-Zugriff.
+  // peek32 erweitert mit Vorzeichen, die Maske schneidet danach die oberen
+  // 32 Bit ab — zwei Befehle fuer etwas, das x86 in EINEM kann: ein
+  // 32-Bit-Ladebefehl null-erweitert von sich aus.
+  //
+  // Zwei Felder statt eines, damit die Verdeckungsregeln des Builtins (#1311,
+  // #2082: verdeckende Funktion, abweichende Argumentzahl, Methode, innere
+  // Funktion) NICHT ein zweites Mal an der Operatorstelle stehen muessen —
+  // das waere genau die "zweite Stelle", die hier regelmaessig auseinander
+  // laeuft. Der Operator aeussert den Wunsch, cg_genCall meldet die
+  // Erfuellung; nur dann darf die Maske entfallen.
+  //
+  // cg_genCall liest den Wunsch am EINTRITT und loescht ihn sofort, damit er
+  // nicht in die Auswertung der Argumente durchsickert.
+  p32Wunsch:         int64;
+  p32Erfuellt:       int64;
   // #1003: byte buffer parallel to locals, 1 = INLINE geschriebener fn-Zeigertyp
   // (`var f: fn(int64): int64`). Ueber einen Typalias merkt sich das die
   // fnAlias-Liste am Namen; ein inline geschriebener Typ HAT keinen Namen und
@@ -13662,6 +13678,35 @@ pub type Codegen = class {
       } else if (op != CGT_AND && op != CGT_OR && self.cg_tryFold(rhsNi) != 0) {
         // CSE: RHS is constant → eval LHS into rax, mov rbx,rax, load const (no push/pop)
         var rhsVal: int64 := self.foldBuf;
+        // #2247: `peek32(adr) & 0xFFFFFFFF` ist ein vorzeichenloser 32-Bit-
+        // Zugriff. peek32 erweitert mit Vorzeichen, die Maske schneidet die
+        // oberen 32 Bit wieder ab — ein 32-Bit-Ladebefehl macht beides in
+        // einem Befehl. Im Summenkern aus bench/arr_int.lyx war das der
+        // letzte reine Transportbefehl im Schleifenrumpf.
+        //
+        // Geaeussert wird nur ein WUNSCH; ob er erfuellt wird, entscheidet
+        // cg_genCall hinter seinen Verdeckungsregeln (#1311, #2082) und
+        // meldet es ueber p32Erfuellt zurueck. Bleibt die Erfuellung aus,
+        // laeuft der Weg unten unveraendert weiter und die Maske wird
+        // erzeugt — die Regeln stehen damit an EINER Stelle.
+        if (op == CGT_BITAND && rhsVal == 4294967295
+            && lhsNi >= 0 && self.cg_nkind(lhsNi) == CGN_CALL
+            && self.cg_isF64Expr(lhsNi) == 0) {
+          var p32Alt: int64 := self.p32Wunsch;
+          var p32ErfAlt: int64 := self.p32Erfuellt;
+          self.p32Wunsch := 1;
+          self.p32Erfuellt := 0;
+          self.cg_genExpr(lhsNi);
+          var p32Ok: int64 := self.p32Erfuellt;
+          self.p32Wunsch := p32Alt;
+          self.p32Erfuellt := p32ErfAlt;
+          if (p32Ok != 0) { return; }
+          // Nicht erfuellt: der Wert steht wie gewohnt in rax, es fehlt nur
+          // die Maske. Sie wird hier nachgezogen, statt den Ausdruck ein
+          // zweites Mal auszuwerten.
+          self.cg_e8(0x89); self.cg_e8(0xC0);            // mov eax, eax
+          return;
+        }
         self.cg_genExpr(lhsNi);
         // #2114: Ganzzahl OP Konstante direkt als Operand (`and rax, imm`,
         // `shl rax, imm`), ohne die Konstante erst nach rax zu laden.
@@ -16318,6 +16363,12 @@ pub type Codegen = class {
     var fnlen: int64 := self.cg_nslen(ni);
     var isMethod: int64 := self.cg_nival(ni);
 
+    // #2247: Wunsch nach dem vorzeichenlosen peek32 aufnehmen und SOFORT
+    // loeschen — er gilt nur fuer diesen Aufruf und darf nicht in die
+    // Auswertung der Argumente durchsickern (`peek32(peek32(x) & 0xFFFFFFFF)`).
+    var p32: int64 := self.p32Wunsch;
+    self.p32Wunsch := 0;
+
     // #2044: Meint der Aufruf eine innere Funktion, gilt ihre Marke — und ihre
     // Deklaration fuer die Vorgabewerte. Der Vorpass hat das mit der
     // Gueltigkeit von sema entschieden; ab hier ist der Name eindeutig, und
@@ -16448,6 +16499,12 @@ pub type Codegen = class {
                 self.cg_e8(pkRexR | 8); self.cg_e8(0x0F); self.cg_e8(0xB6);
               } else if (pkArt == 2) { // movzx rax, word
                 self.cg_e8(pkRexR | 8); self.cg_e8(0x0F); self.cg_e8(0xB7);
+              } else if (pkArt == 3 && p32 != 0) {
+                // #2247: `peek32(...) & 0xFFFFFFFF` — ein 32-Bit-Ladebefehl
+                // null-erweitert von sich aus, die Maske danach entfaellt.
+                // Ohne REX.W, sonst waere es wieder der 64-Bit-Zugriff.
+                self.cg_e8(pkRexR); self.cg_e8(0x8B);   // mov eax, dword [b+i*k]
+                self.p32Erfuellt := 1;
               } else if (pkArt == 3) { // movsxd rax, dword — Vorzeichen wie bisher
                 self.cg_e8(pkRexR | 8); self.cg_e8(0x63);
               } else {                 // mov rax, qword
@@ -17865,8 +17922,16 @@ pub type Codegen = class {
       self.cg_zeroRax();
 
     } else if (self.cg_seq(fname, fnlen, gk32, 6)) {
+      if (p32 != 0) {
+        // #2247: vorzeichenloser Zugriff — `mov eax, [rdi]` null-erweitert
+        // selbst, die Maske danach entfaellt (dieselbe Rechnung wie im
+        // Schnellweg oben, die beiden muessen uebereinstimmen).
+        self.cg_e8(0x8B); self.cg_e8(0x07);
+        self.p32Erfuellt := 1;
+      } else {
       // peek32(addr): movsxd rax, dword [rdi]
       self.cg_e8(0x48); self.cg_e8(0x63); self.cg_e8(0x07);
+      }
 
     } else if (self.cg_seq(fname, fnlen, "ArgvGet", 7)) {
       // ArgvGet(argv: pchar, i: int64): pchar  -- argv in rdi, i in rsi
@@ -28543,6 +28608,8 @@ pub type Codegen = class {
     self.inlArgCount  := 0;
 
     self.simdZielOff := 1;   // #2213: keine Zielablage
+    self.p32Wunsch := 0;     // #2247
+    self.p32Erfuellt := 0;
     self.nextLblId := 0;
 
     // Import dedup (WP-09)
