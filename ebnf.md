@@ -1,6 +1,6 @@
-# Lyx 1.2.24D — Canonical EBNF Grammar
+# Lyx 1.2.24E — Canonical EBNF Grammar
 
-> Stand 2026-10-28, gegen lyxc 1.2.24D geprueft. Die Keyword-Liste in
+> Stand 2026-10-28, gegen lyxc 1.2.24E geprueft. Die Keyword-Liste in
 > Abschnitt 2.1 wurde Wort fuer Wort gegen den Compiler verifiziert; die
 > Typgrammatik in Abschnitt 7 ist um Funktions- und Methodenzeiger ergaenzt,
 > und die match-Produktion in Abschnitt 12 entspricht jetzt dem Parser.
@@ -552,6 +552,31 @@ FixedArrayType      = "[" ConstExpr "]" Type
    (#1230). *)
 
 ParallelArrayType   = "ParallelArray" "<" Type ">" ;
+
+(* Elementart: f32, f64, int8, int16, int32 oder int64. Alles andere wird
+   abgewiesen -- die Ablage braucht eine Schrittweite je Elementbreite und
+   die Vektorschleife eine Operation je Elementart (#2199, #2224, #2247).
+
+   Welche RECHNUNGEN es gibt, haengt an der Elementart, weil die CPUs nicht
+   mehr hergeben:
+
+     Gleitkomma        + - * /
+     int8, int64       + -
+     int16, int32      + - *
+
+   Fuer die Multiplikation auf 8 und 64 Bit und fuer Division und Rest auf
+   JEDER Ganzzahlbreite gibt es weder auf x86 (PMULLQ fehlt, Ganzzahl-
+   Division gar nicht) noch auf ARM64 (kein 64-Bit-MUL als Vektor) einen
+   Befehl. Das wird GEMELDET und nicht emuliert: eine Emulation waere eigener
+   Code mit eigener Laufzeit, und solange sie nicht da ist, ist die Meldung
+   die ehrliche Antwort.
+
+   `*` auf int32 braucht PMULLD und damit `--target-cpu=sse4`; ohne die
+   Zusage wird abgebrochen statt still etwas Langsameres zu erzeugen (#2191).
+   Auf ARM64 ist die Vektormultiplikation Grundbestand.
+
+   Ein Element wird VORZEICHENERWEITERT gelesen -- dieselbe Bedeutung, die
+   peek8/peek16/peek32 tragen (#2300). *)
 
 TupleType           = "(" Type "," Type ")" ;
 

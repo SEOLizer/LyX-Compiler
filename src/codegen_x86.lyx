@@ -148,6 +148,11 @@ con CGN_UTYPE_DECL:     int64 := 91; // WP-BC-16: utype declaration (compile-tim
 con CGN_TYPE_RINGBUF:   int64 := 92; // WP-BC-17: RingBuffer<T> type node
 con CGN_TYPE_PARALLEL:  int64 := 93; // WP-BC-18: parallel Array<T> type node
 con CGN_SIMD_NEW:       int64 := 94; // WP-BC-18: parallel Array<T>(size) expression
+// #2247: Elementkennung eines parallel Array — Breite in den unteren Bits,
+// Art darueber. Gleitkomma ist die nackte Breite (4/8), Ganzzahl setzt
+// CG_SIMD_GANZ. Eine Breite von 16 gibt es nicht, das Bit ist also frei.
+con CG_SIMD_BREITE:     int64 := 15;
+con CG_SIMD_GANZ:       int64 := 16;
 con CGN_FOR_C:          int64 := 102; // C-style for: c0=init(NK_VAR_DECL), c1=cond, c2=step, c3=body
 con CGN_FOR_RANGE:      int64 := 107; // for i in range([start,] stop): c0=start, c1=stop (exklusiv), c2=body
 con CGN_AT_IF:          int64 := 103; // WP-CS-01: @if (nach Sema-Pruning nicht mehr sichtbar; Alias für Vollständigkeit)
@@ -7073,19 +7078,49 @@ pub type Codegen = class {
   // deshalb still f32: `v[0] := 0.1` ergab 0.10000000149011612, `1e40` wurde
   // inf. Beim Lesen wandelte cvtss2sd zurueck (#2183), weshalb runde Werte
   // wie 1.5 richtig aussahen und der Fehler unentdeckt blieb (#2199).
-  fn cg_simdBytesVonTyp(elemTypeNode: int64): int64 {
+  // #2247: Elementkennung eines `parallel Array<T>` — Breite UND Art in einem
+  // Byte, weil die Breite allein nicht mehr eindeutig ist: 4 kann f32 oder
+  // int32 bedeuten. Gleitkomma behaelt die nackte Breite (4 bzw. 8), damit
+  // jeder vorhandene Vergleich `== 8` aus #2224 weiter gilt; Ganzzahl setzt
+  // zusaetzlich CG_SIMD_GANZ.
+  //
+  // Unbekannter oder fehlender Typ ergibt weiter 4 (f32) — das ist der
+  // Vorgabewert aus #2224 und keine neue stille Annahme: sema hat die
+  // Elementart vorher geprueft (_simdElemPruefen) und laesst nichts anderes
+  // durch.
+  fn cg_simdKennungVonTyp(elemTypeNode: int64): int64 {
     if (elemTypeNode < 0) { return 4; }
     if (self.cg_nkind(elemTypeNode) != 60) { return 4; }
-    if (self.cg_seq(self.cg_nsval(elemTypeNode), self.cg_nslen(elemTypeNode), "f64", 3)) { return 8; }
+    var nm: pchar := self.cg_nsval(elemTypeNode);
+    var nl: int64 := self.cg_nslen(elemTypeNode);
+    if (self.cg_seq(nm, nl, "f64", 3)) { return 8; }
+    if (self.cg_seq(nm, nl, "f32", 3)) { return 4; }
+    if (self.cg_seq(nm, nl, "int8", 4))  { return CG_SIMD_GANZ | 1; }
+    if (self.cg_seq(nm, nl, "int16", 5)) { return CG_SIMD_GANZ | 2; }
+    if (self.cg_seq(nm, nl, "int32", 5)) { return CG_SIMD_GANZ | 4; }
+    if (self.cg_seq(nm, nl, "int64", 5)) { return CG_SIMD_GANZ | 8; }
     return 4;
+  }
+
+  // Nur die Breite, ohne die Art — 1, 2, 4 oder 8.
+  fn cg_simdBytesVonTyp(elemTypeNode: int64): int64 {
+    return self.cg_simdKennungVonTyp(elemTypeNode) & CG_SIMD_BREITE;
   }
 
   // Elementbreite eines SIMD-Locals; 4, wenn nichts vermerkt ist.
   fn cg_simdBytesOf(localIdx: int64): int64 {
     if (localIdx < 0) { return 4; }
-    var b: int64 := peek8(self.localSimdBytes + localIdx);
-    if (b == 8) { return 8; }
+    var b: int64 := peek8(self.localSimdBytes + localIdx) & CG_SIMD_BREITE;
+    if (b == 1 || b == 2 || b == 4 || b == 8) { return b; }
     return 4;
+  }
+
+  // #2247: Ist die Elementart eine GANZZAHL? Entscheidet die Operationstabelle
+  // (PADDB/W/D/Q statt ADDPS/ADDPD) und den Rest-Durchgang.
+  fn cg_simdGanzOf(localIdx: int64): int64 {
+    if (localIdx < 0) { return 0; }
+    if ((peek8(self.localSimdBytes + localIdx) & CG_SIMD_GANZ) != 0) { return 1; }
+    return 0;
   }
 
   fn cg_markElemFloat(localIdx: int64, elemTypeNode: int64) {
@@ -7963,6 +7998,8 @@ pub type Codegen = class {
   // 0.10000000149011612).
   fn cg_emitSimdBumpAlloc(bytes: int64) {
     var schub: int64 := 2;
+    if (bytes == 1) { schub := 0; }   // #2247
+    if (bytes == 2) { schub := 1; }   // #2247
     if (bytes == 8) { schub := 3; }
     self.cg_e8(0x50);                                                        // push rax (Elementzahl)
     self.cg_e8(0x48); self.cg_e8(0xC1); self.cg_e8(0xE0); self.cg_e8(schub); // shl rax, 2 bzw. 3
@@ -8048,6 +8085,29 @@ pub type Codegen = class {
     self.cg_vexOpRM(0x11, 0, 0, 2, 0, l, 0, 1, 0);   // vmovups [rdx+rax], v0
   }
 
+  // #2247: derselbe Schritt fuer GANZZAHLEN. Geladen und geschrieben wird mit
+  // VMOVDQA (VEX.66.0F 6F/7F), gerechnet mit VPADD*/VPSUB*/VPMULL* — dieselben
+  // Opcodes wie die SSE-Form (cg_sseGanzOpcode), nur mit VEX davor. pp = 1
+  // ist dabei immer gesetzt (das 0x66 der Ganzzahlgruppe), und die Breite
+  // steckt im Opcode, nicht im Praefix.
+  //
+  // PMULLD kommt aus der 0F-38-Gruppe, also mm = 2 statt 1.
+  fn cg_emitVexGanzSchritt(op: int64, l: int64, bytes: int64) {
+    var gOpc: int64 := self.cg_sseGanzOpcode(op, bytes);
+    if (gOpc < 0) {
+      EPrintStrLn("lyxc: interner Fehler (#2247): Ganzzahl-Vektoroperation ohne Befehl — sema haette das abweisen muessen (_pruefeVektorOpArt)."c);
+      exit(70);
+    }
+    self.cg_vexOpRM(0x6F, 0, 0, 7, 0, l, 1, 1, 0);   // vmovdqa v0, [rdi+rax]
+    self.cg_vexOpRM(0x6F, 1, 0, 6, 0, l, 1, 1, 0);   // vmovdqa v1, [rsi+rax]
+    if (gOpc > 255) {
+      self.cg_vexOpRR(gOpc >> 8, 0, 0, 1, l, 1, 2, 0);   // vpmulld v0, v0, v1
+    } else {
+      self.cg_vexOpRR(gOpc, 0, 0, 1, l, 1, 1, 0);        // vpadd*/vpsub*/vpmullw
+    }
+    self.cg_vexOpRM(0x7F, 0, 0, 2, 0, l, 1, 1, 0);   // vmovdqa [rdx+rax], v0
+  }
+
   // #2205: Vektorpfad in 256 Bit, als Vorlauf der 128-Bit-Schleife.
   //
   // Gemessen wurde VOR dem Bauen, weil der Pfad sich nicht ueberall lohnt
@@ -8079,12 +8139,31 @@ pub type Codegen = class {
   // Die dritte Stufe ist dieselbe Pflicht wie in #2184, wo eine einzige
   // 16-Byte-Schleife bei n = 5 zwoelf Byte hinter dem letzten Element
   // gelesen UND geschrieben hat. Mit 32 Byte je Schritt waeren es bis zu 28.
-  fn cg_emitAVX2BinOp(op: int64, bytes: int64) {
+  fn cg_emitAVX2BinOp(op: int64, kennung: int64) {
     // #2199: Bytezahl = Elementzahl * Elementbreite. Die Blockgroessen
     // darunter bleiben in BYTE (32 und 16) — sie haengen an der
     // Registerbreite, nicht an der Elementart; ein 32-Byte-Block fasst acht
     // f32 oder vier f64. Nur der skalare Rest zaehlt in Elementen.
+    //
+    // #2247: `kennung` traegt Breite UND Art; fuer Ganzzahlen rechnet
+    // cg_emitVexGanzSchritt und der Rest laeuft in Allzweckregistern.
+    var bytes: int64 := kennung & CG_SIMD_BREITE;
+    var ganz:  int64 := 0;
+    if ((kennung & CG_SIMD_GANZ) != 0) { ganz := 1; }
+    if (bytes != 1 && bytes != 2 && bytes != 4 && bytes != 8) {
+      EPrintStrLn("lyxc: interner Fehler (#2224/#2247): Vektorschleife mit einer Elementbreite, die es nicht gibt."c);
+      exit(70);
+    }
+    if (ganz == 0 && bytes != 4 && bytes != 8) {
+      EPrintStrLn("lyxc: interner Fehler (#2247): Gleitkomma-Vektor mit einer Breite ausser 4 und 8."c);
+      exit(70);
+    }
+    // #2247: PMULLD/VPMULLD erst ab sse4 — die Zusage gilt fuer beide
+    // Blockbreiten, deshalb hier EINMAL gefragt statt in jedem Schritt.
+    if (ganz != 0 && self.cg_sseGanzOpcode(op, bytes) > 255) { self.cg_cpuVerlange(1, "sse4"c); }
     var schub: int64 := 2;
+    if (bytes == 1) { schub := 0; }
+    if (bytes == 2) { schub := 1; }
     if (bytes == 8) { schub := 3; }
     var skPf: int64 := self.cg_sseSkalarPraefix(bytes);
     self.cg_e8(0x31); self.cg_e8(0xC0);                                      // xor eax, eax
@@ -8100,7 +8179,7 @@ pub type Codegen = class {
     self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xC8);                    // cmp rax, rcx
     self.cg_e8(0x7F); var jg256: int64 := self.codeLen; self.cg_e8(0);       // jg nach dem Block (kein voller Block)
     var v256Body: int64 := self.codeLen;
-    self.cg_emitVexF32Schritt(op, 1, bytes);
+    if (ganz != 0) { self.cg_emitVexGanzSchritt(op, 1, bytes); } else { self.cg_emitVexF32Schritt(op, 1, bytes); }
     self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(0x20);  // add rax, 32
     self.cg_paarAusrichten(self.codeLen, 5);                                 // cmp+jle als Paar
     self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xC8);                    // cmp rax, rcx
@@ -8114,7 +8193,7 @@ pub type Codegen = class {
     self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xC8);                    // cmp rax, rcx
     self.cg_e8(0x7F); var jg128: int64 := self.codeLen; self.cg_e8(0);       // jg nach dem Block
     var v128Body: int64 := self.codeLen;
-    self.cg_emitVexF32Schritt(op, 0, bytes);
+    if (ganz != 0) { self.cg_emitVexGanzSchritt(op, 0, bytes); } else { self.cg_emitVexF32Schritt(op, 0, bytes); }
     self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(0x10);  // add rax, 16
     var nach128: int64 := self.codeLen;
     cg_patchRel8Wert(self.code, jg128, nach128 - v128Body);
@@ -8132,12 +8211,16 @@ pub type Codegen = class {
     self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xC8);                    // cmp rax, rcx
     self.cg_e8(0x7D); var jge: int64 := self.codeLen; self.cg_e8(0);         // jge .done
     var skBody: int64 := self.codeLen;
+    if (ganz != 0) {
+      self.cg_emitGanzRestOp(op, bytes);   // #2247: Allzweckregister
+    } else {
     self.cg_e8(skPf); self.cg_e8(0x0F); self.cg_e8(0x10); self.cg_e8(0x04); self.cg_e8(0x07);  // movss/sd xmm0, [rdi+rax]
     self.cg_e8(skPf); self.cg_e8(0x0F); self.cg_e8(0x10); self.cg_e8(0x0C); self.cg_e8(0x06);  // movss/sd xmm1, [rsi+rax]
     self.cg_e8(skPf); self.cg_e8(0x0F);
     self.cg_e8(self.cg_sseF32Opcode(op));
     self.cg_e8(0xC1);                                                        // addss/addsd xmm0, xmm1
     self.cg_e8(skPf); self.cg_e8(0x0F); self.cg_e8(0x11); self.cg_e8(0x04); self.cg_e8(0x02);  // movss/sd [rdx+rax], xmm0
+    }
     self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(bytes); // add rax, 4 bzw. 8
     self.cg_e8(0xEB); var backSk: int64 := self.codeLen;
     self.cg_e8(skStart - (backSk + 1));
@@ -8317,11 +8400,32 @@ pub type Codegen = class {
     return 1;
   }
 
-  fn cg_emitSSE2BinOp(op: int64, bytes: int64) {
+  fn cg_emitSSE2BinOp(op: int64, kennung: int64) {
     // #2199: Bytezahl = Elementzahl * Elementbreite; der 16-Byte-Block fasst
     // vier f32 oder zwei f64. Die packed-Form waehlt das Praefix (kein
     // Praefix = addps, 0x66 = addpd), die skalare F3 bzw. F2.
+    //
+    // #2247: `kennung` traegt Breite UND Art. Fuer Ganzzahlen ist alles
+    // anders: das Praefix ist immer 0x66, die Breite steckt im Opcode, die
+    // Blockbefehle heissen MOVDQA statt MOVAPS, und der Rest rechnet in
+    // Allzweckregistern (cg_emitGanzRestOp).
+    var bytes: int64 := kennung & CG_SIMD_BREITE;
+    var ganz:  int64 := 0;
+    if ((kennung & CG_SIMD_GANZ) != 0) { ganz := 1; }
+    // #2224: die Breite muss eine der vorgesehenen sein. Stand hier 0, wurde
+    // `add rax, 0` eine Endlosschleife — gemeldet als Zeitablauf, nicht als
+    // falscher Wert. Seit #2247 sind 1 und 2 ebenfalls gueltig.
+    if (bytes != 1 && bytes != 2 && bytes != 4 && bytes != 8) {
+      EPrintStrLn("lyxc: interner Fehler (#2224/#2247): Vektorschleife mit einer Elementbreite, die es nicht gibt."c);
+      exit(70);
+    }
+    if (ganz == 0 && bytes != 4 && bytes != 8) {
+      EPrintStrLn("lyxc: interner Fehler (#2247): Gleitkomma-Vektor mit einer Breite ausser 4 und 8."c);
+      exit(70);
+    }
     var schub: int64 := 2;
+    if (bytes == 1) { schub := 0; }
+    if (bytes == 2) { schub := 1; }
     if (bytes == 8) { schub := 3; }
     var pkPf: int64 := self.cg_ssePackedPraefix(bytes);
     var skPf: int64 := self.cg_sseSkalarPraefix(bytes);
@@ -8340,6 +8444,28 @@ pub type Codegen = class {
     self.cg_e8(0x7F);
     var jgPos: int64 := self.codeLen; self.cg_e8(0);
     var vecBody: int64 := self.codeLen;
+    if (ganz != 0) {
+      // #2247: movdqa xmm0, [rdi+rax] / xmm1, [rsi+rax]  (66 0F 6F ..)
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0x04); self.cg_e8(0x07);
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0x0C); self.cg_e8(0x06);
+      var gOpc: int64 := self.cg_sseGanzOpcode(op, bytes);
+      if (gOpc < 0) {
+        EPrintStrLn("lyxc: interner Fehler (#2247): Ganzzahl-Vektoroperation ohne Befehl — sema haette das abweisen muessen (_pruefeVektorOpArt)."c);
+        exit(70);
+      }
+      self.cg_e8(0x66); self.cg_e8(0x0F);
+      if (gOpc > 255) {
+        // 0F 38 40 — PMULLD, erst ab sse4. Ohne die Zusage wird laut
+        // abgebrochen statt still etwas Langsameres zu erzeugen (#2191).
+        self.cg_cpuVerlange(1, "sse4"c);
+        self.cg_e8(gOpc & 255); self.cg_e8(gOpc >> 8);
+      } else {
+        self.cg_e8(gOpc);
+      }
+      self.cg_e8(0xC1);  // xmm0, xmm1
+      // movdqa [rdx+rax], xmm0  (66 0F 7F 04 02)
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x7F); self.cg_e8(0x04); self.cg_e8(0x02);
+    } else {
     // movaps xmm0, [rdi+rax]  (0F 28 04 07)
     self.cg_e8(0x0F); self.cg_e8(0x28); self.cg_e8(0x04); self.cg_e8(0x07);
     // movaps xmm1, [rsi+rax]  (0F 28 0C 06)
@@ -8352,6 +8478,7 @@ pub type Codegen = class {
     self.cg_e8(0xC1);  // xmm0, xmm1
     // movaps [rdx+rax], xmm0  (0F 29 04 02)
     self.cg_e8(0x0F); self.cg_e8(0x29); self.cg_e8(0x04); self.cg_e8(0x02);
+    }
     // add rax, 16
     self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(0x10);
     // cmp rax, rcx; jle Rumpf — als Paar ausgerichtet
@@ -8373,6 +8500,9 @@ pub type Codegen = class {
     self.cg_e8(0x7D);
     var jgePos: int64 := self.codeLen; self.cg_e8(0);
     var scalarBody: int64 := self.codeLen;
+    if (ganz != 0) {
+      self.cg_emitGanzRestOp(op, bytes);   // #2247: Allzweckregister
+    } else {
     // movss/movsd xmm0, [rdi+rax]   (#2199: F3 bzw. F2)
     self.cg_e8(skPf); self.cg_e8(0x0F); self.cg_e8(0x10); self.cg_e8(0x04); self.cg_e8(0x07);
     // movss/movsd xmm1, [rsi+rax]
@@ -8384,6 +8514,7 @@ pub type Codegen = class {
     self.cg_e8(0xC1);
     // movss/movsd [rdx+rax], xmm0
     self.cg_e8(skPf); self.cg_e8(0x0F); self.cg_e8(0x11); self.cg_e8(0x04); self.cg_e8(0x02);
+    }
     // add rax, 4 bzw. 8  (#2199: ein ELEMENT weiter)
     self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(bytes);
     // jmp .scalarStart
@@ -8408,6 +8539,74 @@ pub type Codegen = class {
   // Die Opcodes selbst sind identisch (cg_sseF32Opcode) — nur das Praefix
   // entscheidet. Deshalb eine Stelle fuer beide Breiten, wie #2184 es fuer
   // packed und skalar schon festgelegt hat.
+  // #2247: Opcode der GANZZAHL-Vektoroperation, 0x66-Praefix vorausgesetzt.
+  // Zwei Bytes, weil PMULLD aus der 0F-38-Gruppe kommt: Rueckgabe ist
+  // (zweites Byte) * 256 + (erstes Byte), oder -1, wenn es den Befehl nicht
+  // gibt. Die Breite steckt im Opcode selbst, nicht im Praefix — anders als
+  // bei Gleitkomma, wo dasselbe Byte mit 0x66 die Breite wechselt.
+  //
+  //   +  PADDB 0F FC | PADDW 0F FD | PADDD 0F FE | PADDQ 0F D4
+  //   -  PSUBB 0F F8 | PSUBW 0F F9 | PSUBD 0F FA | PSUBQ 0F FB
+  //   *  PMULLW 0F D5 (16 Bit) | PMULLD 0F 38 40 (32 Bit, sse4)
+  //
+  // Fuer * mit 8 oder 64 Bit und fuer / und % gibt es keinen Befehl; sema
+  // weist das vorher ab (_pruefeVektorOpArt). Kommt hier doch einer an, ist
+  // das ein Loch zwischen den beiden Stellen und wird laut gemeldet.
+  fn cg_sseGanzOpcode(op: int64, bytes: int64): int64 {
+    if (op == CGT_PLUS) {
+      if (bytes == 1) { return 0xFC; }
+      if (bytes == 2) { return 0xFD; }
+      if (bytes == 4) { return 0xFE; }
+      if (bytes == 8) { return 0xD4; }
+    }
+    if (op == CGT_MINUS) {
+      if (bytes == 1) { return 0xF8; }
+      if (bytes == 2) { return 0xF9; }
+      if (bytes == 4) { return 0xFA; }
+      if (bytes == 8) { return 0xFB; }
+    }
+    if (op == CGT_STAR) {
+      if (bytes == 2) { return 0xD5; }
+      if (bytes == 4) { return 0x38 + 0x40 * 256; }   // 0F 38 40
+    }
+    return 0 - 1;
+  }
+
+  // #2247: Der skalare Rest eines Ganzzahlvektors laeuft NICHT ueber SSE —
+  // bei Gleitkomma ist der Rest einfach dieselbe Operation mit F3/F2-Praefix,
+  // fuer Ganzzahlen gibt es diese Entsprechung nicht. Gerechnet wird deshalb
+  // in Allzweckregistern, ein Element je Durchgang, mit der Breite im
+  // Ladebefehl.
+  //
+  // r8 = Wert links, r9 = Wert rechts; beide vorzeichenerweitert geladen,
+  // damit die Rechnung derselben Bedeutung folgt wie peek8/16/32 (#2300:
+  // int32 erweitert mit Vorzeichen). Geschrieben wird nur die Breite selbst.
+  fn cg_emitGanzRestOp(op: int64, bytes: int64) {
+    // r8 = [rdi+rax]
+    if (bytes == 1)      { self.cg_e8(0x4C); self.cg_e8(0x0F); self.cg_e8(0xBE); self.cg_e8(0x04); self.cg_e8(0x07); }
+    else if (bytes == 2) { self.cg_e8(0x4C); self.cg_e8(0x0F); self.cg_e8(0xBF); self.cg_e8(0x04); self.cg_e8(0x07); }
+    else if (bytes == 4) { self.cg_e8(0x4C); self.cg_e8(0x63); self.cg_e8(0x04); self.cg_e8(0x07); }
+    else                 { self.cg_e8(0x4C); self.cg_e8(0x8B); self.cg_e8(0x04); self.cg_e8(0x07); }
+    // r9 = [rsi+rax]
+    if (bytes == 1)      { self.cg_e8(0x4C); self.cg_e8(0x0F); self.cg_e8(0xBE); self.cg_e8(0x0C); self.cg_e8(0x06); }
+    else if (bytes == 2) { self.cg_e8(0x4C); self.cg_e8(0x0F); self.cg_e8(0xBF); self.cg_e8(0x0C); self.cg_e8(0x06); }
+    else if (bytes == 4) { self.cg_e8(0x4C); self.cg_e8(0x63); self.cg_e8(0x0C); self.cg_e8(0x06); }
+    else                 { self.cg_e8(0x4C); self.cg_e8(0x8B); self.cg_e8(0x0C); self.cg_e8(0x06); }
+    // r8 <op>= r9
+    if (op == CGT_PLUS)       { self.cg_e8(0x4D); self.cg_e8(0x01); self.cg_e8(0xC8); }   // add r8, r9
+    else if (op == CGT_MINUS) { self.cg_e8(0x4D); self.cg_e8(0x29); self.cg_e8(0xC8); }   // sub r8, r9
+    else if (op == CGT_STAR)  { self.cg_e8(0x4D); self.cg_e8(0x0F); self.cg_e8(0xAF); self.cg_e8(0xC1); }  // imul r8, r9
+    else {
+      EPrintStrLn("lyxc: interner Fehler (#2247): cg_emitGanzRestOp mit einer Operation ohne Ganzzahlform."c);
+      exit(70);
+    }
+    // [rdx+rax] = r8  (nur die Breite selbst)
+    if (bytes == 1)      { self.cg_e8(0x44); self.cg_e8(0x88); self.cg_e8(0x04); self.cg_e8(0x02); }
+    else if (bytes == 2) { self.cg_e8(0x66); self.cg_e8(0x44); self.cg_e8(0x89); self.cg_e8(0x04); self.cg_e8(0x02); }
+    else if (bytes == 4) { self.cg_e8(0x44); self.cg_e8(0x89); self.cg_e8(0x04); self.cg_e8(0x02); }
+    else                 { self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0x04); self.cg_e8(0x02); }
+  }
+
   fn cg_ssePackedPraefix(bytes: int64): int64 {
     if (bytes == 8) { return 0x66; }
     return 0;
@@ -13760,6 +13959,15 @@ pub type Codegen = class {
             EPrintStrLn("  Beide Seiten muessen dieselbe Elementart haben (f32 mit f32, f64 mit f64)."c);
             exit(1);
           }
+          // #2247: und dieselbe ART. Breite allein unterscheidet f32 nicht
+          // von int32; eine Gleitkommaoperation auf Ganzzahl-Bitmustern war
+          // genau der zweite stille Fehler aus #2199.
+          if (self.cg_simdGanzOf(sLI) != self.cg_simdGanzOf(sRI)) {
+            EPrintStrLn("error: codegen: Vektoroperation mit Gleitkomma auf der einen und Ganzzahl auf der anderen Seite (#2247)."c);
+            exit(1);
+          }
+          var simdOpKennung: int64 := simdOpBytes;
+          if (self.cg_simdGanzOf(sLI) != 0) { simdOpKennung := simdOpKennung | CG_SIMD_GANZ; }
           // Both are SIMD locals — emit vectorized SSE2 loop
           var sLO: int64 := self.cg_findLocal(sLN, sLL);
           var sRO: int64 := self.cg_findLocal(sRN, sRL);
@@ -13813,8 +14021,8 @@ pub type Codegen = class {
           // es bei 128 Bit — ein VEX-Praefix auf einer aelteren CPU endet
           // in SIGILL, und ein stiller Rueckfall waere hier genau falsch:
           // der Code liefe, waere aber langsamer als zugesagt (#2191).
-          if (self.cg_cpuHat(2) != 0) { self.cg_emitAVX2BinOp(op, simdOpBytes); }
-          else                        { self.cg_emitSSE2BinOp(op, simdOpBytes); }
+          if (self.cg_cpuHat(2) != 0) { self.cg_emitAVX2BinOp(op, simdOpKennung); }
+          else                        { self.cg_emitSSE2BinOp(op, simdOpKennung); }
           // rax = result SIMD ptr
         } else {
           // idents but not SIMD — general path
@@ -14279,7 +14487,31 @@ pub type Codegen = class {
         self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x04); self.cg_e8(0x19);
         return;
       }
-      if (isSimd == 1 && simdBytes == 8) {
+      // #2247: Ganzzahl-Elemente — die Breite entscheidet den Ladebefehl, und
+      // gelesen wird VORZEICHENERWEITERT. Das ist dieselbe Bedeutung, die
+      // peek8/peek16/peek32 tragen (#2300: int32 erweitert mit Vorzeichen),
+      // und das Gegenstueck zum Schreibpfad, der nur die Breite selbst
+      // ablegt. Bis 1.2.24D lief JEDE Ganzzahlart ueber den f32-Zweig
+      // darunter: Schrittweite 4 und das rohe 32-Bit-Muster. Gemessen hiess
+      // das `c[2] = 0` bei int8/int16 (gelesen an der falschen Stelle) und
+      // `127 + 1 = 128` statt -128 (keine Abschneidung). int32 war richtig,
+      // WEIL seine Schrittweite der f32-Annahme entspricht — ein einziger
+      // gruener Fall belegt hier nichts.
+      if (isSimd == 1 && isSimdFloat == 0) {
+        if (simdBytes == 1) {
+          // movsx rax, byte [rax+rbx]   (48 0F BE 04 18)
+          self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xBE); self.cg_e8(0x04); self.cg_e8(0x18);
+        } else if (simdBytes == 2) {
+          // movsx rax, word [rax+rbx*2] (48 0F BF 04 58)
+          self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xBF); self.cg_e8(0x04); self.cg_e8(0x58);
+        } else if (simdBytes == 4) {
+          // movsxd rax, dword [rax+rbx*4] (48 63 04 98)
+          self.cg_e8(0x48); self.cg_e8(0x63); self.cg_e8(0x04); self.cg_e8(0x98);
+        } else {
+          // mov rax, qword [rax+rbx*8]  (48 8B 04 D8)
+          self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x04); self.cg_e8(0xD8);
+        }
+      } else if (isSimd == 1 && simdBytes == 8) {
         // #2199: `parallel Array<f64>[i]` — 8 Byte Schrittweite, movsd, KEINE
         // Umrechnung. Bis 1.2.19F lief dieser Fall ueber den f32-Pfad: die
         // Ablage hielt 32 Bit, und erst beim Lesen machte cvtss2sd daraus
@@ -20616,7 +20848,7 @@ pub type Codegen = class {
       if (typeNode >= 0 && self.cg_nkind(typeNode) == 93) {
         poke8(self.localIsSimd + localIdx, 1);
         // #2199: Elementbreite mitschreiben (c0 ist der Elementtyp).
-        poke8(self.localSimdBytes + localIdx, self.cg_simdBytesVonTyp(self.cg_nc0(typeNode)));
+        poke8(self.localSimdBytes + localIdx, self.cg_simdKennungVonTyp(self.cg_nc0(typeNode)));   // #2247: Breite UND Art
         poke8(self.localIsArray + localIdx, 0);  // not a regular Array
         // #2183: der ELEMENTTYP muss mit, wie bei `Array<T>` daneben. Ohne ihn
         // galt `v[i]` bei `parallel Array<f32>` als Ganzzahl: cg_isF64ElemOf
@@ -21596,7 +21828,28 @@ pub type Codegen = class {
         // dem Stack; der Panic-Pfad kehrt nicht zurueck, die Unwucht ist also
         // folgenlos.
         if (lhsIsArray == 1) { self.cg_emitIndexBoundsCheck(lhsFixedSize, 1); }
-        if (lhsIsSimd == 1 && lhsSimdBytes == 8) {
+        // #2247: Ganzzahl-Elemente — abgelegt wird NUR die Breite selbst,
+        // Gegenstueck zum Lesepfad, der sie vorzeichenerweitert zurueckholt.
+        // Bis 1.2.24D fiel jede Ganzzahlart in den f32-Zweig darunter und
+        // schrieb 4 Byte an einen 4-Byte-Platz; bei int8/int16 traf das den
+        // falschen Platz und zerstoerte die Nachbarelemente, bei int64 ging
+        // die obere Haelfte verloren (#2199).
+        if (lhsIsSimd == 1 && lhsIsSimdFloat == 0) {
+          self.cg_e8(0x59);                                                      // pop rcx (Wert)
+          if (lhsSimdBytes == 1) {
+            // mov [rax+rbx], cl        (88 0C 18)
+            self.cg_e8(0x88); self.cg_e8(0x0C); self.cg_e8(0x18);
+          } else if (lhsSimdBytes == 2) {
+            // mov [rax+rbx*2], cx      (66 89 0C 58)
+            self.cg_e8(0x66); self.cg_e8(0x89); self.cg_e8(0x0C); self.cg_e8(0x58);
+          } else if (lhsSimdBytes == 4) {
+            // mov [rax+rbx*4], ecx     (89 0C 98)
+            self.cg_e8(0x89); self.cg_e8(0x0C); self.cg_e8(0x98);
+          } else {
+            // mov [rax+rbx*8], rcx     (48 89 0C D8)
+            self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x0C); self.cg_e8(0xD8);
+          }
+        } else if (lhsIsSimd == 1 && lhsSimdBytes == 8) {
           // #2199: `parallel Array<f64>[i] := wert` — 8 Byte, movsd, ohne
           // Umrechnung. Gegenstueck zum Lesepfad (movsd dort); die beiden
           // muessen uebereinstimmen, sonst liest man anders, als man

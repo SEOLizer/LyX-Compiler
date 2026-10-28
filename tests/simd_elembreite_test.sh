@@ -208,10 +208,19 @@ fn main(): int64 {
   return 0;
 }'
 
-# --- Ganzzahl-Elementarten werden laut abgewiesen --------------------------
+# --- Elementarten: zugelassen ist, was eine Umsetzung hat -----------------
 #
-# Drei Formen, weil die Elementart an drei Stellen steht: Ausdruck,
-# Variablentyp, Parameter-/Rueckgabetyp. Die dritte nutzt
+# ACHTUNG, Geschichte dieser Stelle: bis 1.2.24D standen hier fuenf Faelle,
+# die nachwiesen, dass GANZZAHL-Elementarten ABGEWIESEN werden. Mit #2247
+# haben sie eine Umsetzung bekommen (PADDB/W/D/Q, PSUBB/W/D/Q, PMULLW,
+# PMULLD), und die fuenf Faelle wurden damit rot — ein Test, der
+# voraussetzt, dass eine Luecke offen bleibt. Genau davor warnen die
+# Arbeitsregeln; sie sind deshalb ERSETZT, nicht entfernt.
+#
+# Geprueft wird jetzt beides: die Elementarten, die es GIBT, rechnen richtig
+# (weiter unten, mit Werten), und die Elementarten, die es NICHT gibt, werden
+# weiter laut abgewiesen. Drei Formen, weil die Elementart an drei Stellen
+# steht: Ausdruck, Variablentyp, Parameter-/Rueckgabetyp. Die dritte nutzt
 # tests/lyx/simd/simd_example.lyx — mit nur der Ausdrucksform waere der
 # Bestandsfall durchgelaufen.
 abgewiesen() { # name, quelle
@@ -219,27 +228,51 @@ abgewiesen() { # name, quelle
   if (cd "$ROOT" && timeout 200 "$LYXC" --std-path="$ROOT" "$TMP/r.lyx" -o "$TMP/r" >"$TMP/r.log" 2>&1); then
     no "$1" "uebersetzt durch — die stille Fehlrechnung ist zurueck"
   else
-    if grep -q 'parallel Array traegt nur f32 oder f64' "$TMP/r.log"; then ok "$1"
+    if grep -q 'parallel Array traegt' "$TMP/r.log"; then ok "$1"
     else no "$1" "abgewiesen, aber mit anderer Meldung: $(sed -n '2,3p' "$TMP/r.log" | tr '\n' ' ')"; fi
   fi
 }
 
-abgewiesen "#2199: int64 als Ausdruck abgewiesen" 'import std.io;
-fn main(): int64 { let v: parallel Array<int64>(4) = parallel Array<int64>(4); return 0; }'
+# Keine Zahl: `bool` hat keine Vektorform und bleibt abgewiesen — an allen
+# drei Stellen, damit der Weg nicht ueber eine davon offen bleibt.
+abgewiesen "#2247: bool als Ausdruck abgewiesen" 'import std.io;
+fn main(): int64 { let v: parallel Array<bool>(4) = parallel Array<bool>(4); return 0; }'
 
-abgewiesen "#2199: int64 als Variablentyp abgewiesen" 'import std.io;
-fn main(): int64 { var v: parallel Array<int64>; return 0; }'
+abgewiesen "#2247: bool als Variablentyp abgewiesen" 'import std.io;
+fn main(): int64 { var v: parallel Array<bool>; return 0; }'
 
-abgewiesen "#2199: int64 als Parametertyp abgewiesen" 'import std.io;
-fn f(a: parallel Array<int64>): int64 { return 0; }
+abgewiesen "#2247: bool als Parametertyp abgewiesen" 'import std.io;
+fn f(a: parallel Array<bool>): int64 { return 0; }
 fn main(): int64 { return 0; }'
 
-abgewiesen "#2199: int64 als Rueckgabetyp abgewiesen" 'import std.io;
+abgewiesen "#2247: bool als Rueckgabetyp abgewiesen" 'import std.io;
+fn f(): parallel Array<bool> { return 0; }
+fn main(): int64 { return 0; }'
+
+abgewiesen "#2247: pchar ebenso abgewiesen" 'import std.io;
+fn main(): int64 { let v: parallel Array<pchar>(4) = parallel Array<pchar>(4); return 0; }'
+
+# Die Ganzzahlarten, die es gibt, werden NICHT mehr abgewiesen — der
+# Gegenbeleg zu den fuenf Faellen darueber.
+zugelassen() { # name, quelle
+  printf '%s\n' "$2" > "$TMP/z.lyx"
+  if (cd "$ROOT" && timeout 200 "$LYXC" --std-path="$ROOT" "$TMP/z.lyx" -o "$TMP/z" >"$TMP/z.log" 2>&1); then
+    ok "$1"
+  else
+    no "$1" "abgewiesen: $(grep -m1 -iE 'error' "$TMP/z.log" | head -c 100)"
+  fi
+}
+
+zugelassen "#2247: int8 als Variablentyp zugelassen" 'import std.io;
+fn main(): int64 { var v: parallel Array<int8>; return 0; }'
+zugelassen "#2247: int16 als Parametertyp zugelassen" 'import std.io;
+fn f(a: parallel Array<int16>): int64 { return 0; }
+fn main(): int64 { return 0; }'
+zugelassen "#2247: int32 als Ausdruck zugelassen" 'import std.io;
+fn main(): int64 { let v: parallel Array<int32>(4) = parallel Array<int32>(4); return 0; }'
+zugelassen "#2247: int64 als Rueckgabetyp zugelassen" 'import std.io;
 fn f(): parallel Array<int64> { return 0; }
 fn main(): int64 { return 0; }'
-
-abgewiesen "#2199: int32 ebenso abgewiesen" 'import std.io;
-fn main(): int64 { let v: parallel Array<int32>(4) = parallel Array<int32>(4); return 0; }'
 
 # --- lyxos: am Erzeugnis, beide Richtungen ---------------------------------
 #

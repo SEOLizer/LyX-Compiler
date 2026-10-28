@@ -706,10 +706,10 @@ pub type EmitARM64 = class {
     //
     // #2199: `imm` traegt die Elementbreite (4 oder 8). Ohne sie waere `f64`
     // weiter als f32 gerechnet — still und nur an der Genauigkeit erkennbar.
-    if op == IRO_SIMD_ADD { self.emitNeonBinOp(0x4E21D400, 0x1E212800, src1, src2, dest, imm); }
-    if op == IRO_SIMD_SUB { self.emitNeonBinOp(0x4EA1D400, 0x1E213800, src1, src2, dest, imm); }
-    if op == IRO_SIMD_MUL { self.emitNeonBinOp(0x6E21DC00, 0x1E210800, src1, src2, dest, imm); }
-    if op == IRO_SIMD_DIV { self.emitNeonBinOp(0x6E21FC00, 0x1E211800, src1, src2, dest, imm); }
+    if op == IRO_SIMD_ADD { self.emitNeonBinOp(0x4E21D400, 0x1E212800, src1, src2, dest, imm, IRO_SIMD_ADD); }
+    if op == IRO_SIMD_SUB { self.emitNeonBinOp(0x4EA1D400, 0x1E213800, src1, src2, dest, imm, IRO_SIMD_SUB); }
+    if op == IRO_SIMD_MUL { self.emitNeonBinOp(0x6E21DC00, 0x1E210800, src1, src2, dest, imm, IRO_SIMD_MUL); }
+    if op == IRO_SIMD_DIV { self.emitNeonBinOp(0x6E21FC00, 0x1E211800, src1, src2, dest, imm, IRO_SIMD_DIV); }
     // #2222: `-a` — FNEG je Lane. Dieselbe Schleife wie die Binops; FNEG
     // liest nur v0 bzw. s0/d0, der zweite Operand ist deshalb die Quelle
     // selbst (geladen, aber nicht benutzt). `fneg v0.4s, v0.4s` = 0x6EA0F800,
@@ -717,7 +717,7 @@ pub type EmitARM64 = class {
     // (`fneg v0.2d` 0x6EE0F800, `fneg d0` 0x1E614000). Gegengelesen mit
     // llvm-mc. Dieselbe Rechnung wie cg_emitSSE2Neg (x86) und
     // emitSimdNeg (lyxos) — die drei muessen uebereinstimmen.
-    if op == IRO_SIMD_NEG { self.emitNeonBinOp(0x6EA0F800, 0x1E214000, src1, src1, dest, imm); }
+    if op == IRO_SIMD_NEG { self.emitNeonBinOp(0x6EA0F800, 0x1E214000, src1, src1, dest, imm, IRO_SIMD_NEG); }
     if op == IRO_SIMD_NEW { self.emitSimdNew(src1, dest, imm); }
     if op == IRO_SIMD_LOAD_ELEM  { self.emitSimdLoadElem(dest, src1, src2, imm); }
     if op == IRO_SIMD_STORE_ELEM { self.emitSimdStoreElem(dest, src1, src2, imm); }
@@ -2516,20 +2516,102 @@ pub type EmitARM64 = class {
   //
   // Der Vektorteil bleibt bei 16 Byte je Durchlauf (ein q-Register fasst vier
   // f32 oder zwei f64); nur der skalare Rest zaehlt in Elementen.
-  fn emitNeonBinOp(vecWort: int64, skalarWort: int64, src1: int64, src2: int64, dest: int64, bytes: int64) {
+  // #2247: Ganzzahl-Vektorwort je Breite. Das Groessenfeld sitzt in Bit 23:22
+  // (00 = .16B, 01 = .8H, 10 = .4S, 11 = .2D); das Grundwort traegt schon
+  // Rm = v1, Rn = v0, Rd = v0.
+  //
+  //   ADD  Vd.16B, Vn.16B, Vm.16B   0x4E218400
+  //   SUB  Vd.16B, ...              0x6E218400
+  //   MUL  Vd.16B, ...              0x4E219C00   (kein .2D — ARM64 hat kein
+  //                                               64-Bit-MUL als Vektor)
+  //
+  // Dieselbe Einschraenkung wie auf x86 (dort fehlt PMULLQ) — sema weist das
+  // vorher ab (_pruefeVektorOpArt), hier wird es nur nicht still erzeugt.
+  fn neonGanzWort(grund: int64, bytes: int64): int64 {
+    var gr: int64 := 0;
+    if bytes == 2 { gr := 1; }
+    if bytes == 4 { gr := 2; }
+    if bytes == 8 { gr := 3; }
+    return grund | (gr * 0x00400000);
+  }
+
+  // #2247: Ein Element des Restes in Allzweckregistern. Geladen wird
+  // VORZEICHENERWEITERT (x6 = links, x7 = rechts), gerechnet in 64 Bit und
+  // nur die Breite selbst zurueckgeschrieben — dieselbe Bedeutung wie der
+  // x86-Rest (cg_emitGanzRestOp) und wie peek8/16/32 (#2300).
+  //
+  // Adressform ist "Register-Offset mit LSL #0", x5 ist also ein BYTE-Offset
+  // — wie im Vektorteil darueber. x6 und x7 sind frei: der Rumpf benutzt
+  // x0 (Ziel), x2 (Zahl), x3/x4 (Quellen) und x5 (Offset).
+  fn emitNeonGanzRest(op: int64, bytes: int64) {
+    var ldL: int64 := 0;
+    var ldR: int64 := 0;
+    var st:  int64 := 0;
+    // Rm = x5 steht in Bit 20:16 (0x50000). Ohne dieses Feld laeuft der
+    // Zugriff ueber x0 statt ueber den Offset — bei der ersten Fassung
+    // faultete deshalb jedes Feld mit einem REST (ab 5 Elementen bei 4 Byte;
+    // 4 Elemente sind genau ein Vektorblock und gingen gut).
+    if bytes == 1 {
+      ldL := 0x38A56866; ldR := 0x38A56887; st := 0x38256806;   // LDRSB x6/x7, STRB w6
+    } else if bytes == 2 {
+      ldL := 0x78A56866; ldR := 0x78A56887; st := 0x78256806;   // LDRSH, STRH
+    } else if bytes == 4 {
+      ldL := 0xB8A56866; ldR := 0xB8A56887; st := 0xB8256806;   // LDRSW, STR w6
+    } else {
+      ldL := 0xF8656866; ldR := 0xF8656887; st := 0xF8256806;   // LDR x6/x7, STR x6
+    }
+    self.emit32(ldL);          // x6 = [x3, x5]
+    self.emit32(ldR);          // x7 = [x4, x5]
+    if op == IRO_SIMD_ADD      { self.emit32(0x8B0700C6); }      // ADD x6, x6, x7
+    else if op == IRO_SIMD_SUB { self.emit32(0xCB0700C6); }      // SUB x6, x6, x7
+    else if op == IRO_SIMD_MUL { self.emit32(0x9B077CC6); }      // MUL x6, x6, x7
+    else {
+      EPrintStrLn("interner fehler (#2247): emitNeonGanzRest mit einer Operation ohne Ganzzahlform."c);
+      exit(1);
+    }
+    self.emit32(st);           // [x0, x5] = x6  (nur die Breite)
+  }
+
+  fn emitNeonBinOp(vecWort: int64, skalarWort: int64, src1: int64, src2: int64, dest: int64, bytes: int64, ganzOp: int64) {
         // #2199: Schutz gegen eine 0 aus einem nicht versorgten IR-Pfad. Als
         // Schrittweite waere sie eine Endlosschleife (`add rax, 0`) — genau
         // das ist beim unaeren Pfad passiert. Hier wird NICHT stillschweigend
         // 4 angenommen, sondern laut gemeldet: eine 0 heisst, dass eine
         // Stelle in ir_lower die Breite nicht mitgibt, und das gehoert
         // behoben, nicht geraten.
-        if bytes != 4 && bytes != 8 {
-            EPrintStrLn("interner fehler: SIMD-Elementbreite ist weder 4 noch 8 (#2199) — eine IR-Stelle gibt sie nicht mit."c);
+    // #2247: `bytes` ist jetzt eine KENNUNG — Breite unten, Art in Bit 4
+    // (IR_SIMD_GANZ). Gleitkomma traegt weiter die nackte Breite, die
+    // Pruefung unten bleibt fuer sie also unveraendert.
+    var ganz: int64 := 0;
+    if (bytes & 16) != 0 { ganz := 1; }
+    var breite: int64 := bytes & 15;
+        if breite != 1 && breite != 2 && breite != 4 && breite != 8 {
+            EPrintStrLn("interner fehler: SIMD-Elementbreite ist keine von 1, 2, 4, 8 (#2199/#2247) — eine IR-Stelle gibt sie nicht mit."c);
+            exit(1);
+        }
+        if ganz == 0 && breite != 4 && breite != 8 {
+            EPrintStrLn("interner fehler (#2247): Gleitkomma-Vektor mit einer Breite ausser 4 und 8."c);
             exit(1);
         }
     var vw: int64 := vecWort;
     var sw: int64 := skalarWort;
-    if bytes == 8 { vw := vecWort | 0x00400000; sw := skalarWort | 0x00400000; }
+    if ganz != 0 {
+      // Ganzzahl: eigenes Grundwort, Groesse im Feld 23:22. `skalarWort`
+      // bleibt ungenutzt — der Rest rechnet in Allzweckregistern.
+      var grund: int64 := 0;
+      if ganzOp == IRO_SIMD_ADD      { grund := 0x4E218400; }
+      else if ganzOp == IRO_SIMD_SUB { grund := 0x6E218400; }
+      else if ganzOp == IRO_SIMD_MUL { grund := 0x4E219C00; }
+      else {
+        EPrintStrLn("interner fehler (#2247): Ganzzahl-Vektoroperation ohne NEON-Befehl — sema haette das abweisen muessen."c);
+        exit(1);
+      }
+      if ganzOp == IRO_SIMD_MUL && breite == 8 {
+        EPrintStrLn("interner fehler (#2247): 64-Bit-Multiplikation hat auf ARM64 keine Vektorform — sema haette das abweisen muessen."c);
+        exit(1);
+      }
+      vw := self.neonGanzWort(grund, breite);
+    } else if breite == 8 { vw := vecWort | 0x00400000; sw := skalarWort | 0x00400000; }
     // x0 = Zeiger auf lhs, x2 = Elementzahl aus [x0-8]
     self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(src1));
     self.emitLdur(ARM64_X2, ARM64_X0, 0 - 8);
@@ -2537,8 +2619,10 @@ pub type EmitARM64 = class {
     // und die Quellzeiger stehen ohnehin in Rahmen-Slots.
     self.emitStur(ARM64_X2, ARM64_X29, self.slotOff(dest));
     // Ergebnispuffer anlegen: n*4 + 24 Byte, 16-Byte ausgerichtet, Zaehler bei ptr-8
-    if bytes == 8 { self.emit32(0xD37DF042); }   // LSL x2, x2, #3   (#2199)
-    else          { self.emit32(0xD37EF442); }   // LSL x2, x2, #2
+    // #2247: Bytezahl der Ablage je Breite; bei 1 Byte keine Schiebung.
+    if breite == 8      { self.emit32(0xD37DF042); }   // LSL x2, x2, #3   (#2199)
+    else if breite == 4 { self.emit32(0xD37EF442); }   // LSL x2, x2, #2
+    else if breite == 2 { self.emit32(0xD37FF842); }   // LSL x2, x2, #1
     self.emit32(0x91006042);   // ADD x2, x2, #24
     self.emitMovImmReg(ARM64_X0, 0);    // addr = 0
     self.emit32(0xAA0203E1);            // MOV x1, x2  (Laenge)
@@ -2557,8 +2641,10 @@ pub type EmitARM64 = class {
     // Quellzeiger neu laden: x3 = lhs, x4 = rhs
     self.emitLdur(ARM64_X3, ARM64_X29, self.slotOff(src1));
     self.emitLdur(ARM64_X4, ARM64_X29, self.slotOff(src2));
-    if bytes == 8 { self.emit32(0xD37DF042); }   // LSL x2, x2, #3  (Bytezahl, #2199)
-    else          { self.emit32(0xD37EF442); }   // LSL x2, x2, #2
+    // #2247: dieselbe Rechnung wie oben — die beiden muessen uebereinstimmen.
+    if breite == 8      { self.emit32(0xD37DF042); }   // LSL x2, x2, #3  (Bytezahl, #2199)
+    else if breite == 4 { self.emit32(0xD37EF442); }   // LSL x2, x2, #2
+    else if breite == 2 { self.emit32(0xD37FF842); }   // LSL x2, x2, #1
     self.emit32(0xD1004042);   // SUB x2, x2, #16  (letzter voller Block; darf negativ werden)
     self.emitMovImmReg(ARM64_X5, 0);   // Byte-Offset
 
@@ -2583,7 +2669,13 @@ pub type EmitARM64 = class {
     self.emit32(0xEB0200BF);   // CMP x5, x2
     var jgePos: int64 := self.codeLen;
     self.emit32(0x5400000A);   // B.GE .done  (Weite wird nachgetragen)
-    if bytes == 8 {
+    if ganz != 0 {
+      self.emitNeonGanzRest(ganzOp, breite);   // #2247
+      if breite == 1      { self.emit32(0x910004A5); }   // ADD x5, x5, #1
+      else if breite == 2 { self.emit32(0x910008A5); }   // ADD x5, x5, #2
+      else if breite == 4 { self.emit32(0x910010A5); }   // ADD x5, x5, #4
+      else                { self.emit32(0x910020A5); }   // ADD x5, x5, #8
+    } else if breite == 8 {
       self.emit32(0xFC656860);   // LDR d0, [x3, x5]
       self.emit32(0xFC656881);   // LDR d1, [x4, x5]
       self.emit32(sw);           // d0 = d0 OP d1
@@ -2687,16 +2779,26 @@ pub type EmitARM64 = class {
         // 4 angenommen, sondern laut gemeldet: eine 0 heisst, dass eine
         // Stelle in ir_lower die Breite nicht mitgibt, und das gehoert
         // behoben, nicht geraten.
-        if bytes != 4 && bytes != 8 {
-            EPrintStrLn("interner fehler: SIMD-Elementbreite ist weder 4 noch 8 (#2199) — eine IR-Stelle gibt sie nicht mit."c);
+        // #2247: `bytes` ist eine KENNUNG — Breite unten, Art in Bit 4.
+        var ganz: int64 := 0;
+        if (bytes & 16) != 0 { ganz := 1; }
+        var breite: int64 := bytes & 15;
+        if breite != 1 && breite != 2 && breite != 4 && breite != 8 {
+            EPrintStrLn("interner fehler: SIMD-Elementbreite ist keine von 1, 2, 4, 8 (#2199/#2247) — eine IR-Stelle gibt sie nicht mit."c);
+            exit(1);
+        }
+        if ganz == 0 && breite != 4 && breite != 8 {
+            EPrintStrLn("interner fehler (#2247): Gleitkomma-Vektor mit einer Breite ausser 4 und 8."c);
             exit(1);
         }
     self.emitLdur(ARM64_X2, ARM64_X29, self.slotOff(countSlot));
     self.emitStur(ARM64_X2, ARM64_X29, self.slotOff(dest));   // Zahl parken
     // #2199: n*4 fuer f32, n*8 fuer f64. Beide Woerter mit llvm-mc
     // assembliert, nicht getippt.
-    if bytes == 8 { self.emit32(0xD37DF042); }   // LSL x2, x2, #3
-    else          { self.emit32(0xD37EF442); }   // LSL x2, x2, #2
+    // #2247: Groesse je Breite. Bei 1 Byte entfaellt die Schiebung ganz.
+    if breite == 8      { self.emit32(0xD37DF042); }   // LSL x2, x2, #3
+    else if breite == 4 { self.emit32(0xD37EF442); }   // LSL x2, x2, #2
+    else if breite == 2 { self.emit32(0xD37FF842); }   // LSL x2, x2, #1
     self.emit32(0x91006042);   // ADD x2, x2, #24
     self.emitMovImmReg(ARM64_X0, 0);
     self.emit32(0xAA0203E1);            // MOV x1, x2
@@ -2724,15 +2826,37 @@ pub type EmitARM64 = class {
         // 4 angenommen, sondern laut gemeldet: eine 0 heisst, dass eine
         // Stelle in ir_lower die Breite nicht mitgibt, und das gehoert
         // behoben, nicht geraten.
-        if bytes != 4 && bytes != 8 {
-            EPrintStrLn("interner fehler: SIMD-Elementbreite ist weder 4 noch 8 (#2199) — eine IR-Stelle gibt sie nicht mit."c);
+        // #2247: `bytes` ist eine KENNUNG — Breite unten, Art in Bit 4.
+        var ganz: int64 := 0;
+        if (bytes & 16) != 0 { ganz := 1; }
+        var breite: int64 := bytes & 15;
+        if breite != 1 && breite != 2 && breite != 4 && breite != 8 {
+            EPrintStrLn("interner fehler: SIMD-Elementbreite ist keine von 1, 2, 4, 8 (#2199/#2247) — eine IR-Stelle gibt sie nicht mit."c);
+            exit(1);
+        }
+        if ganz == 0 && breite != 4 && breite != 8 {
+            EPrintStrLn("interner fehler (#2247): Gleitkomma-Vektor mit einer Breite ausser 4 und 8."c);
             exit(1);
         }
     self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(ptrSlot));
     self.emitLdur(ARM64_X1, ARM64_X29, self.slotOff(idxSlot));
+    // #2247: Ganzzahl-Element — Index auf die eigene Breite skalieren und
+    // VORZEICHENERWEITERT laden. Das Ergebnis ist eine Ganzzahl und gehoert
+    // in einen Allzweck-Slot, nicht in d0.
+    if ganz != 0 {
+      if breite == 2      { self.emit32(0xD37FF821); }   // LSL x1, x1, #1
+      else if breite == 4 { self.emit32(0xD37EF421); }   // LSL x1, x1, #2
+      else if breite == 8 { self.emit32(0xD37DF021); }   // LSL x1, x1, #3
+      if breite == 1      { self.emit32(0x38A16800); }   // LDRSB x0, [x0, x1]
+      else if breite == 2 { self.emit32(0x78A16800); }   // LDRSH x0, [x0, x1]
+      else if breite == 4 { self.emit32(0xB8A16800); }   // LDRSW x0, [x0, x1]
+      else                { self.emit32(0xF8616800); }   // LDR   x0, [x0, x1]
+      self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
+      return;
+    }
     // #2199: bei f64 acht Byte Schrittweite, `ldr d0` — und KEIN FCVT, der
     // Wert ist schon f64. Die Wandlung gehoert nur zum f32-Fall (#2183).
-    if bytes == 8 {
+    if breite == 8 {
       self.emit32(0xD37DF021);   // LSL x1, x1, #3
       self.emit32(0xFC616800);   // LDR d0, [x0, x1]
     } else {
@@ -2751,15 +2875,38 @@ pub type EmitARM64 = class {
         // 4 angenommen, sondern laut gemeldet: eine 0 heisst, dass eine
         // Stelle in ir_lower die Breite nicht mitgibt, und das gehoert
         // behoben, nicht geraten.
-        if bytes != 4 && bytes != 8 {
-            EPrintStrLn("interner fehler: SIMD-Elementbreite ist weder 4 noch 8 (#2199) — eine IR-Stelle gibt sie nicht mit."c);
+        // #2247: `bytes` ist eine KENNUNG — Breite unten, Art in Bit 4.
+        var ganz: int64 := 0;
+        if (bytes & 16) != 0 { ganz := 1; }
+        var breite: int64 := bytes & 15;
+        if breite != 1 && breite != 2 && breite != 4 && breite != 8 {
+            EPrintStrLn("interner fehler: SIMD-Elementbreite ist keine von 1, 2, 4, 8 (#2199/#2247) — eine IR-Stelle gibt sie nicht mit."c);
             exit(1);
         }
+        if ganz == 0 && breite != 4 && breite != 8 {
+            EPrintStrLn("interner fehler (#2247): Gleitkomma-Vektor mit einer Breite ausser 4 und 8."c);
+            exit(1);
+        }
+    // #2247: Ganzzahl-Element — der Wert kommt aus einem Allzweck-Slot, und
+    // geschrieben wird nur die Breite selbst. Gegenstueck zum Lesen oben.
+    if ganz != 0 {
+      self.emitLdur(ARM64_X2, ARM64_X29, self.slotOff(valSlot));
+      self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(ptrSlot));
+      self.emitLdur(ARM64_X1, ARM64_X29, self.slotOff(idxSlot));
+      if breite == 2      { self.emit32(0xD37FF821); }   // LSL x1, x1, #1
+      else if breite == 4 { self.emit32(0xD37EF421); }   // LSL x1, x1, #2
+      else if breite == 8 { self.emit32(0xD37DF021); }   // LSL x1, x1, #3
+      if breite == 1      { self.emit32(0x38216802); }   // STRB w2, [x0, x1]
+      else if breite == 2 { self.emit32(0x78216802); }   // STRH w2, [x0, x1]
+      else if breite == 4 { self.emit32(0xB8216802); }   // STR  w2, [x0, x1]
+      else                { self.emit32(0xF8216802); }   // STR  x2, [x0, x1]
+      return;
+    }
     self.emitFLdur(ARM64_D0, ARM64_X29, self.slotOff(valSlot));
-    if bytes != 8 { self.emit32(0x1E624000); }   // FCVT s0, d0  (nur f32)
+    if breite != 8 { self.emit32(0x1E624000); }   // FCVT s0, d0  (nur f32)
     self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(ptrSlot));
     self.emitLdur(ARM64_X1, ARM64_X29, self.slotOff(idxSlot));
-    if bytes == 8 {
+    if breite == 8 {
       self.emit32(0xD37DF021);   // LSL x1, x1, #3
       self.emit32(0xFC216800);   // STR d0, [x0, x1]
     } else {

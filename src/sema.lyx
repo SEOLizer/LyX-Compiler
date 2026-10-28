@@ -1028,7 +1028,75 @@ pub type Sema = class {
   fn _simdElemOk(nm: pchar, nl: int64): int64 {
     if (self._strNEq(nm, nl, "f32", 3)) { return 1; }
     if (self._strNEq(nm, nl, "f64", 3)) { return 1; }
+    // #2247: Ganzzahlarten. Die Ablage traegt die Breite seit #2224, die
+    // Vektorschleife hat seitdem eine Operation je Elementart — fuer
+    // Ganzzahlen jetzt PADDB/W/D/Q und PSUBB/W/D/Q. Welche RECHNUNGEN es
+    // darauf gibt, entscheidet _pruefeVektorOpArt; die Elementart selbst
+    // ist zugelassen.
+    if (self._simdElemGanzBreite(nm, nl) != 0) { return 1; }
     return 0;
+  }
+
+  // #2247: Breite einer ganzzahligen Elementart in Byte, oder 0, wenn der
+  // Name keine ist. Eine Stelle fuer die Frage; sema, codegen_x86
+  // (cg_simdKennungVonTyp) und ir_lower (_simdKennungVonTypNode) muessen
+  // dieselben vier Namen kennen.
+  fn _simdElemGanzBreite(nm: pchar, nl: int64): int64 {
+    if (self._strNEq(nm, nl, "int8", 4))  { return 1; }
+    if (self._strNEq(nm, nl, "int16", 5)) { return 2; }
+    if (self._strNEq(nm, nl, "int32", 5)) { return 4; }
+    if (self._strNEq(nm, nl, "int64", 5)) { return 8; }
+    return 0;
+  }
+
+  // #2247: Der Elementtypknoten eines Vektor-NAMENS. Die Kette ist
+  // Bezeichner -> Symbol -> Deklarationsknoten -> Typknoten -> Elementtyp.
+  // Liefert -1, wenn irgendein Glied fehlt — dann wird NICHT abgewiesen
+  // (fail-open wie im Rest der Typprueferei: "unentscheidbar" heisst nicht
+  // "falsch").
+  fn _simdElemTypNodeVon(ni: int64): int64 {
+    if (ni < 0 || self.sn_kind(ni) != SNK_IDENT) { return 0 - 1; }
+    var si: int64 := self.Lookup(self.sn_sVal(ni), self.sn_sLen(ni));
+    if (si < 0) { return 0 - 1; }
+    var sk: int64 := self.SymKind(si);
+    if (sk != SYM_VAR && sk != SYM_PARAM) { return 0 - 1; }
+    var declNi: int64 := self.SymNodeIdx(si);
+    if (declNi < 0) { return 0 - 1; }
+    var typeNi: int64 := self.sn_c0(declNi);
+    if (typeNi < 0 || self.sn_kind(typeNi) != SNK_TYPE_PARALLEL) { return 0 - 1; }
+    return self.sn_c0(typeNi);
+  }
+
+  // #2247: Gibt es diese Rechnung fuer diese Elementart ueberhaupt?
+  //
+  // Auf Ganzzahlvektoren hat x86 nur einen Teil der Operationen, und ARM64
+  // denselben Teil: Addition und Subtraktion fuer alle vier Breiten
+  // (PADDB/W/D/Q, PSUBB/W/D/Q), Multiplikation nur fuer 16 und 32 Bit
+  // (PMULLW, PMULLD). Fuer int8 und int64 gibt es KEINEN Multiplikations-
+  // befehl, fuer keine Breite eine Division, und ebenso keine Restrechnung.
+  //
+  // Das wird abgewiesen statt emuliert. Eine Emulation (Entpacken auf die
+  // naechste Breite, pmuludq-Folge, skalare Schleife im Vektorcode) waere
+  // eigener Code mit eigener Messung — und solange sie nicht da ist, ist die
+  // Meldung die ehrliche Antwort. Ein stiller Durchfall waere hier besonders
+  // teuer: er traefe erst zur Laufzeit und nur bei grossen Werten.
+  fn _pruefeVektorOpArt(ni: int64, op: int64, vekNi: int64) {
+    var et: int64 := self._simdElemTypNodeVon(vekNi);
+    if (et < 0) { return; }
+    if (self.sn_kind(et) != SNK_TYPE_NAME) { return; }
+    var b: int64 := self._simdElemGanzBreite(self.sn_sVal(et), self.sn_sLen(et));
+    if (b == 0) { return; }                       // Gleitkomma: unveraendert
+    if (op == 70 || op == 71) { return; }         // + und - gibt es immer
+    if (op == 72 && (b == 2 || b == 4)) { return; }   // * nur 16 und 32 Bit
+    if (op == 72) {
+      self._errorNode("Vektor-Multiplikation gibt es nur fuer int16 und int32 — fuer int8 und int64 hat die CPU keinen Befehl dafuer (#2247)", ni);
+      return;
+    }
+    if (op == 73 || op == 74) {
+      self._errorNode("Division und Restrechnung gibt es auf Ganzzahlvektoren nicht — die CPU hat keinen Befehl dafuer (#2247)", ni);
+      return;
+    }
+    self._errorNode("diese Rechnung ist auf Ganzzahlvektoren nicht umgesetzt — es gibt + und - fuer alle Breiten und * fuer int16/int32 (#2247)", ni);
   }
 
   // #2199: Den Elementtyp eines `parallel Array<T>`-Knotens pruefen. `tn` ist
@@ -1041,13 +1109,13 @@ pub type Sema = class {
     var nl: int64 := self.sn_sLen(tn);
     if (nl <= 0) { return; }
     if (self._simdElemOk(nm, nl) != 0) { return; }
-    self._errorNodeName("parallel Array traegt nur f32 oder f64, nicht"c, ni, nm, nl);
+    self._errorNodeName("parallel Array traegt f32, f64, int8, int16, int32 oder int64, nicht"c, ni, nm, nl);
     // Der Hinweis mit DERSELBEN Zeilennummer, nicht mit 0: eine zweite Zeile
     // "line 0" sieht nach einer zweiten Fundstelle aus.
     var hl: int64 := 0;
     var hti: int64 := self.sn_tokIdx(ni);
     if (hti >= 0 && hti < self.pTokCount) { hl := self.sn_tokLine(hti); }
-    self._error("  Die Ablage hat eine Schrittweite je Elementbreite, die Vektorschleife eine Operation je Elementart; fuer Ganzzahlen fehlt beides (#2199)."c, hl);
+    self._error("  Die Ablage hat eine Schrittweite je Elementbreite und die Vektorschleife eine Operation je Elementart; andere Arten haben keine von beidem (#2199, #2247)."c, hl);
   }
 
   fn _errorNode(msg: pchar, ni: int64) {
@@ -4118,7 +4186,12 @@ pub type Sema = class {
     if (lv != 0 && rv != 0) {
       if (self.sn_kind(self.sn_c0(ni)) != SNK_IDENT || self.sn_kind(self.sn_c1(ni)) != SNK_IDENT) {
         self._errorNode("Vektorrechnung nur zwischen zwei Variablen umgesetzt — Zwischenergebnis erst einer `parallel Array`-Variablen zuweisen (#2222)", ni);
+        return;
       }
+      // #2247: beide Seiten sind Namen, die Elementart ist also bestimmbar.
+      // Gefragt wird an der LINKEN Seite; dass beide Seiten dieselbe Breite
+      // tragen, prueft der Codegen (cg_simdBytesOf-Vergleich aus #2224).
+      self._pruefeVektorOpArt(ni, self.sn_iVal(ni), self.sn_c0(ni));
       return;
     }
     if (lv == rv) { return; }
