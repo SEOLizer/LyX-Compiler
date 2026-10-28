@@ -141,9 +141,24 @@ fn main(): int64 { return F(); }' "zwischen 1 und 3600000"
 echo
 echo "=== scrubbed: Tabelle im Erzeugnis ==="
 
+# Der Sweep prueft INKREMENTELL: je Zeitgeber-Tick `stride` Byte (4096). Die
+# Kippstelle unten liegt auf Seite 2, wird also erst nach drei Ticks gelesen —
+# das Programm muss so lange LAUFEN. Diese Voraussetzung hing bis 1.2.24C nur
+# an der Rechengeschwindigkeit: mit `interval: 50` brauchte die Stelle 100 ms,
+# und die Schleife (30 Mio. Durchlaeufe) dauerte je nach Maschine 90 bis
+# 310 ms. Sie ist genau die Form, die der x86-Codegen seit #2247 unmittelbar
+# im Register rechnet (`s := s + Rechne(i)`, `i := i + 1`) — nach der
+# Beschleunigung lief das Programm in der CI durch, BEVOR der Sweep die Seite
+# erreichte, und der Test wurde rot, ohne dass die Pruefung kaputt war.
+#
+# Mit `interval: 5` liegt die Stelle nach 15 ms und ein voller Durchgang
+# (20 Seiten) nach 100 ms. Der Abstand zur Laufzeit ist damit rund zehnfach
+# statt knapp, und er waechst nicht mit jeder weiteren Optimierung zurueck.
+# Wer die Schleife hier kuerzt oder das Intervall erhoeht, nimmt dem Test
+# seine Grundlage.
 SC='unit main;
 import std.io;
-@integrity(mode: scrubbed, interval: 50)
+@integrity(mode: scrubbed, interval: 5)
 fn Rechne(a: int64): int64 { return a * 3; }
 fn main(): int64 {
   var i: int64 := 0; var s: int64 := 0;
@@ -187,7 +202,7 @@ else
   # Stuende hier ein Dateioffset, prueften wir die falsche Stelle.
   [ "$(feld STARTVA)" = "4194480" ] && ok "scrubbed: code_start_va = 0x4000b0" \
     || bad "scrubbed: code_start_va" "$(feld STARTVA)"
-  [ "$(feld INTERVAL)" = "50" ] && ok "scrubbed: Intervall uebernommen" \
+  [ "$(feld INTERVAL)" = "5" ] && ok "scrubbed: Intervall uebernommen" \
     || bad "scrubbed: Intervall uebernommen" "$(feld INTERVAL)"
   [ "$(feld MODE)" = "1" ] && ok "scrubbed: Modus 1 vermerkt" \
     || bad "scrubbed: Modus 1 vermerkt" "$(feld MODE)"
