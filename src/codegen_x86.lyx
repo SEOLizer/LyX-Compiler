@@ -8569,6 +8569,52 @@ pub type Codegen = class {
     }
   }
 
+  // #2247: `<op> %rax, %r12+i` — der Akkumulator rechnet UNMITTELBAR in
+  // seinem Register, der Wert steht in rax. rlR ist 0..3 (r12..r15).
+  //
+  // Die Richtung ist entscheidend: das Local ist ZIEL, rax die Quelle.
+  // 0x01/0x29/0x21/0x09/0x31 rechnen r/m64 <op>= r64, also Register <op>= rax
+  // — bei MINUS damit `rX - rax`, die Reihenfolge des Quelltextes. `imul`
+  // hat nur die andere Form (reg <- reg * r/m), deshalb dort reg = das
+  // Local und rm = rax; die Multiplikation ist kommutativ, das Ergebnis
+  // landet richtig.
+  //
+  // Die Frage wird VOR dem Erzeugen des Wertes gestellt. Ein Rueckzieher
+  // waere nicht tragfaehig: cg_genExpr legt neben Befehlsbytes auch
+  // Flickstellen, Datenzellen und Zaehler an — codeLen zurueckzusetzen
+  // liesse die auf Code zeigen, der danach ueberschrieben wird.
+  fn cg_regOpMoeglich(op: int64): int64 {
+    if (op == CGT_PLUS || op == CGT_MINUS || op == CGT_STAR) { return 1; }
+    if (op == CGT_BITAND || op == CGT_BITOR || op == 89) { return 1; }
+    return 0;    // Division, Modulo, Schiebungen, Vergleiche
+  }
+
+  fn cg_regOpRax(rlR: int64, op: int64) {
+    var opc: int64 := 0 - 1;
+    if (op == CGT_PLUS)   { opc := 0x01; }
+    if (op == CGT_MINUS)  { opc := 0x29; }
+    if (op == CGT_BITAND) { opc := 0x21; }
+    if (op == CGT_BITOR)  { opc := 0x09; }
+    if (op == 89)         { opc := 0x31; }
+    if (opc >= 0) {
+      self.cg_e8(0x49);                                 // REX.W | REX.B
+      self.cg_e8(opc);
+      self.cg_e8(0xC0 | (4 + rlR));                     // mod=11, reg=rax, rm=r12+i
+      return;
+    }
+    if (op == CGT_STAR) {
+      self.cg_e8(0x4C);                                 // REX.W | REX.R
+      self.cg_e8(0x0F); self.cg_e8(0xAF);               // imul r12+i, rax
+      self.cg_e8(0xC0 | ((4 + rlR) << 3));
+      return;
+    }
+    // Der Aufrufer hat cg_regOpMoeglich nicht gefragt. Laut scheitern, nie
+    // still etwas Plausibles tun.
+    EPrintStr("lyxc: interner Fehler (#2247): cg_regOpRax ohne erzeugbare Operation: "c);
+    EPrintInt(op); EPrintStr("\n"c);
+    exit(70);
+  }
+
   fn cg_binOpKommutativ(op: int64): int64 {
     if (op == CGT_PLUS || op == CGT_STAR) { return 1; }
     if (op == CGT_BITAND || op == CGT_BITOR || op == 89) { return 1; }
@@ -21006,6 +21052,37 @@ pub type Codegen = class {
               return;
             }
           }
+        }
+        // #2247: derselbe Fall mit einem AUSDRUCK rechts statt einer
+        // Konstante — der Akkumulator jeder Summenschleife:
+        // `s := s + peek32(a + i * 4)`.
+        //
+        // Der allgemeine Weg laesst das Ergebnis in rax und speichert von
+        // dort; zusammen mit dem Operandentausch (cg_binOpLocalRechts) blieb
+        // `add %r13,%rax ; mov %rax,%r13` uebrig. Beides zusammen ist EIN
+        // Befehl: Wert nach rax, dann `add %rax,%r13`.
+        //
+        // Dieselben Bedingungen wie oben (int64 genau, kein
+        // @overflow_check), dazu: die rechte Seite darf nicht f64 sein, und
+        // die Operation muss als `Register <op>= rax` erzeugbar sein
+        // (cg_regOpRax). Division, Modulo und Schiebungen fallen damit auf
+        // den allgemeinen Weg.
+        //
+        // Reihenfolge: der Wert wird VOR dem Lesen des Locals ausgewertet.
+        // Folgenlos, weil nur ein Local im REGISTER so behandelt wird — sein
+        // Slot wird nirgends als Speicher benutzt (#2114), es ist also ueber
+        // keine Adresse erreichbar, und r12..r15 bleiben ueber einen Aufruf
+        // erhalten. Dieselbe Begruendung wie beim Operandentausch.
+        var akOff: int64 := self.cg_einfachesLocalOff(lhs);
+        if (akOff != 0 && akOff == self.cg_einfachesLocalOff(self.cg_nc0(rhs))
+            && self.cg_rlReg(akOff) >= 0
+            && self.cg_lokalIstInt64(lhs) != 0
+            && self.cg_regOpMoeglich(inkOp) != 0
+            && self.cg_nc1(rhs) >= 0
+            && self.cg_isF64Expr(self.cg_nc1(rhs)) == 0) {
+          self.cg_genExpr(self.cg_nc1(rhs));
+          self.cg_regOpRax(self.cg_rlReg(akOff), inkOp);
+          return;
         }
       }
       if (self.cg_nkind(lhs) == CGN_IDENT) {
