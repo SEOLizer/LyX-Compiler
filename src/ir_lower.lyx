@@ -18,6 +18,11 @@ con NODE_OFF_C1:     int64 := 16;
 con NODE_OFF_C2:     int64 := 24;
 con NODE_OFF_C3:     int64 := 32;
 con NODE_OFF_NEXT:   int64 := 40;
+// #2247: Elementkennung eines parallel Array im IR — Breite unten, Art
+// darueber. Spiegelt CG_SIMD_BREITE/CG_SIMD_GANZ im x86-Codegen; die beiden
+// muessen uebereinstimmen.
+con IR_SIMD_BREITE:  int64 := 15;
+con IR_SIMD_GANZ:    int64 := 16;
 con NODE_OFF_IVAL:   int64 := 56;
 con NODE_OFF_SVAL:   int64 := 64;
 con NODE_OFF_SLEN:   int64 := 72;
@@ -2591,7 +2596,18 @@ pub type IRLower = class {
     // _f64Herkunft auf.
     if k == NK_CALL || k == NK_FIELD { return self._f64Herkunft(expr); }
     // WP-SIMD: Element einer parallel-Array<f32> wird als f64 geladen (cvtss2sd) → f64-Ausdruck.
-    if k == NK_INDEX { return self._isSimdExpr(self.nodeC0(expr)); }
+    //
+    // #2247: ABER nur bei einer Gleitkomma-Ablage. Ein Element aus
+    // `parallel Array<int32>` ist eine GANZZAHL. Ohne diese Unterscheidung
+    // galt `a[0]` als f64-Ausdruck, und `as int64` erzeugte darauf ein
+    // FCVTZS — aus der abgelegten 7 wurde 0, weil ihr Bitmuster als double
+    // gelesen etwa 1e-322 ist. Gemessen auf arm64; der x86-Schnellweg geht
+    // nicht ueber diese Stelle und war deshalb schon richtig.
+    if k == NK_INDEX {
+      if self._isSimdExpr(self.nodeC0(expr)) == 0 { return 0; }
+      if (self._simdBytesExpr(self.nodeC0(expr)) & IR_SIMD_GANZ) != 0 { return 0; }
+      return 1;
+    }
     return 0;
   }
 
@@ -2836,20 +2852,37 @@ pub type IRLower = class {
   // deshalb still als f32 darin: 0.1 wurde 0.10000000149011612, 1e40 wurde
   // inf. Die Breite wird jetzt im imm-Feld der IR-Instruktion mitgegeben —
   // die Backends koennen sie nicht aus dem Opcode ableiten.
-  fn _simdBytesVonTypNode(tn: int64): int64 {
+  // #2247: Elementkennung eines `parallel Array<T>` — Breite UND Art in einem
+  // Wert, weil die Breite allein nicht mehr eindeutig ist (4 = f32 ODER
+  // int32). Gleitkomma behaelt die nackte Breite, damit die Backends die
+  // Werte aus #2224 unveraendert lesen; Ganzzahl setzt IR_SIMD_GANZ. Die
+  // Kennung geht als `imm` durch das IR, die Backends zerlegen sie wieder.
+  fn _simdKennungVonTypNode(tn: int64): int64 {
     if tn < 0 { return 4; }
     var et: int64 := self.nodeC0(tn);
     if et < 0 { return 4; }
     if self.nodeKind(et) != NK_TYPE_NAME { return 4; }
-    if _irNameGleich(self.nodeSVal(et), self.nodeSLen(et), "f64"c, 3) != 0 { return 8; }
+    var nm: pchar := self.nodeSVal(et);
+    var nl: int64 := self.nodeSLen(et);
+    if _irNameGleich(nm, nl, "f64"c, 3) != 0 { return 8; }
+    if _irNameGleich(nm, nl, "f32"c, 3) != 0 { return 4; }
+    if _irNameGleich(nm, nl, "int8"c, 4)  != 0 { return IR_SIMD_GANZ | 1; }
+    if _irNameGleich(nm, nl, "int16"c, 5) != 0 { return IR_SIMD_GANZ | 2; }
+    if _irNameGleich(nm, nl, "int32"c, 5) != 0 { return IR_SIMD_GANZ | 4; }
+    if _irNameGleich(nm, nl, "int64"c, 5) != 0 { return IR_SIMD_GANZ | 8; }
     return 4;
   }
 
-  // Dasselbe fuer einen AUSDRUCK, der ein SIMD-Local nennt.
+  fn _simdBytesVonTypNode(tn: int64): int64 {
+    return self._simdKennungVonTypNode(tn) & IR_SIMD_BREITE;
+  }
+
+  // Dasselbe fuer einen AUSDRUCK, der ein SIMD-Local nennt. Geliefert wird die
+  // KENNUNG (Breite plus Art, #2247) — die Backends brauchen beides.
   fn _simdBytesExpr(expr: int64): int64 {
     if expr < 0 { return 4; }
     if self.nodeKind(expr) != NK_IDENT { return 4; }
-    return self._simdBytesVonTypNode(self._localTypeNode(self.nodeSVal(expr), self.nodeSLen(expr)));
+    return self._simdKennungVonTypNode(self._localTypeNode(self.nodeSVal(expr), self.nodeSLen(expr)));
   }
 
   fn _isSimdExpr(expr: int64): int64 {
@@ -10160,9 +10193,13 @@ pub type IRLower = class {
           // Vektorelement ist genauso ein Gleitkommaziel. Die Umwandlung
           // gehoert hierher und nicht in ein Backend: sonst muessten alle
           // drei sie einzeln kennen, und das naechste haette sie wieder nicht.
-          valTemp := self._nachGleit(valTemp, val, 1);
-          self.irAddInstrDirect(IRO_SIMD_STORE_ELEM, aiIdx, valTemp, aiBase,
-                                self._simdBytesExpr(self.nodeC0(target)));   // #2199
+          // #2247: NUR fuer Gleitkomma-Elemente. Bei einer Ganzzahl-Ablage
+          // muss der Wert eine GANZZAHL bleiben — `_nachGleit` machte aus
+          // der 7 das Bitmuster von 7.0, und das Backend legte davon die
+          // unteren Bits ab: geschrieben 7, gelesen 0 (auf arm64 gemessen).
+          var aiKenn: int64 := self._simdBytesExpr(self.nodeC0(target));
+          if (aiKenn & IR_SIMD_GANZ) == 0 { valTemp := self._nachGleit(valTemp, val, 1); }
+          self.irAddInstrDirect(IRO_SIMD_STORE_ELEM, aiIdx, valTemp, aiBase, aiKenn);   // #2199
         } else {
           // #2262: hinter den {cap,len}-Kopf, wie beim Lesen (lowerIndex).
           aiBase := self._elemBasis(self.nodeC0(target), aiBase);

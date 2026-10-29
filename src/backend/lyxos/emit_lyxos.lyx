@@ -482,12 +482,23 @@ pub type EmitLyxOS = class {
         // 4 angenommen, sondern laut gemeldet: eine 0 heisst, dass eine
         // Stelle in ir_lower die Breite nicht mitgibt, und das gehoert
         // behoben, nicht geraten.
-        if bytes != 4 && bytes != 8 {
-            EPrintStrLn("interner fehler: SIMD-Elementbreite ist weder 4 noch 8 (#2199) — eine IR-Stelle gibt sie nicht mit."c);
+        // #2247: `bytes` ist eine KENNUNG — Breite unten, Art in Bit 4
+        // (LYXOS_SIMD_GANZ). Gleitkomma traegt weiter die nackte Breite.
+        var ganz: int64 := 0;
+        if (bytes & 16) != 0 { ganz := 1; }
+        var breite: int64 := bytes & 15;
+        if breite != 1 && breite != 2 && breite != 4 && breite != 8 {
+            EPrintStrLn("interner fehler: SIMD-Elementbreite ist keine von 1, 2, 4, 8 (#2199/#2247) — eine IR-Stelle gibt sie nicht mit."c);
+            exit(1);
+        }
+        if ganz == 0 && breite != 4 && breite != 8 {
+            EPrintStrLn("interner fehler (#2247): Gleitkomma-Vektor mit einer Breite ausser 4 und 8."c);
             exit(1);
         }
         var schub: int64 := 2;
-        if bytes == 8 { schub := 3; }
+        if breite == 1 { schub := 0; }   // #2247
+        if breite == 2 { schub := 1; }   // #2247
+        if breite == 8 { schub := 3; }
         self.emit8(0x48); self.emit8(0x89); self.emit8(0xC8);   // mov rax, rcx
         self.emit8(0x50);                                        // push rax (count)
         self.emit8(0x48); self.emit8(0xC1); self.emit8(0xE0); self.emit8(schub);  // shl rax, 2 bzw. 3
@@ -512,6 +523,67 @@ pub type EmitLyxOS = class {
     }
     // WP-SIMD: vektorisierte f32-Binop. src1/src2=SIMD-ptr-Slots; alloc Ergebnis (gleiche Anzahl);
     // SSE2-Loop (movaps/packed-op/movaps); dest=Ergebnis-ptr. packedOp: addps 0x58/subps 0x5C/mulps 0x59/divps 0x5E.
+    // #2247: Ganzzahl-Opcode je Rumpfform und Breite. Dieselbe Tabelle wie
+    // cg_sseGanzOpcode in codegen_x86 — die beiden muessen uebereinstimmen.
+    // Zwei Bytes als (zweites)*256 + (erstes), weil PMULLD aus der
+    // 0F-38-Gruppe kommt. `opByte` ist der Gleitkomma-Opcode der Operation
+    // und dient hier nur als Unterscheidung (0x58 = +, 0x5C = -, 0x59 = *).
+    fn lyxosGanzOpcode(rumpf: int64, opByte: int64, breite: int64): int64 {
+        if rumpf != SIMD_RUMPF_BINOP {
+            EPrintStrLn("interner fehler (#2247): Ganzzahl-Vektor nur fuer die Binaeroperationen — Vergleich und Negation haben keine Ganzzahlform."c);
+            exit(1);
+        }
+        if opByte == 0x58 {                       // Addition
+            if breite == 1 { return 0xFC; }
+            if breite == 2 { return 0xFD; }
+            if breite == 4 { return 0xFE; }
+            return 0xD4;
+        }
+        if opByte == 0x5C {                       // Subtraktion
+            if breite == 1 { return 0xF8; }
+            if breite == 2 { return 0xF9; }
+            if breite == 4 { return 0xFA; }
+            return 0xFB;
+        }
+        if opByte == 0x59 {                       // Multiplikation
+            if breite == 2 { return 0xD5; }       // PMULLW
+            if breite == 4 { return 0x38 + 0x40 * 256; }   // PMULLD (0F 38 40)
+        }
+        EPrintStrLn("interner fehler (#2247): Ganzzahl-Vektoroperation ohne Befehl — sema haette das abweisen muessen."c);
+        exit(1);
+        return 0;
+    }
+
+    // #2247: Ein Element des Restes in Allzweckregistern — Gegenstueck zu
+    // cg_emitGanzRestOp in codegen_x86. Vorzeichenerweitert geladen (r8/r9),
+    // gerechnet in 64 Bit, zurueckgeschrieben nur die Breite.
+    fn emitGanzRest(rumpf: int64, opByte: int64, breite: int64): void {
+        if breite == 1 {
+            self.emit8(0x4C); self.emit8(0x0F); self.emit8(0xBE); self.emit8(0x04); self.emit8(0x07);
+            self.emit8(0x4C); self.emit8(0x0F); self.emit8(0xBE); self.emit8(0x0C); self.emit8(0x06);
+        } else if breite == 2 {
+            self.emit8(0x4C); self.emit8(0x0F); self.emit8(0xBF); self.emit8(0x04); self.emit8(0x07);
+            self.emit8(0x4C); self.emit8(0x0F); self.emit8(0xBF); self.emit8(0x0C); self.emit8(0x06);
+        } else if breite == 4 {
+            self.emit8(0x4C); self.emit8(0x63); self.emit8(0x04); self.emit8(0x07);
+            self.emit8(0x4C); self.emit8(0x63); self.emit8(0x0C); self.emit8(0x06);
+        } else {
+            self.emit8(0x4C); self.emit8(0x8B); self.emit8(0x04); self.emit8(0x07);
+            self.emit8(0x4C); self.emit8(0x8B); self.emit8(0x0C); self.emit8(0x06);
+        }
+        if opByte == 0x58      { self.emit8(0x4D); self.emit8(0x01); self.emit8(0xC8); }   // add r8, r9
+        else if opByte == 0x5C { self.emit8(0x4D); self.emit8(0x29); self.emit8(0xC8); }   // sub r8, r9
+        else if opByte == 0x59 { self.emit8(0x4D); self.emit8(0x0F); self.emit8(0xAF); self.emit8(0xC1); }  // imul r8, r9
+        else {
+            EPrintStrLn("interner fehler (#2247): emitGanzRest mit einer Operation ohne Ganzzahlform."c);
+            exit(1);
+        }
+        if breite == 1      { self.emit8(0x44); self.emit8(0x88); self.emit8(0x04); self.emit8(0x02); }
+        else if breite == 2 { self.emit8(0x66); self.emit8(0x44); self.emit8(0x89); self.emit8(0x04); self.emit8(0x02); }
+        else if breite == 4 { self.emit8(0x44); self.emit8(0x89); self.emit8(0x04); self.emit8(0x02); }
+        else                { self.emit8(0x4C); self.emit8(0x89); self.emit8(0x04); self.emit8(0x02); }
+    }
+
     fn emitSimdBinOp(packedOp: int64, dest: int64, src1: int64, src2: int64, bytes: int64): void {
         self.emitMovRaxFromSlot(src1); self.emit8(0x48); self.emit8(0x89); self.emit8(0xC7);  // mov rdi, rax (lhs)
         self.emitMovRaxFromSlot(src2); self.emit8(0x48); self.emit8(0x89); self.emit8(0xC6);  // mov rsi, rax (rhs)
@@ -542,14 +614,25 @@ pub type EmitLyxOS = class {
         // 4 angenommen, sondern laut gemeldet: eine 0 heisst, dass eine
         // Stelle in ir_lower die Breite nicht mitgibt, und das gehoert
         // behoben, nicht geraten.
-        if bytes != 4 && bytes != 8 {
-            EPrintStrLn("interner fehler: SIMD-Elementbreite ist weder 4 noch 8 (#2199) — eine IR-Stelle gibt sie nicht mit."c);
+        // #2247: `bytes` ist eine KENNUNG — Breite unten, Art in Bit 4
+        // (LYXOS_SIMD_GANZ). Gleitkomma traegt weiter die nackte Breite.
+        var ganz: int64 := 0;
+        if (bytes & 16) != 0 { ganz := 1; }
+        var breite: int64 := bytes & 15;
+        if breite != 1 && breite != 2 && breite != 4 && breite != 8 {
+            EPrintStrLn("interner fehler: SIMD-Elementbreite ist keine von 1, 2, 4, 8 (#2199/#2247) — eine IR-Stelle gibt sie nicht mit."c);
+            exit(1);
+        }
+        if ganz == 0 && breite != 4 && breite != 8 {
+            EPrintStrLn("interner fehler (#2247): Gleitkomma-Vektor mit einer Breite ausser 4 und 8."c);
             exit(1);
         }
         // #2199: Bytezahl = Elementzahl * Breite; der 16-Byte-Block fasst vier
         // f32 oder zwei f64, der skalare Rest zaehlt in Elementen.
         var schub: int64 := 2;
-        if bytes == 8 { schub := 3; }
+        if breite == 1 { schub := 0; }   // #2247
+        if breite == 2 { schub := 1; }   // #2247
+        if breite == 8 { schub := 3; }
         self.emit8(0x31); self.emit8(0xC0);                                      // xor eax, eax (Byte-Offset)
         self.emit8(0x48); self.emit8(0xC1); self.emit8(0xE1); self.emit8(schub); // shl rcx, 2 bzw. 3
         self.emit8(0x48); self.emit8(0x83); self.emit8(0xE9); self.emit8(0x10);  // sub rcx, 16
@@ -574,7 +657,7 @@ pub type EmitLyxOS = class {
         var jgePos: int64 := self.codeLen; self.emit8(0);
         var scalarBody: int64 := self.codeLen;
         self.emitSimdRumpf(rumpf, opByte, 1, bytes);
-        self.emit8(0x48); self.emit8(0x83); self.emit8(0xC0); self.emit8(bytes); // add rax, 4 bzw. 8
+        self.emit8(0x48); self.emit8(0x83); self.emit8(0xC0); self.emit8(breite); // add rax, Breite (#2247)
         self.emit8(0xEB);
         var scalarBack: int64 := self.codeLen;
         self.emit8(scalarStart - (scalarBack + 1));
@@ -606,13 +689,43 @@ pub type EmitLyxOS = class {
         // 4 angenommen, sondern laut gemeldet: eine 0 heisst, dass eine
         // Stelle in ir_lower die Breite nicht mitgibt, und das gehoert
         // behoben, nicht geraten.
-        if bytes != 4 && bytes != 8 {
-            EPrintStrLn("interner fehler: SIMD-Elementbreite ist weder 4 noch 8 (#2199) — eine IR-Stelle gibt sie nicht mit."c);
+        // #2247: `bytes` ist eine KENNUNG — Breite unten, Art in Bit 4
+        // (LYXOS_SIMD_GANZ). Gleitkomma traegt weiter die nackte Breite.
+        var ganz: int64 := 0;
+        if (bytes & 16) != 0 { ganz := 1; }
+        var breite: int64 := bytes & 15;
+        if breite != 1 && breite != 2 && breite != 4 && breite != 8 {
+            EPrintStrLn("interner fehler: SIMD-Elementbreite ist keine von 1, 2, 4, 8 (#2199/#2247) — eine IR-Stelle gibt sie nicht mit."c);
             exit(1);
+        }
+        if ganz == 0 && breite != 4 && breite != 8 {
+            EPrintStrLn("interner fehler (#2247): Gleitkomma-Vektor mit einer Breite ausser 4 und 8."c);
+            exit(1);
+        }
+        // #2247: Ganzzahl-Rumpf. Spiegelbild von codegen_x86 (cg_sseGanzOpcode
+        // und cg_emitGanzRestOp); die beiden muessen uebereinstimmen, sonst
+        // rechnet lyxos anders als Linux-x86 auf derselben Architektur —
+        // genau der Zustand, den #2300 beseitigt hat.
+        if ganz != 0 {
+            if skalar == 0 {
+                // movdqa xmm0, [rdi+rax] / xmm1, [rsi+rax]  (66 0F 6F ..)
+                self.emit8(0x66); self.emit8(0x0F); self.emit8(0x6F); self.emit8(0x04); self.emit8(0x07);
+                self.emit8(0x66); self.emit8(0x0F); self.emit8(0x6F); self.emit8(0x0C); self.emit8(0x06);
+                var gOpc: int64 := self.lyxosGanzOpcode(rumpf, opByte, breite);
+                self.emit8(0x66); self.emit8(0x0F);
+                if gOpc > 255 { self.emit8(gOpc & 255); self.emit8(gOpc >> 8); }   // 0F 38 40 = PMULLD
+                else          { self.emit8(gOpc); }
+                self.emit8(0xC1);
+                // movdqa [rdx+rax], xmm0  (66 0F 7F 04 02)
+                self.emit8(0x66); self.emit8(0x0F); self.emit8(0x7F); self.emit8(0x04); self.emit8(0x02);
+            } else {
+                self.emitGanzRest(rumpf, opByte, breite);
+            }
+            return;
         }
         var pkPf: int64 := 0;
         var skPf: int64 := 0xF3;
-        if bytes == 8 { pkPf := 0x66; skPf := 0xF2; }
+        if breite == 8 { pkPf := 0x66; skPf := 0xF2; }
         if skalar == 0 {
             if pkPf != 0 { self.emit8(pkPf); }
             self.emit8(0x0F); self.emit8(0x28); self.emit8(0x04); self.emit8(0x07);  // movaps/movapd xmm0, [rdi+rax]
@@ -621,7 +734,7 @@ pub type EmitLyxOS = class {
         }
         if rumpf == SIMD_RUMPF_NEG {
             self.emit8(0x66); self.emit8(0x0F); self.emit8(0x76); self.emit8(0xC9);  // pcmpeqd xmm1, xmm1
-            if bytes == 8 {
+            if breite == 8 {
                 self.emit8(0x66); self.emit8(0x0F); self.emit8(0x73); self.emit8(0xF1); self.emit8(0x3F);  // psllq xmm1, 63
                 self.emit8(0x66); self.emit8(0x0F); self.emit8(0x57); self.emit8(0xC1);                    // xorpd xmm0, xmm1
             } else {
@@ -658,13 +771,33 @@ pub type EmitLyxOS = class {
         // 4 angenommen, sondern laut gemeldet: eine 0 heisst, dass eine
         // Stelle in ir_lower die Breite nicht mitgibt, und das gehoert
         // behoben, nicht geraten.
-        if bytes != 4 && bytes != 8 {
-            EPrintStrLn("interner fehler: SIMD-Elementbreite ist weder 4 noch 8 (#2199) — eine IR-Stelle gibt sie nicht mit."c);
+        // #2247: `bytes` ist eine KENNUNG — Breite unten, Art in Bit 4
+        // (LYXOS_SIMD_GANZ). Gleitkomma traegt weiter die nackte Breite.
+        var ganz: int64 := 0;
+        if (bytes & 16) != 0 { ganz := 1; }
+        var breite: int64 := bytes & 15;
+        if breite != 1 && breite != 2 && breite != 4 && breite != 8 {
+            EPrintStrLn("interner fehler: SIMD-Elementbreite ist keine von 1, 2, 4, 8 (#2199/#2247) — eine IR-Stelle gibt sie nicht mit."c);
+            exit(1);
+        }
+        if ganz == 0 && breite != 4 && breite != 8 {
+            EPrintStrLn("interner fehler (#2247): Gleitkomma-Vektor mit einer Breite ausser 4 und 8."c);
             exit(1);
         }
         self.emitMovRaxFromSlot(ptrSlot);
         self.emitMovRcxFromSlot(idxSlot);
-        if bytes == 8 {
+        // #2247: Ganzzahl-Element — Skalierung je Breite und VORZEICHEN-
+        // erweitert geladen; das Ergebnis ist eine Ganzzahl und gehoert in
+        // einen Allzweck-Slot. Spiegelbild von codegen_x86.
+        if ganz != 0 {
+            if breite == 1      { self.emit8(0x48); self.emit8(0x0F); self.emit8(0xBE); self.emit8(0x04); self.emit8(0x08); }  // movsx rax, byte [rax+rcx]
+            else if breite == 2 { self.emit8(0x48); self.emit8(0x0F); self.emit8(0xBF); self.emit8(0x04); self.emit8(0x48); }  // movsx rax, word [rax+rcx*2]
+            else if breite == 4 { self.emit8(0x48); self.emit8(0x63); self.emit8(0x04); self.emit8(0x88); }                    // movsxd rax, dword [rax+rcx*4]
+            else                { self.emit8(0x48); self.emit8(0x8B); self.emit8(0x04); self.emit8(0xC8); }                    // mov rax, qword [rax+rcx*8]
+            self.emitMovSlotFromRax(dest);
+            return;
+        }
+        if breite == 8 {
             // #2199: 8 Byte Schrittweite (SIB-Skalierung 3 → 0xC8), movsd,
             // KEINE Umrechnung — der Wert ist schon f64.
             self.emit8(0xF2); self.emit8(0x0F); self.emit8(0x10); self.emit8(0x04); self.emit8(0xC8);  // movsd xmm0, [rax+rcx*8]
@@ -682,15 +815,37 @@ pub type EmitLyxOS = class {
         // 4 angenommen, sondern laut gemeldet: eine 0 heisst, dass eine
         // Stelle in ir_lower die Breite nicht mitgibt, und das gehoert
         // behoben, nicht geraten.
-        if bytes != 4 && bytes != 8 {
-            EPrintStrLn("interner fehler: SIMD-Elementbreite ist weder 4 noch 8 (#2199) — eine IR-Stelle gibt sie nicht mit."c);
+        // #2247: `bytes` ist eine KENNUNG — Breite unten, Art in Bit 4
+        // (LYXOS_SIMD_GANZ). Gleitkomma traegt weiter die nackte Breite.
+        var ganz: int64 := 0;
+        if (bytes & 16) != 0 { ganz := 1; }
+        var breite: int64 := bytes & 15;
+        if breite != 1 && breite != 2 && breite != 4 && breite != 8 {
+            EPrintStrLn("interner fehler: SIMD-Elementbreite ist keine von 1, 2, 4, 8 (#2199/#2247) — eine IR-Stelle gibt sie nicht mit."c);
             exit(1);
         }
+        if ganz == 0 && breite != 4 && breite != 8 {
+            EPrintStrLn("interner fehler (#2247): Gleitkomma-Vektor mit einer Breite ausser 4 und 8."c);
+            exit(1);
+        }
+        // #2247: Ganzzahl-Element — der Wert kommt aus einem Allzweck-Slot
+        // (r8), geschrieben wird nur die Breite. Gegenstueck zum Lesen oben.
+        if ganz != 0 {
+            self.emitMovRaxFromSlot(valSlot);
+            self.emit8(0x49); self.emit8(0x89); self.emit8(0xC0);   // mov r8, rax
+            self.emitMovRaxFromSlot(ptrSlot);
+            self.emitMovRcxFromSlot(idxSlot);
+            if breite == 1      { self.emit8(0x44); self.emit8(0x88); self.emit8(0x04); self.emit8(0x08); }                    // mov [rax+rcx], r8b
+            else if breite == 2 { self.emit8(0x66); self.emit8(0x44); self.emit8(0x89); self.emit8(0x04); self.emit8(0x48); }  // mov [rax+rcx*2], r8w
+            else if breite == 4 { self.emit8(0x44); self.emit8(0x89); self.emit8(0x04); self.emit8(0x88); }                    // mov [rax+rcx*4], r8d
+            else                { self.emit8(0x4C); self.emit8(0x89); self.emit8(0x04); self.emit8(0xC8); }                    // mov [rax+rcx*8], r8
+            return;
+        }
         self.emitMovsdXmm0FromSlot(valSlot);
-        if bytes != 8 { self.emit8(0xF2); self.emit8(0x0F); self.emit8(0x5A); self.emit8(0xC0); }  // cvtsd2ss (nur f32)
+        if breite != 8 { self.emit8(0xF2); self.emit8(0x0F); self.emit8(0x5A); self.emit8(0xC0); }  // cvtsd2ss (nur f32)
         self.emitMovRaxFromSlot(ptrSlot);
         self.emitMovRcxFromSlot(idxSlot);
-        if bytes == 8 {
+        if breite == 8 {
             self.emit8(0xF2); self.emit8(0x0F); self.emit8(0x11); self.emit8(0x04); self.emit8(0xC8);  // movsd [rax+rcx*8], xmm0
         } else {
             self.emit8(0xF3); self.emit8(0x0F); self.emit8(0x11); self.emit8(0x04); self.emit8(0x88);  // movss [rax+rcx*4], xmm0
