@@ -1141,6 +1141,19 @@ pub type Codegen = class {
   // Rueckgabetyp-Registry. Er liefert den ERSTEN Eintrag eines Namens, wie
   // die lineare Suche davor; die Tabellen werden nur angehaengt.
   lbHx: int64; coHx: int64; frHx: int64;
+  // #2176: je ein Merker fuer die letzte Antwort von cg_findClass und
+  // cg_fieldTypeNameOf. Beide werden aus derselben Kette gerufen —
+  // cg_isF64Expr -> cg_fieldTypeNameOf -> cg_objClassIdx -> cg_findClass —
+  // und dort mehrfach je Ausdruck mit demselben Argument. Im Profil lagen
+  // deshalb 4,4 % bzw. 4,2 % in zwei Schleifen, die beide schon knapp sind.
+  //
+  // Schluessel ist der ZEIGER auf den Namen (plus Laenge), nicht sein Inhalt:
+  // gleicher Zeiger heisst gleicher Name, und der Vergleich kostet dann
+  // nichts. Ein anderer Zeiger auf denselben Namen verfehlt den Merker nur,
+  // die Suche laeuft dann wie bisher. classCount gehoert zum Schluessel,
+  // damit eine spaeter angelegte Klasse den Merker nicht veralten laesst.
+  fcNameP: int64; fcNameL: int64; fcIdx: int64; fcCnt: int64;
+  ftnNi: int64; ftnP: int64; ftnL: int64; ftnCnt: int64;
   zlHxS: int64;                  // #2175: verglichene Eintraege in cg_hxSuch (fuer die Zaehler)
   // #2175: Funktionsindex der obersten Ebene je (Knotentabelle, Kopf,
   // Quelltext), siehe cg_tlEintrag. Eintrag 48 Byte.
@@ -9751,14 +9764,25 @@ pub type Codegen = class {
   }
 
   fn cg_findClass(name: pchar, nameLen: int64): int64 {
+    // #2176: letzte Antwort, Schluessel Zeiger + Laenge + classCount.
+    if ((name as int64) == self.fcNameP && nameLen == self.fcNameL
+        && self.classCount == self.fcCnt) {
+      return self.fcIdx;
+    }
     var i: int64 := 0;
     while (i < self.classCount) {
       var base: int64 := self.classLayouts + i * CG_CLASS_SZ;
       var p: pchar := peek64(base) as pchar;
       var n: int64 := peek64(base + CG_PATCH_OFF_NAMEPTR);
-      if (n == nameLen && self.cg_seq(p, n, name, nameLen)) { return i; }
+      if (n == nameLen && self.cg_seq(p, n, name, nameLen)) {
+        self.fcNameP := name as int64; self.fcNameL := nameLen;
+        self.fcIdx := i; self.fcCnt := self.classCount;
+        return i;
+      }
       i += 1;
     }
+    self.fcNameP := name as int64; self.fcNameL := nameLen;
+    self.fcIdx := -1; self.fcCnt := self.classCount;
     return -1;
   }
 
@@ -9801,6 +9825,14 @@ pub type Codegen = class {
   fn cg_fieldTypeNameOf(fieldNi: int64, lenBox: int64): pchar {
     poke64(lenBox, 0);
     if (fieldNi < 0) { return 0 as pchar; }
+    // #2176: letzte Antwort. Zum Schluessel gehoert pNodes — ein Knotenindex
+    // gilt nur in SEINER Tabelle, und der Codegen tauscht sie je Unit
+    // (cg_processImportAs). Ohne pNodes im Schluessel wuerde der Merker den
+    // Typnamen eines gleichnumerierten Knotens einer anderen Unit liefern.
+    if (fieldNi == self.ftnNi && self.pNodes == self.ftnCnt) {
+      poke64(lenBox, self.ftnL);
+      return self.ftnP as pchar;
+    }
     if (self.cg_nkind(fieldNi) != CGN_FIELD) { return 0 as pchar; }
     var ci: int64 := self.cg_objClassIdx(self.cg_nc0(fieldNi));
     if (ci < 0) { return 0 as pchar; }
@@ -9815,11 +9847,17 @@ pub type Codegen = class {
       var p: pchar := peek64(fb) as pchar;
       var n: int64 := peek64(fb + CG_CFIELD_OFF_FIELDLEN);
       if (n == flen && self.cg_seq(p, n, fname, flen)) {
-        poke64(lenBox, peek64(fb + CG_CFIELD_OFF_TYPENAMELEN));
-        return peek64(fb + CG_CFIELD_OFF_TYPENAMEPTR) as pchar;
+        var tnl: int64 := peek64(fb + CG_CFIELD_OFF_TYPENAMELEN);
+        var tnp: int64 := peek64(fb + CG_CFIELD_OFF_TYPENAMEPTR);
+        poke64(lenBox, tnl);
+        self.ftnNi := fieldNi; self.ftnP := tnp; self.ftnL := tnl;
+        self.ftnCnt := self.pNodes;
+        return tnp as pchar;
       }
       i += 1;
     }
+    self.ftnNi := fieldNi; self.ftnP := 0; self.ftnL := 0;
+    self.ftnCnt := self.pNodes;
     return 0 as pchar;
   }
 
