@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# tests/strnew_arena_2296_test.sh — #2296: StrNew belegt aus der Bump-Arena,
-# nicht mehr je Aufruf ein eigenes mmap.
+# tests/strnew_arena_2296_test.sh — #2296: StrNew, StrSub und das Feld von
+# StrSplit belegen aus der Bump-Arena, nicht mehr je Aufruf ein eigenes mmap.
 #
 # Bis 1.2.24E war `StrNew(n)` ein rohes `mmap(0, n, ...)`. Eine Anforderung
 # von 32 Byte belegte damit eine ganze SEITE, und `StrFree` ist ein No-op —
@@ -47,11 +47,11 @@ ZIELE="x86"
 [ -n "$QEMU_ARM64" ] && ZIELE="$ZIELE arm64" || echo "HINWEIS: Emulator fuer arm64 fehlt"
 [ -n "$QEMU_RISCV64" ] && ZIELE="$ZIELE riscv" || echo "HINWEIS: Emulator fuer riscv fehlt"
 
-fall() { # name erwartet   (Quelle auf stdin)
-  local name="$1" erw="$2"
+fall() { # name erwartet [ziele]   (Quelle auf stdin)
+  local name="$1" erw="$2" ziele="${3:-$ZIELE}"
   cat > "$TMP/$name.lyx"
   local z
-  for z in $ZIELE; do
+  for z in $ziele; do
     local opt="" q=""
     [ "$z" = arm64 ] && { opt="--target=arm64"; q="$QEMU_ARM64"; }
     [ "$z" = riscv ] && { opt="--target=riscv"; q="$QEMU_RISCV64"; }
@@ -202,6 +202,109 @@ fn main(): int64 {
   var i: int64 := 0; var n: int64 := 0;
   while (i < 20000) { var s: pchar := IntToStr(i); n := n + StrLen(s); i := i + 1; }
   PrintInt(n); PrintStr("\n"c);
+  return 0;
+}
+LYX
+
+# ------------------------------------------------------------------
+# F. Dieselbe Wirkung fuer StrSub und fuer das Feld von StrSplit.
+#
+# StrSub belegte im Helfer `_lyx_strsub` je Aufruf eine Seite (gemessen
+# 80000 KiB fuer 20000 Aufrufe). StrSplit ruft diesen Helfer JE FELD auf
+# und holte sein Feld-Array zusaetzlich per eigenem mmap — nach dem Umbau
+# von StrSub allein blieb es deshalb bei 8,4 MB. Beide Stellen liegen
+# jetzt auf der Arena.
+#
+# Grenzen wie oben weit gefasst: gemessen 640 KiB bzw. 896 KiB, vorher
+# 80000 bzw. 71936 KiB.
+# ------------------------------------------------------------------
+speichergrenze() { # name, grenze-in-KiB, erwartete-ausgabe   (Quelle auf stdin)
+  local name="$1" grenze="$2" erw="$3"
+  cat > "$TMP/$name.lyx"
+  if ! (cd "$ROOT" && timeout 200 "$LYXC" --std-path="$ROOT" "$TMP/$name.lyx" -o "$TMP/$name" >"$TMP/$name.log" 2>&1); then
+    no "$name" "uebersetzt nicht: $(grep -m1 -iE 'error|lyxc:' "$TMP/$name.log")"; return
+  fi
+  if [ ! -x /usr/bin/time ]; then
+    echo "HINWEIS: /usr/bin/time fehlt — $name entfaellt"; return
+  fi
+  local sp aus
+  sp=$(/usr/bin/time -f '%M' -o "$TMP/$name.rss" "$TMP/$name" > "$TMP/$name.out" 2>"$TMP/$name.err"; cat "$TMP/$name.rss" 2>/dev/null)
+  [ -z "$sp" ] && sp=0
+  aus=$(head -1 "$TMP/$name.out")
+  if [ "$aus" != "$erw" ]; then
+    no "$name" "rechnet falsch: '$aus' erwartet '$erw'"
+  elif [ "$sp" -lt "$grenze" ]; then
+    ok "$name: RSS-Spitze ${sp} KiB (Grenze ${grenze})"
+  else
+    no "$name" "RSS-Spitze ${sp} KiB — ueber der Grenze von ${grenze}, der Verlust ist zurueck"
+  fi
+}
+
+speichergrenze strsub_speicher 16384 200000 <<'LYX'
+unit main;
+import std.io;
+fn main(): int64 {
+  var q: pchar := "abcdefghijklmnopqrstuvwxyz"c;
+  var i: int64 := 0; var n: int64 := 0;
+  while (i < 20000) { var s: pchar := StrSub(q, 0, 10); n := n + StrLen(s); i := i + 1; }
+  PrintInt(n); PrintStr("\n"c);
+  return 0;
+}
+LYX
+
+speichergrenze strsplit_speicher 16384 16000 <<'LYX'
+unit main;
+import std.io;
+fn main(): int64 {
+  var q: pchar := "a,bb,ccc,dddd,e,ff,ggg,h"c;
+  var i: int64 := 0; var n: int64 := 0;
+  while (i < 2000) { var t: pchar[] = StrSplit(q, ","c); n := n + len(t); i := i + 1; }
+  PrintInt(n); PrintStr("\n"c);
+  return 0;
+}
+LYX
+
+# Die WERTE von StrSub und StrSplit auf allen Zielen — der Umbau fasst den
+# Helfer an, der die Teilkette kopiert und nullterminiert.
+fall strsub_werte "cde abcdefgh h" <<'LYX'
+unit main;
+import std.io;
+fn main(): int64 {
+  var q: pchar := "abcdefgh"c;
+  PrintStr(StrSub(q, 2, 3)); PrintStr(" "c);
+  PrintStr(StrSub(q, 0, 8)); PrintStr(" "c);
+  PrintStr(StrSub(q, 7, 1)); PrintStr("\n"c);
+  return 0;
+}
+LYX
+
+# Das Feld von StrSplit wird nur bis `count` gefuellt; Kopf und Rest las der
+# Bestand als NULLEN, weil mmap Nullseiten lieferte. Die Arena gibt
+# wiederverwendeten Speicher — deshalb wird dort genullt, und deshalb steht
+# hier eine Probe darauf. Zweimal hintereinander, damit der zweite Aufruf
+# BENUTZTEN Speicher bekommt; ein fehlendes Nullen faellt erst dort auf.
+#
+# NUR x86: `StrSplit` liefert auf arm64 und riscv eine LEERE Liste (len 0),
+# und zwar unveraendert auch mit dem Vorgaengerstand — ein eigener,
+# vorbestehender Defekt, als #2305 gefuehrt. Hier wird er WEDER geprueft
+# NOCH zugesichert: sonst wuerde dieser Test rot, sobald er behoben ist.
+fall strsplit_werte "3=a|bb|ccc 3=a|bb|ccc" "x86" <<'LYX'
+unit main;
+import std.io;
+fn zeig(q: pchar) {
+  var t: pchar[] = StrSplit(q, ","c);
+  PrintInt(len(t)); PrintStr("="c);
+  var i: int64 := 0;
+  while (i < len(t)) {
+    if (i > 0) { PrintStr("|"c); }
+    PrintStr(t[i]);
+    i := i + 1;
+  }
+}
+fn main(): int64 {
+  zeig("a,bb,ccc"c); PrintStr(" "c);
+  zeig("a,bb,ccc"c);
+  PrintStr("\n"c);
   return 0;
 }
 LYX
