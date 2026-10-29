@@ -21,8 +21,8 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.24E
-VERSION_DATE := 2026-10-28
+VERSION   := 1.2.25A
+VERSION_DATE := 2026-10-29
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
 UNITS_DST := $(PKG_DIR)/usr/include/lyx/units/std
@@ -515,6 +515,8 @@ test: lyxc
 	@bash tests/f64_typherleitung_2287_test.sh
 	@echo "--- Canary nur bei Rahmenpuffer, Ueberlauf loest weiter aus (#2245) ---"
 	@bash tests/canary_rahmenpuffer_2245_test.sh
+	@echo "--- StrNew belegt aus der Arena, Puffer bleibt genullt (#2296) ---"
+	@bash tests/strnew_arena_2296_test.sh
 	@echo "--- parallel Array traegt Ganzzahlen, auf x86/arm64/lyxos (#2247) ---"
 	@bash tests/simd_ganzzahl_2247_test.sh
 	@echo "--- peek8/16/32/64 bedeuten auf jedem Ziel dasselbe (#2300) ---"
