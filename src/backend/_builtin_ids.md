@@ -27,7 +27,7 @@ gegen genau diese Liste, ein nicht eingetragener Aufrufer gilt als Kollision.
 | 3 | Prozessende | `Exit`, `panic` | `panic` beendet mit 1 (#1720) |
 | 4 | Pseudozufallszahl (xorshift64) | `Random` | #1728; der Zustand liegt im Wort hinter den Programm-Globalen |
 | 5 | Zustand des Zufallsgenerators setzen | `RandomSeed` | #1728 |
-| 6 | Teilzeichenkette | `StrSub` | |
+| 6 | Teilzeichenkette | `StrSub`, `StrSplit` | StrSplit schneidet seine Felder damit heraus (#2305) |
 | 7 | Verkettung | `StrConcat` | |
 | 8 | Kopie | `StrCopy` | |
 | 9 | Gleitkomma nach stdout | `PrintFloat` | Linux-ARM64 bislang No-op |
@@ -37,7 +37,7 @@ gegen genau diese Liste, ein nicht eingetragener Aufrufer gilt als Kollision.
 | 12 | Formatierte Ausgabe | `Printf` | war bis 1.0.11C fälschlich 10 |
 | 13 | `write(2, ptr, strlen(ptr))` | `EPrintStr`, `EPrintStrLn`, `EPrint`, `panic` | #1388; Länge rechnet das Backend selbst |
 | 14 | Zeilenumbruch nach stderr | `EPrintStrLn`, `EPrintLn`, `panic` | #1388 |
-| 15 | Länge einer Zeichenkette | `StrLen`, `StrLength`, `EPrintInt` | #1388; EPrintInt nutzt sie seit #2266 ausserhalb von lyxos (IntToStr + StrLen + write(2, …)) |
+| 15 | Länge einer Zeichenkette | `StrLen`, `StrLength`, `EPrintInt`, `StrSplit` | #1388; EPrintInt nutzt sie seit #2266 ausserhalb von lyxos (IntToStr + StrLen + write(2, …)) |
 | 16 | Ganzzahl als Dezimaltext, Zeiger zurück | `IntToStr`, `StrFromInt`, `EPrintInt` | #1720; der Puffer stammt seit #2227 aus dem Bump-Block, nicht vom Stapel — er muss den Aufruf überleben; EPrintInt siehe 15 |
 | 17 | Anzahl der Programmargumente | `GetArgC` | #1720; lyxos: Startrumpf legt argc/argv ab (#1754); arm64/riscv: argv in x28/s10, GetArgC zählt bis NULL (#2110) |
 | 18 | Zeiger auf den Argumentvektor | `GetArgV`, `GetArg` | #1720; `GetArg(i)` ist ID 18 plus ein Lesezugriff, keine eigene ID |

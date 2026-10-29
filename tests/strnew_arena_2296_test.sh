@@ -284,11 +284,12 @@ LYX
 # hier eine Probe darauf. Zweimal hintereinander, damit der zweite Aufruf
 # BENUTZTEN Speicher bekommt; ein fehlendes Nullen faellt erst dort auf.
 #
-# NUR x86: `StrSplit` liefert auf arm64 und riscv eine LEERE Liste (len 0),
-# und zwar unveraendert auch mit dem Vorgaengerstand — ein eigener,
-# vorbestehender Defekt, als #2305 gefuehrt. Hier wird er WEDER geprueft
-# NOCH zugesichert: sonst wuerde dieser Test rot, sobald er behoben ist.
-fall strsplit_werte "3=a|bb|ccc 3=a|bb|ccc" "x86" <<'LYX'
+# Seit #2305 auf ALLEN Zielen: bis 1.2.25B lieferte `StrSplit` auf arm64 und
+# riscv eine leere Liste, weil dort die Vier-Parameter-Fassung aus
+# std/string.lyx mit zwei Argumenten gerufen wurde. Die Einschraenkung auf x86
+# stand hier, solange die Luecke offen war; die Zerlegung selbst prueft jetzt
+# tests/strsplit_ir_2305_test.sh, hier geht es weiter um das NULLEN.
+fall strsplit_werte "3=a|bb|ccc 3=a|bb|ccc" <<'LYX'
 unit main;
 import std.io;
 fn zeig(q: pchar) {

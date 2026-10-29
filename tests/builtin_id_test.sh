@@ -16,6 +16,17 @@
 # benennt die emittierte Operation, nicht den Namen im Quelltext; ein nicht
 # eingetragener Aufrufer gilt als Kollision.
 #
+# Namensquelle ist der nächststehende `self.seq(fname, fnlen, "…")`. Eine
+# Senkung, die ihre Builtin-Aufrufe in eine HILFSMETHODE auslagert, hat dort
+# keinen solchen Vergleich (#2305: `_spStrLen`, `_spStrSub`, … der
+# StrSplit-Senkung). Damit die Zuordnung nicht am zufällig letzten Namen der
+# Datei hängt, zählt dort ein ausdrücklicher Vermerk
+#
+#   // LOWERING: <Name>
+#
+# als Namensquelle. Er ersetzt keine Prüfung: fehlt er, greift wieder der
+# nächststehende seq-Name, und ein nicht eingetragener Aufrufer bleibt rot.
+#
 # Zusätzlich: kein ARM64-Zweig darf eine unbehandelte ID still durchfallen
 # lassen.
 
@@ -36,6 +47,10 @@ tmp="$(mktemp)"; trap 'rm -f "$tmp"' EXIT
 awk '
   /self\.seq\(fname, fnlen, "/ {
     match($0, /"[^"]+"/); name = substr($0, RSTART+1, RLENGTH-2)
+  }
+  /\/\/ LOWERING: / {
+    name = substr($0, index($0, "LOWERING: ") + 10)
+    gsub(/[ \t]+$/, "", name)
   }
   /irAddInstrDirect\(IRO_CALL_BUILTIN/ {
     if (match($0, /-1, [0-9]+\)/)) {
