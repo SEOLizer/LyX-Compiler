@@ -4229,12 +4229,19 @@ pub type IRLower = class {
     // uebereinstimmen): sieben Namen gibt es als Builtin UND als pub fn in
     // std/ mit anderer Argumentzahl. Passt die Zahl nicht zur Builtin-Form,
     // ist die Unit-Funktion gemeint und wird sofort gerufen.
-    // StrSplit fehlt hier: einen StrSplit-Builtin hat der IR-Weg nicht, die
-    // Unit-Funktion gewinnt dort ohnehin (tests/builtin-drift-allow.txt).
+    // #2305, RICHTIGSTELLUNG: hier stand, StrSplit brauche keinen Eintrag,
+    // weil "die Unit-Funktion dort ohnehin gewinnt". Sie gewann auch bei
+    // falscher ARGUMENTZAHL: `StrSplit(s, delim)` traf die Vier-Parameter-
+    // Fassung aus std/string.lyx, deren `out` und `maxParts` damit undefiniert
+    // waren — auf arm64 und riscv kam still eine leere Liste heraus, auf x86
+    // das richtige Ergebnis. Seit die Senkung existiert, steht der Name hier
+    // mit seiner Builtin-Form (2), damit die Vier-Argument-Form weiter die
+    // Unit-Funktion ruft.
     var fbAufgeschoben: int64 := 0 - 1;
     if fbUserIdx >= 0 && nlTreffer < 0 && self._zielIstLyxos() == 0
         && self._eigeneUnitDefiniert(fname, fnlen) == 0 {
       var fbWant: int64 := 0 - 1;
+      if self.seq(fname, fnlen, "StrSplit", 8)   { fbWant := 2; }   // #2305
       if self.seq(fname, fnlen, "StrFind", 7)    { fbWant := 2; }
       if self.seq(fname, fnlen, "StrTrim", 7)    { fbWant := 1; }
       if self.seq(fname, fnlen, "FloatToStr", 10) { fbWant := 1; }
@@ -4551,6 +4558,177 @@ pub type IRLower = class {
         self.irAddInstrDirect(IRO_STORE_LOCAL, 0, scy0, -1, 0);
         self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 8);
       }
+      return dest;
+    }
+
+    // #2305: StrSplit(s, delim) → pchar[]. Dieselbe Zerlegung wie
+    // `_lyx_strsplit` auf x86 (codegen_x86.lyx, CG_H_STRSPLIT) — die beiden
+    // muessen uebereinstimmen, geprueft in tests/strsplit_ir_2305_test.sh an
+    // denselben Faellen auf allen drei Zielen.
+    //
+    // Vorher gewann hier die VIER-Parameter-Fassung aus std/string.lyx
+    // (`StrSplit(s, delim, out, maxParts)`), gerufen mit ZWEI Argumenten:
+    // `out` und `maxParts` waren undefiniert, die Funktion schrieb ins Nichts
+    // und gab 0 zurueck. Auf x86 hielt die Weiche `cg_builtinArity` das ab,
+    // im IR-Weg fehlte der Name in der fbWant-Liste — mit dem Kommentar, das
+    // sei unbedenklich, weil "die Unit-Funktion dort ohnehin gewinnt". Genau
+    // das war der Defekt: sie gewann auch bei falscher Argumentzahl, und eine
+    // leere Liste ist ein plausibles Ergebnis, das niemand meldet.
+    //
+    // Die Senkung steht bewusst HIER und nicht als Builtin-ID in den
+    // Backends: der Vertrag ist eine Schleife ueber vorhandene Bausteine
+    // (StrLen 15, StrSub 6, peek8 200, poke64 205), und so bekommen arm64,
+    // riscv und jedes kuenftige IR-Ziel sie zusammen, statt in zwei
+    // handgeschriebenen Assemblerfassungen auseinanderzulaufen.
+    //
+    // Vertrag des Erzeugnisses (wie x86): [+0]=cap, [+8]=len,
+    // [+16+i*8]=pchar[i]. Leere Felder bleiben erhalten (",a" → "", "a"),
+    // leere Eingabe ergibt ein leeres Feld, ein leerer Trenner ein Feld mit
+    // der ganzen Zeichenkette.
+    //
+    // Der Speicher kommt aus IRO_ALLOC, nicht aus der Bump-Arena:
+    // `_arenaAlloc` rechnet die Groesse zur Uebersetzungszeit, hier steht sie
+    // erst zur Laufzeit fest ((slen+2)*8+16). Das ist derselbe offene Punkt
+    // wie in #2296 fuer den IR-Weg.
+    if (self.seq(fname, fnlen, "StrSplit", 8) && arg0 >= 0
+        && self.nodeNext(arg0) >= 0 && self.nodeNext(self.nodeNext(arg0)) < 0
+        && self._irVerdecktBuiltin(fname, fnlen) == 0) {
+      var spDN: int64 := self.nodeNext(arg0);
+
+      // --- Eingaenge in eigene Slots, bevor irgendein Builtin die festen
+      // Slots 0..2 belegt (StrLen und StrSub rechnen dort).
+      var spS: int64 := self.allocTemp();
+      var spD: int64 := self.allocTemp();
+      var spT0: int64 := self.lowerExpr(arg0);
+      self.irAddInstrDirect(IRO_STORE_LOCAL, spS, spT0, -1, 0);
+      var spT1: int64 := self.lowerExpr(spDN);
+      self.irAddInstrDirect(IRO_STORE_LOCAL, spD, spT1, -1, 0);
+
+      var spSlen: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_STORE_LOCAL, spSlen, self._spStrLen(spS), -1, 0);
+      var spDlen: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_STORE_LOCAL, spDlen, self._spStrLen(spD), -1, 0);
+
+      // --- Feld anlegen: (slen + 2) * 8 + 16 Byte, Kopf eingeschlossen.
+      var spZwei: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_CONST_INT, spZwei, -1, -1, 2);
+      var spCap: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_ADD, spCap, spSlen, spZwei, 0);
+      var spAcht: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_CONST_INT, spAcht, -1, -1, 8);
+      var spSz: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_MUL, spSz, spCap, spAcht, 0);
+      var spSechzehn: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_CONST_INT, spSechzehn, -1, -1, 16);
+      var spSz2: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_ADD, spSz2, spSz, spSechzehn, 0);
+      var spArr: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_ALLOC, spArr, spSz2, -1, 0);
+      self._spPoke64(spArr, spCap);
+
+      // --- Laufzustand. Jeder dieser Werte wird mehrfach beschrieben und
+      // deshalb nur ueber STORE_LOCAL gefuehrt (wie in _arenaAlloc).
+      var spCnt: int64 := self.allocTemp();
+      var spNull: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_CONST_INT, spNull, -1, -1, 0);
+      self.irAddInstrDirect(IRO_STORE_LOCAL, spCnt, spNull, -1, 0);
+      var spLast: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_STORE_LOCAL, spLast, spNull, -1, 0);
+      var spI: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_STORE_LOCAL, spI, spNull, -1, 0);
+      var spEins: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_CONST_INT, spEins, -1, -1, 1);
+
+      // Leerer Trenner: die Schleife darf nicht laufen, sonst passt die leere
+      // Folge an jeder Stelle. x86 liefert dann EIN Feld mit der ganzen
+      // Zeichenkette — das entsteht unten aus dem Rest.
+      var spLeerTr: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_CMP_EQ, spLeerTr, spDlen, spNull, 0);
+      var spLblEnde: int64 := self.genLabel();
+      self.irAddInstrDirect(IRO_BR_TRUE, -1, spLeerTr, -1, spLblEnde);
+
+      var spLblKopf: int64 := self.genLabel();
+      self.irEmitLabel(spLblKopf);
+      // while (i + dlen <= slen)
+      var spIEnd: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_ADD, spIEnd, spI, spDlen, 0);
+      var spWeiter: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_CMP_LE, spWeiter, spIEnd, spSlen, 0);
+      self.irEmitBrFalse(spWeiter, spLblEnde);
+
+      // --- dlen Bytes vergleichen. `match` faellt auf 0 und bricht ab.
+      var spTreff: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_STORE_LOCAL, spTreff, spEins, -1, 0);
+      var spJ: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_STORE_LOCAL, spJ, spNull, -1, 0);
+      var spLblVglKopf: int64 := self.genLabel();
+      var spLblVglEnde: int64 := self.genLabel();
+      self.irEmitLabel(spLblVglKopf);
+      var spJOk: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_CMP_LT, spJOk, spJ, spDlen, 0);
+      self.irEmitBrFalse(spJOk, spLblVglEnde);
+      var spAdrS: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_ADD, spAdrS, spS, spI, 0);
+      var spAdrS2: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_ADD, spAdrS2, spAdrS, spJ, 0);
+      var spBS: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_STORE_LOCAL, spBS, self._spPeek8(spAdrS2), -1, 0);
+      var spAdrD: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_ADD, spAdrD, spD, spJ, 0);
+      var spBD: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_STORE_LOCAL, spBD, self._spPeek8(spAdrD), -1, 0);
+      var spGleich: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_CMP_EQ, spGleich, spBS, spBD, 0);
+      var spLblGleich: int64 := self.genLabel();
+      self.irAddInstrDirect(IRO_BR_TRUE, -1, spGleich, -1, spLblGleich);
+      self.irAddInstrDirect(IRO_STORE_LOCAL, spTreff, spNull, -1, 0);
+      self.irEmitJmp(spLblVglEnde);
+      self.irEmitLabel(spLblGleich);
+      var spJ1: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_ADD, spJ1, spJ, spEins, 0);
+      self.irAddInstrDirect(IRO_STORE_LOCAL, spJ, spJ1, -1, 0);
+      self.irEmitJmp(spLblVglKopf);
+      self.irEmitLabel(spLblVglEnde);
+
+      // --- kein Treffer: eine Stelle weiter.
+      var spLblKeinTr: int64 := self.genLabel();
+      self.irEmitBrFalse(spTreff, spLblKeinTr);
+
+      // Treffer: Feld [lastPos, i) ablegen, hinter den Trenner springen.
+      var spSegLen: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_SUB, spSegLen, spI, spLast, 0);
+      self._spFeldAblegen(spArr, spCnt, self._spStrSub(spS, spLast, spSegLen));
+      var spCnt1: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_ADD, spCnt1, spCnt, spEins, 0);
+      self.irAddInstrDirect(IRO_STORE_LOCAL, spCnt, spCnt1, -1, 0);
+      var spNachTr: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_ADD, spNachTr, spI, spDlen, 0);
+      self.irAddInstrDirect(IRO_STORE_LOCAL, spLast, spNachTr, -1, 0);
+      self.irAddInstrDirect(IRO_STORE_LOCAL, spI, spNachTr, -1, 0);
+      self.irEmitJmp(spLblKopf);
+
+      self.irEmitLabel(spLblKeinTr);
+      var spI1: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_ADD, spI1, spI, spEins, 0);
+      self.irAddInstrDirect(IRO_STORE_LOCAL, spI, spI1, -1, 0);
+      self.irEmitJmp(spLblKopf);
+
+      // --- Rest hinter dem letzten Trenner; auch leer wird abgelegt, sonst
+      // verschwindet das letzte Feld bei "a,b," und bei leerer Eingabe.
+      self.irEmitLabel(spLblEnde);
+      var spRestLen: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_SUB, spRestLen, spSlen, spLast, 0);
+      self._spFeldAblegen(spArr, spCnt, self._spStrSub(spS, spLast, spRestLen));
+      var spCnt2: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_ADD, spCnt2, spCnt, spEins, 0);
+      self.irAddInstrDirect(IRO_STORE_LOCAL, spCnt, spCnt2, -1, 0);
+
+      // len steht bei [arr+8] — dieselbe Stelle, die `len()` liest (#2262).
+      var spAdrLen: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_ADD, spAdrLen, spArr, spAcht, 0);
+      self._spPoke64(spAdrLen, spCnt);
+
+      self.irAddInstrDirect(IRO_STORE_LOCAL, dest, spArr, -1, 0);
       return dest;
     }
 
@@ -7596,6 +7774,71 @@ pub type IRLower = class {
   // Index/Array Access Lowering
   // ------------------------------------------------------------------
   
+  // ------------------------------------------------------------------
+  // #2305: Bausteine der StrSplit-Senkung. Sie rufen die vorhandenen
+  // Builtins so, wie lowerCall es auch sonst tut — StrLen und StrSub rechnen
+  // in den FESTEN Slots 0..2, deshalb werden deren Argumente unmittelbar vor
+  // dem Aufruf dorthin gelegt und das Ergebnis sofort in einen eigenen Slot
+  // gesichert. Wer hier einen Wert ueber einen dieser Aufrufe hinweg in Slot
+  // 0..2 haelt, verliert ihn.
+  //
+  // LOWERING: StrSplit
+  // (Namensquelle fuer tests/builtin_id_test.sh: diese Methoden tragen keinen
+  //  eigenen seq()-Vergleich, die IDs 15, 6, 200 und 205 werden hier fuer die
+  //  StrSplit-Senkung gerufen.)
+  // ------------------------------------------------------------------
+  fn _spStrLen(ptrSlot: int64): int64 {
+    self.irAddInstrDirect(IRO_STORE_LOCAL, 0, ptrSlot, -1, 0);
+    var r: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_CALL_BUILTIN, r, -1, -1, 15);
+    return r;
+  }
+
+  fn _spStrSub(sSlot: int64, startSlot: int64, lenSlot: int64): int64 {
+    self.irAddInstrDirect(IRO_STORE_LOCAL, 0, sSlot, -1, 0);
+    self.irAddInstrDirect(IRO_STORE_LOCAL, 1, startSlot, -1, 0);
+    self.irAddInstrDirect(IRO_STORE_LOCAL, 2, lenSlot, -1, 0);
+    var r: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_CALL_BUILTIN, r, -1, -1, 6);
+    return r;
+  }
+
+  fn _spPeek8(adrSlot: int64): int64 {
+    var b: int64 := self.tempCount;
+    var k: int64 := 0;
+    while k < 4 { self.allocTemp(); k := k + 1; }
+    self.irAddInstrDirect(IRO_STORE_LOCAL, b, adrSlot, -1, 0);
+    var r: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_CALL_BUILTIN, r, b, -1, 200);
+    return r;
+  }
+
+  fn _spPoke64(adrSlot: int64, wertSlot: int64) {
+    var b: int64 := self.tempCount;
+    var k: int64 := 0;
+    while k < 4 { self.allocTemp(); k := k + 1; }
+    self.irAddInstrDirect(IRO_STORE_LOCAL, b, adrSlot, -1, 0);
+    self.irAddInstrDirect(IRO_STORE_LOCAL, b + 1, wertSlot, -1, 0);
+    var r: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_CALL_BUILTIN, r, b, -1, 205);
+  }
+
+  // Feld i des Erzeugnisses liegt bei [arr + 16 + i*8] — dieselbe Rechnung
+  // wie im x86-Helfer `_lyx_strsplit`.
+  fn _spFeldAblegen(arrSlot: int64, idxSlot: int64, wertSlot: int64) {
+    var acht: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_CONST_INT, acht, -1, -1, 8);
+    var off: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_MUL, off, idxSlot, acht, 0);
+    var sechzehn: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_CONST_INT, sechzehn, -1, -1, 16);
+    var off2: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_ADD, off2, off, sechzehn, 0);
+    var adr: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_ADD, adr, arrSlot, off2, 0);
+    self._spPoke64(adr, wertSlot);
+  }
+
   fn lowerIndex(expr: int64): int64 {
     // #2060: `a[i]` auf einem Klassenobjekt mit `Get` ist `a.Get(i)`.
     //
