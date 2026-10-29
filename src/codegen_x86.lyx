@@ -241,7 +241,12 @@ con CG_H_F64STR_CHK: int64 := 1372;
 con CG_H_F64STR_CHK_LEN: int64 := 106;
 con CG_H_MAP_STR:      int64 := 1478;  // #1291: Map mit Zeichenketten-Schluesseln
 con CG_H_MAP_STR_LEN:  int64 := 480;   // #2150: Map-Kern mit Wachstum, gemessen
-con CG_H_USER:         int64 := 1958;  // 1478 + 480 (#2150)
+// #2296: Arena-Belegung als Helfer, damit _lyx_strsub seine festgeschriebene
+// Laenge und seinen Versatz behaelt. Die Laenge ist GEMESSEN, nicht gezaehlt
+// — der Codegen bricht ab, wenn sie nicht stimmt.
+con CG_H_BUMP:         int64 := 1958;  // 1478 + 480
+con CG_H_BUMP_LEN:     int64 := 208;   // gemessen, nicht gezaehlt
+con CG_H_USER:         int64 := 2166;  // CG_H_BUMP + CG_H_BUMP_LEN
 
 // Patch kinds
 con CG_PATCH_CALL:     int64 := 0;
@@ -1243,6 +1248,16 @@ pub type Codegen = class {
   //
   // cg_genCall liest den Wunsch am EINTRITT und loescht ihn sofort, damit er
   // nicht in die Auswertung der Argumente durchsickert.
+  // #2296: Wohin ein gescheitertes mmap springen soll, statt einen eigenen
+  // Melder mitzubringen — Versatz des OOM-Melders aus Map-Teil 1, oder 0.
+  //
+  // Gebraucht fuer den Arena-Helfer: der liegt HINTER 1372, und win64 kopiert
+  // von dort alles woertlich in die PE (win_x86.lyx, WIN_HELPERS_SZ). Ein
+  // eigener Melder waere dort `write` und `exit_group` als rohe Syscalls —
+  // tests/win64_syscalls_test.sh zaehlt genau das, und mit der ersten Fassung
+  // stieg die Zahl von 3 auf 5. Der Melder in Map-Teil 1 liegt VOR 1372 und
+  // wird nicht kopiert.
+  mmapOomSprung:     int64;
   p32Wunsch:         int64;
   p32Erfuellt:       int64;
   // #1003: byte buffer parallel to locals, 1 = INLINE geschriebener fn-Zeigertyp
@@ -25967,31 +25982,39 @@ pub type Codegen = class {
     self.cg_e8(0x56);
     // push rdx             52
     self.cg_e8(0x52);
-    // mov rdi, 0           48 C7 C7 00 00 00 00
-    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC7);
-    self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
-    // rsi = len+17: mov rsi,[rsp]; nop; add rsi,17  (5 bytes for mov+nop to match old size)
-    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x34); self.cg_e8(0x24); // mov rsi,[rsp]
-    self.cg_e8(0x90);                                                          // nop (pad)
-    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC6); self.cg_e8(0x11); // add rsi,17
-    // mov edx, 3           BA 03 00 00 00
-    self.cg_e8(0xBA); self.cg_e8(0x03); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
-    // mov r10, 34          49 C7 C2 22 00 00 00
-    self.cg_e8(0x49); self.cg_e8(0xC7); self.cg_e8(0xC2);
-    self.cg_e8(0x22); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
-    // mov r8, -1           49 C7 C0 FF FF FF FF
-    self.cg_e8(0x49); self.cg_e8(0xC7); self.cg_e8(0xC0);
-    self.cg_e8(0xFF); self.cg_e8(0xFF); self.cg_e8(0xFF); self.cg_e8(0xFF);
-    // xor r9, r9 (3 bytes saves 4 vs mov r9,0; offset absorbed by add rsi,17 = +4 bytes net 0)
-    self.cg_e8(0x4D); self.cg_e8(0x31); self.cg_e8(0xC9);
-    // mov eax, 9           B8 09 00 00 00
-    self.cg_e8(0xB8); self.cg_e8(0x09); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
-    // syscall              0F 05
-    self.cg_e8(0x0F); self.cg_e8(0x05);
-    // rax = mmap buffer. Do NOT save to [rsp+24] — that is the return address!
-    // rax remains valid (not touched) until after the pops.
-    // nop × 5              90 90 90 90 90  (keep helper at exactly 71 bytes)
-    self.cg_e8(0x90); self.cg_e8(0x90); self.cg_e8(0x90); self.cg_e8(0x90); self.cg_e8(0x90);
+    // #2296: Puffer aus der Bump-Arena statt per `mmap` JE AUFRUF. Eine
+    // Teilkette von 10 Byte belegte vorher eine ganze Seite, und `StrFree`
+    // ist ein No-op — gemessen 78 MB fuer 20000 Aufrufe. Besonders teuer
+    // ueber `StrSplit`, das diesen Helfer JE FELD aufruft.
+    //
+    // Die Belegung steht in einem eigenen Helfer (_lyx_bumpalloc, CG_H_BUMP),
+    // nicht hier: die Arena-Folge ist 279 Byte lang und passt nicht in das
+    // Fenster, das die `mmap`-Folge hinterlaesst. So bleibt DIESER Helfer auf
+    // seinen 71 Byte und an seinem Versatz — und damit bleiben auch seine
+    // beiden Aufrufstellen unberuehrt, darunter die in `_lyx_strsplit`
+    // (handgezaehlte 81 Byte mit festen Sprungweiten).
+    //
+    // Groesse: len + 17 (Platz fuer die Null und die Ausrichtung), aus
+    // [rsp] — dort liegt rdx (len), weil drei Register gesichert wurden.
+    // GENULLT werden muss nichts: die Kopierschleife unten beschreibt alle
+    // len Byte und setzt die Null dahinter.
+    //
+    // rax ueberlebt bis hinter die Pops, wie bisher beim mmap-Ergebnis.
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x34); self.cg_e8(0x24);   // mov rsi,[rsp]  (len)
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC6); self.cg_e8(0x11);   // add rsi,17
+    // call _lyx_bumpalloc — rel32 ab dem Ende dieses Befehls
+    self.cg_e8(0xE8);
+    var ssBumpPos: int64 := self.codeLen;
+    self.cg_e32(CG_H_BUMP - ssBumpPos - 4);
+    // Auffuellen auf die alten 50 Byte, damit Laenge und Versatz dieses
+    // Helfers unveraendert bleiben. Uebersprungen statt durchlaufen: ein
+    // `jmp` kostet einen Sprung, 37 NOPs kosten 37 Befehle JE AUFRUF.
+    self.cg_e8(0xEB); self.cg_e8(0x23);                                       // jmp +35
+    var ssPad: int64 := 0;
+    while (ssPad < 35) { self.cg_e8(0x90); ssPad := ssPad + 1; }
+    // 4 + 4 + 5 + 2 + 35 = 50 Byte — genau das Fenster, das die
+    // `mmap`-Folge hinterlassen hat. Die Pruefung hinter dem `ret` haelt es
+    // fest.
     // Copy loop: rdi=dest, rsi=src, rcx=count
     // pop rcx = len        59  (0x5A=pop rdx, 0x59=pop rcx — rcx is the rep movsb count!)
     self.cg_e8(0x59);
@@ -26010,9 +26033,24 @@ pub type Codegen = class {
     self.cg_e8(0xC6); self.cg_e8(0x07); self.cg_e8(0x00);
     // nop × 3              90 90 90  (pad to keep 71-byte total)
     self.cg_e8(0x90); self.cg_e8(0x90); self.cg_e8(0x90);
-    // ret                  C3  (returns rax = mmap_buf)
+    // ret                  C3  (returns rax = Puffer)
     self.cg_e8(0xC3);
     // strsub is 71 bytes  ✓
+    //
+    // #2296: und das wird jetzt GEPRUEFT. Der naechste Helfer liegt auf
+    // einem festen Versatz (CG_H_STRCHARAT), und die Aufrufe dorthin rechnen
+    // mit der Konstante — eine falsche Laenge hier haette den Sprung
+    // daneben gelegt, ohne dass irgendetwas gemeldet haette. Beim Umbau auf
+    // die Arena war meine erste Fassung zwei Byte zu lang; ohne diese
+    // Pruefung waere das still durchgegangen.
+    if (self.codeLen != CG_H_STRCHARAT) {
+      EPrintStr("codegen error: nach _lyx_strsub steht der Zeiger bei "c);
+      EPrintInt(self.codeLen);
+      EPrintStr(", erwartet "c);
+      EPrintInt(CG_H_STRCHARAT);
+      EPrintStrLn(" — die Laenge von _lyx_strsub stimmt nicht (#2296)"c);
+      exit(1);
+    }
 
     // ---- _lyx_strcharat (6 bytes, starts at offset 304) ----
     // StrCharAt(s: pchar, i: int64): int64
@@ -26362,14 +26400,34 @@ pub type Codegen = class {
     self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(0x02); // add rax, 2
     self.cg_e8(0x48); self.cg_e8(0x6B); self.cg_e8(0xC0); self.cg_e8(0x08); // imul rax,rax,8
     self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(0x10); // add rax, 16
-    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC6);     // mov rsi, rax
-    self.cg_e8(0x31); self.cg_e8(0xFF);                        // xor edi, edi
-    self.cg_e8(0xBA); self.cg_e8(0x03); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00); // mov edx,3
-    self.cg_e8(0x41); self.cg_e8(0xBA); self.cg_e8(0x22); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00); // mov r10d,34
-    self.cg_e8(0x49); self.cg_e8(0xC7); self.cg_e8(0xC0); self.cg_e8(0xFF); self.cg_e8(0xFF); self.cg_e8(0xFF); self.cg_e8(0xFF); // mov r8,-1
-    self.cg_e8(0x45); self.cg_e8(0x31); self.cg_e8(0xC9);     // xor r9d, r9d
-    self.cg_e8(0xB8); self.cg_e8(0x09); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00); // mov eax,9
-    self.cg_e8(0x0F); self.cg_e8(0x05);                        // syscall → rax=arr
+    // #2296: auch das FELD kommt aus der Arena, nicht aus einem eigenen
+    // `mmap`. Das war die dritte Stelle derselben Art: nach dem Umbau von
+    // StrSub blieb `StrSplit` bei 8,4 MB fuer 2000 Aufrufe, weil hier je
+    // Aufruf eine weitere Seite lag.
+    //
+    // GENULLT, im Unterschied zu StrSub: `mmap` lieferte Nullseiten, und das
+    // Feld wird nur bis `count` gefuellt — Kopf und Rest las der Bestand als
+    // Nullen. Ohne das Nullen waere es eine stille Aenderung an einer Stelle,
+    // die niemand prueft.
+    //
+    // Die Groesse liegt vor dem Aufruf auf dem Stapel: `cg_emitBumpAllocRsi`
+    // rundet rsi auf 16 und gibt nicht zu, es danach unveraendert zu lassen.
+    // 3+1+5+1+3+1+2+2+1 = 19 Byte, dazu 14 Byte Fuellung = 33 — genau das
+    // Fenster der alten `mmap`-Folge.
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC6);     // mov rsi, rax  (Groesse)
+    self.cg_e8(0x56);                                          // push rsi
+    self.cg_e8(0xE8);                                          // call _lyx_bumpalloc
+    var ss3bp: int64 := self.codeLen;
+    self.cg_e32(CG_H_BUMP - ss3bp - 4);
+    self.cg_e8(0x59);                                          // pop rcx  (Groesse)
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC7);     // mov rdi, rax
+    self.cg_e8(0x50);                                          // push rax
+    self.cg_e8(0x31); self.cg_e8(0xC0);                        // xor eax, eax
+    self.cg_e8(0xF3); self.cg_e8(0xAA);                        // rep stosb
+    self.cg_e8(0x58);                                          // pop rax
+    self.cg_e8(0xEB); self.cg_e8(0x0C);                        // jmp +12
+    var ss3pad: int64 := 0;
+    while (ss3pad < 12) { self.cg_e8(0x90); ss3pad := ss3pad + 1; }
     self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xC7);     // mov r15, rax
     // Block 4: Init fill (5 bytes)
     self.cg_e8(0x31); self.cg_e8(0xDB);                        // xor ebx, ebx  (count=0)
@@ -26513,6 +26571,9 @@ pub type Codegen = class {
     self.cg_e8(0x45); self.cg_e8(0x31); self.cg_e8(0xC0);  // xor r8d,r8d
     self.cg_e8(0xE9); self.cg_e8(0x60); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00);  // jmp kern
     // oom:
+    // #2296: Versatz merken — der Arena-Helfer hinter 1372 springt hierher,
+    // statt einen eigenen Melder mitzubringen (siehe mmapOomSprung).
+    self.mmapOomSprung := self.codeLen;
     // #2150: Der Text liegt im DATENbereich, nicht im Code — Text zwischen
     // Befehlen disassembliert jeder Werkzeug anders (tests/disasm_test.sh).
     var oomText: int64 := self.dataLen;
@@ -26941,7 +27002,52 @@ pub type Codegen = class {
       EPrintStrLn(" — CG_H_USER anpassen (#2150)"c);
       exit(1);
     }
-    // Total helpers: ... + CG_H_F64STR_CHK_LEN + CG_H_MAP_STR_LEN = CG_H_USER  ✓
+    // Total helpers: ... + CG_H_F64STR_CHK_LEN + CG_H_MAP_STR_LEN
+    //                + CG_H_BUMP_LEN = CG_H_USER  ✓
+
+    // ---- _lyx_bumpalloc (ab CG_H_BUMP) — #2296 ----
+    //
+    // Groesse in rsi → rax = Puffer aus der Bump-Arena. Dieselbe Arena wie
+    // `new`, StrNew, die Verkettung und IntToStr; `cg_emitBumpAllocRsi`
+    // rundet auf 16 auf.
+    //
+    // WARUM EIN HELFER UND NICHT INLINE: `_lyx_strsub` hat eine
+    // festgeschriebene Laenge (71 Byte, mit NOPs aufgefuellt), und die Folge
+    // der Arena passt dort nicht hinein. Mit diesem Helfer bleibt der
+    // strsub-Helfer auf seiner Laenge UND an seinem Versatz — und damit
+    // bleiben auch seine beiden Aufrufstellen unberuehrt, darunter die in
+    // `_lyx_strsplit` (Block 6, handgezaehlte 81 Byte mit festen
+    // Sprungweiten). Haette strsub den Puffer von AUSSEN bekommen, waere
+    // dieser Block mitsamt seinen Weiten neu zu rechnen gewesen.
+    //
+    // Er liegt bewusst HINTER 1372: die Arena holt im langsamen Weg per
+    // `mmap` Nachschub, und win64 kopiert den Helferblock nur bis dorthin
+    // woertlich (win_x86.lyx, WIN_HELPERS_SZ) — ein roher Syscall in einer
+    // PE-Datei waere genau das, was tests/win64_syscalls_test.sh zaehlt.
+    // Dieselbe Erwaegung wie bei __lyx_f64_to_str_chk und dem Map-Kern.
+    var bumpStart: int64 := self.codeLen;
+    if (bumpStart != CG_H_BUMP) {
+      EPrintStr("codegen error: Arena-Helfer beginnt bei "c); EPrintInt(bumpStart);
+      EPrintStr(", erwartet "c); EPrintInt(CG_H_BUMP);
+      EPrintStrLn(" — CG_H_BUMP anpassen (#2296)"c);
+      exit(1);
+    }
+    // Der Sprung zum Melder gilt NUR fuer diesen Helfer; danach wieder die
+    // eigene Kopie, die im Benutzercode richtig ist (sie wird nicht kopiert).
+    self.cg_emitBumpAllocRsi();   // rax = Puffer
+    self.mmapOomSprung := 0;
+    self.cg_e8(0xC3);             // ret
+    // Gemessen statt gezaehlt, wie bei den beiden Helfern darueber (#1284):
+    // ein Versatz legte den Benutzercode an die falsche Stelle, und das
+    // traefe JEDES Programm.
+    if (self.codeLen - bumpStart != CG_H_BUMP_LEN) {
+      EPrintStr("codegen error: Arena-Helfer hat "c);
+      EPrintInt(self.codeLen - bumpStart);
+      EPrintStr(" Byte, erwartet "c);
+      EPrintInt(CG_H_BUMP_LEN);
+      EPrintStrLn(" — CG_H_BUMP_LEN und CG_H_USER anpassen (#2296)"c);
+      exit(1);
+    }
   }
 
   // ------------------------------------------------------------------
@@ -28882,6 +28988,7 @@ pub type Codegen = class {
 
     self.simdZielOff := 1;   // #2213: keine Zielablage
     self.p32Wunsch := 0;     // #2247
+    self.mmapOomSprung := 0; // #2296
     self.p32Erfuellt := 0;
     self.nextLblId := 0;
 
@@ -32555,6 +32662,19 @@ pub type Codegen = class {
     // Test als Schranke fuehrt. Eine Pruefung davor waere kein Gewinn,
     // sondern zwei weitere Syscalls in einer Datei, die keine haben darf.
     if (self.msAbi != 0) { return; }
+
+    // #2296: Ist ein Melder bekannt, wird dorthin GESPRUNGEN statt einer
+    // zweiten Kopie. Gebraucht fuer Code hinter 1372, der sonst rohe
+    // Syscalls in die PE traegt (write, exit_group).
+    if (self.mmapOomSprung != 0) {
+      self.cg_paarAusrichten(self.codeLen, 12);
+      self.cg_e8(0x48); self.cg_e8(0x3D);
+      self.cg_e8(0x01); self.cg_e8(0xF0); self.cg_e8(0xFF); self.cg_e8(0xFF);   // cmp rax, -4095
+      self.cg_e8(0x0F); self.cg_e8(0x83);                                        // jae rel32 → Melder
+      var oomP: int64 := self.codeLen;
+      self.cg_e32(self.mmapOomSprung - oomP - 4);
+      return;
+    }
 
     // #2244: cmp und jb verschmelzen zu einem Paar und duerfen zusammen
     // keine 32-Byte-Grenze kreuzen. Bis 1.2.23C fehlte das hier — der Sprung
