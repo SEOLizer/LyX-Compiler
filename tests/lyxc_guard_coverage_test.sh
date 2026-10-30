@@ -75,14 +75,24 @@ cat > "$TMP/langsam" <<'STUBEOF'
 sleep 30
 STUBEOF
 chmod +x "$TMP/langsam"
-cat > "$TMP/probe.sh" <<PROBEEOF
-LYXC="$TMP/langsam"
-LYXC_TIMEOUT=1
+# Die Probe benutzt die VORGESCHRIEBENE Form `LYXC="${LYXC:-…}"` und bekommt
+# den Platzhalter von aussen mitgegeben — so, wie es jeder Test erlaubt sein
+# muss (tests/lyxc_umgebung_test.sh verlangt genau das). Eine feste Zuweisung
+# an LYXC stuende hier sonst als Verstoss in der Pruefung, und die
+# Ausnahmeliste dafuer zu erweitern waere der falsche Weg: die Regel ist
+# richtig, nur die Form war es nicht.
+# Begrenzer in Anfuehrungszeichen: so steht die Zeile UNVERAENDERT in der
+# Datei, ohne Escapen. Mit einem offenen Begrenzer waere daraus
+# `LYXC="\${LYXC:-…}"` geworden, und das Backslash bricht das
+# Erlaubnis-Muster der Wache — die Zeile sah dann wie eine feste Zuweisung
+# aus, obwohl sie keine ist. ROOT kommt beim Aufruf aus der Umgebung.
+cat > "$TMP/probe.sh" <<'PROBEEOF'
+LYXC="${LYXC:-$ROOT/lyxc}"
 . "$ROOT/tests/lib/lyxc_guard.sh"
-"\$LYXC" --tut-nichts >/dev/null 2>&1
-echo \$?
+"$LYXC" --tut-nichts >/dev/null 2>&1
+echo $?
 PROBEEOF
-rc=$(bash "$TMP/probe.sh" 2>/dev/null | tail -1)
+rc=$(ROOT="$ROOT" LYXC="$TMP/langsam" LYXC_TIMEOUT=1 bash "$TMP/probe.sh" 2>/dev/null | tail -1)
 if [ "$rc" = "124" ]; then
   ok "Zeitlimit greift (rc=124 statt Endloslauf)"
 else
