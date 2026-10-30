@@ -275,6 +275,15 @@ pub con CG_EXTERN_OFF_LIBLEN:  int64 := 24;
 pub con CG_EXTERN_OFF_NODE:    int64 := 32;
 
 // Table entry sizes and field offsets
+// #2310: Kandidateneintrag der Registerzuteilung, seit diesem Stand mit NAME
+// und LAENGE (Offsets 40 und 48). cg_rlKandIdx verglich 4 473 523 Eintraege je
+// Selbstbau — 16,8 je Aufruf — und holte jede Laenge ueber einen Aufruf
+// (cg_rlKNameL, der seinerseits cg_nslen ruft). Jetzt ist der Vergleich ein
+// peek64. Ein Vorfilter lohnt hier, anders als bei den Namenssuchen in #2176:
+// 48,3 % der Aufrufe finden nichts und laufen die ganze Liste ab.
+con CG_RLK_SZ:            int64 := 56;
+con CG_RLK_OFF_NAMEP:     int64 := 40;
+con CG_RLK_OFF_NAMEL:     int64 := 48;
 con CG_LOCAL_SZ:          int64 := 24;
 con CG_LOCAL_OFF_NAMELEN: int64 := 8;
 con CG_LOCAL_OFF_RBPOFF:  int64 := 16;
@@ -9127,7 +9136,7 @@ pub type Codegen = class {
   fn cg_rlKnotenIdx(kb: int64, kn: int64, knoten: int64): int64 {
     var i: int64 := 0;
     while (i < kn) {
-      if (peek64(kb + i * 40) == knoten) { return i; }
+      if (peek64(kb + i * CG_RLK_SZ) == knoten) { return i; }
       i += 1;
     }
     return 0 - 1;
@@ -9140,22 +9149,28 @@ pub type Codegen = class {
     var bestS: int64 := 0 - 1;
     var i: int64 := 0;
     while (i < kn) {
-      var k: int64 := peek64(kb + i * 40);
-      if (self.cg_rlKNameL(k) == nl && self.cg_seq(self.cg_rlKNameP(k), nl, np, nl)) {
-        if (best < 0 || peek64(kb + i * 40 + 32) > bestS) { best := i; bestS := peek64(kb + i * 40 + 32); }
+      var e: int64 := kb + i * CG_RLK_SZ;
+      if (peek64(e + CG_RLK_OFF_NAMEL) == nl
+          && self.cg_seq(peek64(e + CG_RLK_OFF_NAMEP) as pchar, nl, np, nl)) {   // #2310
+        if (best < 0 || peek64(e + 32) > bestS) { best := i; bestS := peek64(e + 32); }
       }
       i += 1;
     }
     return best;
   }
 
-  // Kandidatenpuffer: je 40 Byte {Knoten, Gewicht, ok, Deklarationen, Stempel}.
+  // Kandidatenpuffer: je CG_RLK_SZ Byte
+  // {Knoten, Gewicht, ok, Deklarationen, Stempel, NameP, NameL}.
+  // #2310: Name und Laenge stehen IM Eintrag. Vorher holte jeder Vergleich
+  // beides ueber cg_rlKNameL/cg_rlKNameP, die ihrerseits cg_nslen/cg_nsval
+  // rufen — 4,47 Mio mal je Selbstbau, 16,8 Eintraege je Aufruf.
   fn cg_rlKandIdx(kb: int64, kn: int64, np: pchar, nl: int64): int64 {
     if (nl <= 0) { return 0 - 1; }
     var i: int64 := 0;
     while (i < kn) {
-      var k: int64 := peek64(kb + i * 40);
-      if (self.cg_rlKNameL(k) == nl && self.cg_seq(self.cg_rlKNameP(k), nl, np, nl)) { return i; }
+      var e: int64 := kb + i * CG_RLK_SZ;
+      if (peek64(e + CG_RLK_OFF_NAMEL) == nl
+          && self.cg_seq(peek64(e + CG_RLK_OFF_NAMEP) as pchar, nl, np, nl)) { return i; }
       i += 1;
     }
     return 0 - 1;
@@ -9180,8 +9195,10 @@ pub type Codegen = class {
       var kn: int64 := peek64(kbBox + 8);
       if (modus == 0 && k == CGN_VAR_DECL && (self.cg_nival(cur) & 4) == 0
           && self.cg_rlTypOk(self.cg_nc0(cur)) != 0 && kn < 64) {
-        var nb: int64 := kb + kn * 40;
+        var nb: int64 := kb + kn * CG_RLK_SZ;
         poke64(nb, cur); poke64(nb + 8, 0); poke64(nb + 16, 1); poke64(nb + 24, 0); poke64(nb + 32, 0);
+        poke64(nb + CG_RLK_OFF_NAMEP, self.cg_rlKNameP(cur) as int64);   // #2310
+        poke64(nb + CG_RLK_OFF_NAMEL, self.cg_rlKNameL(cur));
         poke64(kbBox + 8, kn + 1);
       }
       if (modus == 1) {
@@ -9193,7 +9210,7 @@ pub type Codegen = class {
             // Korrektheit: gebunden wird ueber den Knoten (cg_rlBinde), und
             // welcher Slot gemeint ist, entscheidet der Codegen selbst.
             var kz: int64 := self.cg_rlZuletzt(kb, kn, self.cg_nsval(cur), self.cg_nslen(cur));
-            var kr: int64 := kb + kz * 40;
+            var kr: int64 := kb + kz * CG_RLK_SZ;
             var gw: int64 := 1;
             var t: int64 := tiefe;
             if (t > 3) { t := 3; }
@@ -9204,7 +9221,7 @@ pub type Codegen = class {
             // 1.2.19J schied ein Name mit zweiter Deklaration ganz aus —
             // `var i` in zwei Schleifen sperrte beide —, weil ueber den
             // Namen gebunden wurde.
-            var kd: int64 := kb + self.cg_rlKnotenIdx(kb, kn, cur) * 40;
+            var kd: int64 := kb + self.cg_rlKnotenIdx(kb, kn, cur) * CG_RLK_SZ;
             poke64(kd + 24, peek64(kd + 24) + 1);
             poke64(kbBox + 32, peek64(kbBox + 32) + 1);
             poke64(kd + 32, peek64(kbBox + 32) + 1);
@@ -9215,10 +9232,10 @@ pub type Codegen = class {
             // meinen, ist hier nicht sicher zu entscheiden.
             var ka: int64 := 0;
             while (ka < kn) {
-              var kq: int64 := peek64(kb + ka * 40);
+              var kq: int64 := peek64(kb + ka * CG_RLK_SZ);
               if (self.cg_rlKNameL(kq) == self.cg_nslen(cur)
                   && self.cg_seq(self.cg_rlKNameP(kq), self.cg_nslen(cur), self.cg_nsval(cur), self.cg_nslen(cur))) {
-                poke64(kb + ka * 40 + 16, 0);
+                poke64(kb + ka * CG_RLK_SZ + 16, 0);
               }
               ka += 1;
             }
@@ -9229,7 +9246,7 @@ pub type Codegen = class {
           var ai: int64 := self.cg_nc0(cur);
           if (ai >= 0 && self.cg_nkind(ai) == CGN_IDENT) {
             var ak: int64 := self.cg_rlKandIdx(kb, kn, self.cg_nsval(ai), self.cg_nslen(ai));
-            if (ak >= 0) { poke64(kb + ak * 40 + 16, 0); }
+            if (ak >= 0) { poke64(kb + ak * CG_RLK_SZ + 16, 0); }
           }
         }
       }
@@ -9260,7 +9277,7 @@ pub type Codegen = class {
     var body: int64 := self.cg_nc2(fni);
     if (body < 0 || self.cg_nkind(body) != CGN_BLOCK) { return; }
     var kbBox: int64 := alloc(40);
-    poke64(kbBox, alloc(64 * 40)); poke64(kbBox + 8, 0); poke64(kbBox + 16, 0);
+    poke64(kbBox, alloc(64 * CG_RLK_SZ)); poke64(kbBox + 8, 0); poke64(kbBox + 16, 0);
     poke64(kbBox + 32, 1);   // #2228: Stempelzaehler (Parameter haben 1)
     // Parameter zuerst: ein int64-Parameter ist Kandidat wie ein Local, seine
     // "Deklaration" ist der Spill im Prolog (cg_spillRdi..R9 bzw. die Kopie
@@ -9269,17 +9286,21 @@ pub type Codegen = class {
     if (self.rlSelfKnoten == fni) {
       var sb: int64 := peek64(kbBox);
       poke64(sb, fni); poke64(sb + 8, 0); poke64(sb + 16, 1); poke64(sb + 24, 1); poke64(sb + 32, 1);
+      poke64(sb + CG_RLK_OFF_NAMEP, self.cg_rlKNameP(fni) as int64);   // #2310: "self"
+      poke64(sb + CG_RLK_OFF_NAMEL, self.cg_rlKNameL(fni));
       poke64(kbBox + 8, 1);
     }
     var pp: int64 := self.cg_nc0(fni);
     while (pp >= 0) {
       var pkn: int64 := peek64(kbBox + 8);
       if (self.cg_nkind(pp) == CGN_PARAM && pkn < 64) {
-        var pb: int64 := peek64(kbBox) + pkn * 40;
+        var pb: int64 := peek64(kbBox) + pkn * CG_RLK_SZ;
         var pok: int64 := self.cg_rlTypOk(self.cg_nc0(pp));
         if (self.cg_rlKandIdx(peek64(kbBox), pkn, self.cg_nsval(pp), self.cg_nslen(pp)) >= 0) { pok := 0; }
         poke64(pb, pp); poke64(pb + 8, 0); poke64(pb + 16, pok); poke64(pb + 24, 1);
         poke64(pb + 32, 1);   // #2228: Stempel — vor jeder Deklaration im Rumpf sichtbar
+        poke64(pb + CG_RLK_OFF_NAMEP, self.cg_rlKNameP(pp) as int64);   // #2310
+        poke64(pb + CG_RLK_OFF_NAMEL, self.cg_rlKNameL(pp));
         poke64(kbBox + 8, pkn + 1);
       }
       pp := self.cg_nnext(pp);
@@ -9299,14 +9320,14 @@ pub type Codegen = class {
       var bestW: int64 := 1;
       var i: int64 := 0;
       while (i < kn) {
-        var r: int64 := kb + i * 40;
+        var r: int64 := kb + i * CG_RLK_SZ;
         if (peek64(r + 16) != 0 && peek64(r + 24) == 1 && peek64(r + 8) > bestW) {
           best := i; bestW := peek64(r + 8);
         }
         i += 1;
       }
       if (best < 0) { break; }
-      var br: int64 := kb + best * 40;
+      var br: int64 := kb + best * CG_RLK_SZ;
       var bk: int64 := peek64(br);
       poke64(tab + n * 48, self.cg_rlKNameP(bk) as int64);
       poke64(tab + n * 48 + 8, self.cg_rlKNameL(bk));
