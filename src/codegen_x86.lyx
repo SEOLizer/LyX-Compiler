@@ -1239,6 +1239,7 @@ pub type Codegen = class {
   fcNameP: int64; fcNameL: int64; fcIdx: int64; fcCnt: int64;
   ftnNi: int64; ftnP: int64; ftnL: int64; ftnCnt: int64;
   zlHxS: int64;                  // #2175: verglichene Eintraege in cg_hxSuch (fuer die Zaehler)
+  zlVmVektor: int64;             // #2194: auf den Vektorweg gelegte Schleifen
   // #2175: Funktionsindex der obersten Ebene je (Knotentabelle, Kopf,
   // Quelltext), siehe cg_tlEintrag. Eintrag 48 Byte.
   tlTab: int64; tlAnz: int64; tlCap: int64; tlLetzt: int64;
@@ -23376,7 +23377,250 @@ pub type Codegen = class {
     poke32(self.code + jOk, self.codeLen - jOk - 4);
   }
 
+
+  // ------------------------------------------------------------------
+  // #2194: elementweise Schleife erkennen und auf den vorhandenen
+  // Vektorrechner legen.
+  //
+  // Erkannt wird GENAU eine Form, und zwar eng:
+  //
+  //   while (i < n) { pokeW(c + idx, (peekW(a + idx) OP peekW(b + idx)) & maskeW); i += 1; }
+  //
+  // mit idx = `i` (nur W == 1) oder `i * W`, maskeW optional, und OP aus
+  // {+, -, *}, soweit cg_sseGanzOpcode den Befehl fuer diese Breite kennt.
+  //
+  // Gesenkt wird NICHT auf eine neue Maschinerie: cg_emitSSE2BinOp bzw.
+  // cg_emitAVX2BinOp rechnen genau diese Operation ueber drei Zeiger und eine
+  // Elementzahl (rdi/rsi/rdx/rcx) und bringen den skalaren Rest-Durchgang
+  // selbst mit. Hier entsteht also nur die ERKENNUNG davor.
+  //
+  // UEBERLAPPUNG: a, b und c sind hier gewoehnliche Zeiger, meist Parameter.
+  // Ob sie sich ueberschneiden, ist beim Uebersetzen nicht entscheidbar, und
+  // bei 16 Byte je Schritt in aufsteigender Ordnung liefert z. B. c == a + 1
+  // etwas ANDERES als die skalare Schleife. Deshalb steht vor der
+  // Vektorschleife eine Pruefung ZUR LAUFZEIT; ueberschneidet sich etwas,
+  // laeuft die skalare Fassung wie bisher. Zwei Zeigervergleiche vor einer
+  // Schleife ueber tausende Elemente kosten messbar nichts, und die Sprache
+  // braucht dafuer keine Zusage. Ein spaeteres `@noalias` kann die Pruefung
+  // einsparen, ist aber nicht Voraussetzung.
+  //
+  // Kasten: [0] aOff [8] bOff [16] cOff [24] nOff [32] iOff [40] Breite [48] Op
+  fn cg_vmIdentOff(ni: int64): int64 {
+    if (ni < 0 || self.cg_nkind(ni) != CGN_IDENT) { return 0; }
+    return self.cg_findLocal(self.cg_nsval(ni), self.cg_nslen(ni));
+  }
+
+  // Breite eines peek/poke-Namens, 0 wenn es keiner ist. lesen = 1 fragt nach
+  // peek, lesen = 0 nach poke.
+  fn cg_vmBreiteVonName(nm: pchar, nl: int64, lesen: int64): int64 {
+    if (lesen != 0) {
+      if (self.cg_seq(nm, nl, "peek8"c, 5))  { return 1; }
+      if (self.cg_seq(nm, nl, "peek16"c, 6)) { return 2; }
+      if (self.cg_seq(nm, nl, "peek32"c, 6)) { return 4; }
+      return 0;
+    }
+    if (self.cg_seq(nm, nl, "poke8"c, 5))  { return 1; }
+    if (self.cg_seq(nm, nl, "poke16"c, 6)) { return 2; }
+    if (self.cg_seq(nm, nl, "poke32"c, 6)) { return 4; }
+    return 0;
+  }
+
+  // Ist `adr` die Form `BASIS + idx`, wobei idx zur Schleifenvariablen passt?
+  // Liefert den Rahmenversatz der Basis, sonst 0. `breite` muss zur
+  // Indexform passen: bei 1 steht `i` da, sonst `i * breite`.
+  fn cg_vmBasisVon(adr: int64, iOff: int64, breite: int64): int64 {
+    if (adr < 0 || self.cg_nkind(adr) != CGN_BINOP) { return 0; }
+    if (self.cg_nival(adr) != CGT_PLUS) { return 0; }
+    var bOff: int64 := self.cg_vmIdentOff(self.cg_nc0(adr));
+    if (bOff == 0) { return 0; }
+    var idx: int64 := self.cg_nc1(adr);
+    if (breite == 1) {
+      if (self.cg_vmIdentOff(idx) != iOff) { return 0; }
+      return bOff;
+    }
+    if (idx < 0 || self.cg_nkind(idx) != CGN_BINOP || self.cg_nival(idx) != CGT_STAR) { return 0; }
+    if (self.cg_vmIdentOff(self.cg_nc0(idx)) != iOff) { return 0; }
+    var kN: int64 := self.cg_nc1(idx);
+    if (kN < 0 || self.cg_nkind(kN) != CGN_LIT_INT) { return 0; }
+    if (self.cg_nival(kN) != breite) { return 0; }
+    return bOff;
+  }
+
+  fn cg_vmErkennen(ni: int64, kasten: int64): int64 {
+    if (self.debugMode != 0 || self.debugInfoEnabled != 0) { return 0; }
+    // Bedingung: i < n, beide als Local.
+    var bed: int64 := self.cg_nc0(ni);
+    if (bed < 0 || self.cg_nkind(bed) != CGN_BINOP || self.cg_nival(bed) != CGT_LT) { return 0; }
+    var iOff: int64 := self.cg_vmIdentOff(self.cg_nc0(bed));
+    var nOff: int64 := self.cg_vmIdentOff(self.cg_nc1(bed));
+    if (iOff == 0 || nOff == 0 || iOff == nOff) { return 0; }
+    // Rumpf: genau zwei Anweisungen.
+    var rumpf: int64 := self.cg_nc1(ni);
+    if (rumpf < 0 || self.cg_nkind(rumpf) != CGN_BLOCK) { return 0; }
+    var s1: int64 := self.cg_nc0(rumpf);
+    if (s1 < 0 || self.cg_nkind(s1) != CGN_EXPR_STMT) { return 0; }
+    var s2: int64 := self.cg_nnext(s1);
+    if (s2 < 0 || self.cg_nkind(s2) != CGN_ASSIGN) { return 0; }
+    if (self.cg_nnext(s2) != -1) { return 0; }
+    // Fortschaltung: i := i + 1, nichts anderes.
+    if (self.cg_vmIdentOff(self.cg_nc0(s2)) != iOff) { return 0; }
+    var inc: int64 := self.cg_nc1(s2);
+    if (inc < 0 || self.cg_nkind(inc) != CGN_BINOP || self.cg_nival(inc) != CGT_PLUS) { return 0; }
+    if (self.cg_vmIdentOff(self.cg_nc0(inc)) != iOff) { return 0; }
+    var eins: int64 := self.cg_nc1(inc);
+    if (eins < 0 || self.cg_nkind(eins) != CGN_LIT_INT || self.cg_nival(eins) != 1) { return 0; }
+    // Schreibseite: pokeW(c + idx, wert)
+    var ruf: int64 := self.cg_nc0(s1);
+    if (ruf < 0 || self.cg_nkind(ruf) != CGN_CALL) { return 0; }
+    var breite: int64 := self.cg_vmBreiteVonName(self.cg_nsval(ruf), self.cg_nslen(ruf), 0);
+    if (breite == 0) { return 0; }
+    var adr: int64 := self.cg_nc0(ruf);
+    if (adr < 0) { return 0; }
+    var wert: int64 := self.cg_nnext(adr);
+    if (wert < 0 || self.cg_nnext(wert) != -1) { return 0; }
+    var cOff: int64 := self.cg_vmBasisVon(adr, iOff, breite);
+    if (cOff == 0) { return 0; }
+    // Maske abziehen, wenn sie genau die Breite trifft — sie ist dort tot
+    // (#2324), und ohne dieses Abziehen wuerde die Form nicht erkannt.
+    if (self.cg_nkind(wert) == CGN_BINOP && self.cg_nival(wert) == CGT_BITAND) {
+      var mk: int64 := self.cg_nc1(wert);
+      if (mk >= 0 && self.cg_nkind(mk) == CGN_LIT_INT) {
+        var mv: int64 := self.cg_nival(mk);
+        var soll: int64 := 255;
+        if (breite == 2) { soll := 65535; }
+        if (breite == 4) { soll := 4294967295; }
+        if (mv == soll) { wert := self.cg_nc0(wert); }
+      }
+    }
+    if (wert < 0 || self.cg_nkind(wert) != CGN_BINOP) { return 0; }
+    var op: int64 := self.cg_nival(wert);
+    if (op != CGT_PLUS && op != CGT_MINUS && op != CGT_STAR) { return 0; }
+    var vOpc: int64 := self.cg_sseGanzOpcode(op, breite);
+    if (vOpc < 0) { return 0; }
+    // #2194: Befehle aus der 0F-38-Gruppe (PMULLD) brauchen die sse4-Zusage.
+    // Bei `parallel Array` ist ein Abbruch dort richtig — wer Vektoren
+    // schreibt, hat sie verlangt. Hier wird AUTOMATISCH umgeformt: eine
+    // CPU-Forderung zu erheben, die im Quelltext niemand gestellt hat,
+    // machte aus einem uebersetzbaren Programm einen Fehler. Deckt die
+    // Ziel-CPU es nicht, bleibt es bei der skalaren Schleife.
+    if (vOpc > 255 && self.cg_cpuHat(1) == 0) { return 0; }
+    // Beide Leseseiten: peekW derselben Breite auf derselben Indexform.
+    var lN: int64 := self.cg_nc0(wert);
+    var rN: int64 := self.cg_nc1(wert);
+    if (lN < 0 || rN < 0) { return 0; }
+    if (self.cg_nkind(lN) != CGN_CALL || self.cg_nkind(rN) != CGN_CALL) { return 0; }
+    if (self.cg_vmBreiteVonName(self.cg_nsval(lN), self.cg_nslen(lN), 1) != breite) { return 0; }
+    if (self.cg_vmBreiteVonName(self.cg_nsval(rN), self.cg_nslen(rN), 1) != breite) { return 0; }
+    var la: int64 := self.cg_nc0(lN);
+    var ra: int64 := self.cg_nc0(rN);
+    if (la < 0 || ra < 0) { return 0; }
+    if (self.cg_nnext(la) != -1 || self.cg_nnext(ra) != -1) { return 0; }
+    var aOff: int64 := self.cg_vmBasisVon(la, iOff, breite);
+    var bOff2: int64 := self.cg_vmBasisVon(ra, iOff, breite);
+    if (aOff == 0 || bOff2 == 0) { return 0; }
+    // Die Zeiger duerfen nicht die Schleifenvariable oder die Schranke sein —
+    // sonst veraendert der Rumpf, was die Bedingung liest.
+    if (aOff == iOff || bOff2 == iOff || cOff == iOff) { return 0; }
+    if (aOff == nOff || bOff2 == nOff || cOff == nOff) { return 0; }
+    poke64(kasten,      aOff);
+    poke64(kasten + 8,  bOff2);
+    poke64(kasten + 16, cOff);
+    poke64(kasten + 24, nOff);
+    poke64(kasten + 32, iOff);
+    poke64(kasten + 40, breite);
+    poke64(kasten + 48, op);
+    return 1;
+  }
+
+  // #2194: Vektorfassung ausgeben. Liefert die Flickstelle des Sprungs, der
+  // die skalare Fassung ueberspringt (der Aufrufer flickt sie hinter die
+  // Schleife), oder -1, wenn nichts ausgegeben wurde.
+  fn cg_vmEmit(kasten: int64): int64 {
+    var aOff: int64 := peek64(kasten);
+    var bOff: int64 := peek64(kasten + 8);
+    var cOff: int64 := peek64(kasten + 16);
+    var nOff: int64 := peek64(kasten + 24);
+    var iOff: int64 := peek64(kasten + 32);
+    var breite: int64 := peek64(kasten + 40);
+    var op: int64 := peek64(kasten + 48);
+    var schub: int64 := 0;
+    if (breite == 2) { schub := 1; }
+    if (breite == 4) { schub := 2; }
+
+    // rdi = a, rsi = b, rdx = c, rcx = n
+    self.cg_loadRax(aOff); self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC7);   // mov rdi, rax
+    self.cg_loadRax(bOff); self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC6);   // mov rsi, rax
+    self.cg_loadRax(cOff); self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC2);   // mov rdx, rax
+    self.cg_loadRax(nOff); self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC1);   // mov rcx, rax
+
+    // Leere oder negative Laenge: skalar. Die Vektorschleife rechnet mit
+    // rcx - 16 als letztem vollen Block; mit rcx <= 0 waere das Verhalten
+    // nicht offensichtlich, und Offensichtlichkeit ist hier mehr wert als
+    // ein gesparter Vergleich.
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xF9); self.cg_e8(0x01);        // cmp rcx, 1
+    self.cg_e8(0x0F); self.cg_e8(0x8C);                                            // jl skalar
+    var jKlein: int64 := self.codeLen; self.cg_e32(0);
+
+    // r8 = Laenge in Byte = rcx << schub
+    self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xC8);                          // mov r8, rcx
+    if (schub > 0) { self.cg_e8(0x49); self.cg_e8(0xC1); self.cg_e8(0xE0); self.cg_e8(schub); }  // shl r8, schub
+
+    // Ueberlappung Ziel/links: erlaubt, wenn c + len <= a ODER a + len <= c.
+    // r9 = c + len, r10 = a + len
+    self.cg_e8(0x4D); self.cg_e8(0x89); self.cg_e8(0xC1);                          // mov r9, r8
+    self.cg_e8(0x49); self.cg_e8(0x01); self.cg_e8(0xD1);                          // add r9, rdx
+    self.cg_e8(0x4D); self.cg_e8(0x89); self.cg_e8(0xC2);                          // mov r10, r8
+    self.cg_e8(0x49); self.cg_e8(0x01); self.cg_e8(0xFA);                          // add r10, rdi
+    self.cg_e8(0x49); self.cg_e8(0x39); self.cg_e8(0xF9);                          // cmp r9, rdi
+    self.cg_e8(0x0F); self.cg_e8(0x86);                                            // jbe ok1
+    var jOk1: int64 := self.codeLen; self.cg_e32(0);
+    self.cg_e8(0x49); self.cg_e8(0x39); self.cg_e8(0xD2);                          // cmp r10, rdx
+    self.cg_e8(0x0F); self.cg_e8(0x87);                                            // ja skalar
+    var jUeb1: int64 := self.codeLen; self.cg_e32(0);
+    poke32(self.code + jOk1, self.codeLen - jOk1 - 4);
+
+    // dasselbe fuer Ziel/rechts
+    self.cg_e8(0x4D); self.cg_e8(0x89); self.cg_e8(0xC1);                          // mov r9, r8
+    self.cg_e8(0x49); self.cg_e8(0x01); self.cg_e8(0xD1);                          // add r9, rdx
+    self.cg_e8(0x4D); self.cg_e8(0x89); self.cg_e8(0xC2);                          // mov r10, r8
+    self.cg_e8(0x49); self.cg_e8(0x01); self.cg_e8(0xF2);                          // add r10, rsi
+    self.cg_e8(0x49); self.cg_e8(0x39); self.cg_e8(0xF1);                          // cmp r9, rsi
+    self.cg_e8(0x0F); self.cg_e8(0x86);                                            // jbe ok2
+    var jOk2: int64 := self.codeLen; self.cg_e32(0);
+    self.cg_e8(0x49); self.cg_e8(0x39); self.cg_e8(0xD2);                          // cmp r10, rdx
+    self.cg_e8(0x0F); self.cg_e8(0x87);                                            // ja skalar
+    var jUeb2: int64 := self.codeLen; self.cg_e32(0);
+    poke32(self.code + jOk2, self.codeLen - jOk2 - 4);
+
+    // Vektorteil. Die Breitenkennung traegt die Ganzzahlmarke (#2247).
+    var kennung: int64 := breite | CG_SIMD_GANZ;
+    if (self.cg_cpuHat(2) != 0) { self.cg_emitAVX2BinOp(op, kennung); }
+    else                        { self.cg_emitSSE2BinOp(op, kennung); }
+
+    // Die skalare Schleife verliesse i mit dem ersten Wert, fuer den
+    // `i < n` nicht mehr gilt — also n. Code hinter der Schleife darf das
+    // sehen, deshalb hier nachziehen.
+    self.cg_loadRax(nOff);
+    self.cg_storeRax(iOff);
+    self.cg_e8(0xE9);                                                              // jmp hinter die Schleife
+    var jUeber: int64 := self.codeLen; self.cg_e32(0);
+
+    // Hier beginnt die skalare Fassung: alle Ausstiege zeigen hierhin.
+    poke32(self.code + jKlein, self.codeLen - jKlein - 4);
+    poke32(self.code + jUeb1,  self.codeLen - jUeb1 - 4);
+    poke32(self.code + jUeb2,  self.codeLen - jUeb2 - 4);
+    self.zlVmVektor += 1;
+    return jUeber;
+  }
+
   fn cg_genWhile(ni: int64) {
+    // #2194: elementweise Schleife? Dann steht davor die Vektorfassung samt
+    // Laufzeitpruefung, und der Sprung darueber wird unten geflickt. Die
+    // skalare Fassung bleibt vollstaendig stehen — sie traegt den Fall mit
+    // Ueberlappung und ist der Vergleichsweg der Tests.
+    var vmUeber: int64 := 0 - 1;
+    var vmKasten: int64 := alloc(56);
+    if (self.cg_vmErkennen(ni, vmKasten) != 0) { vmUeber := self.cg_vmEmit(vmKasten); }
     var U:              int64 := self.cg_unrollFactor();
     var savedBreakHead: int64 := self.curBreakHead;
     var savedContHead:  int64 := self.curContHead;
@@ -23450,6 +23694,9 @@ pub type Codegen = class {
     var exitPos: int64 := self.codeLen;
     self.cg_patchList(jzHead, exitPos);
     self.cg_patchList(allBreakHead, exitPos);
+    // #2194: Der Sprung, mit dem die Vektorfassung die skalare ueberspringt,
+    // zeigt hinter die GANZE Schleife — also hierhin, nach allen Ausstiegen.
+    if (vmUeber >= 0) { poke32(self.code + vmUeber, self.codeLen - vmUeber - 4); }
     // Restore outer loop's break/continue lists
     self.curBreakHead := savedBreakHead;
     self.curContHead  := savedContHead;

@@ -150,8 +150,15 @@ fi
 if command -v strace >/dev/null 2>&1; then
   if (cd "$TMP" && timeout 300 strace -f -e trace=openat,open -o "$TMP/op.txt" \
         "$LYXC" --std-path="$ROOT" -I"$TMP" "$TMP/haupt.lyx" -o "$TMP/haupt3" >"$TMP/bau3.log" 2>&1); then
-    mehrfach=$(grep -o '"[^"]*u/[a-z]*\.lyx"' "$TMP/op.txt" | sort | uniq -c | awk '$1 > 1 {print $2" ("$1"x)"}')
-    anz=$(grep -o '"[^"]*u/[a-z]*\.lyx"' "$TMP/op.txt" | sort -u | wc -l)
+    # #2194: Das Muster muss das Verzeichnis `u/` treffen und nicht irgendein
+    # Pfadstueck, das auf `u` endet. Genau daran ist dieser Test einmal flakig
+    # geworden: `mktemp` hiess `tmp.3iuRzVnMLu`, und `...VnMLu/haupt.lyx` sah
+    # wie eine Unit unter `u/` aus — die Hauptdatei wird aber legitim zweimal
+    # geoeffnet (steht so in #2314). Verlangt wird deshalb ein Anfuehrungs-
+    # zeichen oder ein Schraegstrich DIREKT vor dem `u/`.
+    _mu='"u/[a-z]+\.lyx"|/u/[a-z]+\.lyx"'
+    mehrfach=$(grep -oE "$_mu" "$TMP/op.txt" | sort | uniq -c | awk '$1 > 1 {print $2" ("$1"x)"}')
+    anz=$(grep -oE "$_mu" "$TMP/op.txt" | sort -u | wc -l)
     if [ "$anz" -lt 2 ]; then
       no "oeffnungen" "nur $anz Unit-Datei(en) in der strace-Ausgabe gefunden — Zaehlung greift nicht"
     elif [ -n "$mehrfach" ]; then

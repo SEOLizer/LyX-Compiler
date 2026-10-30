@@ -54,15 +54,45 @@ fi
 # --- 3. Die Grenze greift auch wirklich ----------------------------------
 # Ohne diese Probe wuerde eine Bibliothek, die versehentlich nichts tut, alle
 # obigen Pruefungen bestehen.
+#
+# #2194: Hier stand `$LYXC src/lyxc.lyx` mit einem Zeitlimit von einer
+# Sekunde — die Probe setzte also voraus, dass der SELBSTBAU laenger als eine
+# Sekunde dauert. Genau das ist weggefallen: auf der CI-Maschine war er
+# schneller als das Limit, und der Test meldete "die Bibliothek kappt nicht",
+# obwohl sie in Ordnung war. Ein Test, der voraussetzt, dass der Compiler
+# langsam bleibt, wird mit jeder Beschleunigung roter — dieselbe Falle wie
+# "ein Test darf nicht voraussetzen, dass eine Luecke offen bleibt"
+# (CLAUDE.md).
+#
+# Geprueft wird jetzt die BIBLIOTHEK, nicht die Geschwindigkeit des
+# Compilers: sie umhuellt irgendein `$LYXC`, also genuegt ein Platzhalter,
+# der sicher laenger laeuft als das Limit. Das Ergebnis haengt damit an
+# nichts, was sich durch Optimierung aendern kann.
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
-cat > "$TMP/probe.sh" <<PROBEEOF
+cat > "$TMP/langsam" <<'STUBEOF'
+#!/usr/bin/env bash
+# Platzhalter fuer lyxc: kehrt absichtlich nicht vor dem Zeitlimit zurueck.
+sleep 30
+STUBEOF
+chmod +x "$TMP/langsam"
+# Die Probe benutzt die VORGESCHRIEBENE Form `LYXC="${LYXC:-…}"` und bekommt
+# den Platzhalter von aussen mitgegeben — so, wie es jeder Test erlaubt sein
+# muss (tests/lyxc_umgebung_test.sh verlangt genau das). Eine feste Zuweisung
+# an LYXC stuende hier sonst als Verstoss in der Pruefung, und die
+# Ausnahmeliste dafuer zu erweitern waere der falsche Weg: die Regel ist
+# richtig, nur die Form war es nicht.
+# Begrenzer in Anfuehrungszeichen: so steht die Zeile UNVERAENDERT in der
+# Datei, ohne Escapen. Mit einem offenen Begrenzer waere daraus
+# `LYXC="\${LYXC:-…}"` geworden, und das Backslash bricht das
+# Erlaubnis-Muster der Wache — die Zeile sah dann wie eine feste Zuweisung
+# aus, obwohl sie keine ist. ROOT kommt beim Aufruf aus der Umgebung.
+cat > "$TMP/probe.sh" <<'PROBEEOF'
 LYXC="${LYXC:-$ROOT/lyxc}"
-LYXC_TIMEOUT=1
 . "$ROOT/tests/lib/lyxc_guard.sh"
-"\$LYXC" --std-path="$ROOT" "$ROOT/src/lyxc.lyx" -o "$TMP/out" >/dev/null 2>&1
-echo \$?
+"$LYXC" --tut-nichts >/dev/null 2>&1
+echo $?
 PROBEEOF
-rc=$(bash "$TMP/probe.sh" 2>/dev/null | tail -1)
+rc=$(ROOT="$ROOT" LYXC="$TMP/langsam" LYXC_TIMEOUT=1 bash "$TMP/probe.sh" 2>/dev/null | tail -1)
 if [ "$rc" = "124" ]; then
   ok "Zeitlimit greift (rc=124 statt Endloslauf)"
 else
