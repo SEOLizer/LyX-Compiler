@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.26G
+VERSION   := 1.2.26H
 VERSION_DATE := 2026-10-30
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -519,6 +519,7 @@ test: lyxc
 	@bash tests/strnew_arena_2296_test.sh
 	@echo "--- eine Unit wird einmal gelesen und geparst (#2176) ---"
 	@bash tests/parse_cache_2176_test.sh
+	@bash tests/locals_merker_2316_test.sh
 	@echo "--- StrSplit zerlegt auf allen Zielen gleich (#2305) ---"
 	@bash tests/strsplit_ir_2305_test.sh
 	@echo "--- parallel Array traegt Ganzzahlen, auf x86/arm64/lyxos (#2247) ---"

@@ -800,6 +800,16 @@ pub type Codegen = class {
   locals:     int64;
   localCount: int64;
   localCap:   int64;
+  // #2316: Zahl aller je angelegten Locals (nur cg_addLocal zaehlt hoch) —
+  // Teil des Merkerschluessels in cg_findLocalIdx, siehe dort.
+  localGen: int64;
+  flNameP: int64;
+  flNameL: int64;
+  flTab:   int64;
+  flCnt:   int64;
+  flBase:  int64;
+  flGen:   int64;
+  flIdx:   int64;
   frameSize:  int64;   // bytes allocated below rbp (grows with each local)
   structArenaOff:  int64;   // #1580/#1595: Datenoffset des Bump-Bereichs, -1 = ungenutzt
 
@@ -2097,6 +2107,7 @@ pub type Codegen = class {
     poke64(off + CG_LOCAL_OFF_NAMELEN, nlen);
     poke64(off + CG_LOCAL_OFF_RBPOFF,  0 - self.frameSize);
     if (self.localCount + 1 > self.localHigh) { self.localHigh := self.localCount + 1; }   // #1334
+    self.localGen := self.localGen + 1;   // #2316: Teil des Merkerschluessels
     // Zero the type entry for this new local
     var toff: int64 := self.localTypes + self.localCount * CG_LOCTYPE_SZ;
     poke64(toff,                   0);
@@ -2115,20 +2126,21 @@ pub type Codegen = class {
     return 0 - self.frameSize;
   }
 
+  // #2316: dieselbe Suche wie cg_findLocalIdx, nur mit dem Rahmenversatz als
+  // Antwort. Bis 1.2.26G lief sie als EIGENE Schleife ueber dieselbe Tabelle —
+  // die Form, bei der spaeter die eine Stelle nachgezogen wird und die andere
+  // nicht (bei cg_findGlobal war es genau so, dort fehlte der Laengenfilter
+  // aus #2176). Jetzt geht sie durch den Index und bekommt dessen Merker mit.
+  //
+  // zlFlV (#2174) zaehlt hier NICHT mehr: die Vergleiche finden in
+  // cg_findLocalIdxKern statt und stehen unter findLocalIdx_vergleiche. Ohne
+  // diesen Hinweis saehe die Zeitlinie aus, als waere die Arbeit
+  // verschwunden, statt verlagert.
   fn cg_findLocal(name: pchar, nlen: int64): int64 {
-    var i: int64 := self.localCount - 1;
-    while (i >= self.localBase) {  // WP-02: respect localBase for closure inner fn scope
-      var base: int64 := self.locals + i * CG_LOCAL_SZ;
-      var sname: pchar := peek64(base) as pchar;
-      var slen:  int64 := peek64(base + CG_LOCAL_OFF_NAMELEN);
-      if (slen == nlen && self.cg_seq(sname, slen, name, nlen)) {   // #2176
-        if (self.zlAktiv != 0) { self.zlFlA += 1; self.zlFlV += self.localCount - i; }   // #2174
-        return peek64(base + CG_LOCAL_OFF_RBPOFF);
-      }
-      i -= 1;
-    }
-    if (self.zlAktiv != 0) { self.zlFlA += 1; self.zlFlV += self.localCount - self.localBase; }   // #2174
-    return 0;  // 0 = not found (valid offsets are always negative)
+    if (self.zlAktiv != 0) { self.zlFlA += 1; }   // #2174: Aufrufe weiter zaehlen
+    var i: int64 := self.cg_findLocalIdx(name, nlen);
+    if (i < 0) { return 0; }   // 0 = not found (valid offsets are always negative)
+    return peek64(self.locals + i * CG_LOCAL_SZ + CG_LOCAL_OFF_RBPOFF);
   }
 
   // Returns index (0-based) of local by name, or -1 if not found
@@ -2145,7 +2157,39 @@ pub type Codegen = class {
     self.cg_loadRax(peek64(self.locals + li * CG_LOCAL_SZ + CG_LOCAL_OFF_RBPOFF));
   }
 
+  // #2316: Merker fuer cg_findLocalIdx. 2,2 Mio Aufrufe je Selbstbau, im
+  // Schnitt 9,01 Vergleiche — ein Index zahlt sich bei dieser Laenge nicht
+  // aus (der Hash muesste den ganzen Namen durchrechnen, die 9 Vergleiche
+  // scheitern meist schon am Laengenfilter aus #2308). Was sich lohnt, ist
+  // die WIEDERHOLUNG zu sparen, wie bei cg_findClass (#2309).
+  //
+  // Der Schluessel muss das SICHTFENSTER eindeutig bestimmen. Die Anzahl
+  // allein genuegt NICHT: ein Gueltigkeitsbereich wird am Ende abgeschnitten
+  // (localCount := savedLocals, sechs Stellen), der naechste legt auf
+  // demselben Platz eine ANDERE Variable an — gleiche Anzahl, anderer Inhalt,
+  // und der Merker haette still den falschen Slot geliefert.
+  //
+  // Deshalb zusaetzlich localGen: die Zahl aller je angelegten Locals. Sie
+  // zaehlt NUR in cg_addLocal hoch, also an einer Stelle; die sechs
+  // Abschneidestellen brauchen davon nichts zu wissen, weil ein Abschneiden
+  // die Anzahl aendert und ein spaeteres Anlegen die Generation. Zu gleichem
+  // (Generation, Anzahl) gehoert damit zwingend derselbe Inhalt — Slots unter
+  // der Spitze werden nie umgeschrieben, cg_addLocal haengt nur an.
   fn cg_findLocalIdx(name: pchar, nlen: int64): int64 {
+    if ((name as int64) == self.flNameP && nlen == self.flNameL
+        && self.locals == self.flTab && self.localCount == self.flCnt
+        && self.localBase == self.flBase && self.localGen == self.flGen) {
+      return self.flIdx;
+    }
+    var r: int64 := self.cg_findLocalIdxKern(name, nlen);
+    self.flNameP := name as int64; self.flNameL := nlen;
+    self.flTab := self.locals; self.flCnt := self.localCount;
+    self.flBase := self.localBase; self.flGen := self.localGen;
+    self.flIdx := r;
+    return r;
+  }
+
+  fn cg_findLocalIdxKern(name: pchar, nlen: int64): int64 {
     var i: int64 := self.localCount - 1;
     while (i >= self.localBase) {  // WP-02: respect localBase
       var base: int64 := self.locals + i * CG_LOCAL_SZ;
