@@ -36,6 +36,31 @@ zaehle() {   # Datei -> "gesamt|nr:anzahl,..."
 import sys, collections
 d = open(sys.argv[1], 'rb').read()
 pos = [i for i in range(len(d) - 1) if d[i] == 0x0F and d[i+1] == 0x05]
+# #2324: `0F 05` im Bytestrom ist nicht zwingend ein `syscall`-BEFEHL — es kann
+# auch MITTEN in einem anderen Befehl stehen. Gesehen bei einem `call rel32`
+# mit der Verschiebung 0xFFFF050F: dort stehen die beiden Bytes als Teil der
+# Weite. Ein solcher Treffer wandert mit dem Code-Layout, taucht also auf und
+# verschwindet, sobald sich irgendwo eine Laenge aendert — genau so wurde
+# dieser Test rot, obwohl die ECHTEN Syscalls (1, 231, 231) unveraendert waren.
+#
+# Das ist die Lehre aus #1370 auf der Zaehlseite: verglichen werden
+# BEFEHLSGRENZEN, nicht Text. Ein vollstaendiger Dekodierer waere hier zu
+# viel; es genuegt, die Faelle auszuschliessen, in denen die beiden Bytes
+# nachweislich in der Verschiebung eines unmittelbar davorstehenden Ruf- oder
+# Sprungbefehls liegen (E8/E9 rel32, 0F 8x rel32). Die Weite ist vier Byte
+# lang, `0F 05` kann darin an drei Stellen beginnen.
+def in_verschiebung(p):
+    # Steht `0F 05` als k-tes Byte der vier Byte langen Weite (k = 1..3), dann
+    # liegt das Opcode-Byte bei p-k: `E8`/`E9` beim Ruf- bzw. Sprungbefehl,
+    # `0F 8x` beim bedingten Sprung (dort ist p-k das zweite Opcode-Byte).
+    for k in (1, 2, 3):
+        a = p - k
+        if a >= 0 and d[a] in (0xE8, 0xE9):
+            return True
+        if a >= 1 and d[a-1] == 0x0F and 0x80 <= d[a] <= 0x8F:
+            return True
+    return False
+
 c = collections.Counter()
 for p in pos:
     nr = None
@@ -43,8 +68,10 @@ for p in pos:
         nr = int.from_bytes(d[p-8:p], 'little')       # movabs rax, imm64
     elif p >= 5 and d[p-5] == 0xB8:
         nr = int.from_bytes(d[p-4:p], 'little')       # mov eax, imm32
+    elif in_verschiebung(p):
+        continue                                      # kein Befehl, nur Bytes
     c[nr] += 1
-print("%d|%s" % (len(pos), ",".join("%s:%d" % (k, v) for k, v in sorted(c.items(), key=lambda x: (x[0] is None, x[0])))))
+print("%d|%s" % (sum(c.values()), ",".join("%s:%d" % (k, v) for k, v in sorted(c.items(), key=lambda x: (x[0] is None, x[0])))))
 PY
 }
 

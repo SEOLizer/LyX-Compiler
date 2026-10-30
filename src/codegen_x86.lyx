@@ -5322,6 +5322,18 @@ pub type Codegen = class {
     if (k == 2) { sc := 1; }
     if (k == 4) { sc := 2; }
     if (k == 8) { sc := 3; }
+    // #2324: Basis 101 (rbp/r13) bedeutet mit mod=00 "32-Bit-Verschiebung
+    // ohne Basis" — dieselbe Falle wie in #2205. Mit mod=01 und einer
+    // Verschiebung von 0 ist r13 als Basis dagegen gueltig. Das kostet EIN
+    // Byte und bleibt EIN Befehl; der Weg davor war: Adresse rechnen, in ein
+    // Register schieben, dann laden (drei Befehle), und beim linken Operanden
+    // zusaetzlich retten und zurueckholen.
+    if ((basis & 7) == 5) {
+      self.cg_e8(0x44 | ((reg & 7) << 3));        // ModRM: mod=01, rm=100 (SIB)
+      self.cg_e8((sc * 64) | ((index & 7) << 3) | (basis & 7));
+      self.cg_e8(0);                              // disp8 = 0
+      return;
+    }
     self.cg_e8(0x04 | ((reg & 7) << 3));          // ModRM: mod=00, rm=100 (SIB)
     self.cg_e8((sc * 64) | ((index & 7) << 3) | (basis & 7));
   }
@@ -17157,7 +17169,14 @@ pub type Codegen = class {
             // dagegen gueltig, Tauschen ist hier aber nicht moeglich, weil die
             // Skalierung am Index haengt.
             var pkGeht: int64 := 1;
-            if (pkBasisReg == 13) { pkGeht := 0; }
+            // #2324: r13 als Basis geht jetzt — cg_memBasisIndex kodiert sie
+            // mit mod=01 und Verschiebung 0. Vorher fiel JEDER Zugriff mit
+            // r13 als Basis auf den allgemeinen Weg zurueck, und das traf
+            // regelmaessig den ERSTEN Parameter einer Funktion: der liegt
+            // nach cg_rlWaehlen meist in r13. Im Kern aus bench/arr_int.lyx
+            // bekam `peek8(b + i)` deshalb die indizierte Form und
+            // `peek8(a + i)` nicht — gleiche Quellform, verschiedene
+            // Behandlung, allein wegen der Registernummer.
             if (pkBasisReg >= 12 && pkBasisReg == pkIndex) { pkGeht := 0; }
             // Beim SCHREIBEN muss die Basis VORHER tragfaehig sein: sobald der
             // Wert in rax steht, ist der allgemeine Weg nicht mehr erreichbar.
@@ -17200,7 +17219,29 @@ pub type Codegen = class {
             if (pkGeht != 0) {
               // Schreiben: erst der WERT nach rax — danach ist die Adresse
               // ohne Umweg erreichbar, das push/pop-Paar entfaellt.
-              self.cg_genExpr(pkWert);
+              //
+              // #2324: `(X) & 0xFF` vor einem 8-Bit-Schreibbefehl ist TOT —
+              // `mov [..], al` schreibt nur das untere Byte, die Maske davor
+              // aendert daran nichts. Ebenso 0xFFFF vor 16 Bit und
+              // 0xFFFFFFFF vor 32. Das ist dieselbe Ueberlegung, die #2247
+              // schon fuer `peek32(...) & 0xFFFFFFFF` auf der LESESEITE
+              // angestellt hat (p32Erfuellt) — hier die Schreibseite, die
+              // damals nicht nachgezogen wurde. Im Kern aus bench/arr_int.lyx
+              // ist es ein Befehl je Element.
+              var pkW2: int64 := pkWert;
+              if (pkArt >= 5 && pkArt <= 7 && pkW2 >= 0
+                  && self.cg_nkind(pkW2) == CGN_BINOP && self.cg_nival(pkW2) == CGT_BITAND) {
+                var pkMi: int64 := self.cg_nc1(pkW2);
+                if (pkMi >= 0 && self.cg_tryFold(pkMi) != 0) {
+                  var pkMv: int64 := self.foldBuf;
+                  var pkSoll: int64 := 0;
+                  if (pkArt == 5) { pkSoll := 255; }
+                  if (pkArt == 6) { pkSoll := 65535; }
+                  if (pkArt == 7) { pkSoll := 4294967295; }
+                  if (pkMv == pkSoll) { pkW2 := self.cg_nc0(pkW2); }
+                }
+              }
+              self.cg_genExpr(pkW2);
               var pkB2: int64 := pkBasisReg;
               if (pkB2 < 12) {
                 // Basis nach rbx (rax traegt den Wert). rbx ist das
