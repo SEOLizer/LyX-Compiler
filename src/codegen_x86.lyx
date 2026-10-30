@@ -1133,6 +1133,28 @@ pub type Codegen = class {
   zlLbA: int64; zlLbT: int64;    // cg_findLabel
   zlCoA: int64; zlCoT: int64;    // cg_findConIdx
   zlLnA: int64; zlLnT: int64;    // cg_lineOf (Suchschritte + einmal gelesene Zeichen, #2175)
+  // #2310: Merker fuer cg_isF64Expr. Gemessen waren 3,44 Mio Aufrufe je
+  // Selbstbau, davon 91,4 % WIEDERHOLUNGEN derselben Frage bei unveraenderter
+  // Lage; im Aufrufbaum traegt die Funktion mit ihren Kindern rund ein Fuenftel
+  // der Zeit (perf --call-graph: 318 von 1522 Stacks).
+  //
+  // Die Antwort haengt NICHT nur am Knoten. Fuer CGN_IDENT entscheidet
+  // cg_findLocalIdx, also der Stand der Locals-Tabelle: derselbe Knoten
+  // antwortet in einer anderen Funktion anders — und schon nach einer
+  // weiteren var-Deklaration in DERSELBEN Funktion. Dazu kommen Erfassungen
+  // (capturedVars, outerFuncName), Globale, Konstanten und — ueber
+  // cg_isF64ElemOf und cg_fieldTypeNameOf — die Klassenlayouts.
+  //
+  // Deshalb steht die ganze LAGE im Schluessel, statt eine Generation an den
+  // Schreibstellen zu zaehlen: eine vergessene Schreibstelle waere ein
+  // stiller falscher f64-Befund, und genau diese Fehlerart hat #905, #1373,
+  // #1499 und #2287 gekostet. Was im Schluessel steht, kann nicht veralten.
+  //
+  // Eintrag (80 Byte): ni+1 (0 = leer), pNodes, localBase, localCount,
+  // capturedCount, outerFuncName, globalVarCount, conCount, classCount,
+  // Antwort.
+  zlF4A: int64; zlF4W: int64;
+  zlF4Tab: int64; zlF4Cap: int64;
   // #2175: Zeilenanfaenge je Quelltext fuer cg_lineOf. Eintrag (32 Byte):
   // Quelltextzeiger, Laenge, Zeiger auf die aufsteigenden Offsets aller '\n',
   // deren Anzahl. lnLetzt = zuletzt benutzter Eintrag.
@@ -7231,7 +7253,45 @@ pub type Codegen = class {
   }
 
   // Returns 1 if expression ni produces an f64 value (IEEE-754 bits in GP register).
+  // #2310: Mantel um cg_isF64ExprKern. Er beantwortet die Frage aus dem
+  // Merker, wenn derselbe Knoten bei GLEICHER Lage schon gefragt wurde.
   fn cg_isF64Expr(ni: int64): int64 {
+    if ni < 0 { return 0; }
+    if (self.zlF4Tab == 0) { return self.cg_isF64ExprKern(ni); }
+    var h: int64 := ni * 2654435761;
+    if (h < 0) { h := 0 - h; }
+    var e: int64 := self.zlF4Tab + (h % self.zlF4Cap) * 80;
+    if (self.zlAktiv != 0) { self.zlF4A += 1; }
+    if (peek64(e) == ni + 1
+        && peek64(e + 8)  == self.pNodes
+        && peek64(e + 16) == self.localBase
+        && peek64(e + 24) == self.localCount
+        && peek64(e + 32) == self.capturedCount
+        && peek64(e + 40) == (self.outerFuncName as int64)
+        && peek64(e + 48) == self.globalVarCount
+        && peek64(e + 56) == self.conCount
+        && peek64(e + 64) == self.classCount) {
+      if (self.zlAktiv != 0) { self.zlF4W += 1; }
+      return peek64(e + 72);
+    }
+    var r: int64 := self.cg_isF64ExprKern(ni);
+    // Die Lage wird NACH dem Kern gelesen: er fragt nur, er veraendert nichts
+    // — und wenn das eines Tages nicht mehr stimmt, gehoert der dann gueltige
+    // Stand in den Eintrag, nicht der von vorher.
+    poke64(e,      ni + 1);
+    poke64(e + 8,  self.pNodes);
+    poke64(e + 16, self.localBase);
+    poke64(e + 24, self.localCount);
+    poke64(e + 32, self.capturedCount);
+    poke64(e + 40, self.outerFuncName as int64);
+    poke64(e + 48, self.globalVarCount);
+    poke64(e + 56, self.conCount);
+    poke64(e + 64, self.classCount);
+    poke64(e + 72, r);
+    return r;
+  }
+
+  fn cg_isF64ExprKern(ni: int64): int64 {
     if ni < 0 { return 0; }
     var k: int64 := self.cg_nkind(ni);
     if k == CGN_LIT_FLOAT { return 1; }
@@ -29152,6 +29212,8 @@ pub type Codegen = class {
     self.zlFlA := 0; self.zlFlV := 0; self.zlFiA := 0; self.zlFiV := 0; self.zlFuA := 0; self.zlFuV := 0;
     self.zlFrA := 0; self.zlFrT := 0; self.zlLbA := 0; self.zlLbT := 0;
     self.zlCoA := 0; self.zlCoT := 0; self.zlLnA := 0; self.zlLnT := 0; self.zlHxS := 0;
+    self.zlF4A := 0; self.zlF4W := 0;   // #2310
+    self.zlF4Cap := 65536; self.zlF4Tab := alloc(self.zlF4Cap * 80);   // #2310
     self.lnCap := 16; self.lnTab := alloc(self.lnCap * 32); self.lnAnz := 0; self.lnLetzt := 0;   // #2175
     self.lbHx := self.cg_hxNeu(1024); self.coHx := self.cg_hxNeu(256); self.frHx := self.cg_hxNeu(256);
     self.tlCap := 16; self.tlTab := alloc(self.tlCap * 48); self.tlAnz := 0; self.tlLetzt := 0;
