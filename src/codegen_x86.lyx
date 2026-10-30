@@ -385,6 +385,15 @@ con CG_IMPORT_OFF_LEN: int64 := 8;
 // #2134: generische Funktionen. Je Deklaration ein Satz (gfRecs) mit dem
 // Kontext ihrer Unit — die Spezialisierungen entstehen erst am Ende, wenn die
 // Unit laengst durchlaufen ist, und muessen dann in ihre Tabelle zurueck.
+// #2316: ab dieser Tabellengroesse lohnt der Namensindex. Darunter bleibt es
+// bei der linearen Suche. GEMESSEN am Selbstbau (Median aus 7 abwechselnden
+// Laeufen je Fassung, taskset -c 2, cycles:u), nicht geschaetzt:
+//
+//   Schwelle 2   +1,02 %   (Hash ueber den ganzen Namen kostet mehr als die
+//                           paar Vergleiche, die am Laengenfilter scheitern)
+//   Schwelle 8    0,00 %   <- genommen
+//   Schwelle 16  +0,28 %   (die Tabellen mit 8..15 Eintraegen fallen weg)
+con CG_IDX_AB:         int64 := 8;
 con CG_GF_SZ:          int64 := 168;
 con CG_GF_OFF_NAMELEN: int64 := 8;
 con CG_GF_OFF_LBL:     int64 := 16;
@@ -879,6 +888,19 @@ pub type Codegen = class {
   // Je Eintrag 32 Byte: Name, Laenge, Marke, Markenlaenge.
   cgUnitPrivVTab:  int64;
   cgUnitPrivVCnt:  int64;
+  // #2316: Namensindex ueber diese Tabelle. Der Schluessel ist die TABELLE
+  // selbst (Zeiger und Anzahl), nicht die Unit: die beiden Felder darueber
+  // werden an zehn Stellen gesichert und zurueckgestellt (Unit-Wechsel #2097,
+  // je erzeugte Funktion CG_GF_OFF_PVTAB). Ein Index, der an seiner Tabelle
+  // haengt, reist dadurch von selbst mit und kann nie zu einer anderen
+  // gehoeren — keine dieser zehn Stellen muss davon wissen. Weicht der
+  // Schluessel ab, wird neu gebaut.
+  cgUnitPrivHx:    int64;
+  cgUnitPrivHxTab: int64;
+  cgUnitPrivHxCnt: int64;
+  // #2316: Gegenprobe — beide Suchen ausfuehren und die Antworten
+  // vergleichen. Siehe cg_privIdx.
+  idxGegenprobe:   int64;
   conStrengAnf:    int64;   // #2102
   conStreng:       int64;   // #2102
   // #1262: bekannte Import-Aliase (Name/Laenge paarweise), fuer die
@@ -16232,7 +16254,10 @@ pub type Codegen = class {
   // (globalVars, conTable) fragen hier an JEDEM Eingang (cg_addGlobal,
   // cg_findGlobal, cg_findGlobalIdx, cg_addCon, cg_findConVal, cg_hasConVal,
   // cg_findConIdx). Eine Marke enthaelt "#" und trifft sich selbst nicht.
-  fn cg_privIdx(name: pchar, nlen: int64): int64 {
+  // #2316: die lineare Suche, wie sie bis 1.2.26D die einzige war. Sie bleibt
+  // als MASSSTAB stehen: die Gegenprobe vergleicht den Index gegen sie, und
+  // bei kleinen Tabellen wird sie weiter benutzt (CG_IDX_AB).
+  fn cg_privIdxLinear(name: pchar, nlen: int64): int64 {
     var i: int64 := 0;
     while (i < self.cgUnitPrivVCnt) {
       var b: int64 := self.cgUnitPrivVTab + i * 32;
@@ -16241,6 +16266,49 @@ pub type Codegen = class {
       i := i + 1;
     }
     return 0 - 1;
+  }
+
+  // #2316: Index zur laufenden Tabelle bauen. Der erste Eintrag eines Namens
+  // gewinnt — dieselbe Antwort, die die lineare Suche von vorn gibt
+  // (cg_hxEin laesst den ersten stehen).
+  fn cg_privHxBauen() {
+    self.cgUnitPrivHx := self.cg_hxNeu(16);
+    var i: int64 := 0;
+    while (i < self.cgUnitPrivVCnt) {
+      self.cgUnitPrivHx := self.cg_hxEin(self.cgUnitPrivHx, self.cgUnitPrivVTab, 32, 8, i);
+      i := i + 1;
+    }
+    self.cgUnitPrivHxTab := self.cgUnitPrivVTab;
+    self.cgUnitPrivHxCnt := self.cgUnitPrivVCnt;
+  }
+
+  fn cg_privIdx(name: pchar, nlen: int64): int64 {
+    if (self.cgUnitPrivVCnt == 0) { return 0 - 1; }
+    // Kleine Tabelle: der Index kostet mehr als er spart (Hash ueber den
+    // ganzen Namen gegen wenige Vergleiche, die am Laengenfilter scheitern).
+    if (self.cgUnitPrivVCnt < CG_IDX_AB) { return self.cg_privIdxLinear(name, nlen); }
+    if (self.cgUnitPrivHxTab != self.cgUnitPrivVTab
+        || self.cgUnitPrivHxCnt != self.cgUnitPrivVCnt) { self.cg_privHxBauen(); }
+    var r: int64 := self.cg_hxSuch(self.cgUnitPrivHx, self.cgUnitPrivVTab, 32, 8, name, nlen);
+    // #2316: Gegenprobe. Die Gefahr bei einem Index ist nicht die falsche
+    // Antwort, sondern die AUSBLEIBENDE: wird eine Tabelle ergaenzt, ohne den
+    // Index nachzuziehen, meldet die Suche "nicht gefunden" — und das ist in
+    // diesem Compiler an vielen Stellen still eine 0 (#1966). Mit dem
+    // Schalter laufen beide Wege und muessen uebereinstimmen; ein Selbstbau
+    // und `make test` damit pruefen jede Anfuegestelle, statt sie
+    // aufzuzaehlen.
+    if (self.idxGegenprobe != 0) {
+      var l: int64 := self.cg_privIdxLinear(name, nlen);
+      if (l != r) {
+        EPrintStr("lyxc: interner Fehler (#2316): Namensindex weicht ab bei '"c);
+        sys_write(2, name as int64, nlen);
+        EPrintStr("' — Index "c); EPrintInt(r);
+        EPrintStr(", lineare Suche "c); EPrintInt(l);
+        EPrintStrLn(" (cgUnitPrivVTab)"c);
+        exit(70);
+      }
+    }
+    return r;
   }
 
   // #1655: "unit.name#fn" als Marke. Der Trenner ist derselbe wie beim
