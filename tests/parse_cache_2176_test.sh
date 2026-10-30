@@ -109,6 +109,109 @@ else
   no "zweiter bau" "$(grep -m1 -iE 'error|lyxc:' "$TMP/bau2.log")"
 fi
 
+# ------------------------------------------------------------------
+# D. #2314: ein Treffer heisst auch, dass NICHT gelesen wurde.
+#
+# Bis 1.2.26B teilte der Cache nur den Baum: der Codegen las die Datei
+# vorher trotzdem vollstaendig und verwarf den Puffer gleich wieder
+# (164 Oeffnungen fuer 82 Dateien im Selbstbau). `lesen_gespart` muss
+# deshalb GLEICH `treffer` sein — jede uebernommene Unit ist eine
+# eingesparte Lesung. Steht die Zahl darunter, liest noch jemand doppelt.
+# ------------------------------------------------------------------
+if [ -f "$TMP/tt.json" ]; then
+  w2=$(python3 -I -c "
+import json
+d=json.load(open('$TMP/tt.json'))
+ev=d['traceEvents'] if isinstance(d,dict) else d
+for e in ev:
+    a=e.get('args',{})
+    if 'parse_cache_treffer' in a:
+        print(a['parse_cache_treffer'], a.get('parse_cache_lesen_gespart','-1')); break
+else:
+    print('-1 -1')
+" 2>/dev/null)
+  tre2=${w2%% *}; gesp=${w2##* }
+  if [ "$gesp" = "-1" ]; then
+    no "lesen_gespart" "Zaehler parse_cache_lesen_gespart fehlt in der Zeitlinie"
+  elif [ "$gesp" != "$tre2" ]; then
+    no "lesen_gespart" "$tre2 Treffer, aber nur $gesp ohne Lesung — der Rest wird doppelt gelesen"
+  else
+    ok "lesen_gespart: $gesp von $tre2 Treffern ohne zweite Lesung"
+  fi
+fi
+
+# ------------------------------------------------------------------
+# E. #2314 an der WIRKUNG: jede Unit wird genau einmal geoeffnet.
+#
+# Der Zaehler oben sagt, was der Compiler ueber sich selbst meldet; hier
+# zaehlt das Betriebssystem mit. Ohne strace wird uebersprungen, nicht
+# stillschweigend fuer gut erklaert.
+# ------------------------------------------------------------------
+if command -v strace >/dev/null 2>&1; then
+  if (cd "$TMP" && timeout 300 strace -f -e trace=openat,open -o "$TMP/op.txt" \
+        "$LYXC" --std-path="$ROOT" -I"$TMP" "$TMP/haupt.lyx" -o "$TMP/haupt3" >"$TMP/bau3.log" 2>&1); then
+    mehrfach=$(grep -o '"[^"]*u/[a-z]*\.lyx"' "$TMP/op.txt" | sort | uniq -c | awk '$1 > 1 {print $2" ("$1"x)"}')
+    anz=$(grep -o '"[^"]*u/[a-z]*\.lyx"' "$TMP/op.txt" | sort -u | wc -l)
+    if [ "$anz" -lt 2 ]; then
+      no "oeffnungen" "nur $anz Unit-Datei(en) in der strace-Ausgabe gefunden — Zaehlung greift nicht"
+    elif [ -n "$mehrfach" ]; then
+      no "oeffnungen" "mehrfach geoeffnet: $mehrfach"
+    else
+      ok "oeffnungen: $anz Units, jede genau einmal geoeffnet"
+    fi
+  else
+    no "strace-lauf" "$(grep -m1 -iE 'error|lyxc:' "$TMP/bau3.log")"
+  fi
+else
+  echo "SKIP oeffnungen: strace nicht vorhanden"
+fi
+
+# ------------------------------------------------------------------
+# F. #2314: der Pfad der Unit kommt mit aus dem Cache.
+#
+# Beim Treffer oeffnet der Codegen die Datei nicht mehr und kennt ihren Pfad
+# also nicht aus eigener Anschauung. Daran haengt aber, wo `@embed` einer
+# importierten Unit sucht: relativ zu IHRER Datei, nicht zum Hauptprogramm
+# (#1971). Die Vorlage liegt deshalb NUR in u/ — findet der Compiler sie,
+# stimmt der Pfad; fehlt er, bricht die Uebersetzung ab oder nimmt eine
+# fremde Datei.
+#
+# Gegenseite: dieselbe Vorlage liegt mit ANDEREM Inhalt neben dem
+# Hauptprogramm. Ein Test, der nur "uebersetzt durch" prueft, waere auch
+# erfuellt, wenn die falsche Datei genommen wuerde.
+#
+# Dieser Teil waere vor #2314 GRUEN gewesen — er ist eine Klammer um den neuen
+# Weg, keine Wiedergabe des Defekts: bis dahin kannte der Codegen den Pfad aus
+# seiner eigenen Lesung. Rot wird er, sobald der Pfad nicht mehr aus dem Cache
+# mitkommt. Die Defektseite von #2314 prueft Teil E.
+# ------------------------------------------------------------------
+mkdir -p "$TMP/r/u"
+printf 'aus-der-unit' > "$TMP/r/u/vorlage.txt"
+printf 'aus-dem-hauptprogramm' > "$TMP/r/vorlage.txt"
+cat > "$TMP/r/u/drei.lyx" <<'LYX'
+unit u.drei;
+pub fn DreiText(): pchar { return @embed("vorlage.txt"); }
+pub fn DreiLen(): int64 { return @embed_len("vorlage.txt"); }
+LYX
+cat > "$TMP/r/haupt.lyx" <<'LYX'
+unit main;
+import std.io;
+import u.drei;
+fn main(): int64 { PrintStr(DreiText()); PrintStr("\n"c); return 0; }
+LYX
+if (cd "$TMP/r" && timeout 200 "$LYXC" --std-path="$ROOT" -I"$TMP/r" "$TMP/r/haupt.lyx" -o "$TMP/r/haupt" >"$TMP/r/bau.log" 2>&1); then
+  istr=$( cd "$TMP/r" && timeout 30 ./haupt 2>&1 )
+  if [ "$istr" = "aus-der-unit" ]; then
+    ok "embed-pfad: @embed der Unit aus u/ genommen"
+  elif [ "$istr" = "aus-dem-hauptprogramm" ]; then
+    no "embed-pfad" "Vorlage neben dem Hauptprogramm genommen — der Pfad der Unit fehlt (#1971/#2314)"
+  else
+    no "embed-pfad" "unerwartete Ausgabe '$istr'"
+  fi
+else
+  no "embed-pfad" "$(grep -v Copyright "$TMP/r/bau.log" | grep -m1 -iE 'error|lyxc:')"
+fi
+
 echo "=== PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
 exit 0
