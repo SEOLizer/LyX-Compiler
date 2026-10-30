@@ -898,6 +898,18 @@ pub type Codegen = class {
   cgUnitPrivHx:    int64;
   cgUnitPrivHxTab: int64;
   cgUnitPrivHxCnt: int64;
+  // #2316 Schritt 2: dasselbe fuer die Klassen- und die Globalstabelle.
+  // Anders als die private Tabelle WACHSEN diese beiden waehrend der
+  // Uebersetzung (classCount bzw. globalVarCount steigen). Ein Neubau je
+  // Anfuegung waere quadratisch; deshalb wird NACHGETRAGEN, solange der
+  // Tabellenzeiger derselbe ist, und nur bei einem Zeigerwechsel (die
+  // Tabelle wurde umkopiert) neu gebaut.
+  clsHx:    int64;
+  clsHxTab: int64;
+  clsHxCnt: int64;
+  gvHx:     int64;
+  gvHxTab:  int64;
+  gvHxCnt:  int64;
   // #2316: Gegenprobe — beide Suchen ausfuehren und die Antworten
   // vergleichen. Siehe cg_privIdx.
   idxGegenprobe:   int64;
@@ -2988,21 +3000,68 @@ pub type Codegen = class {
     }
   }
 
+  // #2316: lineare Suche in der Globalstabelle als MASSSTAB. Sie liefert den
+  // INDEX; wer den Datenversatz braucht, liest ihn am Eintrag (cg_findGlobal).
+  fn cg_gvIdxLinear(name: pchar, nlen: int64): int64 {
+    var i: int64 := 0;
+    while (i < self.globalVarCount) {
+      var base: int64 := self.globalVars + i * 24;
+      var glen: int64 := peek64(base + CG_GLOBAL_OFF_NAMELEN);
+      if (glen == nlen && self.cg_seq(peek64(base) as pchar, glen, name, nlen)) { return i; }
+      i += 1;
+    }
+    return 0 - 1;
+  }
+
+  // #2316: Index der Globalstabelle pflegen — nachtragen, solange der Zeiger
+  // derselbe ist; neu bauen nach dem Umkopieren (cg_addGlobal verdoppelt).
+  fn cg_gvHxPflegen() {
+    if (self.gvHxTab != self.globalVars || self.gvHxCnt > self.globalVarCount) {
+      self.gvHx := self.cg_hxNeu(64);
+      self.gvHxTab := self.globalVars;
+      self.gvHxCnt := 0;
+    }
+    while (self.gvHxCnt < self.globalVarCount) {
+      self.gvHx := self.cg_hxEin(self.gvHx, self.globalVars, 24,
+                                 CG_GLOBAL_OFF_NAMELEN, self.gvHxCnt);
+      self.gvHxCnt := self.gvHxCnt + 1;
+    }
+  }
+
+  // #2316: EIN Eingang fuer beide Wege (cg_findGlobal, cg_findGlobalIdx). Die
+  // beiden liefen bis 1.2.26E jeder seine eigene Schleife ueber dieselbe
+  // Tabelle — und unterschiedlich: cg_findGlobal hatte den Laengenfilter aus
+  // #2176 nicht. Zwei Suchen ueber eine Tabelle sind die Stelle, an der die
+  // eine spaeter nachgezogen wird und die andere nicht (CLAUDE.md: "die zweite
+  // Stelle wurde nicht nachgezogen").
+  fn cg_gvIdx(name: pchar, nlen: int64): int64 {
+    if (self.globalVarCount < CG_IDX_AB) { return self.cg_gvIdxLinear(name, nlen); }
+    self.cg_gvHxPflegen();
+    var r: int64 := self.cg_hxSuch(self.gvHx, self.globalVars, 24,
+                                   CG_GLOBAL_OFF_NAMELEN, name, nlen);
+    if (self.idxGegenprobe != 0) {
+      var l: int64 := self.cg_gvIdxLinear(name, nlen);
+      if (l != r) {
+        EPrintStr("lyxc: interner Fehler (#2316): Namensindex weicht ab bei Global '"c);
+        sys_write(2, name as int64, nlen);
+        EPrintStr("' — Index "c); EPrintInt(r);
+        EPrintStr(", lineare Suche "c); EPrintInt(l);
+        EPrintStrLn(" (globalVars)"c);
+        exit(70);
+      }
+    }
+    return r;
+  }
+
   fn cg_findGlobal(name: pchar, nlen: int64): int64 {
     var pvI: int64 := self.cg_privIdx(name, nlen);   // #2097/#2099
     if (pvI >= 0) {
       name := peek64(self.cgUnitPrivVTab + pvI * 32 + 16) as pchar;
       nlen := peek64(self.cgUnitPrivVTab + pvI * 32 + 24);
     }
-    var i: int64 := 0;
-    while (i < self.globalVarCount) {
-      var base: int64 := self.globalVars + i * 24;
-      var gname: pchar := peek64(base) as pchar;
-      var glen:  int64 := peek64(base + CG_GLOBAL_OFF_NAMELEN);
-      if (self.cg_seq(gname, glen, name, nlen)) { return peek64(base + CG_GLOBAL_OFF_DOFF); }
-      i += 1;
-    }
-    return -1;
+    var gi: int64 := self.cg_gvIdx(name, nlen);
+    if (gi < 0) { return 0 - 1; }
+    return peek64(self.globalVars + gi * 24 + CG_GLOBAL_OFF_DOFF);
   }
 
   fn cg_findGlobalIdx(name: pchar, nlen: int64): int64 {
@@ -3011,15 +3070,7 @@ pub type Codegen = class {
       name := peek64(self.cgUnitPrivVTab + pvI * 32 + 16) as pchar;
       nlen := peek64(self.cgUnitPrivVTab + pvI * 32 + 24);
     }
-    var i: int64 := 0;
-    while (i < self.globalVarCount) {
-      var base: int64 := self.globalVars + i * 24;
-      var gname: pchar := peek64(base) as pchar;
-      var glen:  int64 := peek64(base + CG_GLOBAL_OFF_NAMELEN);
-      if (glen == nlen && self.cg_seq(gname, glen, name, nlen)) { return i; }   // #2176
-      i += 1;
-    }
-    return -1;
+    return self.cg_gvIdx(name, nlen);   // #2316
   }
 
   // mov rax, [rip+disp32]
@@ -9867,27 +9918,68 @@ pub type Codegen = class {
     free(buf, 24);
   }
 
-  fn cg_findClass(name: pchar, nameLen: int64): int64 {
-    // #2176: letzte Antwort, Schluessel Zeiger + Laenge + classCount.
-    if ((name as int64) == self.fcNameP && nameLen == self.fcNameL
-        && self.classCount == self.fcCnt) {
-      return self.fcIdx;
-    }
+  // #2316: die lineare Suche als MASSSTAB — Vergleichsweg der Gegenprobe und
+  // die Fassung unter CG_IDX_AB. Ohne den Merker, damit sie unabhaengig ist.
+  fn cg_findClassLinear(name: pchar, nameLen: int64): int64 {
     var i: int64 := 0;
     while (i < self.classCount) {
       var base: int64 := self.classLayouts + i * CG_CLASS_SZ;
       var p: pchar := peek64(base) as pchar;
       var n: int64 := peek64(base + CG_PATCH_OFF_NAMEPTR);
-      if (n == nameLen && self.cg_seq(p, n, name, nameLen)) {
-        self.fcNameP := name as int64; self.fcNameL := nameLen;
-        self.fcIdx := i; self.fcCnt := self.classCount;
-        return i;
-      }
+      if (n == nameLen && self.cg_seq(p, n, name, nameLen)) { return i; }
       i += 1;
     }
+    return 0 - 1;
+  }
+
+  // #2316: Index der Klassentabelle auf den Stand bringen. Nachtragen, solange
+  // der Zeiger derselbe ist; neu bauen, wenn die Tabelle umkopiert wurde
+  // (cg_addClass verdoppelt sie) oder die Zahl kleiner wurde — Letzteres kommt
+  // nicht vor, wird aber behandelt statt stillschweigend angenommen.
+  fn cg_clsHxPflegen() {
+    if (self.clsHxTab != self.classLayouts || self.clsHxCnt > self.classCount) {
+      self.clsHx := self.cg_hxNeu(64);
+      self.clsHxTab := self.classLayouts;
+      self.clsHxCnt := 0;
+    }
+    while (self.clsHxCnt < self.classCount) {
+      self.clsHx := self.cg_hxEin(self.clsHx, self.classLayouts, CG_CLASS_SZ,
+                                  CG_PATCH_OFF_NAMEPTR, self.clsHxCnt);
+      self.clsHxCnt := self.clsHxCnt + 1;
+    }
+  }
+
+  fn cg_findClass(name: pchar, nameLen: int64): int64 {
+    // #2176/#2309: letzte Antwort, Schluessel Zeiger + Laenge + classCount.
+    // Der Merker bleibt VOR dem Index: er vergleicht drei Maschinenworte und
+    // ist damit billiger als jeder Hash ueber den Namen. Er traegt genau den
+    // Fall, der hier haeufig ist — dieselbe Namensstelle mehrfach gefragt.
+    if ((name as int64) == self.fcNameP && nameLen == self.fcNameL
+        && self.classCount == self.fcCnt) {
+      return self.fcIdx;
+    }
+    var r: int64 := 0 - 1;
+    if (self.classCount < CG_IDX_AB) {
+      r := self.cg_findClassLinear(name, nameLen);
+    } else {
+      self.cg_clsHxPflegen();
+      r := self.cg_hxSuch(self.clsHx, self.classLayouts, CG_CLASS_SZ,
+                          CG_PATCH_OFF_NAMEPTR, name, nameLen);
+      if (self.idxGegenprobe != 0) {
+        var l: int64 := self.cg_findClassLinear(name, nameLen);
+        if (l != r) {
+          EPrintStr("lyxc: interner Fehler (#2316): Namensindex weicht ab bei Klasse '"c);
+          sys_write(2, name as int64, nameLen);
+          EPrintStr("' — Index "c); EPrintInt(r);
+          EPrintStr(", lineare Suche "c); EPrintInt(l);
+          EPrintStrLn(" (classLayouts)"c);
+          exit(70);
+        }
+      }
+    }
     self.fcNameP := name as int64; self.fcNameL := nameLen;
-    self.fcIdx := -1; self.fcCnt := self.classCount;
-    return -1;
+    self.fcIdx := r; self.fcCnt := self.classCount;
+    return r;
   }
 
   fn cg_getFieldOffset(classIdx: int64, fieldName: pchar, fieldLen: int64): int64 {
