@@ -8446,14 +8446,16 @@ pub type Codegen = class {
     var v256Body: int64 := self.codeLen;
     if (ganz != 0) { self.cg_emitVexGanzSchritt(op, 1, bytes); } else { self.cg_emitVexF32Schritt(op, 1, bytes); }
     self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(0x20);  // add rax, 32
-    self.cg_paarAusrichten(self.codeLen, 5);                                 // cmp+jle als Paar
+    // #2339: Fuellung VOR den Rumpf, nicht hinein.
+    v256Body := v256Body + self.cg_rumpfAusrichten(v256Body, 5);
     self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xC8);                    // cmp rax, rcx
     self.cg_e8(0x7E); var back256: int64 := self.codeLen;                   // jle Rumpf
     self.cg_e8(v256Body - (back256 + 1));
 
     // ---- einmal 16 Byte, falls noch einer passt ----
     var nach256: int64 := self.codeLen;
-    cg_patchRel8Wert(self.code, jg256, nach256 - v256Body);
+    // #2339: ausdruecklich gegen jg256, siehe cg_emitSSE2BinOp.
+    cg_patchRel8Wert(self.code, jg256, nach256 - (jg256 + 1));
     self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC1); self.cg_e8(0x10);  // add rcx, 16  (= n*4 - 16)
     self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xC8);                    // cmp rax, rcx
     self.cg_e8(0x7F); var jg128: int64 := self.codeLen; self.cg_e8(0);       // jg nach dem Block
@@ -8573,14 +8575,18 @@ pub type Codegen = class {
     self.cg_e8(0x0F); self.cg_e8(0x57); self.cg_e8(0xC2);                    // xorps xmm0, xmm2
     self.cg_e8(0x0F); self.cg_e8(0x29); self.cg_e8(0x04); self.cg_e8(0x02);  // movaps [rdx+rax], xmm0
     self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(0x10);  // add rax, 16
-    self.cg_paarAusrichten(self.codeLen, 5);                                 // cmp+jle als Paar
+    // #2339: Fuellung VOR den Rumpf, nicht hinein.
+    vecBody := vecBody + self.cg_rumpfAusrichten(vecBody, 5);
     self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xC8);                    // cmp rax, rcx
     self.cg_e8(0x7E); var vecBackPos: int64 := self.codeLen;
     self.cg_e8(vecBody - (vecBackPos + 1));                                  // jle Rumpf
 
     // ---- Rest: Element fuer Element ----
     var tailStart: int64 := self.codeLen;
-    cg_patchRel8Wert(self.code, jgPos, tailStart - vecBody);
+    // #2339: ausdruecklich gegen jgPos gerechnet. Bis hierher stand
+    // `tailStart - vecBody` und stimmte nur, WEIL vecBody == jgPos + 1 war —
+    // eine stille Invariante, die eine Fuellung vor dem Rumpf bricht.
+    cg_patchRel8Wert(self.code, jgPos, tailStart - (jgPos + 1));
     self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC1); self.cg_e8(0x10);  // add rcx, 16
     var scalarStart: int64 := self.codeLen;
     self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xC8);                    // cmp rax, rcx
@@ -8786,8 +8792,9 @@ pub type Codegen = class {
     }
     // add rax, 16
     self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(0x10);
-    // cmp rax, rcx; jle Rumpf — als Paar ausgerichtet
-    self.cg_paarAusrichten(self.codeLen, 5);
+    // cmp rax, rcx; jle Rumpf — als Paar ausgerichtet.
+    // #2339: Fuellung VOR den Rumpf, nicht hinein.
+    vecBody := vecBody + self.cg_rumpfAusrichten(vecBody, 5);
     self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xC8);
     self.cg_e8(0x7E);
     var vecBackPos: int64 := self.codeLen;
@@ -8795,7 +8802,9 @@ pub type Codegen = class {
 
     // ---- Rest: rcx zurueck auf die volle Bytezahl, dann 4 Byte je Schritt ----
     var tailStart: int64 := self.codeLen;
-    cg_patchRel8Wert(self.code, jgPos, tailStart - vecBody);
+    // #2339: ausdruecklich gegen jgPos, nicht ueber die stille Invariante
+    // vecBody == jgPos + 1 — die bricht, sobald vor dem Rumpf gefuellt wird.
+    cg_patchRel8Wert(self.code, jgPos, tailStart - (jgPos + 1));
     // add rcx, 16
     self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC1); self.cg_e8(0x10);
     var scalarStart: int64 := self.codeLen;
@@ -9856,6 +9865,61 @@ pub type Codegen = class {
       i -= 1;
     }
     self.cg_nopsSchreiben(anfang, pad);
+  }
+
+  // #2339: Dasselbe Ziel wie cg_paarAusrichten — ein cmp/jcc-Paar nicht ueber
+  // eine 32-Byte-Grenze legen —, aber fuer das Ende eines SCHLEIFENRUMPFES.
+  //
+  // Der Unterschied ist, WO bezahlt wird. cg_paarAusrichten schiebt die
+  // Fuellung unmittelbar vor das Paar; in einer Schleife liegt sie damit IM
+  // RUMPF und laeuft bei jedem Durchlauf mit. Gemessen am Kern int32_sum_L1
+  // (4096 Elemente, 20000 Wiederholungen, i5-8250U, Median aus fuenf):
+  //
+  //     Paar sauber, keine Fuellung im Rumpf      41.828.337 Takte
+  //     dieselbe Schleife mit 5 Byte Fuellung     ~52.000.000 Takte   1,25x
+  //
+  // Die Fuellung kostet also real. Sie WEGZULASSEN ist aber viel teurer —
+  // dieselbe Schleife mit straddelndem Paar, Vorlauf vor der Schleife, sonst
+  // byteweise identisch:
+  //
+  //     cmp auf mod32 = 27   177.300.997 Takte   4,24x
+  //     cmp auf mod32 = 28    82.899.730 Takte   1,98x
+  //     cmp auf mod32 = 29    63.207.925 Takte   1,51x
+  //     cmp auf mod32 = 30    62.476.784 Takte   1,49x
+  //     cmp auf mod32 = 31    62.521.549 Takte   1,49x
+  //
+  // Ausrichten ist also richtig; nur die Fuellung gehoert nicht in den Rumpf.
+  // Diese Funktion verschiebt deshalb den GANZEN Rumpf nach hinten und legt
+  // die Fuellung VOR den Schleifenanfang — dort laeuft sie einmal je
+  // Schleifeneintritt.
+  //
+  // Rueckgabe: die Zahl der eingefuegten Bytes. DER AUFRUFER MUSS SEINEN
+  // RUMPFANFANG DARUM ERHOEHEN — sonst zeigt der Ruecksprung hinter die
+  // Fuellung statt auf den ersten Befehl des Rumpfes.
+  //
+  // Voraussetzung: der Rumpf traegt keine inneren Flickstellen, die als
+  // absoluter Versatz vermerkt sind. Fuer die Vektorrumpfe gilt das — die
+  // Vorwaertsweite steht davor und wird nach dem Rumpf geflickt, die
+  // Rueckwaertsweite wird aus der Endlage gerechnet.
+  fn cg_rumpfAusrichten(rumpfAnfang: int64, rest: int64): int64 {
+    var a: int64 := self.codeLen + 0xb0;
+    var ende: int64 := self.codeLen + rest + 0xb0;             // exklusiv
+    if ((a >> 5) == ((ende - 1) >> 5) && (ende & 31) != 0) { return 0; }
+    var pad: int64 := 32 - (a & 31);
+    var lang: int64 := self.codeLen - rumpfAnfang;
+    if (lang <= 0) { return 0; }
+    var i: int64 := 0;
+    while (i < pad) { self.cg_e8(0x90); i += 1; }               // Platz schaffen
+    // Den Rumpf von HINTEN kopieren, die Bereiche ueberlappen.
+    var quelle: int64 := self.code + rumpfAnfang;
+    var ziel:   int64 := quelle + pad;
+    i := lang - 1;
+    while (i >= 0) {
+      poke8(ziel + i, peek8(quelle + i));
+      i -= 1;
+    }
+    self.cg_nopsSchreiben(rumpfAnfang, pad);
+    return pad;
   }
 
   // #2247: Den naechsten Befehl auf eine 32-Byte-Grenze legen.
@@ -24203,7 +24267,9 @@ pub type Codegen = class {
       self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0xD4); self.cg_e8(0xE5);      // paddq xmm4, xmm5
     }
     self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(0x10);        // add rax, 16
-    self.cg_paarAusrichten(self.codeLen, 5);
+    // #2339: Fuellung VOR den Rumpf, nicht hinein. Der Vorwaertssprung oben
+    // ist rel32 und wird aus codeLen geflickt, zieht also von selbst nach.
+    vecBody := vecBody + self.cg_rumpfAusrichten(vecBody, 5);
     self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xC8);                          // cmp rax, rcx
     self.cg_e8(0x7E);                                                              // jle Rumpf
     var vecBack: int64 := self.codeLen;
