@@ -20,9 +20,19 @@
 #      darf KEINE Division enthalten, eines mit variablem Divisor muss eine
 #      enthalten. Ohne die zweite Haelfte wuerde der Test auch bestehen, wenn
 #      gar nicht umgeformt wird.
-#   3. GEGENSEITE DER ERKENNUNG: ein Divisor, der KEINE Zweierpotenz ist
-#      (1000), muss weiter ueber die Division laufen und richtig rechnen. Sonst
-#      waere nicht belegt, dass die Bedingung eng genug ist.
+#   3. GEGENSEITE DER ERKENNUNG: ein Divisor, den die Bedingung NICHT trifft,
+#      muss weiter ueber die Division laufen und richtig rechnen. Sonst waere
+#      nicht belegt, dass die Bedingung eng genug ist.
+#
+#      Dieser Nachweis stand bis 1.2.26K auf dem Divisor 1000 — und wurde
+#      damit rot, sobald #2330 Schritt 2 auch den allgemeinen konstanten
+#      Divisor per Multiplikation erledigte. Genau der Fall, vor dem
+#      CLAUDE.md warnt: ein Test darf nicht voraussetzen, dass eine Luecke
+#      offen bleibt. Die Gegenseite steht deshalb jetzt auf einem Divisor,
+#      den BEIDE Schritte ablehnen: 6148914691236517206 liegt ueber 2^62
+#      (Schritt 2 braucht die Kopffreiheit fuer seine Schleifenschranke) und
+#      ist keine Zweierpotenz. Dass 1000 richtig rechnet, wird weiter
+#      geprueft — nur nicht mehr daran, dass es LANGSAM rechnet.
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LYXC="${LYXC:-$ROOT/lyxc}"
@@ -150,6 +160,10 @@ if baue konst "$Q_KONST" && baue vari "$Q_VAR"; then
 fi
 
 # ---------------------------------------------------------------- 3
+# 1000 ist keine Zweierpotenz und muss richtig rechnen. SEIT #2330 Schritt 2
+# laeuft es allerdings ebenfalls ohne idiv (Multiplikation mit Faktor), taugt
+# also nicht mehr als Nachweis dafuer, dass die Zweierpotenz-Bedingung eng
+# ist. Der Wert wird weiter geprueft, der Weg nicht mehr.
 Q_NICHTPOT='unit main;
 import std.io;
 fn f(x: int64): int64 { return (x / 1000) + (x % 1000); }
@@ -157,11 +171,23 @@ fn main(): int64 { PrintInt(f(12345)); PrintStr("\n"); return 0; }'
 if baue nichtpot "$Q_NICHTPOT"; then
   aus=$( cd "$TMP" && timeout 30 ./nichtpot 2>&1 )
   if [ "$aus" = "357" ]; then ok "kein Zweierpotenz-Divisor rechnet richtig (357)"; else no "nicht-Zweierpotenz" "'$aus' erwartet 357"; fi
-  nn=$(divzahl "$TMP/nichtpot"); nk2=$(divzahl "$TMP/konst")
+fi
+
+# Die eigentliche Gegenseite: ein Divisor, den BEIDE Schritte ablehnen.
+# 6148914691236517206 liegt ueber 2^62 und ist keine Zweierpotenz, muss also
+# die Division behalten. 12345 / 6148914691236517206 ist 0, der Rest 12345.
+Q_ABGELEHNT='unit main;
+import std.io;
+fn f(x: int64): int64 { return (x / 6148914691236517206) + (x % 6148914691236517206); }
+fn main(): int64 { PrintInt(f(12345)); PrintStr("\n"); return 0; }'
+if baue abgelehnt "$Q_ABGELEHNT"; then
+  aus=$( cd "$TMP" && timeout 30 ./abgelehnt 2>&1 )
+  if [ "$aus" = "12345" ]; then ok "abgelehnter Divisor rechnet richtig (12345)"; else no "abgelehnter Divisor" "'$aus' erwartet 12345"; fi
+  nn=$(divzahl "$TMP/abgelehnt"); nk2=$(divzahl "$TMP/konst")
   if [ "$nn" -gt "$nk2" ]; then
-    ok "erzeugnis: 1000 laeuft weiter ueber die Division ($nn gegen $nk2)"
+    ok "erzeugnis: abgelehnter Divisor laeuft weiter ueber die Division ($nn gegen $nk2)"
   else
-    no "gegenseite" "1000 wurde umgeformt ($nn gegen $nk2) — die Bedingung ist zu weit"
+    no "gegenseite" "umgeformt trotz Ablehnung ($nn gegen $nk2) — die Bedingung ist zu weit"
   fi
 fi
 
