@@ -8701,6 +8701,19 @@ pub type Codegen = class {
     // sub rcx, 16  (rcx = letzter Offset, an dem noch ein voller Block passt;
     //               darf negativ werden, der Vergleich unten ist vorzeichenbehaftet)
     self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xE9); self.cg_e8(0x10);
+    // #2336: Fuer die Byte-Multiplikation braucht die Folge im Rumpf zwei
+    // feste Register, und beide werden HIER einmal gesetzt statt je Block:
+    //   xmm2 = 0      zum Entpacken der Bytes auf 16 Bit
+    //   xmm5 = 0x00FF je Wort — die Maske, die auf acht Bit ABSCHNEIDET.
+    // Die Maske entsteht ohne Speicherkonstante aus `pcmpeqw` (alle Bits)
+    // und `psrlw 8`.
+    var i8mul: int64 := 0;
+    if (ganz != 0 && bytes == 1 && op == CGT_STAR) { i8mul := 1; }
+    if (i8mul != 0) {
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0xEF); self.cg_e8(0xD2);              // pxor xmm2, xmm2
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x75); self.cg_e8(0xED);              // pcmpeqw xmm5, xmm5
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x71); self.cg_e8(0xD5); self.cg_e8(8);  // psrlw xmm5, 8
+    }
 
     // ---- Vektorteil: while (rax <= rcx), unten geprueft (#2215, wie cg_emitAVX2BinOp) ----
     // cmp rax, rcx
@@ -8713,6 +8726,32 @@ pub type Codegen = class {
       // #2247: movdqa xmm0, [rdi+rax] / xmm1, [rsi+rax]  (66 0F 6F ..)
       self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0x04); self.cg_e8(0x07);
       self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0x0C); self.cg_e8(0x06);
+      if (i8mul != 0) {
+        // #2336: 16 Byte-Produkte, abgeschnitten auf acht Bit.
+        //
+        // PACKUSWB SAETTIGT — ohne die Maske wuerde jedes Produkt ueber 255
+        // zu 255 statt zu seinen unteren acht Bit. `16 * 16` muesste 0
+        // ergeben und ergaebe 255, `255 * 255` muesste 1 ergeben und ergaebe
+        // ebenfalls 255. Ein Test mit kleinen Faktoren bestaetigt diese
+        // falsche Fassung, deshalb steht die Maske hier und nicht als
+        // Verbesserung "falls noetig".
+        //
+        // Nach dem PAND liegen alle Worte in 0..255, die Saettigung von
+        // PACKUSWB kann also nicht mehr zuschlagen.
+        self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0xD8);  // movdqa xmm3, xmm0
+        self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0xE1);  // movdqa xmm4, xmm1
+        self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x60); self.cg_e8(0xC2);  // punpcklbw xmm0, xmm2
+        self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x60); self.cg_e8(0xCA);  // punpcklbw xmm1, xmm2
+        self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x68); self.cg_e8(0xDA);  // punpckhbw xmm3, xmm2
+        self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x68); self.cg_e8(0xE2);  // punpckhbw xmm4, xmm2
+        self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0xD5); self.cg_e8(0xC1);  // pmullw xmm0, xmm1
+        self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0xD5); self.cg_e8(0xDC);  // pmullw xmm3, xmm4
+        self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0xDB); self.cg_e8(0xC5);  // pand xmm0, xmm5
+        self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0xDB); self.cg_e8(0xDD);  // pand xmm3, xmm5
+        self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x67); self.cg_e8(0xC3);  // packuswb xmm0, xmm3
+        // movdqa [rdx+rax], xmm0
+        self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x7F); self.cg_e8(0x04); self.cg_e8(0x02);
+      } else {
       var gOpc: int64 := self.cg_sseGanzOpcode(op, bytes);
       if (gOpc < 0) {
         EPrintStrLn("lyxc: interner Fehler (#2247): Ganzzahl-Vektoroperation ohne Befehl — sema haette das abweisen muessen (_pruefeVektorOpArt)."c);
@@ -8730,6 +8769,7 @@ pub type Codegen = class {
       self.cg_e8(0xC1);  // xmm0, xmm1
       // movdqa [rdx+rax], xmm0  (66 0F 7F 04 02)
       self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x7F); self.cg_e8(0x04); self.cg_e8(0x02);
+      }
     } else {
     // movaps xmm0, [rdi+rax]  (0F 28 04 07)
     self.cg_e8(0x0F); self.cg_e8(0x28); self.cg_e8(0x04); self.cg_e8(0x07);
@@ -8835,6 +8875,19 @@ pub type Codegen = class {
       if (bytes == 4) { return 0x38 + 0x40 * 256; }   // 0F 38 40
     }
     return 0 - 1;
+  }
+
+  // #2336: Fuer die Byte-MULTIPLIKATION gibt es keinen gepackten Befehl.
+  // SSE und AVX2 kennen PMULLW (16 Bit) und PMULLD (32 Bit), aber KEIN
+  // PMULLB — `cg_sseGanzOpcode(CGT_STAR, 1)` liefert deshalb zu Recht -1.
+  // Gerechnet wird stattdessen ueber Entpacken auf 16 Bit, PMULLW und
+  // Zurueckpacken; die Folge steht in cg_emitSSE2BinOp.
+  //
+  // Diese Funktion sagt, dass es diesen Weg GIBT — damit die Erkennung die
+  // Form nicht ablehnt und der Emitter nicht in den internen Fehler laeuft.
+  fn cg_sseGanzSonderweg(op: int64, bytes: int64): int64 {
+    if (op == CGT_STAR && bytes == 1) { return 1; }
+    return 0;
   }
 
   // #2247: Der skalare Rest eines Ganzzahlvektors laeuft NICHT ueber SSE —
@@ -23797,7 +23850,9 @@ pub type Codegen = class {
     var op: int64 := self.cg_nival(wert);
     if (op != CGT_PLUS && op != CGT_MINUS && op != CGT_STAR) { return 0; }
     var vOpc: int64 := self.cg_sseGanzOpcode(op, breite);
-    if (vOpc < 0) { return 0; }
+    // #2336: fuer `int8 *` gibt es keinen gepackten Befehl, aber einen
+    // eigenen Weg (Entpacken, PMULLW, Zurueckpacken).
+    if (vOpc < 0 && self.cg_sseGanzSonderweg(op, breite) == 0) { return 0; }
     // #2194: Befehle aus der 0F-38-Gruppe (PMULLD) brauchen die sse4-Zusage.
     // Bei `parallel Array` ist ein Abbruch dort richtig — wer Vektoren
     // schreibt, hat sie verlangt. Hier wird AUTOMATISCH umgeformt: eine
@@ -23895,8 +23950,14 @@ pub type Codegen = class {
 
     // Vektorteil. Die Breitenkennung traegt die Ganzzahlmarke (#2247).
     var kennung: int64 := breite | CG_SIMD_GANZ;
-    if (self.cg_cpuHat(2) != 0) { self.cg_emitAVX2BinOp(op, kennung); }
-    else                        { self.cg_emitSSE2BinOp(op, kennung); }
+    // #2336: Der Byte-Multiplikationsweg ist bisher nur als SSE2-Folge
+    // gebaut. Ohne diese Weiche liefe er mit --target-cpu=avx2 in den
+    // internen Fehler von cg_emitAVX2BinOp (Opcode -1) und BRAECHE die
+    // Uebersetzung ab — ein Abbruch waere hier schlimmer als die schmalere
+    // Fassung. Eine AVX2-Folge ist moeglich und als Rest gefuehrt.
+    var sonder: int64 := self.cg_sseGanzSonderweg(op, breite);
+    if (self.cg_cpuHat(2) != 0 && sonder == 0) { self.cg_emitAVX2BinOp(op, kennung); }
+    else                                       { self.cg_emitSSE2BinOp(op, kennung); }
 
     // Die skalare Schleife verliesse i mit dem ersten Wert, fuer den
     // `i < n` nicht mehr gilt — also n. Code hinter der Schleife darf das
