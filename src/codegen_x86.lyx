@@ -23673,12 +23673,27 @@ pub type Codegen = class {
   // Ist `adr` die Form `BASIS + idx`, wobei idx zur Schleifenvariablen passt?
   // Liefert den Rahmenversatz der Basis, sonst 0. `breite` muss zur
   // Indexform passen: bei 1 steht `i` da, sonst `i * breite`.
-  fn cg_vmBasisVon(adr: int64, iOff: int64, breite: int64): int64 {
+  //
+  // #2334: zusaetzlich die Form `BASIS + o`, wenn `o` die Hilfsvariable aus
+  // dem Rumpfkopf ist (`var o: int64 := i * breite`). Verglichen wird ihr
+  // NAME, nicht ihr Rahmenversatz: sie wird erst beim Erzeugen des Rumpfes
+  // angelegt, hat zur Erkennungszeit also noch keinen Platz, und
+  // `cg_findLocal` wuerde 0 oder eine gleichnamige AEUSSERE Variable
+  // liefern. Innerhalb des Rumpfes verdeckt die Deklaration jede aeussere
+  // gleichen Namens, und sie steht vor allen Verwendungen — der
+  // Namensvergleich trifft damit genau die gemeinte Variable.
+  // oNl == 0 heisst: keine Hilfsvariable, nur die bisherigen Formen.
+  fn cg_vmBasisVon(adr: int64, iOff: int64, breite: int64, oNm: pchar, oNl: int64): int64 {
     if (adr < 0 || self.cg_nkind(adr) != CGN_BINOP) { return 0; }
     if (self.cg_nival(adr) != CGT_PLUS) { return 0; }
     var bOff: int64 := self.cg_vmIdentOff(self.cg_nc0(adr));
     if (bOff == 0) { return 0; }
     var idx: int64 := self.cg_nc1(adr);
+    if (oNl != 0 && idx >= 0 && self.cg_nkind(idx) == CGN_IDENT
+        && self.cg_nslen(idx) == oNl
+        && self.cg_seq(self.cg_nsval(idx), self.cg_nslen(idx), oNm, oNl) != 0) {
+      return bOff;
+    }
     if (breite == 1) {
       if (self.cg_vmIdentOff(idx) != iOff) { return 0; }
       return bOff;
@@ -23699,10 +23714,46 @@ pub type Codegen = class {
     var iOff: int64 := self.cg_vmIdentOff(self.cg_nc0(bed));
     var nOff: int64 := self.cg_vmIdentOff(self.cg_nc1(bed));
     if (iOff == 0 || nOff == 0 || iOff == nOff) { return 0; }
-    // Rumpf: genau zwei Anweisungen.
+    // Rumpf: genau zwei Anweisungen — oder drei, wenn die erste eine
+    // Hilfsvariable fuer den Index anlegt (#2334).
     var rumpf: int64 := self.cg_nc1(ni);
     if (rumpf < 0 || self.cg_nkind(rumpf) != CGN_BLOCK) { return 0; }
     var s1: int64 := self.cg_nc0(rumpf);
+    // #2334: `var o: int64 := i * K` am Rumpfanfang. Ohne diesen Zweig blieb
+    // jede int16- und int32-Schleife skalar, obwohl PADDW, PADDD, PMULLW und
+    // PMULLD in cg_sseGanzOpcode stehen: `bench/arr_int.lyx` schreibt den
+    // Index als Hilfsvariable, und damit war die Pruefung auf genau zwei
+    // Anweisungen schon vor der Breite gescheitert. int8 ging, int16 lag
+    // 9,20x hinter gcc -O3 — bei identischer Rechnung.
+    //
+    // Zugelassen ist GENAU EINE solche Deklaration, und ihr Initialwert muss
+    // `i * K` mit K als Ganzzahlliteral sein. Ob K zur Breite passt, laesst
+    // sich hier noch nicht entscheiden: die Breite steht erst mit dem
+    // poke-Namen fest. Die Pruefung steht deshalb weiter unten.
+    var oNm: pchar := ""c;
+    var oNl: int64 := 0;
+    var oK: int64 := 0;
+    if (s1 >= 0 && self.cg_nkind(s1) == CGN_VAR_DECL) {
+      var ini: int64 := self.cg_nc1(s1);
+      if (ini < 0 || self.cg_nkind(ini) != CGN_BINOP) { return 0; }
+      if (self.cg_nival(ini) != CGT_STAR) { return 0; }
+      if (self.cg_vmIdentOff(self.cg_nc0(ini)) != iOff) { return 0; }
+      var kN0: int64 := self.cg_nc1(ini);
+      if (kN0 < 0 || self.cg_nkind(kN0) != CGN_LIT_INT) { return 0; }
+      oK := self.cg_nival(kN0);
+      if (oK != 1 && oK != 2 && oK != 4) { return 0; }
+      oNm := self.cg_nsval(s1);
+      oNl := self.cg_nslen(s1);
+      if (oNl <= 0) { return 0; }
+      // Die Hilfsvariable darf nicht so heissen wie Zaehler oder Schranke:
+      // sonst verdeckt sie im Rumpf genau die Groessen, die die Bedingung
+      // liest, und `i := i + 1` traefe die verdeckte Variable.
+      var iN: int64 := self.cg_nc0(bed);
+      var nN: int64 := self.cg_nc1(bed);
+      if (self.cg_seq(self.cg_nsval(iN), self.cg_nslen(iN), oNm, oNl) != 0) { return 0; }
+      if (self.cg_seq(self.cg_nsval(nN), self.cg_nslen(nN), oNm, oNl) != 0) { return 0; }
+      s1 := self.cg_nnext(s1);
+    }
     if (s1 < 0 || self.cg_nkind(s1) != CGN_EXPR_STMT) { return 0; }
     var s2: int64 := self.cg_nnext(s1);
     if (s2 < 0 || self.cg_nkind(s2) != CGN_ASSIGN) { return 0; }
@@ -23719,11 +23770,15 @@ pub type Codegen = class {
     if (ruf < 0 || self.cg_nkind(ruf) != CGN_CALL) { return 0; }
     var breite: int64 := self.cg_vmBreiteVonName(self.cg_nsval(ruf), self.cg_nslen(ruf), 0);
     if (breite == 0) { return 0; }
+    // #2334: jetzt ist die Breite bekannt — der Faktor der Hilfsvariablen
+    // muss sie treffen. `var o := i * 3` bei poke16 ist keine Indexform
+    // dieses Feldes und darf nicht durchfallen.
+    if (oNl != 0 && oK != breite) { return 0; }
     var adr: int64 := self.cg_nc0(ruf);
     if (adr < 0) { return 0; }
     var wert: int64 := self.cg_nnext(adr);
     if (wert < 0 || self.cg_nnext(wert) != -1) { return 0; }
-    var cOff: int64 := self.cg_vmBasisVon(adr, iOff, breite);
+    var cOff: int64 := self.cg_vmBasisVon(adr, iOff, breite, oNm, oNl);
     if (cOff == 0) { return 0; }
     // Maske abziehen, wenn sie genau die Breite trifft — sie ist dort tot
     // (#2324), und ohne dieses Abziehen wuerde die Form nicht erkannt.
@@ -23760,8 +23815,8 @@ pub type Codegen = class {
     var ra: int64 := self.cg_nc0(rN);
     if (la < 0 || ra < 0) { return 0; }
     if (self.cg_nnext(la) != -1 || self.cg_nnext(ra) != -1) { return 0; }
-    var aOff: int64 := self.cg_vmBasisVon(la, iOff, breite);
-    var bOff2: int64 := self.cg_vmBasisVon(ra, iOff, breite);
+    var aOff: int64 := self.cg_vmBasisVon(la, iOff, breite, oNm, oNl);
+    var bOff2: int64 := self.cg_vmBasisVon(ra, iOff, breite, oNm, oNl);
     if (aOff == 0 || bOff2 == 0) { return 0; }
     // Die Zeiger duerfen nicht die Schleifenvariable oder die Schranke sein —
     // sonst veraendert der Rumpf, was die Bedingung liest.
