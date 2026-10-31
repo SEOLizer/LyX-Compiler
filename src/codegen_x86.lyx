@@ -1240,6 +1240,7 @@ pub type Codegen = class {
   ftnNi: int64; ftnP: int64; ftnL: int64; ftnCnt: int64;
   zlHxS: int64;                  // #2175: verglichene Eintraege in cg_hxSuch (fuer die Zaehler)
   zlVmVektor: int64;             // #2194: auf den Vektorweg gelegte Schleifen
+  zlDivKonst: int64;             // #2330: Divisionen durch Zweierpotenz ohne idiv
   // #2175: Funktionsindex der obersten Ebene je (Knotentabelle, Kopf,
   // Quelltext), siehe cg_tlEintrag. Eintrag 48 Byte.
   tlTab: int64; tlAnz: int64; tlCap: int64; tlLetzt: int64;
@@ -9093,6 +9094,83 @@ pub type Codegen = class {
     return 0;
   }
 
+  // ------------------------------------------------------------------
+  // #2330: Division und Rest durch eine KONSTANTE Zweierpotenz.
+  //
+  // Bis 1.2.26J erzeugte der Codegen fuer `/` und `%` immer `idiv` bzw.
+  // `div`, auch wenn der Divisor eine Konstante war. `idiv r64` liegt auf
+  // Skylake bei 36 bis 95 Takten und laesst sich kaum ueberlappen; gemessen
+  // am Fuellkern aus #2329 kostete `i % 1000` gegenueber `i & 1023`
+  // +6,29 ns je Element, also rund 16 Takte.
+  //
+  // Dieser Schritt nimmt NUR die positiven Zweierpotenzen. Alles andere
+  // faellt weiter auf die Division zurueck — der allgemeine Fall braucht die
+  // Multiplikation mit vorbereitetem Faktor und eine eigene Pruefung.
+  //
+  // DIE FALLE, und sie ist der Grund fuer die Korrektur unten: bei
+  // VORZEICHENBEHAFTETER Division ist `x / 2^k` NICHT `sar x, k`. Der Shift
+  // rundet gegen minus unendlich, Lyx (wie C) rundet gegen null:
+  // -7 / 2 ist -3, `sar` liefert -4. Deshalb wird vorher (2^k - 1)
+  // addiert, aber nur wenn x negativ ist — die Maske aus `sar rdx, 63`
+  // erledigt das verzweigungsfrei. CLAUDE.md nennt genau diesen Fall.
+  //
+  // Der Rest folgt daraus: r = x - (x / 2^k) * 2^k. Gerechnet wird
+  // (x + korr) & ~(2^k - 1) fuer den abgeschnittenen Anteil und davon die
+  // Differenz zu x.
+  //
+  // Die Nullpruefung aus WP-BC-48 entfaellt hier zu Recht: ein konstanter
+  // Divisor ungleich null kann nicht null sein, und null nimmt diesen Weg
+  // nicht (siehe Bedingung unten).
+  fn cg_divKonstPot(op: int64, lhsNi: int64, rhsNi: int64): int64 {
+    if (op != CGT_SLASH && op != CGT_PERCENT) { return 0; }
+    if (lhsNi < 0 || rhsNi < 0) { return 0; }
+    if (self.cg_isF64Expr(lhsNi) != 0 || self.cg_isF64Expr(rhsNi) != 0) { return 0; }
+    if (self.cg_tryFold(rhsNi) == 0) { return 0; }
+    var c: int64 := self.foldBuf;
+    if (c <= 0) { return 0; }                 // null, negativ: nicht hier
+    // Zweierpotenz? Und k so klein, dass (2^k - 1) als 32-Bit-Direktwert
+    // passt — darueber waere ein weiterer Ladebefehl noetig, und der Fall
+    // kommt in der Praxis nicht vor.
+    var k: int64 := 0;
+    var t: int64 := c;
+    while ((t & 1) == 0) { t := t >> 1; k := k + 1; }
+    if (t != 1) { return 0; }                 // keine Zweierpotenz
+    if (k < 1 || k > 30) { return 0; }
+    var unsig: int64 := self.cg_isUnsignedExpr(lhsNi);
+    var maske: int64 := c - 1;
+
+    self.cg_genExpr(lhsNi);                   // rax = Dividend
+
+    if (unsig != 0) {
+      if (op == CGT_SLASH) {
+        self.cg_e8(0x48); self.cg_e8(0xC1); self.cg_e8(0xE8); self.cg_e8(k);   // shr rax, k
+      } else {
+        self.cg_e8(0x48); self.cg_e8(0x25); self.cg_e32(maske);                // and rax, maske
+      }
+      self.zlDivKonst += 1;
+      return 1;
+    }
+
+    // vorzeichenbehaftet: rdx = Vorzeichenmaske, dann Korrektur
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC2);                      // mov rdx, rax
+    self.cg_e8(0x48); self.cg_e8(0xC1); self.cg_e8(0xFA); self.cg_e8(63);      // sar rdx, 63
+    self.cg_e8(0x48); self.cg_e8(0x81); self.cg_e8(0xE2); self.cg_e32(maske);  // and rdx, maske
+    if (op == CGT_SLASH) {
+      self.cg_e8(0x48); self.cg_e8(0x01); self.cg_e8(0xD0);                    // add rax, rdx
+      self.cg_e8(0x48); self.cg_e8(0xC1); self.cg_e8(0xF8); self.cg_e8(k);     // sar rax, k
+      self.zlDivKonst += 1;
+      return 1;
+    }
+    // Rest: x - ((x + korr) & ~maske)
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC3);                      // mov rbx, rax (x)
+    self.cg_e8(0x48); self.cg_e8(0x01); self.cg_e8(0xD0);                      // add rax, rdx
+    self.cg_e8(0x48); self.cg_e8(0x25); self.cg_e32(0 - c);                    // and rax, ~maske
+    self.cg_e8(0x48); self.cg_e8(0x29); self.cg_e8(0xC3);                      // sub rbx, rax
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xD8);                      // mov rax, rbx
+    self.zlDivKonst += 1;
+    return 1;
+  }
+
   fn cg_binOpLocalRechts(op: int64, lhsNi: int64, rhsNi: int64): int64 {
     var lN: int64 := lhsNi;
     var rN: int64 := rhsNi;
@@ -14291,6 +14369,11 @@ pub type Codegen = class {
           self.cg_emitBinOp(op, self.cg_isUnsignedExpr(lhsNi),
                             self.cg_isUnsignedExpr(lhsNi) | self.cg_isUnsignedExpr(rhsNi));
         }
+      } else if (op != CGT_AND && op != CGT_OR && self.cg_divKonstPot(op, lhsNi, rhsNi) != 0) {
+        // #2330: Division oder Rest durch eine konstante Zweierpotenz — der
+        // Fall ist dort vollstaendig erzeugt. Die Pruefung steht VOR dem
+        // allgemeinen Konstantenweg darunter: der laedt die Konstante und
+        // rechnet mit idiv weiter, und genau das soll hier entfallen.
       } else if (op != CGT_AND && op != CGT_OR && self.cg_tryFold(rhsNi) != 0) {
         // CSE: RHS is constant → eval LHS into rax, mov rbx,rax, load const (no push/pop)
         var rhsVal: int64 := self.foldBuf;
@@ -14443,7 +14526,7 @@ pub type Codegen = class {
           // rax = result SIMD ptr
         } else {
           // idents but not SIMD — general path
-          if (self.cg_binOpLocalRechts(op, lhsNi, rhsNi) == 0) {   // #2114
+          if (self.cg_divKonstPot(op, lhsNi, rhsNi) == 0 && self.cg_binOpLocalRechts(op, lhsNi, rhsNi) == 0) {   // #2114
           self.cg_lhsRhsNachRbxRax(lhsNi, rhsNi);   // #2114
           if self.cg_isF64Expr(lhsNi) != 0 || self.cg_isF64Expr(rhsNi) != 0 {
             self.cg_emitMixedToF64(lhsNi, rhsNi);   // #1212
@@ -14458,7 +14541,7 @@ pub type Codegen = class {
         // General: eval LHS, push; eval RHS; pop rbx
         // #2114: rechts ein einfaches Local und beide Seiten ganzzahlig —
         // dann als Speicheroperand, ohne push/pop (cg_binOpLocalRechts).
-        if (self.cg_binOpLocalRechts(op, lhsNi, rhsNi) == 0) {
+        if (self.cg_divKonstPot(op, lhsNi, rhsNi) == 0 && self.cg_binOpLocalRechts(op, lhsNi, rhsNi) == 0) {
         self.cg_lhsRhsNachRbxRax(lhsNi, rhsNi);   // #2114
         if self.cg_isF64Expr(lhsNi) != 0 || self.cg_isF64Expr(rhsNi) != 0 {
           self.cg_emitMixedToF64(lhsNi, rhsNi);   // #1212
