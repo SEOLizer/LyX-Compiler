@@ -38,13 +38,39 @@ baue() {  # name quelle
 }
 
 paddb() {  # datei -> Anzahl PADDB/PADDW/PADDD (SSE2 oder VEX)
+  # Gezaehlt wird ueber ROHE BYTES, weil ein Lyx-Erzeugnis keine Sektionen
+  # hat und `objdump -d` daran gar nichts disassembliert.
+  #
+  # Das ist die Falle aus #1370, und sie hat hier zugeschlagen: die erste
+  # Fassung suchte `C4|C5` und ZWEI Bytes weiter den Opcode, ohne die
+  # VEX-Struktur zu pruefen. Am 2026-10-31 traf das `e8 c5 d3 fe ff` — ein
+  # `call rel32`, dessen Verschiebung mit C5 beginnt und zwei Bytes weiter
+  # FE (PADDW) enthaelt. Rot wurde der Test, weil eine Aenderung am Codegen
+  # (#2330) eine Sprungweite verschoben hat. Vorher war er GRUEN DURCH
+  # ZUFALL — derselbe Befund wie bei #2244.
+  #
+  # Jetzt wird die Praefix-STRUKTUR geprueft, nicht ein einzelnes Byte:
+  #   * 2-Byte-VEX:  C5 <R vvvv L pp> opc
+  #                  pp muss 01 sein (Praefix 66), sonst ist es kein
+  #                  PADD-Opcode-Raum.
+  #   * 3-Byte-VEX:  C4 <RXB mmmmm> <W vvvv L pp> opc
+  #                  mmmmm muss 00001 sein (0F-Karte), pp muss 01 sein —
+  #                  und der OPCODE steht an i+3. Die erste Fassung las ihn
+  #                  an i+2 und konnte den 3-Byte-VEX damit ueberhaupt
+  #                  nicht erkennen: ein zweiter Fehler im selben Zaehler.
+  # Ein Falschtreffer braucht damit drei zusammenpassende Bytes statt zwei.
   python3 -I - "$1" <<'PY'
 import sys
 d = open(sys.argv[1], 'rb').read()
+OPC = (0xFC, 0xFD, 0xFE)                 # PADDB / PADDW / PADDD
 n = 0
-for opc in (0xFC, 0xFD, 0xFE):           # PADDB / PADDW / PADDD
-    n += sum(1 for i in range(len(d)-2) if d[i] == 0x66 and d[i+1] == 0x0F and d[i+2] == opc)
-    n += sum(1 for i in range(len(d)-2) if d[i] in (0xC4, 0xC5) and d[i+2] == opc)
+for i in range(len(d) - 3):
+    if d[i] == 0x66 and d[i+1] == 0x0F and d[i+2] in OPC:
+        n += 1
+    elif d[i] == 0xC5 and (d[i+1] & 3) == 1 and d[i+2] in OPC:
+        n += 1
+    elif d[i] == 0xC4 and (d[i+1] & 0x1F) == 1 and (d[i+2] & 3) == 1 and d[i+3] in OPC:
+        n += 1
 print(n)
 PY
 }

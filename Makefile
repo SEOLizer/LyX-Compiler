@@ -21,8 +21,8 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.26K
-VERSION_DATE := 2026-10-30
+VERSION   := 1.2.27A
+VERSION_DATE := 2026-10-31
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
 UNITS_DST := $(PKG_DIR)/usr/include/lyx/units/std
@@ -521,6 +521,7 @@ test: lyxc
 	@bash tests/parse_cache_2176_test.sh
 	@bash tests/autovektor_2194_test.sh
 	@bash tests/div_konstante_2330_test.sh
+	@bash tests/div_magie_2330_test.sh
 	@bash tests/locals_merker_2316_test.sh
 	@echo "--- StrSplit zerlegt auf allen Zielen gleich (#2305) ---"
 	@bash tests/strsplit_ir_2305_test.sh

@@ -1241,6 +1241,13 @@ pub type Codegen = class {
   zlHxS: int64;                  // #2175: verglichene Eintraege in cg_hxSuch (fuer die Zaehler)
   zlVmVektor: int64;             // #2194: auf den Vektorweg gelegte Schleifen
   zlDivKonst: int64;             // #2330: Divisionen durch Zweierpotenz ohne idiv
+  zlDivMagie: int64;             // #2330: Divisionen durch konstanten Divisor ohne idiv
+  // #2330: Rueckgabewerte der Magie-Rechnung. Lyx kennt nur einen
+  // Rueckgabewert, die Nebenergebnisse liegen deshalb hier.
+  dblRest: int64;                // cg_dblMod: reduzierter Rest
+  udivRest: int64;               // cg_udiv: Rest der vorzeichenlosen Division
+  magieM: int64;                 // cg_magieVz: Faktor (Bitmuster, darf negativ sein)
+  magieS: int64;                 // cg_magieVz: Rechtsshift
   // #2175: Funktionsindex der obersten Ebene je (Knotentabelle, Kopf,
   // Quelltext), siehe cg_tlEintrag. Eintrag 48 Byte.
   tlTab: int64; tlAnz: int64; tlCap: int64; tlLetzt: int64;
@@ -9171,6 +9178,161 @@ pub type Codegen = class {
     return 1;
   }
 
+  // ------------------------------------------------------------------
+  // #2330 Schritt 2: beliebiger KONSTANTER Divisor ohne idiv.
+  //
+  // Schritt 1 nahm nur die Zweierpotenzen. Alles andere lief weiter in den
+  // `idiv` — auf Skylake 36 bis 95 Takte, kaum ueberlappbar. Der Ausweg ist
+  // seit Granlund/Montgomery bekannt und steht bei Warren (Hacker's Delight,
+  // 2. Auflage, Kapitel 10): statt durch d zu teilen, wird mit einem im
+  // Compiler ausgerechneten Faktor M multipliziert und das HOHE Wort der
+  // 128-Bit-Multiplikation geschoben.
+  //
+  //   q = (M * n) >> (64 + s)   plus zwei Korrekturen, siehe unten
+  //
+  // Das ist genau die Folge, die gcc -O3 fuer `n % 1000` erzeugt; der hier
+  // gerechnete Faktor stimmt mit dessen 0x20C49BA5E353F7CF (s = 7) ueberein.
+  //
+  // ZWEI KORREKTUREN, und jede einzelne macht bei Weglassen falsche Zahlen:
+  //
+  // 1. M kann 2^63 erreichen. Als vorzeichenbehaftete Zahl gelesen ist es
+  //    dann negativ, und `imul` rechnet um 2^64*n zu klein — deshalb in
+  //    diesem Fall `add rdx, n` vor dem Schieben. Betrifft 5712 der
+  //    Divisoren unter 20000, darunter 15, 21, 23, 25.
+  // 2. Der Shift rundet gegen minus unendlich, Lyx (wie C) gegen null.
+  //    Dieselbe Falle wie in Schritt 1, hier aber NACH dem Schieben
+  //    aufgeloest: `q - (n >> 63)` addiert 1, wenn n negativ war.
+  //
+  // Nur VORZEICHENBEHAFTETE Dividenden. Der vorzeichenlose Fall braucht
+  // einen anderen Faktor und fuer etwa die Haelfte der Divisoren eine
+  // zusaetzliche Additionsstufe mit Uebertrag; er bleibt bei `div` und ist
+  // als eigener Schritt geführt.
+  //
+  // Die Rechnung unten laeuft ohne vorzeichenbehafteten Ueberlauf, weil der
+  // Compiler mit `--overflow-checks` uebersetzt werden kann: cg_dblMod
+  // rechnet `2r - m` als `r - (m - r)`, und die Verdopplung der Quotienten
+  // benutzt `<< 1` (kein geprueftes PLUS) statt `* 2`.
+
+  // r := (2*r + bit) mod m. Rueckgabe: 1, wenn m abgezogen wurde (das ist das
+  // naechste Bit des Quotienten), Rest in self.dblRest.
+  // Vorbedingung: 0 <= r < m, 1 <= m <= 2^63-1, bit in {0,1}.
+  fn cg_dblMod(r: int64, m: int64, bit: int64): int64 {
+    var v: int64 := 0;
+    var s: int64 := 0;
+    // 2*r kann 2^63 erreichen und waere dann negativ. `r - (m - r)` ist
+    // dasselbe wie 2r - m und bleibt im Wertebereich.
+    if (r >= m - r) { v := r - (m - r); s := 1; } else { v := r + r; }
+    v := v + bit;
+    if (v >= m) { v := v - m; s := 1; }
+    self.dblRest := v;
+    return s;
+  }
+
+  // Vorzeichenlose Division a / b per Schieben und Abziehen, 64 Runden.
+  // `a` ist ein BITMUSTER und darf das oberste Bit gesetzt haben (2^63);
+  // gelesen wird es nur bitweise, gerechnet wird nie damit. `b` muss positiv
+  // sein. Rest in self.udivRest.
+  fn cg_udiv(a: int64, b: int64): int64 {
+    var q: int64 := 0;
+    var r: int64 := 0;
+    var i: int64 := 63;
+    while (i >= 0) {
+      var bit: int64 := (a >> i) & 1;
+      var s: int64 := self.cg_dblMod(r, b, bit);
+      r := self.dblRest;
+      q := (q << 1) + s;
+      i := i - 1;
+    }
+    self.udivRest := r;
+    return q;
+  }
+
+  // Faktor und Shift fuer die vorzeichenbehaftete Division durch d > 0.
+  // Verfahren aus Hacker's Delight (`magic`), mit 64-Bit-Breite und ohne
+  // 128-Bit-Arithmetik: die beiden Anfangsdivisionen gehen durch cg_udiv,
+  // danach wird nur verdoppelt und reduziert.
+  // Rueckgabe 1 bei Erfolg (self.magieM, self.magieS gesetzt), sonst 0.
+  fn cg_magieVz(d: int64): int64 {
+    var SB: int64 := 1 << 63;                 // 2^63 als Bitmuster
+    var IMAX: int64 := 0 - 1 - SB;            // 2^63-1, ohne Ueberlauf gerechnet
+    if (d < 3) { return 0; }
+    if (d > (1 << 62)) { return 0; }          // Kopffreiheit fuer q1 unten
+    self.cg_udiv(SB, d);
+    var anc: int64 := IMAX - self.udivRest;   // |nc| = 2^63-1 - (2^63 mod d)
+    if (anc < 1) { return 0; }
+    var q1: int64 := self.cg_udiv(SB, anc);
+    var r1: int64 := self.udivRest;
+    var q2: int64 := self.cg_udiv(SB, d);
+    var r2: int64 := self.udivRest;
+    var p: int64 := 63;
+    var fertig: int64 := 0;
+    while (fertig == 0) {
+      p := p + 1;
+      if (p > 127) { return 0; }              // laeuft nicht zusammen
+      var s1: int64 := self.cg_dblMod(r1, anc, 0);
+      r1 := self.dblRest;
+      q1 := (q1 << 1) + s1;
+      var s2: int64 := self.cg_dblMod(r2, d, 0);
+      r2 := self.dblRest;
+      q2 := (q2 << 1) + s2;                   // darf ueber 2^63 laufen (M < 0)
+      var delta: int64 := d - r2;
+      if (q1 < delta) { fertig := 0; } else if (q1 == delta && r1 == 0) { fertig := 0; } else { fertig := 1; }
+    }
+    if (q2 == IMAX) { return 0; }             // q2+1 waere ein Ueberlauf
+    var s: int64 := p - 64;
+    if (s < 0 || s > 63) { return 0; }
+    self.magieM := q2 + 1;
+    self.magieS := s;
+    return 1;
+  }
+
+  // Erzeugt `/` bzw. `%` mit konstantem Divisor als Multiplikation.
+  // Rueckgabe 1, wenn Code erzeugt wurde (rax traegt das Ergebnis).
+  fn cg_divKonstMagie(op: int64, lhsNi: int64, rhsNi: int64): int64 {
+    if (op != CGT_SLASH && op != CGT_PERCENT) { return 0; }
+    if (lhsNi < 0 || rhsNi < 0) { return 0; }
+    if (self.cg_isF64Expr(lhsNi) != 0 || self.cg_isF64Expr(rhsNi) != 0) { return 0; }
+    // vorzeichenlos bleibt bei `div` (anderer Faktor, Zusatzstufe)
+    if (self.cg_isUnsignedExpr(lhsNi) != 0) { return 0; }
+    if (self.cg_tryFold(rhsNi) == 0) { return 0; }
+    var d: int64 := self.foldBuf;
+    if (d < 3) { return 0; }                  // 0, negativ, 1, 2: nicht hier
+    if ((d & (d - 1)) == 0) { return 0; }     // Zweierpotenz: Schritt 1
+    if (self.cg_magieVz(d) == 0) { return 0; }
+    var M: int64 := self.magieM;
+    var sh: int64 := self.magieS;
+
+    self.cg_genExpr(lhsNi);                                                    // rax = n
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC3);                      // mov rbx, rax (n sichern)
+    self.cg_e8(0x48); self.cg_e8(0xB9); self.cg_e64(M);                        // movabs rcx, M
+    self.cg_e8(0x48); self.cg_e8(0xF7); self.cg_e8(0xE9);                      // imul rcx -> rdx:rax
+    if (M < 0) {
+      self.cg_e8(0x48); self.cg_e8(0x01); self.cg_e8(0xDA);                    // add rdx, rbx
+    }
+    if (sh > 0) {
+      self.cg_e8(0x48); self.cg_e8(0xC1); self.cg_e8(0xFA); self.cg_e8(sh);    // sar rdx, sh
+    }
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xD8);                      // mov rax, rbx
+    self.cg_e8(0x48); self.cg_e8(0xC1); self.cg_e8(0xF8); self.cg_e8(63);      // sar rax, 63
+    self.cg_e8(0x48); self.cg_e8(0x29); self.cg_e8(0xC2);                      // sub rdx, rax -> rdx = q
+    if (op == CGT_SLASH) {
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xD0);                    // mov rax, rdx
+      self.zlDivMagie += 1;
+      return 1;
+    }
+    // Rest: n - q*d. Das Produkt kann nicht ueberlaufen, denn |q*d| <= |n|.
+    if (d >= 0 - (1 << 31) && d < (1 << 31)) {
+      self.cg_e8(0x48); self.cg_e8(0x69); self.cg_e8(0xD2); self.cg_e32(d);    // imul rdx, rdx, d
+    } else {
+      self.cg_e8(0x48); self.cg_e8(0xB9); self.cg_e64(d);                      // movabs rcx, d
+      self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xAF); self.cg_e8(0xD1);  // imul rdx, rcx
+    }
+    self.cg_e8(0x48); self.cg_e8(0x29); self.cg_e8(0xD3);                      // sub rbx, rdx
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xD8);                      // mov rax, rbx
+    self.zlDivMagie += 1;
+    return 1;
+  }
+
   fn cg_binOpLocalRechts(op: int64, lhsNi: int64, rhsNi: int64): int64 {
     var lN: int64 := lhsNi;
     var rN: int64 := rhsNi;
@@ -14369,7 +14531,7 @@ pub type Codegen = class {
           self.cg_emitBinOp(op, self.cg_isUnsignedExpr(lhsNi),
                             self.cg_isUnsignedExpr(lhsNi) | self.cg_isUnsignedExpr(rhsNi));
         }
-      } else if (op != CGT_AND && op != CGT_OR && self.cg_divKonstPot(op, lhsNi, rhsNi) != 0) {
+      } else if (op != CGT_AND && op != CGT_OR && (self.cg_divKonstPot(op, lhsNi, rhsNi) != 0 || self.cg_divKonstMagie(op, lhsNi, rhsNi) != 0)) {
         // #2330: Division oder Rest durch eine konstante Zweierpotenz — der
         // Fall ist dort vollstaendig erzeugt. Die Pruefung steht VOR dem
         // allgemeinen Konstantenweg darunter: der laedt die Konstante und
@@ -14526,7 +14688,7 @@ pub type Codegen = class {
           // rax = result SIMD ptr
         } else {
           // idents but not SIMD — general path
-          if (self.cg_divKonstPot(op, lhsNi, rhsNi) == 0 && self.cg_binOpLocalRechts(op, lhsNi, rhsNi) == 0) {   // #2114
+          if (self.cg_divKonstPot(op, lhsNi, rhsNi) == 0 && self.cg_divKonstMagie(op, lhsNi, rhsNi) == 0 && self.cg_binOpLocalRechts(op, lhsNi, rhsNi) == 0) {   // #2114
           self.cg_lhsRhsNachRbxRax(lhsNi, rhsNi);   // #2114
           if self.cg_isF64Expr(lhsNi) != 0 || self.cg_isF64Expr(rhsNi) != 0 {
             self.cg_emitMixedToF64(lhsNi, rhsNi);   // #1212
@@ -14541,7 +14703,7 @@ pub type Codegen = class {
         // General: eval LHS, push; eval RHS; pop rbx
         // #2114: rechts ein einfaches Local und beide Seiten ganzzahlig —
         // dann als Speicheroperand, ohne push/pop (cg_binOpLocalRechts).
-        if (self.cg_divKonstPot(op, lhsNi, rhsNi) == 0 && self.cg_binOpLocalRechts(op, lhsNi, rhsNi) == 0) {
+        if (self.cg_divKonstPot(op, lhsNi, rhsNi) == 0 && self.cg_divKonstMagie(op, lhsNi, rhsNi) == 0 && self.cg_binOpLocalRechts(op, lhsNi, rhsNi) == 0) {
         self.cg_lhsRhsNachRbxRax(lhsNi, rhsNi);   // #2114
         if self.cg_isF64Expr(lhsNi) != 0 || self.cg_isF64Expr(rhsNi) != 0 {
           self.cg_emitMixedToF64(lhsNi, rhsNi);   // #1212
