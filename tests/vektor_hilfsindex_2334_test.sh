@@ -37,6 +37,7 @@
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LYXC="${LYXC:-$ROOT/lyxc}"
 _g="$(dirname "$0")/lib/lyxc_guard.sh"; [ -f "$_g" ] || _g="$(dirname "$0")/../lib/lyxc_guard.sh"; . "$_g"
+_v="$(dirname "$0")/lib/vektorzahl.sh"; [ -f "$_v" ] || _v="$(dirname "$0")/../lib/vektorzahl.sh"; . "$_v"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 ulimit -c 0
 PASS=0; FAIL=0
@@ -45,42 +46,6 @@ no() { echo "FAIL $1: $2"; FAIL=$((FAIL+1)); }
 
 baue() { printf '%s' "$2" > "$TMP/$1.lyx"
          (cd "$TMP" && timeout 200 "$LYXC" --std-path="$ROOT" ${3:-} "$TMP/$1.lyx" -o "$TMP/$1" >"$TMP/$1.log" 2>&1); }
-
-vekzahl() {   # Datei [opcodes] -> Anzahl gepackter Ganzzahl-Vektorbefehle
-  python3 -I - "$1" "${2:-add}" <<'PY'
-import sys
-d = open(sys.argv[1], 'rb').read()
-GRUPPEN = {
-    # PADDB/W/D, PSUBB/W/D, PMULLW  — alle in der 0F-Karte
-    'add': (0xFC, 0xFD, 0xFE, 0xF8, 0xF9, 0xFA, 0xD5),
-    'mullw': (0xD5,),
-}
-OPC = GRUPPEN[sys.argv[2]]
-n = 0
-for i in range(len(d) - 3):
-    if d[i] == 0x66 and d[i+1] == 0x0F and d[i+2] in OPC:
-        n += 1
-    elif d[i] == 0xC5 and (d[i+1] & 3) == 1 and d[i+2] in OPC:
-        n += 1
-    elif d[i] == 0xC4 and (d[i+1] & 0x1F) == 1 and (d[i+2] & 3) == 1 and d[i+3] in OPC:
-        n += 1
-print(n)
-PY
-}
-
-pmulld() {   # Datei -> Anzahl PMULLD (0F-38-Karte, deshalb eigener Zaehler)
-  python3 -I - "$1" <<'PY'
-import sys
-d = open(sys.argv[1], 'rb').read()
-n = 0
-for i in range(len(d) - 4):
-    if d[i] == 0x66 and d[i+1] == 0x0F and d[i+2] == 0x38 and d[i+3] == 0x40:
-        n += 1
-    elif d[i] == 0xC4 and (d[i+1] & 0x1F) == 2 and (d[i+2] & 3) == 1 and d[i+3] == 0x40:
-        n += 1
-print(n)
-PY
-}
 
 # ---------------------------------------------------------------- 1
 # n = 1000 ist kein Vielfaches von 16, 8 oder 4 — der Rest-Durchgang laeuft
@@ -294,7 +259,7 @@ fn main(): int64 {
   return 0;
 }'
 if baue ja "$Q_JA"; then
-  N=$(vekzahl "$TMP/ja")
+  N=$(vek_zahl "$TMP/ja.lyx" 'padd[bwd]|vpadd[bwd]|pmullw|vpmullw')
   if [ "$N" -ge 2 ]; then ok "Erzeugnis: Hilfsform wird vektorisiert ($N gepackte Befehle)"
   else no "Erzeugnis Hilfsform" "nur $N gepackte Befehle — nicht erkannt"; fi
 else
@@ -319,7 +284,7 @@ fn main(): int64 {
   return 0;
 }'
   if baue "nein_$1" "$Q"; then
-    local N; N=$(vekzahl "$TMP/nein_$1")
+    local N; N=$(vek_zahl "$TMP/nein_$1.lyx" 'padd[bwd]|vpadd[bwd]|pmullw|vpmullw')
     if [ "$N" -eq 0 ]; then ok "Gegenseite $1: kein gepackter Befehl"
     else no "Gegenseite $1" "$N gepackte Befehle — die Bedingung ist zu weit"; fi
   else
@@ -360,14 +325,14 @@ fn main(): int64 {
 }'
 A=""; B=""
 if baue mb "$Q_MULLD" "--target-cpu=baseline"; then
-  N=$(pmulld "$TMP/mb"); A=$( cd "$TMP" && timeout 60 ./mb 2>&1 )
+  N=$(vek_zahl "$TMP/mb.lyx" 'pmulld|vpmulld' --target-cpu=baseline); A=$( cd "$TMP" && timeout 60 ./mb 2>&1 )
   if [ "$N" -eq 0 ]; then ok "Gating: --target-cpu=baseline ohne PMULLD"
   else no "Gating baseline" "$N PMULLD — eine automatische Umformung hat eine CPU-Forderung erhoben"; fi
 else
   no "Gating baseline" "uebersetzt nicht: $(grep -v Copyright "$TMP/mb.log" | grep -m1 -iE 'error|lyxc:')"
 fi
 if baue ms "$Q_MULLD" "--target-cpu=sse4"; then
-  N=$(pmulld "$TMP/ms"); B=$( cd "$TMP" && timeout 60 ./ms 2>&1 )
+  N=$(vek_zahl "$TMP/ms.lyx" 'pmulld|vpmulld' --target-cpu=sse4); B=$( cd "$TMP" && timeout 60 ./ms 2>&1 )
   if [ "$N" -ge 1 ]; then ok "Gating: --target-cpu=sse4 emittiert PMULLD ($N)"
   else no "Gating sse4" "kein PMULLD, obwohl zugesagt"; fi
 else

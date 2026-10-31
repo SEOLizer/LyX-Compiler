@@ -26,6 +26,7 @@
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LYXC="${LYXC:-$ROOT/lyxc}"
 _g="$(dirname "$0")/lib/lyxc_guard.sh"; [ -f "$_g" ] || _g="$(dirname "$0")/../lib/lyxc_guard.sh"; . "$_g"
+_v="$(dirname "$0")/lib/vektorzahl.sh"; [ -f "$_v" ] || _v="$(dirname "$0")/../lib/vektorzahl.sh"; . "$_v"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 ulimit -c 0
 PASS=0; FAIL=0
@@ -35,44 +36,6 @@ no() { echo "FAIL $1: $2"; FAIL=$((FAIL+1)); }
 baue() {  # name quelle
   printf '%s' "$2" > "$TMP/$1.lyx"
   (cd "$TMP" && timeout 200 "$LYXC" --std-path="$ROOT" "$TMP/$1.lyx" -o "$TMP/$1" >"$TMP/$1.log" 2>&1)
-}
-
-paddb() {  # datei -> Anzahl PADDB/PADDW/PADDD (SSE2 oder VEX)
-  # Gezaehlt wird ueber ROHE BYTES, weil ein Lyx-Erzeugnis keine Sektionen
-  # hat und `objdump -d` daran gar nichts disassembliert.
-  #
-  # Das ist die Falle aus #1370, und sie hat hier zugeschlagen: die erste
-  # Fassung suchte `C4|C5` und ZWEI Bytes weiter den Opcode, ohne die
-  # VEX-Struktur zu pruefen. Am 2026-10-31 traf das `e8 c5 d3 fe ff` — ein
-  # `call rel32`, dessen Verschiebung mit C5 beginnt und zwei Bytes weiter
-  # FE (PADDW) enthaelt. Rot wurde der Test, weil eine Aenderung am Codegen
-  # (#2330) eine Sprungweite verschoben hat. Vorher war er GRUEN DURCH
-  # ZUFALL — derselbe Befund wie bei #2244.
-  #
-  # Jetzt wird die Praefix-STRUKTUR geprueft, nicht ein einzelnes Byte:
-  #   * 2-Byte-VEX:  C5 <R vvvv L pp> opc
-  #                  pp muss 01 sein (Praefix 66), sonst ist es kein
-  #                  PADD-Opcode-Raum.
-  #   * 3-Byte-VEX:  C4 <RXB mmmmm> <W vvvv L pp> opc
-  #                  mmmmm muss 00001 sein (0F-Karte), pp muss 01 sein —
-  #                  und der OPCODE steht an i+3. Die erste Fassung las ihn
-  #                  an i+2 und konnte den 3-Byte-VEX damit ueberhaupt
-  #                  nicht erkennen: ein zweiter Fehler im selben Zaehler.
-  # Ein Falschtreffer braucht damit drei zusammenpassende Bytes statt zwei.
-  python3 -I - "$1" <<'PY'
-import sys
-d = open(sys.argv[1], 'rb').read()
-OPC = (0xFC, 0xFD, 0xFE)                 # PADDB / PADDW / PADDD
-n = 0
-for i in range(len(d) - 3):
-    if d[i] == 0x66 and d[i+1] == 0x0F and d[i+2] in OPC:
-        n += 1
-    elif d[i] == 0xC5 and (d[i+1] & 3) == 1 and d[i+2] in OPC:
-        n += 1
-    elif d[i] == 0xC4 and (d[i+1] & 0x1F) == 1 and (d[i+2] & 3) == 1 and d[i+3] in OPC:
-        n += 1
-print(n)
-PY
 }
 
 # ---------------------------------------------------------------- 1 + 2
@@ -164,7 +127,7 @@ fi
 
 # ---------------------------------------------------------------- 3a: PADDB da
 if [ -f "$TMP/werte" ]; then
-  n=$(paddb "$TMP/werte")
+  n=$(vek_zahl "$TMP/werte.lyx" 'padd[bwd]|vpadd[bwd]')
   if [ "$n" -ge 1 ]; then ok "erzeugnis: $n Vektoraddition(en) im Code"
   else no "erzeugnis" "kein PADDB/PADDW/PADDD — es wurde nicht vektorisiert"; fi
 fi
@@ -190,7 +153,7 @@ if ! baue nein "$Q_NEIN"; then
 else
   aus=$( cd "$TMP" && timeout 30 ./nein 2>&1 )
   if [ "$aus" = "16" ]; then ok "gegenseite: Wert 16"; else no "gegenseite" "'$aus' erwartet '16'"; fi
-  n=$(paddb "$TMP/nein")
+  n=$(vek_zahl "$TMP/nein.lyx" 'padd[bwd]|vpadd[bwd]')
   if [ "$n" -eq 0 ]; then ok "gegenseite: kein Vektorbefehl (i += 2 ist nicht die erkannte Form)"
   else no "gegenseite" "$n Vektorbefehl(e), obwohl die Form nicht erkannt sein darf"; fi
 fi
@@ -204,7 +167,7 @@ Q_SKALAR=$(printf '%s' "$Q_WERTE" | sed 's|poke8(c + i, (peek8(a + i) + peek8(b 
 if ! baue skalar "$Q_SKALAR"; then
   no "skalare Fassung uebersetzen" "$(grep -v Copyright "$TMP/skalar.log" | grep -m1 -iE 'error|lyxc:')"
 else
-  ns=$(paddb "$TMP/skalar")
+  ns=$(vek_zahl "$TMP/skalar.lyx" 'padd[bwd]|vpadd[bwd]')
   if [ "$ns" -eq 0 ]; then ok "skalare Fassung: kein Vektorbefehl (Vergleichsweg ist wirklich skalar)"
   else no "skalare Fassung" "$ns Vektorbefehl(e) — der Vergleich waere wertlos"; fi
   aus=$( cd "$TMP" && timeout 60 ./skalar 2>&1 )
