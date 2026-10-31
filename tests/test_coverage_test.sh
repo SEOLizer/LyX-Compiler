@@ -119,6 +119,10 @@ is_exempt() {
                                           # von den Scripts eingebunden und vom
                                           # Waechter lyxc_guard_coverage_test.sh
                                           # selbst geprueft
+    lib/vektorzahl.sh)       return 0 ;;  # #2335: Bibliothek, kein Test — zaehlt
+                                          # Vektorbefehle ueber Befehlsgrenzen fuer
+                                          # autovektor_2194/vektor_hilfsindex_2334/
+                                          # vektor_reduktion_2335
     *)                       return 1 ;;
   esac
 }
