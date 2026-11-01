@@ -227,3 +227,11 @@ Suffix auf `A`. Der **Suffix** zählt die Kompilate innerhalb des Tages —
 Vollständig implementieren — **keine Stubs**. Was den Rahmen sprengt, wird
 nicht halb angefangen, sondern als Issue mit Repro und Lösungsweg geführt und
 im PR als nicht enthalten benannt.
+
+## Sicherheitsrelevante Änderungen
+
+Bei sicherheitsrelevanten Architektur- oder Codeänderungen (Capabilities,
+seccomp, Allokation, Parser fremder Bytes, FFI, Rechtevergabe, Netzdienste)
+den Skill `secure-development-expert` heranziehen und die dort verlangten
+Risiken, Nachweise und Tests berücksichtigen. Er ergänzt diese Regeln, er
+ersetzt sie nicht; bei Widerspruch gilt diese Datei.

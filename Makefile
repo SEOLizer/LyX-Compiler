@@ -373,6 +373,12 @@ test: lyxc
 	@bash tests/xxhash_2235_test.sh
 	@echo "--- bench/arr_int: Ganzzahl-Feldkerne wie C, drei Ziele (#2195) ---"
 	@bash tests/bench_arr_int_test.sh
+	@echo "--- Benchmark 1: Funktionsnetz rechnet in Lyx, C und Referenz gleich (#2332) ---"
+	@bash tests/bench_netz_test.sh
+	@echo "--- Arithmetikvertrag der Benchmark-Suite: uint64, mod 2^64, Rotation (#2332) ---"
+	@bash tests/arith_vertrag_test.sh
+	@echo "--- bench/vergleich: Last uebersetzt in allen Fassungen gleich (#2332) ---"
+	@bash tests/bench_vergleich_test.sh
 	@echo "--- Zeichenketten-Builtins arm64/riscv aus dem Bump-Block (#2227) ---"
 	@bash tests/bump_ir_2227_test.sh
 	@echo "--- esp32/arm-cm: 64-Bit-Anfangswerte laut beim Lesen (#2239) ---"
@@ -1324,3 +1330,11 @@ test-lyxos-units: lyxc
 	  echo "Diese Eintraege sind ueberholt:$$auferstanden"; exit 1; \
 	fi; \
 	test $$fail -eq 0
+
+.PHONY: bench-vergleich
+bench-vergleich: lyxc
+	@bash tools/bench_vergleich.sh -f 2000 -n 5 -w 2000
+
+.PHONY: bench-netz
+bench-netz: lyxc
+	@bash tools/bench_netz.sh -f 2000 -m 20 -w 200

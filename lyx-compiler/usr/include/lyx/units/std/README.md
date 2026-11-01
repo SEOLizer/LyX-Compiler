@@ -630,8 +630,11 @@ Hash functions for data structures, integrity and passwords.
 - `HashFarm32(data: pchar): int64` - FarmHash32
 - `HashFarm64(data: pchar): int64` - FarmHash64
 - `HashFarm64Hex(data: pchar): pchar` - FarmHash64 as hex
-- `HashxxHash32(data: pchar): int64` - xxHash32 (very fast)
-- `HashxxHash64(data: pchar): int64` - xxHash64
+- `HashxxHash32(data: pchar): int64` - xxHash32 (XXH32, seed 0)
+- `HashxxHash64(data: pchar): int64` - xxHash64 (XXH64, seed 0)
+- `XXHash32(data: int64, len: int64, seed: int64): int64` - XXH32 over a buffer
+- `XXHash64(data: int64, len: int64, seed: int64): int64` - XXH64 over a buffer
+- `XXHash64Str(s: pchar): int64` - XXH64 of a string, seed 0
 - `HashCRC32(data: pchar): int64` - CRC32
 - `HashInt64/32(key: int64): int64` - Integer hash
 
