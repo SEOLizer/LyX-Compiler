@@ -487,6 +487,22 @@ pub type CompilerConfig = class {
   zlEv:      int64;   // je Ereignis 32 Byte: Name, Start (ns), Dauer (ns), Zusatz (pchar oder 0)
   zlEvN:     int64;
   zlEvCap:   int64;
+  // #2343: --compile-profile — strukturiertes Compilatprofil als
+  // versioniertes JSON. Es nutzt DENSELBEN Ereignispuffer wie --time-trace
+  // (zlEv); zwei Puffer fuer dieselbe Sache waeren zwei Aufzaehlungen, die
+  // auseinanderlaufen. Eigen ist nur die Serialisierung und der Zahlenspeicher
+  // cpMet: die Zusatzwerte des Zeitstrahls liegen als vorformatierter Text in
+  // Mikrosekunden vor, das Profil braucht sie als Zahl in Nanosekunden.
+  cpAktiv:       bool;
+  cpPfad:        pchar;    // 0 = aus dem Ausgabenamen abgeleitet
+  cpLevel:       int64;    // 0 basic, 1 analysis, 2 detailed
+  cpLevelGesetzt: bool;    // fuer "Level ohne --compile-profile ist ein Fehler"
+  cpFnFilter:    pchar;
+  cpPassFilter:  pchar;
+  cpSerNs:       int64;    // Dauer der Profilserialisierung, getrennt gemessen
+  cpMet:         int64;    // je Eintrag 32 Byte: Name, Wert, Span-Index, Art
+  cpMetN:        int64;
+  cpMetCap:      int64;
   irSourceMap:  bool;
   // #2316: Namensindex gegen die lineare Suche pruefen (beide laufen, die
   // Antworten muessen uebereinstimmen). Nur fuer den Nachweis gedacht, nicht
@@ -687,6 +703,16 @@ pub type CompilerConfig = class {
     self.profileEnabled := false;
     self.tracePasses    := false;
     self.timeTrace      := 0 as pchar;   // #2174
+    self.cpAktiv        := false;        // #2343
+    self.cpPfad         := 0 as pchar;
+    self.cpLevel        := 0;
+    self.cpLevelGesetzt := false;
+    self.cpFnFilter     := 0 as pchar;
+    self.cpPassFilter   := 0 as pchar;
+    self.cpSerNs        := 0 - 1;        // -1 = nicht gemessen, nicht 0 ns
+    self.cpMet          := 0;
+    self.cpMetN         := 0;
+    self.cpMetCap       := 0;
     self.zlEvN          := 0;
     self.zlEvCap        := 0;
     self.irSourceMap    := false;
@@ -874,6 +900,12 @@ pub type CompilerConfig = class {
     }
     // Validate required options
     if self.earlyExit {
+      return false;
+    }
+    // #2343: Profiloptionen pruefen, BEVOR irgendetwas gebaut wird. Nach
+    // earlyExit, damit --help und --version davon unberuehrt bleiben.
+    if !self._cpOptionenPruefen() {
+      self.exitCode := 2;
       return false;
     }
     // Reject output paths with ".." components to prevent path traversal
@@ -1562,6 +1594,45 @@ pub type CompilerConfig = class {
       self.timeTrace := StrSub(arg, 13, StrLen(arg) - 13);
       return;
     }
+    // #2343: Compilatprofil. Der blosse Schalter und die Form mit Pfad sind
+    // ZWEI exakte Pruefungen. Ein StrStartsWith auf "--compile-profile" ohne
+    // '=' traefe auch "--compile-profile-level=..." und jeden kuenftigen
+    // Namen mit demselben Anfang; dieselbe Form hat bei --std-path schon
+    // einmal einen Pfad um ein Zeichen verschoben. Ein Schalter, der den
+    // nachfolgenden Quelldateinamen als Pfad frisst, entsteht hier gar nicht:
+    // der Pfad kommt nur nach '='.
+    if StrCmp(arg, "--compile-profile"c) == 0 {
+      self.cpAktiv := true;
+      return;
+    }
+    if StrStartsWith(arg, "--compile-profile=") {
+      // "--compile-profile=" sind 18 Zeichen einschliesslich '='.
+      var cpp: pchar := (arg + 18) as pchar;
+      if StrLen(cpp) == 0 {
+        self._rejectWert("--compile-profile"c, ""c, "ein Dateipfad"c);
+        return;
+      }
+      self.cpAktiv := true;
+      self.cpPfad := cpp;
+      return;
+    }
+    if StrStartsWith(arg, "--compile-profile-level=") {
+      var cpl: pchar := (arg + 24) as pchar;   // 24 Zeichen mit '='
+      self.cpLevelGesetzt := true;
+      if StrCmp(cpl, "basic"c) == 0    { self.cpLevel := 0; return; }
+      if StrCmp(cpl, "analysis"c) == 0 { self.cpLevel := 1; return; }
+      if StrCmp(cpl, "detailed"c) == 0 { self.cpLevel := 2; return; }
+      self._rejectWert("--compile-profile-level"c, cpl, "basic, analysis, detailed"c);
+      return;
+    }
+    if StrStartsWith(arg, "--compile-profile-function=") {
+      self.cpFnFilter := (arg + 27) as pchar;   // 27 Zeichen mit '='
+      return;
+    }
+    if StrStartsWith(arg, "--compile-profile-pass=") {
+      self.cpPassFilter := (arg + 23) as pchar;   // 23 Zeichen mit '='
+      return;
+    }
     if StrCmp(arg, "--index-gegenprobe"c) == 0 {
       self.idxGegenprobe := true;   // #2316
       return;
@@ -1663,7 +1734,7 @@ pub type CompilerConfig = class {
     if StrCmp(arg, "--version"c) == 0 {
       PrintStr("lyxc"c);
       PrintStr(" "c);
-      PrintStrLn("1.2.27E"c);
+      PrintStrLn("1.2.28A"c);
       PrintStr("Build: "c);
       PrintStrLn("bootstrap"c);
       self.exitCode := 0;
@@ -1685,7 +1756,7 @@ pub type CompilerConfig = class {
       PrintStr("  Name: "c);
       PrintStrLn("lyxc"c);
       PrintStr("  Version: "c);
-      PrintStrLn("1.2.27E"c);
+      PrintStrLn("1.2.28A"c);
       PrintStr("  Build: "c);
       PrintStrLn("bootstrap"c);
       PrintStr("  Target: "c);
@@ -1941,7 +2012,7 @@ pub type CompilerConfig = class {
   }
 
   fn printHelp(): void {
-    PrintStrLn("lyxc 1.2.27E (bootstrap)");
+    PrintStrLn("lyxc 1.2.28A (bootstrap)");
     PrintStrLn("Copyright (c) 2026 Andreas Roene. All rights reserved.");
     PrintStrLn("");
     PrintStrLn("Verwendung: lyxc <datei.lyx> [-o <ausgabe>] [--target=TARGET] [--arch=ARCH]");
@@ -1991,6 +2062,11 @@ pub type CompilerConfig = class {
     PrintStrLn("  --symtab-dump          Symbol-Tabelle ausgeben");
     PrintStrLn("  --trace-passes         Transformation Tracing");
     PrintStrLn("  --time-trace=DATEI     Zeitlinie der Phasen als JSON (Chrome-Trace-Format, #2174)");
+    PrintStrLn("  --compile-profile[=DATEI]  Compilatprofil als versioniertes JSON (#2343)");
+    PrintStrLn("                         ohne DATEI: <ausgabe>.lyxc-profile.json");
+    PrintStrLn("  --compile-profile-level=L  basic (Vorgabe), analysis, detailed");
+    PrintStrLn("  --compile-profile-function=NAME  Detaildaten auf eine Funktion beschraenken");
+    PrintStrLn("  --compile-profile-pass=ID  Detaildaten auf einen Pass beschraenken");
     PrintStrLn("  --ir-source-map        IR Source Mapping anzeigen");
     PrintStrLn("  --index-gegenprobe     Namensindex gegen die lineare Suche pruefen (#2316, langsam)");
     PrintStrLn("  --type-reasoning       Type-Checker Reasoning anzeigen");
@@ -2043,7 +2119,7 @@ pub type CompilerConfig = class {
   // ---------------------------------------------------------------------------
   
   pub fn Compile(inputFile: pchar, outputFile: pchar): int64 {
-    if self.timeTrace != 0 as pchar { self.zlStart := MonotonicTimeNano(); self.zlCpu0 := lyxc_zlCpuNs(); }   // #2174
+    if self._zlPufferAn() { self.zlStart := MonotonicTimeNano(); self.zlCpu0 := lyxc_zlCpuNs(); }   // #2174, #2343
     // WP-T15: --self-test — LCBS-Integrationstest (läuft vor dem normalen Compile-Pfad)
     if self.selfTest {
       // inputFile = argv[0] (lyxc-Binary-Pfad) wenn via main() übergeben
@@ -2214,7 +2290,7 @@ pub type CompilerConfig = class {
       sema.unitTrusted := 0;
     }
     injectSystemConstants(sema, self);         // WP-CS-05
-    if self.timeTrace != 0 as pchar { sema.zlAktiv := 1; }   // #2174
+    if self._cpZaehlerAn() { sema.zlAktiv := 1; }   // #2174, #2343
     var semaResult: int64 := sema.Check(astRoot);
     self._passEnd("sema"c, _t3);
     if self.timeTrace != 0 as pchar {
@@ -2223,6 +2299,15 @@ pub type CompilerConfig = class {
       zs := StrConcat(StrConcat(zs, self._zlKv("Lookup_aufrufe"c, sema.zlLkA)), ","c);
       zs := StrConcat(zs, self._zlKv("Lookup_vergleiche"c, sema.zlLkT));
       self._zlZusatz(zs);
+    }
+    // #2343: dieselben Zahlen als Zahl, fuer das Compilatprofil.
+    if self.cpAktiv {
+      if self.cpLevel >= 1 {
+        self._cpMet("importe_ns"c, sema.zlImpNs, 1);
+        self._cpMet("importe_units"c, sema.zlImpN, 0);
+        self._cpMet("lookup_aufrufe"c, sema.zlLkA, 0);
+        self._cpMet("lookup_vergleiche"c, sema.zlLkT, 0);
+      }
     }
 
     // WP-BC-45: --symtab-dump (non-destructive, continues compilation)
@@ -2669,7 +2754,7 @@ pub type CompilerConfig = class {
       // Offsets, und genau zwei davon haengen an diesem Schalter.
       if self.kernelMode != 0 { cg.kernelMode := 1; }
       cg.Init(source, parser.nodes, parser.toks);
-      if self.timeTrace != 0 as pchar { cg.zlAktiv := 1; }   // #2174: nach Init (Init setzt die Zaehler zurueck)
+      if self._cpZaehlerAn() { cg.zlAktiv := 1; }   // #2174: nach Init (Init setzt die Zaehler zurueck)
       cg.pNodeCount := parser.nodeCount;   // #2134: generische Funktionen
       cg.includePath := self.includePath;
       cg.stdPath     := self.stdPath;
@@ -2808,6 +2893,19 @@ pub type CompilerConfig = class {
         // Steht die Zahl unter parse_cache_treffer, liest noch jemand doppelt.
         zf := StrConcat(zf, self._zlKv("parse_cache_lesen_gespart"c, pcLesenGespart));
         self._zlZusatz(zf);
+      }
+      if self.cpAktiv {   // #2343
+        if self.cpLevel >= 1 {
+          self._cpMet("findConIdx_vergleiche"c, cg.zlCoT, 0);
+          self._cpMet("lineOf_aufrufe"c, cg.zlLnA, 0);
+          self._cpMet("lineOf_schritte"c, cg.zlLnT, 0);
+          self._cpMet("isF64Expr_aufrufe"c, cg.zlF4A, 0);
+          self._cpMet("isF64Expr_wiederholungen"c, cg.zlF4W, 0);
+          self._cpMet("parse_cache_eintraege"c, pcEintraege, 0);
+          self._cpMet("parse_cache_treffer"c, pcTreffer, 0);
+          self._cpMet("parse_cache_lesen_gespart"c, pcLesenGespart, 0);
+          self._cpMet("vektorschleifen"c, cg.zlVmVektor, 0);
+        }
       }
       return self.exitCode;
     }
@@ -2950,7 +3048,7 @@ pub type CompilerConfig = class {
     // #1845: Die IR-Strecke hatte keine Pass-Marken — bei einem 80-Sekunden-Lauf
     // waren 78 davon unbeobachtet, weil `--trace-passes` nach `analysis` endete.
     var _t5i: int64 := self._passStart("ir-lowering"c);
-    if self.timeTrace != 0 as pchar { lower.zlAktiv := 1; }   // #2174
+    if self._cpZaehlerAn() { lower.zlAktiv := 1; }   // #2174, #2343
     lower.lowerModule(astRoot);
     self._passEnd("ir-lowering"c, _t5i);
     if self.timeTrace != 0 as pchar {   // #2174
@@ -2959,6 +3057,14 @@ pub type CompilerConfig = class {
       zi := StrConcat(StrConcat(zi, self._zlKv("findTypeDecl_aufrufe"c, lower.zlTdA)), ","c);
       zi := StrConcat(zi, self._zlKv("findTypeDecl_vergleiche"c, lower.zlTdV));
       self._zlZusatz(zi);
+    }
+    if self.cpAktiv {   // #2343
+      if self.cpLevel >= 1 {
+        self._cpMet("tregFind_aufrufe"c, lower.zlTfA, 0);
+        self._cpMet("tregFind_vergleiche"c, lower.zlTfV, 0);
+        self._cpMet("findTypeDecl_aufrufe"c, lower.zlTdA, 0);
+        self._cpMet("findTypeDecl_vergleiche"c, lower.zlTdV, 0);
+      }
     }
     self.lyxosResListe := lower.irResListe;   // #1971: fuer die LBF-Ressourcenbloecke
 
@@ -5765,6 +5871,24 @@ pub type CompilerConfig = class {
   // Vergleiche der linearen Suchen). Ohne Option wird nichts gesammelt und
   // nichts gezaehlt; das Erzeugnis ist mit und ohne Option bitgleich.
   // ---------------------------------------------------------------------------
+  // #2343: Sammelt der Ereignispuffer? Fuer --time-trace und fuer jedes
+  // Profil-Level, denn Phasenzeiten stehen schon in basic.
+  fn _zlPufferAn(): bool {
+    if self.timeTrace != 0 as pchar { return true; }
+    return self.cpAktiv;
+  }
+
+  // #2343: Laufen die FEINEN Zaehler der Phasen (Lookup-Vergleiche,
+  // Cache-Treffer, Importzeiten)? Sie kosten im Rumpf der Phasen etwas, also
+  // erst ab analysis. In basic bleiben sie aus, und coverage sagt das.
+  fn _cpZaehlerAn(): bool {
+    if self.timeTrace != 0 as pchar { return true; }
+    if self.cpAktiv {
+      if self.cpLevel >= 1 { return true; }
+    }
+    return false;
+  }
+
   fn _zlEreignis(name: pchar, t0: int64, dauer: int64): void {
     if self.zlEvN >= self.zlEvCap {
       var nc: int64 := self.zlEvCap * 2;
@@ -5825,8 +5949,468 @@ pub type CompilerConfig = class {
     }
   }
 
+
+  // ---------------------------------------------------------------------------
+  // #2343: Compilatprofil (--compile-profile) — eigener Serializer auf dem
+  // Ereignispuffer von #2174. Grundsaetze des Datenvertrags:
+  //
+  //   * Jede Messung ist ein Objekt {"value":N,"origin":"measured"}. Fehlt die
+  //     Faehigkeit, steht {"value":null,"unavailable":"GRUND"} -- NIEMALS eine
+  //     0. Eine 0 heisst gemessene Null, und ein stiller Nullwert hat in
+  //     diesem Repo schon mehrfach einen Defekt verdeckt.
+  //   * Dauern in ganzen Nanosekunden, Groessen in Byte.
+  //   * coverage trennt vier Zustaende: measured, not_instrumented, not_run
+  //     und absent. "absent" heisst, den Pass gibt es im Compiler nicht;
+  //     "not_run" heisst, er existiert und lief in diesem Lauf nicht. Der
+  //     Unterschied traegt den spaeteren Buildvergleich.
+  //   * Die Summe der Spannzeiten ist KEINE Walltime. Es wird deshalb auch
+  //     keine solche Summe geschrieben -- wer sie braucht, bildet sie selbst
+  //     und weiss dann, was er tut.
+  //   * span_id gilt nur innerhalb eines Laufs; verglichen wird ueber pass_id.
+  // ---------------------------------------------------------------------------
+
+  // Zahlenspeicher der Phasenkennzahlen. Die Zusatzwerte des Zeitstrahls
+  // liegen als fertiger Text in Mikrosekunden vor; sie hier umzudeuten waere
+  // eine zweite Aufzaehlung derselben Sache. Darum die Zahl selbst, mit der
+  // Spanne, zu der sie gehoert.
+  //   art 0 = Anzahl, art 1 = Nanosekunden
+  fn _cpMet(name: pchar, wert: int64, art: int64): void {
+    if !self.cpAktiv { return; }
+    if self.cpMetN >= self.cpMetCap {
+      var nc: int64 := self.cpMetCap * 2;
+      if nc < 32 { nc := 32; }
+      var nb: int64 := alloc(nc * 32);
+      if self.cpMetN > 0 { memcpy(nb, self.cpMet, self.cpMetN * 32); }
+      self.cpMet := nb;
+      self.cpMetCap := nc;
+    }
+    var e: int64 := self.cpMet + self.cpMetN * 32;
+    poke64(e, name as int64);
+    poke64(e + 8, wert);
+    poke64(e + 16, self.zlEvN - 1);   // die zuletzt beendete Spanne
+    poke64(e + 24, art);
+    self.cpMetN := self.cpMetN + 1;
+  }
+
+  // JSON-Textwert. Nur Anfuehrungszeichen, Rueckstrich und Steuerzeichen
+  // brauchen eine Behandlung; Pfade und Namen sind sonst UTF-8-durchlaessig.
+  fn _cpEsc(v: pchar): pchar {
+    if v == 0 as pchar { return ""c; }
+    var n: int64 := StrLen(v);
+    var out: int64 := alloc(n * 6 + 1);
+    var i: int64 := 0;
+    var o: int64 := 0;
+    while i < n {
+      var c: int64 := peek8((v as int64) + i);
+      if c == 34 {
+        poke8(out + o, 92); poke8(out + o + 1, 34); o := o + 2;
+      } else if c == 92 {
+        poke8(out + o, 92); poke8(out + o + 1, 92); o := o + 2;
+      } else if c < 32 {
+        // \u00XX — die einzige Form, die jeder JSON-Leser nimmt.
+        poke8(out + o, 92); poke8(out + o + 1, 117);
+        poke8(out + o + 2, 48); poke8(out + o + 3, 48);
+        poke8(out + o + 4, self._cpHexZiffer(c / 16));
+        poke8(out + o + 5, self._cpHexZiffer(c % 16));
+        o := o + 6;
+      } else {
+        poke8(out + o, c); o := o + 1;
+      }
+      i := i + 1;
+    }
+    poke8(out + o, 0);
+    return out as pchar;
+  }
+
+  fn _cpHexZiffer(v: int64): int64 {
+    if v < 10 { return 48 + v; }
+    return 97 + (v - 10);
+  }
+
+  fn _cpTxt(k: pchar, v: pchar): pchar {
+    return StrConcat(StrConcat(StrConcat(StrConcat("\""c, k), "\":\""c), self._cpEsc(v)), "\""c);
+  }
+
+  fn _cpZahl(k: pchar, v: int64): pchar {
+    return StrConcat(StrConcat(StrConcat("\""c, k), "\":"c), IntToStr(v));
+  }
+
+  fn _cpBool(k: pchar, v: bool): pchar {
+    var t: pchar := "false"c;
+    if v { t := "true"c; }
+    return StrConcat(StrConcat(StrConcat("\""c, k), "\":"c), t);
+  }
+
+  // Messobjekt. Herkunft steht immer dabei, damit keine Schaetzung als
+  // Messung durchgeht.
+  fn _cpMess(k: pchar, v: int64): pchar {
+    var j: pchar := StrConcat(StrConcat("\""c, k), "\":{\"value\":"c);
+    j := StrConcat(j, IntToStr(v));
+    return StrConcat(j, ",\"origin\":\"measured\"}"c);
+  }
+
+  // Messobjekt mit Geltungsbereich — fuer CPU-Zeit und Spitzenspeicher, die
+  // Prozesswerte sind und keiner Phase gehoeren.
+  fn _cpMessScope(k: pchar, v: int64, scope: pchar): pchar {
+    var j: pchar := StrConcat(StrConcat("\""c, k), "\":{\"value\":"c);
+    j := StrConcat(j, IntToStr(v));
+    j := StrConcat(j, ",\"origin\":\"measured\",\"scope\":\""c);
+    return StrConcat(StrConcat(j, scope), "\"}"c);
+  }
+
+  // Fehlende Faehigkeit. Kein 0, kein Weglassen — ein Grund.
+  fn _cpFehlt(k: pchar, grund: pchar): pchar {
+    var j: pchar := StrConcat(StrConcat("\""c, k), "\":{\"value\":null,\"unavailable\":\""c);
+    return StrConcat(StrConcat(j, grund), "\"}"c);
+  }
+
+  fn _cpLevelName(): pchar {
+    if self.cpLevel == 1 { return "analysis"c; }
+    if self.cpLevel == 2 { return "detailed"c; }
+    return "basic"c;
+  }
+
+  // Die Pass-Kennungen, die dieser Compiler ueberhaupt kennt. Sie sind die
+  // stabile Schnittstelle des Berichts und zugleich die Liste, gegen die ein
+  // --compile-profile-pass geprueft wird. Wer eine Phase instrumentiert,
+  // traegt sie hier ein.
+  fn _cpPassBekannt(id: pchar): bool {
+    if StrCmp(id, "lexer"c) == 0 { return true; }
+    if StrCmp(id, "parser"c) == 0 { return true; }
+    if StrCmp(id, "sema"c) == 0 { return true; }
+    if StrCmp(id, "analysis"c) == 0 { return true; }
+    if StrCmp(id, "ir-lowering"c) == 0 { return true; }
+    if StrCmp(id, "codegen-x86_64"c) == 0 { return true; }
+    if StrCmp(id, "codegen-win-x86_64"c) == 0 { return true; }
+    if StrCmp(id, "codegen-macos-x86_64"c) == 0 { return true; }
+    if StrCmp(id, "lyxos-emit"c) == 0 { return true; }
+    return false;
+  }
+
+  fn _cpPassListe(): pchar {
+    return "lexer, parser, sema, analysis, ir-lowering, codegen-x86_64, codegen-win-x86_64, codegen-macos-x86_64, lyxos-emit"c;
+  }
+
+  // CLI-Pruefung. Jeder Fehler hier beendet den Lauf, bevor gebaut wird.
+  fn _cpOptionenPruefen(): bool {
+    if !self.cpAktiv {
+      var ohne: bool := false;
+      if self.cpLevelGesetzt { ohne := true; }
+      if self.cpFnFilter != 0 as pchar { ohne := true; }
+      if self.cpPassFilter != 0 as pchar { ohne := true; }
+      if ohne {
+        EPrintStrLn("lyxc: --compile-profile-level, --compile-profile-function und");
+        EPrintStrLn("      --compile-profile-pass brauchen --compile-profile.");
+        return false;
+      }
+      return true;
+    }
+    // Filter sind in basic kein Detailwunsch, sondern ein Irrtum: in basic
+    // entstehen keine Detaildaten, die ein Filter einschraenken koennte.
+    if self.cpLevel == 0 {
+      var mitFilter: bool := false;
+      if self.cpFnFilter != 0 as pchar { mitFilter := true; }
+      if self.cpPassFilter != 0 as pchar { mitFilter := true; }
+      if mitFilter {
+        EPrintStrLn("lyxc: Filter brauchen --compile-profile-level=analysis oder =detailed.");
+        EPrintStrLn("      In basic entstehen keine Detaildaten.");
+        return false;
+      }
+    }
+    // Ein angegebener Profilpfad darf weder die Quelle noch das Erzeugnis
+    // treffen. Geprueft wird VOR dem Bau: eine Ablehnung erst danach haette
+    // schon uebersetzt und den Lauf trotzdem als Erfolg gemeldet. Verglichen
+    // werden die Pfade, wie sie auf der Kommandozeile stehen; kanonisiert
+    // wird nicht, und der Bericht behauptet das auch nicht.
+    if self.cpPfad != 0 as pchar {
+      if self.inputFile != 0 {
+        if StrCmp(self.cpPfad, self.inputFile as pchar) == 0 {
+          EPrintStrLn("lyxc: --compile-profile wuerde die Quelldatei ueberschreiben.");
+          return false;
+        }
+      }
+      var aus: pchar := "a.out"c;
+      if self.outputFile != 0 { aus := self.outputFile as pchar; }
+      if StrCmp(self.cpPfad, aus) == 0 {
+        EPrintStrLn("lyxc: --compile-profile wuerde die Ausgabedatei ueberschreiben.");
+        return false;
+      }
+    }
+
+    // Unbekannte Pass-Kennung frueh melden, nicht erst als leere Trefferzahl.
+    if self.cpPassFilter != 0 as pchar {
+      if !self._cpPassBekannt(self.cpPassFilter) {
+        EPrintStr("lyxc: unbekannte Pass-Kennung fuer --compile-profile-pass: '"c);
+        EPrintStr(self.cpPassFilter);
+        EPrintStrLn("'");
+        EPrintStr("      bekannt sind: "c);
+        EPrintStrLn(self._cpPassListe());
+        return false;
+      }
+    }
+    return true;
+  }
+
+  // Der Profilpfad. Ohne '=' wird er aus dem vollstaendigen Ausgabenamen
+  // abgeleitet: app -> app.lyxc-profile.json, app.exe -> app.exe.lyxc-profile.json.
+  fn _cpZielPfad(outputFile: pchar): pchar {
+    if self.cpPfad != 0 as pchar { return self.cpPfad; }
+    return StrConcat(outputFile, ".lyxc-profile.json"c);
+  }
+
+
+  // Spannen aus dem Ereignispuffer. Die Zusatzkennzahlen haengen ueber den
+  // Span-Index daran.
+  fn _cpSpans(): pchar {
+    var j: pchar := "["c;
+    var i: int64 := 0;
+    while i < self.zlEvN {
+      var e: int64 := self.zlEv + i * 32;
+      if i > 0 { j := StrConcat(j, ","c); }
+      j := StrConcat(j, "{"c);
+      j := StrConcat(j, self._cpZahl("span_id"c, i));
+      j := StrConcat(j, ",\"parent_span_id\":null,"c);
+      j := StrConcat(j, self._cpTxt("pass_id"c, peek64(e) as pchar));
+      j := StrConcat(j, ",\"task_id\":null,"c);
+      j := StrConcat(j, self._cpZahl("thread_id"c, 0));
+      j := StrConcat(j, ","c);
+      j := StrConcat(j, self._cpZahl("start_offset_ns"c, peek64(e + 8) - self.zlStart));
+      j := StrConcat(j, ","c);
+      j := StrConcat(j, self._cpMess("duration_ns"c, peek64(e + 16)));
+      // Selbstzeit braucht Kindspannen und eine Behandlung ueberlappender
+      // Intervalle. Beides gibt es nicht, also steht hier ein Grund.
+      j := StrConcat(j, ","c);
+      j := StrConcat(j, self._cpFehlt("self_duration_ns"c, "NO_CHILD_SPANS"c));
+      j := StrConcat(j, ",\"metrics\":{"c);
+      var m: int64 := 0;
+      var erste: bool := true;
+      while m < self.cpMetN {
+        var me: int64 := self.cpMet + m * 32;
+        if peek64(me + 16) == i {
+          if !erste { j := StrConcat(j, ","c); }
+          erste := false;
+          var nm: pchar := peek64(me) as pchar;
+          j := StrConcat(j, self._cpMess(nm, peek64(me + 8)));
+        }
+        m := m + 1;
+      }
+      j := StrConcat(j, "}}"c);
+      i := i + 1;
+    }
+    return StrConcat(j, "]"c);
+  }
+
+  // Abdeckung. Vier Zustaende, und fuer jeden nicht gemessenen Bereich ein
+  // Grund statt eines Nullwerts.
+  fn _cpCoverage(): pchar {
+    var j: pchar := "{"c;
+    j := StrConcat(j, self._cpTxt("level"c, self._cpLevelName()));
+    j := StrConcat(j, ",\"filters\":{"c);
+    if self.cpFnFilter != 0 as pchar {
+      j := StrConcat(j, self._cpTxt("function"c, self.cpFnFilter));
+    } else {
+      j := StrConcat(j, "\"function\":null"c);
+    }
+    j := StrConcat(j, ","c);
+    if self.cpPassFilter != 0 as pchar {
+      j := StrConcat(j, self._cpTxt("pass"c, self.cpPassFilter));
+    } else {
+      j := StrConcat(j, "\"pass\":null"c);
+    }
+    // Trefferzahl gilt nur fuer Detaildaten; die gibt es in Schritt 1 nicht.
+    j := StrConcat(j, ",\"matches\":null},\"passes\":["c);
+    var zd: pchar := "not_instrumented"c;
+    var i: int64 := 0;
+    while i < self.zlEvN {
+      var nm: pchar := peek64(self.zlEv + i * 32) as pchar;
+      if i > 0 { j := StrConcat(j, ","c); }
+      j := StrConcat(j, "{"c);
+      j := StrConcat(j, self._cpTxt("pass_id"c, nm));
+      j := StrConcat(j, ","c);
+      j := StrConcat(j, self._cpTxt("timing"c, "measured"c));
+      j := StrConcat(j, ","c);
+      j := StrConcat(j, self._cpTxt("decisions"c, zd));
+      j := StrConcat(j, "}"c);
+      i := i + 1;
+    }
+    // Was es gibt und nicht gemeldet wird, und was es nicht gibt. Der
+    // Unterschied ist der Kern des Berichts, nicht eine Fussnote.
+    if self.zlEvN > 0 { j := StrConcat(j, ","c); }
+    j := StrConcat(j, "{\"pass_id\":\"ir-optimize\",\"timing\":\"not_instrumented\",\"decisions\":\"not_instrumented\",\"note\":\"laeuft innerhalb von codegen-* ohne eigene Spanne\"},"c);
+    j := StrConcat(j, "{\"pass_id\":\"vectorize\",\"timing\":\"not_instrumented\",\"decisions\":\"not_instrumented\",\"note\":\"cg_vmErkennen entscheidet, meldet aber noch nicht; nur x86-64\"},"c);
+    j := StrConcat(j, "{\"pass_id\":\"inline\",\"timing\":\"not_run\",\"decisions\":\"not_run\",\"note\":\"Pass ist nicht verdrahtet\"}"c);
+    j := StrConcat(j, "],\"missing_capabilities\":["c);
+    j := StrConcat(j, "\"PHASE_RSS\",\"THREAD_CPU_TIME\",\"CHILD_CPU_TIME\",\"CRITICAL_PATH\","c);
+    j := StrConcat(j, "\"IO_COUNTERS\",\"ALLOCATION_COUNTERS\",\"INPUT_HASHES\",\"DECISION_EVENTS\"]}"c);
+    return j;
+  }
+
+  fn _cpZielName(): pchar {
+    if self.target == LYX_TC_X86_64 { return "linux-x86_64"c; }
+    if self.target == LYX_TC_ARM64 { return "linux-arm64"c; }
+    if self.target == LYX_TC_RISCV64 { return "linux-riscv64"c; }
+    if self.target == LYX_TC_LYXOS { return "lyxos"c; }
+    if self.target == LYX_TC_WINDOWS_X86_64 { return "windows-x86_64"c; }
+    if self.target == LYX_TC_MACOS_X86_64 { return "macos-x86_64"c; }
+    return "andere"c;
+  }
+
+  // Der Bericht. Wird in eine Nachbardatei geschrieben und erst dann an den
+  // Platz gezogen: ein Schreibfehler darf keinen halben Bericht hinterlassen,
+  // und einen vorhandenen schon gar nicht ersetzen.
+  fn _cpSchreiben(inputFile: pchar, outputFile: pchar, gebaut: bool): void {
+    if !self.cpAktiv { return; }
+    var t0: int64 := MonotonicTimeNano();
+    // Der Pfad ist in _cpOptionenPruefen schon gegen Quelle und Erzeugnis
+    // gehalten worden -- vor dem Bau, wie es sein muss. Ein abgeleiteter Pfad
+    // kann beide nicht treffen, er haengt den Zusatz an den Ausgabenamen.
+    var pfad: pchar := self._cpZielPfad(outputFile);
+
+    var j: pchar := "{\"schema_version\":\"1.0\","c;
+    // Laufkennung aus Prozessnummer und Startzeitpunkt. Sie ist eindeutig je
+    // Lauf und steht NICHT im Compilat -- sonst waere jedes Erzeugnis anders.
+    j := StrConcat(j, self._cpTxt("invocation_id"c,
+            StrConcat(StrConcat(IntToStr(getpid()), "-"c), IntToStr(self.zlStart))));
+    j := StrConcat(j, ",\"compiler\":{"c);
+    // tools/next_version.sh ersetzt jedes Literal "x.y.zS"c in dieser Datei
+    // global; diese Stelle wird also mitgezogen und driftet nicht weg.
+    j := StrConcat(j, self._cpTxt("version"c, "1.2.28A"c));
+    j := StrConcat(j, ","c);
+    j := StrConcat(j, self._cpFehlt("commit"c, "NO_COMMIT_IN_BINARY"c));
+    j := StrConcat(j, ","c);
+    j := StrConcat(j, self._cpBool("self_hosted"c, true));
+    j := StrConcat(j, "},\"inputs\":{"c);
+    j := StrConcat(j, self._cpTxt("root"c, inputFile));
+    // Inhalts-Hashes der tatsaechlich gelesenen Quellen gibt es noch nicht.
+    // "root_only" sagt das; eine leere Liste mit Vollstaendigkeitsanspruch
+    // waere eine Falschaussage.
+    j := StrConcat(j, ",\"hash_algorithm\":null,"c);
+    j := StrConcat(j, self._cpTxt("completeness"c, "root_only"c));
+    j := StrConcat(j, ",\"files\":[]},\"configuration\":{"c);
+    j := StrConcat(j, self._cpTxt("target"c, self._cpZielName()));
+    j := StrConcat(j, ","c);
+    j := StrConcat(j, self._cpZahl("opt_level"c, self.optLevel));
+    j := StrConcat(j, ","c);
+    j := StrConcat(j, self._cpBool("debug_symbols"c, self.debugSymbols));
+    j := StrConcat(j, ","c);
+    j := StrConcat(j, self._cpBool("runtime_checks"c, self.runtimeChecks));
+    j := StrConcat(j, "},\"environment\":{"c);
+    j := StrConcat(j, self._cpTxt("os"c, "linux"c));
+    j := StrConcat(j, ","c);
+    j := StrConcat(j, self._cpZahl("workers"c, 1));
+    j := StrConcat(j, ","c);
+    j := StrConcat(j, self._cpFehlt("cache_state"c, "NOT_OBSERVED"c));
+    j := StrConcat(j, "},\"coverage\":"c);
+    j := StrConcat(j, self._cpCoverage());
+
+    // Status. Ein uebersprungener Build ist weder Erfolg noch Fehler: ohne
+    // eigenen Wert waere er von einem erfolgreichen nicht zu unterscheiden.
+    var res: pchar := "success"c;
+    var comp: pchar := "full"c;
+    if !gebaut {
+      res := "up_to_date"c;
+      comp := "none"c;
+    } else if self.exitCode != 0 {
+      res := "compile_error"c;
+      comp := "partial"c;
+    }
+    j := StrConcat(j, ",\"status\":{"c);
+    j := StrConcat(j, self._cpTxt("result"c, res));
+    j := StrConcat(j, ","c);
+    j := StrConcat(j, self._cpZahl("exit_code"c, self.exitCode));
+    j := StrConcat(j, ","c);
+    j := StrConcat(j, self._cpTxt("completion"c, comp));
+    j := StrConcat(j, "},\"summary\":{"c);
+    // Ohne Uebersetzungslauf gibt es keine Compilezeit. zlStart ist dann 0,
+    // und t0 - 0 waere eine Riesenzahl, die als Messung durchgeht.
+    if gebaut {
+      j := StrConcat(j, self._cpMess("compile_wall_ns"c, t0 - self.zlStart));
+      j := StrConcat(j, ","c);
+      j := StrConcat(j, self._cpMessScope("process_cpu_ns"c, lyxc_zlCpuNs() - self.zlCpu0, "process"c));
+    } else {
+      j := StrConcat(j, self._cpFehlt("compile_wall_ns"c, "NOT_COMPILED"c));
+      j := StrConcat(j, ","c);
+      j := StrConcat(j, self._cpFehlt("process_cpu_ns"c, "NOT_COMPILED"c));
+    }
+    var rss: int64 := lyxc_zlPeakRssKb();
+    j := StrConcat(j, ","c);
+    if rss < 0 {
+      j := StrConcat(j, self._cpFehlt("peak_rss_bytes"c, "PROC_STATUS_UNREADABLE"c));
+    } else {
+      j := StrConcat(j, self._cpMessScope("peak_rss_bytes"c, rss * 1024, "process"c));
+    }
+    j := StrConcat(j, ","c);
+    j := StrConcat(j, self._cpFehlt("phase_rss_bytes"c, "PHASE_RSS"c));
+    j := StrConcat(j, ","c);
+    j := StrConcat(j, self._cpFehlt("child_cpu_ns"c, "CHILD_CPU_TIME"c));
+    var ab: int64 := 0 - 1;
+    if gebaut {
+      if self.exitCode == 0 { ab := FileSize(outputFile); }
+    }
+    j := StrConcat(j, ","c);
+    if ab < 0 {
+      j := StrConcat(j, self._cpFehlt("output_bytes"c, "NO_OUTPUT"c));
+    } else {
+      j := StrConcat(j, self._cpMess("output_bytes"c, ab));
+    }
+    j := StrConcat(j, "},\"spans\":"c);
+    j := StrConcat(j, self._cpSpans());
+    // Entscheidungen kommen in Schritt 2. Leere Listen heissen hier NICHT
+    // "geprueft und nichts gefunden" -- das sagt coverage mit
+    // DECISION_EVENTS unter missing_capabilities.
+    j := StrConcat(j, ",\"decisions\":[],\"decision_summary\":[],\"artifacts\":["c);
+    if ab >= 0 {
+      j := StrConcat(j, "{"c);
+      j := StrConcat(j, self._cpTxt("path"c, outputFile));
+      j := StrConcat(j, ","c);
+      j := StrConcat(j, self._cpZahl("bytes"c, ab));
+      j := StrConcat(j, ",\"hash\":null,"c);
+      j := StrConcat(j, self._cpTxt("role"c, "executable"c));
+      j := StrConcat(j, "}"c);
+    }
+    j := StrConcat(j, "],\"collection\":{"c);
+    j := StrConcat(j, self._cpTxt("level"c, self._cpLevelName()));
+    j := StrConcat(j, ","c);
+    j := StrConcat(j, self._cpZahl("spans_recorded"c, self.zlEvN));
+    j := StrConcat(j, ","c);
+    j := StrConcat(j, self._cpZahl("metrics_recorded"c, self.cpMetN));
+    j := StrConcat(j, ","c);
+    j := StrConcat(j, self._cpZahl("events_dropped"c, 0));
+    j := StrConcat(j, ",\"truncated\":false,\"filtered\":false,\"warnings\":[],"c);
+    // Die Serialisierungsdauer steht NEBEN der Compilezeit, nicht darin.
+    // Sie wird gemessen, nachdem der Text steht, und ist deshalb ein Wert
+    // dieses Laufs, kein herausgerechneter Messoverhead.
+    j := StrConcat(j, self._cpMess("serialize_ns"c, MonotonicTimeNano() - t0));
+    j := StrConcat(j, "}}\n"c);
+
+    // Nachbardatei im ZIELVERZEICHNIS, damit das Umziehen im selben
+    // Dateisystem bleibt.
+    var tmp: pchar := StrConcat(StrConcat(pfad, ".tmp."c), IntToStr(getpid()));
+    var n: int64 := StrLen(j);
+    var w: int64 := FileWriteAll(tmp, j, n) as int64;
+    if w != n {
+      EPrintStr("warning: --compile-profile: nicht schreibbar: "c);
+      EPrintStrLn(tmp);
+      unlink(tmp);
+      return;
+    }
+    if rename(tmp, pfad) != 0 {
+      EPrintStr("warning: --compile-profile: Umbenennen fehlgeschlagen: "c);
+      EPrintStrLn(pfad);
+      unlink(tmp);
+      return;
+    }
+    // Abschlussmeldung auf stderr; stdout bleibt den Compilerfunktionen.
+    EPrintStr("lyxc: Compilatprofil ("c);
+    EPrintStr(self._cpLevelName());
+    EPrintStr(") geschrieben: "c);
+    EPrintStrLn(pfad);
+  }
+
   fn _passStart(name: pchar): int64 {
-    if !self.tracePasses && self.timeTrace == 0 as pchar { return 0; }
+    // #2343: auch das Compilatprofil braucht die Spannen — schon in basic,
+    // denn Phasenzeiten gehoeren dort hinein.
+    if !self.tracePasses && self.timeTrace == 0 as pchar && !self.cpAktiv { return 0; }
     if self.tracePasses {
       PrintStr("[pass] "c);
       PrintStr(name);
@@ -5836,9 +6420,9 @@ pub type CompilerConfig = class {
   }
 
   fn _passEnd(name: pchar, t0: int64): void {
-    if !self.tracePasses && self.timeTrace == 0 as pchar { return; }
+    if !self.tracePasses && self.timeTrace == 0 as pchar && !self.cpAktiv { return; }
     var elapsed: int64 := MonotonicTimeNano() - t0;
-    if self.timeTrace != 0 as pchar { self._zlEreignis(name, t0, elapsed); }   // #2174
+    if self._zlPufferAn() { self._zlEreignis(name, t0, elapsed); }   // #2174, #2343
     if !self.tracePasses { return; }
     var us: int64 := elapsed / 1000;
     var ms: int64 := elapsed / 1000000;
@@ -6583,7 +7167,7 @@ pub fn main(argc: int64, argv: pchar): int64 {
 
   // Print version banner unless suppressed with --quiet
   if not cfg.quiet {
-    PrintStr("lyxc 1.2.27E — Copyright (c) 2026 Andreas Röne. All rights reserved.\n"c);
+    PrintStr("lyxc 1.2.28A — Copyright (c) 2026 Andreas Röne. All rights reserved.\n"c);
   }
 
   // WP-BC-50: --unit-info <file> — read .lyu file, print metadata, exit
@@ -6668,12 +7252,17 @@ pub fn main(argc: int64, argv: pchar): int64 {
   if cfg.shouldRebuild(inputFile, outputFile) {
     cfg.Compile(inputFile, outputFile);
     cfg._zlSchreiben();   // #2174
+    cfg._cpSchreiben(inputFile, outputFile, true);   // #2343
   } else {
     if cfg.enableVerbose {
       PrintStr("Skipping "c);
       PrintStr(inputFile);
       PrintStrLn(" (already up to date)");
     }
+    // #2343: Auch der uebersprungene Build bekommt einen Bericht -- mit
+    // result "up_to_date". Ohne ihn waere ein ausgelassener Build von einem
+    // erfolgreichen nicht zu unterscheiden.
+    cfg._cpSchreiben(inputFile, outputFile, false);
   }
 
   // Print statistics

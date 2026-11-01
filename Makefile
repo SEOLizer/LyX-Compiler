@@ -373,6 +373,8 @@ test: lyxc
 	@bash tests/xxhash_2235_test.sh
 	@echo "--- bench/arr_int: Ganzzahl-Feldkerne wie C, drei Ziele (#2195) ---"
 	@bash tests/bench_arr_int_test.sh
+	@echo "--- Compilatprofil: Datenvertrag, Fehlerpfade, Compilat bitgleich (#2343) ---"
+	@bash tests/compile_profile_test.sh
 	@echo "--- Zeichenketten-Builtins arm64/riscv aus dem Bump-Block (#2227) ---"
 	@bash tests/bump_ir_2227_test.sh
 	@echo "--- esp32/arm-cm: 64-Bit-Anfangswerte laut beim Lesen (#2239) ---"
