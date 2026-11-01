@@ -21,8 +21,8 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.27E
-VERSION_DATE := 2026-10-31
+VERSION   := 1.2.28A
+VERSION_DATE := 2026-11-01
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
 UNITS_DST := $(PKG_DIR)/usr/include/lyx/units/std
@@ -373,6 +373,8 @@ test: lyxc
 	@bash tests/xxhash_2235_test.sh
 	@echo "--- bench/arr_int: Ganzzahl-Feldkerne wie C, drei Ziele (#2195) ---"
 	@bash tests/bench_arr_int_test.sh
+	@echo "--- Compilatprofil: Datenvertrag, Fehlerpfade, Compilat bitgleich (#2343) ---"
+	@bash tests/compile_profile_test.sh
 	@echo "--- Zeichenketten-Builtins arm64/riscv aus dem Bump-Block (#2227) ---"
 	@bash tests/bump_ir_2227_test.sh
 	@echo "--- esp32/arm-cm: 64-Bit-Anfangswerte laut beim Lesen (#2239) ---"
@@ -503,6 +505,8 @@ test: lyxc
 	@bash tests/ir_array_kopf_2262_test.sh
 	@echo "--- IR-Ziele: Selbstbau-Builtins, logisches Nicht, Selbstbau arm64/riscv (#2266, #2271) ---"
 	@bash tests/ir_selbstbau_2266_test.sh
+	@echo "--- getpid auf allen IR-Zielen, Wert gegen die Shell gepruefen (#2343) ---"
+	@bash tests/getpid_backends_test.sh
 	@echo "--- Builtin-IDs ohne Doppelbelegung, Float-Speicher auf allen Zielen (#2265) ---"
 	@bash tests/builtin_kollision_2265_test.sh
 	@echo "--- IR-Ziele: FileSize aus Bausteinen, ArgvGet als Text (#2258, #2274) ---"
