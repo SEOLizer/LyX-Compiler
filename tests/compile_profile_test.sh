@@ -369,5 +369,65 @@ else
   no "15 Filterwirkung" "$(tail -2 "$TMP/p15.log" | tr '\n' ' ')"
 fi
 
+# 16. Der Deckel wirkt ZWEISEITIG: unter der Grenze wird nichts verworfen und
+#     `truncated` bleibt false; mit einer kleinen Grenze stehen genau so viele
+#     Einzelereignisse im Bericht, der Rest erscheint als events_dropped.
+#     Ein Test, der nur die kleine Grenze prueft, waere auch von einem Deckel
+#     erfuellt, der immer zuschlaegt.
+rm -f "$TMP/vapp"
+baueVek --compile-profile="$TMP/v_gross.json" --compile-profile-level=detailed --compile-profile-max-events=100000000
+rm -f "$TMP/vapp"
+baueVek --compile-profile="$TMP/v_klein.json" --compile-profile-level=detailed --compile-profile-max-events=3
+if python3 -I -c "
+import json
+g=json.load(open('$TMP/v_gross.json')); k=json.load(open('$TMP/v_klein.json'))
+cg=g['collection']; ck=k['collection']
+assert cg['event_limit']==100000000, cg['event_limit']
+assert cg['events_dropped']==0, 'ohne Not verworfen: %r' % (cg['events_dropped'],)
+assert cg['truncated'] is False, 'truncated ohne Trunkierung'
+assert len(g['decisions'])==cg['decisions_recorded']
+assert ck['event_limit']==3, ck['event_limit']
+assert len(k['decisions'])==3, 'Deckel nicht eingehalten: %d' % len(k['decisions'])
+assert ck['truncated'] is True, 'Trunkierung nicht ausgewiesen'
+assert ck['events_dropped']>0, 'verworfene Ereignisse nicht gezaehlt'
+assert ck['decisions_recorded']+ck['events_dropped']==cg['decisions_recorded'], \
+    'aufgezeichnet + verworfen (%d+%d) trifft den ungedeckelten Lauf (%d) nicht' % (
+        ck['decisions_recorded'],ck['events_dropped'],cg['decisions_recorded'])
+" 2>"$TMP/p16.log"; then
+  ok "16 Deckel haelt die Grenze ein und weist die Trunkierung aus, ohne Deckel wird nichts verworfen"
+else
+  no "16 Deckel zweiseitig" "$(tail -2 "$TMP/p16.log" | tr '\n' ' ')"
+fi
+
+# 17. Ein Deckel, der klaglos angenommen wird, liest sich hinterher wie ein
+#     wirksamer. Geprueft werden deshalb die Raender UND das Ende des Wertes:
+#     "12x" ist ein Tippfehler, kein stillschweigendes 12.
+fehler=0
+pruefe_ab() { # $1 = Argumente (ein String), $2 = was abgelehnt werden soll
+  rm -f "$TMP/vapp" "$TMP/v_ab.json"
+  # shellcheck disable=SC2086
+  ( cd "$TMP" && "$LYXC" --std-path="$ROOT" vek.lyx -o vapp --compile-profile="$TMP/v_ab.json" $1 ) >/dev/null 2>"$TMP/ab.log"
+  rc=$?
+  if [ "$rc" -ne 2 ]; then
+    no "17 $2" "rc=$rc, erwartet 2 (CLI-Fehler vor dem Bau)"
+    fehler=1
+  elif [ -s "$TMP/v_ab.json" ]; then
+    no "17 $2" "Bericht trotz CLI-Fehler entstanden"
+    fehler=1
+  fi
+}
+pruefe_ab "--compile-profile-level=detailed --compile-profile-max-events=0" "Null"
+pruefe_ab "--compile-profile-level=detailed --compile-profile-max-events=12x" "Ziffern mit Rest"
+pruefe_ab "--compile-profile-level=detailed --compile-profile-max-events=" "leerer Wert"
+pruefe_ab "--compile-profile-level=detailed --compile-profile-max-events=999999999999" "ueber der Obergrenze"
+pruefe_ab "--compile-profile-max-events=99" "Deckel in basic"
+rm -f "$TMP/vapp" "$TMP/v_ab.json"
+( cd "$TMP" && "$LYXC" --std-path="$ROOT" vek.lyx -o vapp --compile-profile-max-events=99 ) >/dev/null 2>&1
+if [ $? -ne 2 ]; then
+  no "17 Deckel ohne --compile-profile" "kein CLI-Fehler"
+  fehler=1
+fi
+[ "$fehler" -eq 0 ] && ok "17 ungueltiger Deckel wird vor dem Bau abgelehnt (Null, Rest, leer, zu gross, falsche Stufe, ohne Profil)"
+
 echo "Ergebnis: $PASS PASS, $FAIL FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
