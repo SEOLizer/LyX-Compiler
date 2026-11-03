@@ -1240,6 +1240,16 @@ pub type Codegen = class {
   ftnNi: int64; ftnP: int64; ftnL: int64; ftnCnt: int64;
   zlHxS: int64;                  // #2175: verglichene Eintraege in cg_hxSuch (fuer die Zaehler)
   zlVmVektor: int64;             // #2194: auf den Vektorweg gelegte Schleifen
+  // #2343: Entscheidungssenke des Compilatprofils. Ohne cpDecAktiv wird
+  // nichts aufgezeichnet und keine Zeile berechnet.
+  cpDecAktiv:     int64;
+  cpDec:          int64;   // je Eintrag 56 Byte: Code, Ergebnis, Zeile, Name, Namenslaenge, Datei, Dateilaenge
+  cpDecN:         int64;
+  cpDecCap:       int64;
+  cpDecVerworfen: int64;   // wegen der Puffergrenze nicht aufgezeichnet
+  cpVmNi:         int64;   // Knoten der Schleife, die gerade geprueft wird
+  cpFnNam:        pchar;   // Funktion, die gerade erzeugt wird (0 = unbekannt)
+  cpFnLen:        int64;
   zlVrVektor: int64;             // #2335: auf den Vektorweg gelegte Reduktionen
   zlDivKonst: int64;             // #2330: Divisionen durch Zweierpotenz ohne idiv
   zlDivMagie: int64;             // #2330: Divisionen durch konstanten Divisor ohne idiv
@@ -14289,6 +14299,10 @@ pub type Codegen = class {
     self.curFnRetNarrow := self.cg_narrowKindOfTypeNode(self.cg_nc1(ni));
     var savedMRetFnWert: int64 := self.curFnRetFnWert;          // #2133
     self.curFnRetFnWert := self.cg_typIstFnWert(self.cg_nc1(ni));
+    var savedMCpFnNam: pchar := self.cpFnNam;                   // #2343
+    var savedMCpFnLen: int64 := self.cpFnLen;
+    self.cpFnNam := self.cg_nsval(ni);
+    self.cpFnLen := self.cg_nslen(ni);
     // #1878: Lockstep an einer METHODE. Zweite Stelle derselben Aufzaehlung —
     // die freie Funktion steht in cg_genFuncDecl, die beiden muessen
     // uebereinstimmen.
@@ -14310,6 +14324,8 @@ pub type Codegen = class {
     self.curFnRetRange := savedMRetRange;
     self.curFnRetNarrow := savedMRetNarrow;                     // #1151
     self.curFnRetFnWert := savedMRetFnWert;                     // #2133
+    self.cpFnNam := savedMCpFnNam;                              // #2343
+    self.cpFnLen := savedMCpFnLen;
     // Implicit return
     self.cg_zeroRax();
     self.cg_emitEpilogue();
@@ -15687,6 +15703,12 @@ pub type Codegen = class {
       // Funktion (#2133: ueber eine Rueckgabegrenze immer Satz). Wer es ueber
       // ein Local ruft, erfaehrt das ueber localFnRetSatz.
       self.curFnRetFnWert := self.cg_typIstFnWert(lRetTy);
+      // #2343: ein Lambda hat keinen Namen. "<lambda>" ist ehrlicher als der
+      // Name der umgebenden Funktion, der eine falsche Stelle nennen wuerde.
+      var savedLCpFnNam: pchar := self.cpFnNam;
+      var savedLCpFnLen: int64 := self.cpFnLen;
+      self.cpFnNam := "<lambda>"c;
+      self.cpFnLen := 8;
       self.fnRetIsFloat := 0;
       if (lRetTy >= 0 && self.cg_isFloatTypeName(self.cg_nsval(lRetTy), self.cg_nslen(lRetTy)) != 0) {
         self.fnRetIsFloat := 1;
@@ -15695,6 +15717,8 @@ pub type Codegen = class {
       self.curFnRetRange := self.cg_rangeOfTypeNode(lRetTy);
       self.curFnRetNarrow := self.cg_narrowKindOfTypeNode(lRetTy);
       self.cg_genBlock(closureBody);
+      self.cpFnNam := savedLCpFnNam;   // #2343
+      self.cpFnLen := savedLCpFnLen;
       self.curFnRetFnWert := savedLRetFnWert;
       self.fnRetIsFloat := savedLRetFloat;
       self.fnRetStructBytes := savedLRetStruct;
@@ -23824,18 +23848,80 @@ pub type Codegen = class {
     return bOff;
   }
 
+  // ---------------------------------------------------------------------------
+  // #2343: Entscheidungen des Autovektorisierers. Erzeugt werden sie DORT, wo
+  // die Entscheidung faellt -- nicht nachtraeglich aus dem Maschinencode
+  // erraten. Jeder Eintrag traegt einen stabilen Reason-Code; der
+  // Erklaerungstext im Bericht darf sich aendern, der Code nicht.
+  // ---------------------------------------------------------------------------
+  fn _cpDecAdd(code: pchar, ergebnis: int64): void {
+    if (self.cpDecAktiv == 0) { return; }
+    // Puffergrenze. Trunkierung wird AUSGEWIESEN, nicht verschwiegen: ein
+    // Bericht, der stillschweigend aufhoert, liest sich wie ein vollstaendiger.
+    if (self.cpDecN >= 16384) { self.cpDecVerworfen += 1; return; }
+    if (self.cpDecN >= self.cpDecCap) {
+      var nc: int64 := self.cpDecCap * 2;
+      if (nc < 64) { nc := 64; }
+      var nb: int64 := alloc(nc * 56);
+      if (self.cpDecN > 0) { memcpy(nb, self.cpDec, self.cpDecN * 56); }
+      self.cpDec := nb;
+      self.cpDecCap := nc;
+    }
+    // Die Zeile wird NUR hier berechnet, also nur bei eingeschalteter
+    // Aufzeichnung. cg_lineOf zaehlt seine Aufrufe mit (zlLnA), die Kennzahl
+    // lineOf_aufrufe enthaelt in der Stufe detailed deshalb auch die Aufrufe
+    // des Profils selbst. Das steht im Bericht als Warnung; es
+    // herauszurechnen waere eine Schaetzung, die wie eine Messung aussieht.
+    // cg_nsoff liest denselben Slot wie der Name: ein Knoten OHNE Namen hat
+    // dort 0, und cg_lineOf gibt dann 1 zurueck. Ein while-Knoten ist so
+    // einer -- ohne diese Pruefung trug jede Entscheidung "Zeile 1", was wie
+    // eine Messung aussieht und keine ist.
+    var zeile: int64 := 0;
+    if (self.cpVmNi >= 0) {
+      if (self.cg_nsoff(self.cpVmNi) > 0) { zeile := self.cg_lineOf(self.cpVmNi); }
+    }
+    var e: int64 := self.cpDec + self.cpDecN * 56;
+    poke64(e, code as int64);
+    poke64(e + 8, ergebnis);
+    poke64(e + 16, zeile);
+    poke64(e + 24, self.cpFnNam as int64);
+    poke64(e + 32, self.cpFnLen);
+    // Die Datei gehoert zum Eintrag, nicht zum Lauf: cg_lineOf zaehlt in der
+    // Quelle der GERADE erzeugten Unit (srcFilePath wird beim Import getauscht
+    // und danach zurueckgesetzt). Wer hier den Namen der Hauptdatei einsetzt,
+    // schreibt eine Zeilennummer, die es in dieser Datei nicht gibt.
+    poke64(e + 40, self.srcFilePath as int64);
+    poke64(e + 48, self.srcFileLen);
+    self.cpDecN += 1;
+  }
+
+  // Ablehnung mit Grund. Steht an 38 Stellen in cg_vmErkennen und muss dort
+  // eine Zeile bleiben, damit die Bedingung lesbar bleibt.
+  fn _vmNein(code: pchar): int64 {
+    if (self.cpDecAktiv != 0) { self._cpDecAdd(code, 0); }
+    return 0;
+  }
+
   fn cg_vmErkennen(ni: int64, kasten: int64): int64 {
-    if (self.debugMode != 0 || self.debugInfoEnabled != 0) { return 0; }
+    // #2343: der Knoten, zu dem die naechste Entscheidung gehoert. _vmNein
+    // bekommt ihn nicht als Argument -- es steht an 38 Stellen und soll dort
+    // eine Zeile bleiben.
+    self.cpVmNi := ni;
+    if (self.debugMode != 0 || self.debugInfoEnabled != 0) { return self._vmNein("DEBUG_MODE"c); }
     // Bedingung: i < n, beide als Local.
     var bed: int64 := self.cg_nc0(ni);
-    if (bed < 0 || self.cg_nkind(bed) != CGN_BINOP || self.cg_nival(bed) != CGT_LT) { return 0; }
+    if (bed < 0 || self.cg_nkind(bed) != CGN_BINOP || self.cg_nival(bed) != CGT_LT) { return self._vmNein("CONDITION_NOT_I_LT_N"c); }
+    // #2343: der Zaehler ist ein Bezeichner und traegt deshalb einen
+    // Quelloffset, der while-Knoten nicht. Ab hier kann eine Entscheidung
+    // also eine Zeile nennen.
+    if (self.cg_nc0(bed) >= 0) { self.cpVmNi := self.cg_nc0(bed); }
     var iOff: int64 := self.cg_vmIdentOff(self.cg_nc0(bed));
     var nOff: int64 := self.cg_vmIdentOff(self.cg_nc1(bed));
-    if (iOff == 0 || nOff == 0 || iOff == nOff) { return 0; }
+    if (iOff == 0 || nOff == 0 || iOff == nOff) { return self._vmNein("CONDITION_OPERANDS_NOT_LOCALS"c); }
     // Rumpf: genau zwei Anweisungen — oder drei, wenn die erste eine
     // Hilfsvariable fuer den Index anlegt (#2334).
     var rumpf: int64 := self.cg_nc1(ni);
-    if (rumpf < 0 || self.cg_nkind(rumpf) != CGN_BLOCK) { return 0; }
+    if (rumpf < 0 || self.cg_nkind(rumpf) != CGN_BLOCK) { return self._vmNein("BODY_NOT_BLOCK"c); }
     var s1: int64 := self.cg_nc0(rumpf);
     // #2334: `var o: int64 := i * K` am Rumpfanfang. Ohne diesen Zweig blieb
     // jede int16- und int32-Schleife skalar, obwohl PADDW, PADDD, PMULLW und
@@ -23853,51 +23939,51 @@ pub type Codegen = class {
     var oK: int64 := 0;
     if (s1 >= 0 && self.cg_nkind(s1) == CGN_VAR_DECL) {
       var ini: int64 := self.cg_nc1(s1);
-      if (ini < 0 || self.cg_nkind(ini) != CGN_BINOP) { return 0; }
-      if (self.cg_nival(ini) != CGT_STAR) { return 0; }
-      if (self.cg_vmIdentOff(self.cg_nc0(ini)) != iOff) { return 0; }
+      if (ini < 0 || self.cg_nkind(ini) != CGN_BINOP) { return self._vmNein("HELPER_INIT_NOT_BINOP"c); }
+      if (self.cg_nival(ini) != CGT_STAR) { return self._vmNein("HELPER_INIT_NOT_MUL"c); }
+      if (self.cg_vmIdentOff(self.cg_nc0(ini)) != iOff) { return self._vmNein("HELPER_INIT_NOT_LOOP_VAR"c); }
       var kN0: int64 := self.cg_nc1(ini);
-      if (kN0 < 0 || self.cg_nkind(kN0) != CGN_LIT_INT) { return 0; }
+      if (kN0 < 0 || self.cg_nkind(kN0) != CGN_LIT_INT) { return self._vmNein("HELPER_FACTOR_NOT_LITERAL"c); }
       oK := self.cg_nival(kN0);
-      if (oK != 1 && oK != 2 && oK != 4) { return 0; }
+      if (oK != 1 && oK != 2 && oK != 4) { return self._vmNein("HELPER_FACTOR_UNSUPPORTED"c); }
       oNm := self.cg_nsval(s1);
       oNl := self.cg_nslen(s1);
-      if (oNl <= 0) { return 0; }
+      if (oNl <= 0) { return self._vmNein("HELPER_NAME_EMPTY"c); }
       // Die Hilfsvariable darf nicht so heissen wie Zaehler oder Schranke:
       // sonst verdeckt sie im Rumpf genau die Groessen, die die Bedingung
       // liest, und `i := i + 1` traefe die verdeckte Variable.
       var iN: int64 := self.cg_nc0(bed);
       var nN: int64 := self.cg_nc1(bed);
-      if (self.cg_seq(self.cg_nsval(iN), self.cg_nslen(iN), oNm, oNl) != 0) { return 0; }
-      if (self.cg_seq(self.cg_nsval(nN), self.cg_nslen(nN), oNm, oNl) != 0) { return 0; }
+      if (self.cg_seq(self.cg_nsval(iN), self.cg_nslen(iN), oNm, oNl) != 0) { return self._vmNein("HELPER_SHADOWS_LOOP_VAR"c); }
+      if (self.cg_seq(self.cg_nsval(nN), self.cg_nslen(nN), oNm, oNl) != 0) { return self._vmNein("HELPER_SHADOWS_BOUND"c); }
       s1 := self.cg_nnext(s1);
     }
-    if (s1 < 0 || self.cg_nkind(s1) != CGN_EXPR_STMT) { return 0; }
+    if (s1 < 0 || self.cg_nkind(s1) != CGN_EXPR_STMT) { return self._vmNein("BODY_FIRST_NOT_EXPR_STMT"c); }
     var s2: int64 := self.cg_nnext(s1);
-    if (s2 < 0 || self.cg_nkind(s2) != CGN_ASSIGN) { return 0; }
-    if (self.cg_nnext(s2) != -1) { return 0; }
+    if (s2 < 0 || self.cg_nkind(s2) != CGN_ASSIGN) { return self._vmNein("BODY_SECOND_NOT_ASSIGN"c); }
+    if (self.cg_nnext(s2) != -1) { return self._vmNein("BODY_HAS_THIRD_STATEMENT"c); }
     // Fortschaltung: i := i + 1, nichts anderes.
-    if (self.cg_vmIdentOff(self.cg_nc0(s2)) != iOff) { return 0; }
+    if (self.cg_vmIdentOff(self.cg_nc0(s2)) != iOff) { return self._vmNein("STEP_TARGET_NOT_LOOP_VAR"c); }
     var inc: int64 := self.cg_nc1(s2);
-    if (inc < 0 || self.cg_nkind(inc) != CGN_BINOP || self.cg_nival(inc) != CGT_PLUS) { return 0; }
-    if (self.cg_vmIdentOff(self.cg_nc0(inc)) != iOff) { return 0; }
+    if (inc < 0 || self.cg_nkind(inc) != CGN_BINOP || self.cg_nival(inc) != CGT_PLUS) { return self._vmNein("STEP_NOT_ADDITION"c); }
+    if (self.cg_vmIdentOff(self.cg_nc0(inc)) != iOff) { return self._vmNein("STEP_OPERAND_NOT_LOOP_VAR"c); }
     var eins: int64 := self.cg_nc1(inc);
-    if (eins < 0 || self.cg_nkind(eins) != CGN_LIT_INT || self.cg_nival(eins) != 1) { return 0; }
+    if (eins < 0 || self.cg_nkind(eins) != CGN_LIT_INT || self.cg_nival(eins) != 1) { return self._vmNein("STEP_NOT_PLUS_ONE"c); }
     // Schreibseite: pokeW(c + idx, wert)
     var ruf: int64 := self.cg_nc0(s1);
-    if (ruf < 0 || self.cg_nkind(ruf) != CGN_CALL) { return 0; }
+    if (ruf < 0 || self.cg_nkind(ruf) != CGN_CALL) { return self._vmNein("STORE_NOT_CALL"c); }
     var breite: int64 := self.cg_vmBreiteVonName(self.cg_nsval(ruf), self.cg_nslen(ruf), 0);
-    if (breite == 0) { return 0; }
+    if (breite == 0) { return self._vmNein("STORE_WIDTH_UNKNOWN"c); }
     // #2334: jetzt ist die Breite bekannt — der Faktor der Hilfsvariablen
     // muss sie treffen. `var o := i * 3` bei poke16 ist keine Indexform
     // dieses Feldes und darf nicht durchfallen.
-    if (oNl != 0 && oK != breite) { return 0; }
+    if (oNl != 0 && oK != breite) { return self._vmNein("HELPER_FACTOR_MISMATCH"c); }
     var adr: int64 := self.cg_nc0(ruf);
-    if (adr < 0) { return 0; }
+    if (adr < 0) { return self._vmNein("STORE_NO_ADDRESS"c); }
     var wert: int64 := self.cg_nnext(adr);
-    if (wert < 0 || self.cg_nnext(wert) != -1) { return 0; }
+    if (wert < 0 || self.cg_nnext(wert) != -1) { return self._vmNein("STORE_ARITY_MISMATCH"c); }
     var cOff: int64 := self.cg_vmBasisVon(adr, iOff, breite, oNm, oNl);
-    if (cOff == 0) { return 0; }
+    if (cOff == 0) { return self._vmNein("STORE_INDEX_FORM_MISMATCH"c); }
     // Maske abziehen, wenn sie genau die Breite trifft — sie ist dort tot
     // (#2324), und ohne dieses Abziehen wuerde die Form nicht erkannt.
     if (self.cg_nkind(wert) == CGN_BINOP && self.cg_nival(wert) == CGT_BITAND) {
@@ -23910,38 +23996,38 @@ pub type Codegen = class {
         if (mv == soll) { wert := self.cg_nc0(wert); }
       }
     }
-    if (wert < 0 || self.cg_nkind(wert) != CGN_BINOP) { return 0; }
+    if (wert < 0 || self.cg_nkind(wert) != CGN_BINOP) { return self._vmNein("VALUE_NOT_BINOP"c); }
     var op: int64 := self.cg_nival(wert);
-    if (op != CGT_PLUS && op != CGT_MINUS && op != CGT_STAR) { return 0; }
+    if (op != CGT_PLUS && op != CGT_MINUS && op != CGT_STAR) { return self._vmNein("OP_NOT_VECTORIZABLE"c); }
     var vOpc: int64 := self.cg_sseGanzOpcode(op, breite);
     // #2336: fuer `int8 *` gibt es keinen gepackten Befehl, aber einen
     // eigenen Weg (Entpacken, PMULLW, Zurueckpacken).
-    if (vOpc < 0 && self.cg_sseGanzSonderweg(op, breite) == 0) { return 0; }
+    if (vOpc < 0 && self.cg_sseGanzSonderweg(op, breite) == 0) { return self._vmNein("NO_VECTOR_OPCODE"c); }
     // #2194: Befehle aus der 0F-38-Gruppe (PMULLD) brauchen die sse4-Zusage.
     // Bei `parallel Array` ist ein Abbruch dort richtig — wer Vektoren
     // schreibt, hat sie verlangt. Hier wird AUTOMATISCH umgeformt: eine
     // CPU-Forderung zu erheben, die im Quelltext niemand gestellt hat,
     // machte aus einem uebersetzbaren Programm einen Fehler. Deckt die
     // Ziel-CPU es nicht, bleibt es bei der skalaren Schleife.
-    if (vOpc > 255 && self.cg_cpuHat(1) == 0) { return 0; }
+    if (vOpc > 255 && self.cg_cpuHat(1) == 0) { return self._vmNein("NO_SSE4_FOR_PMULLD"c); }
     // Beide Leseseiten: peekW derselben Breite auf derselben Indexform.
     var lN: int64 := self.cg_nc0(wert);
     var rN: int64 := self.cg_nc1(wert);
-    if (lN < 0 || rN < 0) { return 0; }
-    if (self.cg_nkind(lN) != CGN_CALL || self.cg_nkind(rN) != CGN_CALL) { return 0; }
-    if (self.cg_vmBreiteVonName(self.cg_nsval(lN), self.cg_nslen(lN), 1) != breite) { return 0; }
-    if (self.cg_vmBreiteVonName(self.cg_nsval(rN), self.cg_nslen(rN), 1) != breite) { return 0; }
+    if (lN < 0 || rN < 0) { return self._vmNein("LOAD_SIDE_MISSING"c); }
+    if (self.cg_nkind(lN) != CGN_CALL || self.cg_nkind(rN) != CGN_CALL) { return self._vmNein("LOAD_NOT_CALL"c); }
+    if (self.cg_vmBreiteVonName(self.cg_nsval(lN), self.cg_nslen(lN), 1) != breite) { return self._vmNein("LOAD_LEFT_WIDTH_MISMATCH"c); }
+    if (self.cg_vmBreiteVonName(self.cg_nsval(rN), self.cg_nslen(rN), 1) != breite) { return self._vmNein("LOAD_RIGHT_WIDTH_MISMATCH"c); }
     var la: int64 := self.cg_nc0(lN);
     var ra: int64 := self.cg_nc0(rN);
-    if (la < 0 || ra < 0) { return 0; }
-    if (self.cg_nnext(la) != -1 || self.cg_nnext(ra) != -1) { return 0; }
+    if (la < 0 || ra < 0) { return self._vmNein("LOAD_NO_ADDRESS"c); }
+    if (self.cg_nnext(la) != -1 || self.cg_nnext(ra) != -1) { return self._vmNein("LOAD_ARITY_MISMATCH"c); }
     var aOff: int64 := self.cg_vmBasisVon(la, iOff, breite, oNm, oNl);
     var bOff2: int64 := self.cg_vmBasisVon(ra, iOff, breite, oNm, oNl);
-    if (aOff == 0 || bOff2 == 0) { return 0; }
+    if (aOff == 0 || bOff2 == 0) { return self._vmNein("LOAD_INDEX_FORM_MISMATCH"c); }
     // Die Zeiger duerfen nicht die Schleifenvariable oder die Schranke sein —
     // sonst veraendert der Rumpf, was die Bedingung liest.
-    if (aOff == iOff || bOff2 == iOff || cOff == iOff) { return 0; }
-    if (aOff == nOff || bOff2 == nOff || cOff == nOff) { return 0; }
+    if (aOff == iOff || bOff2 == iOff || cOff == iOff) { return self._vmNein("POINTER_IS_LOOP_VAR"c); }
+    if (aOff == nOff || bOff2 == nOff || cOff == nOff) { return self._vmNein("POINTER_IS_BOUND"c); }
     poke64(kasten,      aOff);
     poke64(kasten + 8,  bOff2);
     poke64(kasten + 16, cOff);
@@ -24036,6 +24122,12 @@ pub type Codegen = class {
     poke32(self.code + jUeb1,  self.codeLen - jUeb1 - 4);
     poke32(self.code + jUeb2,  self.codeLen - jUeb2 - 4);
     self.zlVmVektor += 1;
+    // #2343: die andere Seite. Ein Bericht, der nur Ablehnungen zaehlt, waere
+    // auch von einem Vektorisierer erfuellt, der nie etwas anwendet.
+    // Die Ueberlappung von Ziel und Quellen ist hier NICHT statisch bewiesen,
+    // sondern zur Laufzeit geprueft (die Vergleichspaare oben, Ausstieg in die
+    // skalare Fassung) -- deshalb der eigene Code statt eines "alias proven".
+    if (self.cpDecAktiv != 0) { self._cpDecAdd("VECTOR_APPLIED_ALIAS_CHECKED_AT_RUNTIME"c, 1); }
     return jUeber;
   }
 
@@ -27058,6 +27150,15 @@ pub type Codegen = class {
     // #2133: Funktionstyp als Rueckgabe — `return` liefert einen Satz.
     var savedRetFnWert: int64 := self.curFnRetFnWert;
     self.curFnRetFnWert := self.cg_typIstFnWert(retTyNode);
+    // #2343: Name der Funktion, die gerade erzeugt wird -- fuer die
+    // Entscheidungen des Profils. Dieselbe Form wie lockstepName ein paar
+    // Zeilen weiter; wer hier eine neue Art von Rumpf anlegt, muss BEIDE
+    // setzen. Drei Stellen erzeugen einen Rumpf: Funktion (hier), Methode
+    // (cg_genMethodDecl) und Lambda.
+    var savedCpFnNam: pchar := self.cpFnNam;
+    var savedCpFnLen: int64 := self.cpFnLen;
+    self.cpFnNam := fname;
+    self.cpFnLen := fnlen;
 
     // WP-25.2: Compat-Warnung + WP-R9/R10/R11: Proxy/Landlock/seccomp am Anfang von 'main'
     if fnlen == 4 {
@@ -27163,6 +27264,8 @@ pub type Codegen = class {
     self.curFnRetRange := savedRetRange;   // #1097
     self.curFnRetNarrow := savedRetNarrow; // #1151
     self.curFnRetFnWert := savedRetFnWert; // #2133
+    self.cpFnNam := savedCpFnNam;          // #2343
+    self.cpFnLen := savedCpFnLen;
 
     // Restore outer function context
     self.outerFuncName := savedOuterName;
@@ -30589,6 +30692,13 @@ pub type Codegen = class {
     self.zlFrA := 0; self.zlFrT := 0; self.zlLbA := 0; self.zlLbT := 0;
     self.zlCoA := 0; self.zlCoT := 0; self.zlLnA := 0; self.zlLnT := 0; self.zlHxS := 0;
     self.zlF4A := 0; self.zlF4W := 0;   // #2310
+    // #2343: Entscheidungssenke. zlVmVektor zaehlt die angewandten Faelle und
+    // wird hier mitgesetzt -- bis #2343 stand er in keiner Ruecksetzung, was
+    // beim Selbstbau zweier Einheiten in einem Lauf addiert haette.
+    self.zlVmVektor := 0;
+    self.cpDecAktiv := 0; self.cpDec := 0; self.cpDecN := 0; self.cpDecCap := 0;
+    self.cpDecVerworfen := 0; self.cpVmNi := 0 - 1;
+    self.cpFnNam := 0 as pchar; self.cpFnLen := 0;
     self.zlF4Cap := 65536; self.zlF4Tab := alloc(self.zlF4Cap * 80);   // #2310
     self.lnCap := 16; self.lnTab := alloc(self.lnCap * 32); self.lnAnz := 0; self.lnLetzt := 0;   // #2175
     self.lbHx := self.cg_hxNeu(1024); self.coHx := self.cg_hxNeu(256); self.frHx := self.cg_hxNeu(256);

@@ -503,6 +503,10 @@ pub type CompilerConfig = class {
   cpMet:         int64;    // je Eintrag 32 Byte: Name, Wert, Span-Index, Art
   cpMetN:        int64;
   cpMetCap:      int64;
+  cpDecPtr:      int64;    // #2343 Schritt 2: Entscheidungen aus dem Codegen, je 56 Byte
+  cpDecAnz:      int64;
+  cpDecDrop:     int64;    // wegen der Puffergrenze verworfen
+  cpDecTreffer:  int64;    // Entscheidungen, die die Filter passieren
   irSourceMap:  bool;
   // #2316: Namensindex gegen die lineare Suche pruefen (beide laufen, die
   // Antworten muessen uebereinstimmen). Nur fuer den Nachweis gedacht, nicht
@@ -713,6 +717,10 @@ pub type CompilerConfig = class {
     self.cpMet          := 0;
     self.cpMetN         := 0;
     self.cpMetCap       := 0;
+    self.cpDecPtr       := 0;
+    self.cpDecAnz       := 0;
+    self.cpDecDrop      := 0;
+    self.cpDecTreffer   := 0 - 1;   // -1 = ohne Filter nicht gezaehlt
     self.zlEvN          := 0;
     self.zlEvCap        := 0;
     self.irSourceMap    := false;
@@ -2754,7 +2762,12 @@ pub type CompilerConfig = class {
       // Offsets, und genau zwei davon haengen an diesem Schalter.
       if self.kernelMode != 0 { cg.kernelMode := 1; }
       cg.Init(source, parser.nodes, parser.toks);
-      if self._cpZaehlerAn() { cg.zlAktiv := 1; }   // #2174: nach Init (Init setzt die Zaehler zurueck)
+      if self._cpZaehlerAn() { cg.zlAktiv := 1; }
+      // #2343 Schritt 2: Einzelentscheidungen nur in detailed. Sie kosten
+      // einen Eintrag je gepruefter Schleife und eine Zeilenberechnung.
+      if self.cpAktiv {
+        if self.cpLevel >= 2 { cg.cpDecAktiv := 1; }
+      }   // #2174: nach Init (Init setzt die Zaehler zurueck)
       cg.pNodeCount := parser.nodeCount;   // #2134: generische Funktionen
       cg.includePath := self.includePath;
       cg.stdPath     := self.stdPath;
@@ -2905,6 +2918,13 @@ pub type CompilerConfig = class {
           self._cpMet("parse_cache_treffer"c, pcTreffer, 0);
           self._cpMet("parse_cache_lesen_gespart"c, pcLesenGespart, 0);
           self._cpMet("vektorschleifen"c, cg.zlVmVektor, 0);
+        }
+      }
+      if self.cpAktiv {
+        if self.cpLevel >= 2 {
+          self.cpDecPtr := cg.cpDec;
+          self.cpDecAnz := cg.cpDecN;
+          self.cpDecDrop := cg.cpDecVerworfen;
         }
       }
       return self.exitCode;
@@ -6064,6 +6084,137 @@ pub type CompilerConfig = class {
     return StrConcat(StrConcat(j, grund), "\"}"c);
   }
 
+  // #2343 Schritt 2: passt eine Entscheidung durch die Filter? Funktions- und
+  // Passfilter sind mit UND verknuepft und beschraenken NUR die Einzelliste,
+  // nicht die Zusammenfassung.
+  //
+  // Der Funktionsfilter vergleicht den Namen, den der Codegen an der
+  // Entscheidungsstelle hat -- das ist der EINFACHE Name, kein qualifizierter.
+  // Einen qualifizierten gibt es dort nicht; der Bericht sagt das in
+  // coverage.filters.function_match, statt einen zu behaupten.
+  fn _cpDecPasst(e: int64): bool {
+    if self.cpPassFilter != 0 as pchar {
+      if StrCmp(self.cpPassFilter, "vectorize"c) != 0 { return false; }
+    }
+    if self.cpFnFilter != 0 as pchar {
+      var nm: pchar := peek64(e + 24) as pchar;
+      if nm == 0 as pchar { return false; }
+      var nl: int64 := peek64(e + 32);
+      if StrLen(self.cpFnFilter) != nl { return false; }
+      var i: int64 := 0;
+      while i < nl {
+        if peek8((self.cpFnFilter as int64) + i) != peek8((nm as int64) + i) { return false; }
+        i := i + 1;
+      }
+    }
+    return true;
+  }
+
+  fn _cpDecName(e: int64): pchar {
+    var nm: pchar := peek64(e + 24) as pchar;
+    if nm == 0 as pchar { return 0 as pchar; }
+    return StrSub(nm, 0, peek64(e + 32));
+  }
+
+  // Die Einzelereignisse. Ohne detailed leer -- und coverage sagt dann, dass
+  // keine erfasst wurden, damit die leere Liste nicht als "geprueft und
+  // nichts gefunden" gelesen wird.
+  fn _cpDecisions(): pchar {
+    var j: pchar := "["c;
+    if self.cpLevel < 2 { return StrConcat(j, "]"c); }
+    var i: int64 := 0;
+    var n: int64 := 0;
+    while i < self.cpDecAnz {
+      var e: int64 := self.cpDecPtr + i * 56;
+      if self._cpDecPasst(e) {
+        if n > 0 { j := StrConcat(j, ","c); }
+        n := n + 1;
+        j := StrConcat(j, "{\"pass_id\":\"vectorize\","c);
+        var erg: pchar := "rejected"c;
+        if peek64(e + 8) != 0 { erg := "applied"c; }
+        j := StrConcat(j, self._cpTxt("outcome"c, erg));
+        j := StrConcat(j, ","c);
+        j := StrConcat(j, self._cpTxt("reason_code"c, peek64(e) as pchar));
+        j := StrConcat(j, ","c);
+        var nm: pchar := self._cpDecName(e);
+        if nm == 0 as pchar {
+          j := StrConcat(j, "\"function\":null,"c);
+        } else {
+          j := StrConcat(j, self._cpTxt("function"c, nm));
+          j := StrConcat(j, ","c);
+        }
+        var zl: int64 := peek64(e + 16);
+        // Die Datei kommt AUS DEM EINTRAG. Eine Entscheidung in einer
+        // importierten Unit traegt deren Pfad; der Pfad der Hauptdatei waere
+        // zu einer fremden Zeilennummer eine erfundene Stelle.
+        var dp: pchar := peek64(e + 40) as pchar;
+        var dl: int64 := peek64(e + 48);
+        if zl > 0 && dp != 0 as pchar && dl > 0 {
+          j := StrConcat(j, "\"location\":{\"file\":"c);
+          j := StrConcat(j, StrConcat(StrConcat("\""c, self._cpEsc(StrSub(dp, 0, dl))), "\","c));
+          j := StrConcat(j, self._cpZahl("line"c, zl));
+          j := StrConcat(j, "}}"c);
+        } else {
+          j := StrConcat(j, self._cpFehlt("location"c, "NO_SOURCE_OFFSET"c));
+          j := StrConcat(j, "}"c);
+        }
+      }
+      i := i + 1;
+    }
+    self.cpDecTreffer := n;
+    return StrConcat(j, "]"c);
+  }
+
+  // Zaehler nach Pass, Ergebnis und Grund. Sie bleiben GLOBAL, auch wenn ein
+  // Filter die Einzelliste beschneidet -- sonst sieht eine gefilterte Sicht
+  // wie der ganze Lauf aus. Gruppiert wird ueber den Zeiger des Reason-Codes:
+  // die Codes sind Literale, gleicher Code heisst derselbe Zeiger.
+  fn _cpDecSummary(): pchar {
+    var j: pchar := "["c;
+    if self.cpLevel < 2 { return StrConcat(j, "]"c); }
+    var i: int64 := 0;
+    var raus: int64 := 0;
+    while i < self.cpDecAnz {
+      var e: int64 := self.cpDecPtr + i * 56;
+      var code: int64 := peek64(e);
+      var erg: int64 := peek64(e + 8);
+      // Schon ausgegeben?
+      var k: int64 := 0;
+      var gesehen: bool := false;
+      while k < i {
+        var f: int64 := self.cpDecPtr + k * 56;
+        if peek64(f) == code {
+          if peek64(f + 8) == erg { gesehen := true; }
+        }
+        k := k + 1;
+      }
+      if !gesehen {
+        var anz: int64 := 0;
+        var m: int64 := i;
+        while m < self.cpDecAnz {
+          var g: int64 := self.cpDecPtr + m * 56;
+          if peek64(g) == code {
+            if peek64(g + 8) == erg { anz := anz + 1; }
+          }
+          m := m + 1;
+        }
+        if raus > 0 { j := StrConcat(j, ","c); }
+        raus := raus + 1;
+        var en: pchar := "rejected"c;
+        if erg != 0 { en := "applied"c; }
+        j := StrConcat(j, "{\"pass_id\":\"vectorize\","c);
+        j := StrConcat(j, self._cpTxt("outcome"c, en));
+        j := StrConcat(j, ","c);
+        j := StrConcat(j, self._cpTxt("reason_code"c, code as pchar));
+        j := StrConcat(j, ","c);
+        j := StrConcat(j, self._cpZahl("count"c, anz));
+        j := StrConcat(j, "}"c);
+      }
+      i := i + 1;
+    }
+    return StrConcat(j, "]"c);
+  }
+
   fn _cpLevelName(): pchar {
     if self.cpLevel == 1 { return "analysis"c; }
     if self.cpLevel == 2 { return "detailed"c; }
@@ -6217,8 +6368,17 @@ pub type CompilerConfig = class {
     } else {
       j := StrConcat(j, "\"pass\":null"c);
     }
-    // Trefferzahl gilt nur fuer Detaildaten; die gibt es in Schritt 1 nicht.
-    j := StrConcat(j, ",\"matches\":null},\"passes\":["c);
+    // Trefferzahl: nur sinnvoll, wenn Einzeldaten erfasst wurden. Sonst
+    // null -- nicht 0, was "geprueft, nichts getroffen" behaupten wuerde.
+    j := StrConcat(j, ","c);
+    if self.cpDecTreffer < 0 {
+      j := StrConcat(j, "\"matches\":null"c);
+    } else {
+      j := StrConcat(j, self._cpZahl("matches"c, self.cpDecTreffer));
+    }
+    // Der Funktionsfilter vergleicht den einfachen Namen; einen
+    // qualifizierten hat der Codegen an der Entscheidungsstelle nicht.
+    j := StrConcat(j, ",\"function_match\":\"plain_name\"},\"passes\":["c);
     var zd: pchar := "not_instrumented"c;
     var i: int64 := 0;
     while i < self.zlEvN {
@@ -6237,11 +6397,25 @@ pub type CompilerConfig = class {
     // Unterschied ist der Kern des Berichts, nicht eine Fussnote.
     if self.zlEvN > 0 { j := StrConcat(j, ","c); }
     j := StrConcat(j, "{\"pass_id\":\"ir-optimize\",\"timing\":\"not_instrumented\",\"decisions\":\"not_instrumented\",\"note\":\"laeuft innerhalb von codegen-* ohne eigene Spanne\"},"c);
-    j := StrConcat(j, "{\"pass_id\":\"vectorize\",\"timing\":\"not_instrumented\",\"decisions\":\"not_instrumented\",\"note\":\"cg_vmErkennen entscheidet, meldet aber noch nicht; nur x86-64\"},"c);
+    // vectorize: in detailed meldet cg_vmErkennen jede Entscheidung, sonst
+    // laeuft es ununterbrochen, erfasst aber nichts. Nur x86-64 hat den Pass
+    // ueberhaupt -- auf arm64 und riscv ist er ABSENT, nicht bloss stumm.
+    if self.cpLevel >= 2 {
+      if self.target == LYX_TC_X86_64 {
+        j := StrConcat(j, "{\"pass_id\":\"vectorize\",\"timing\":\"not_instrumented\",\"decisions\":\"per_event\",\"note\":\"cg_vmErkennen, 38 Ablehnungsgruende; eine eigene Spanne hat der Pass nicht\"},"c);
+      } else {
+        j := StrConcat(j, "{\"pass_id\":\"vectorize\",\"timing\":\"absent\",\"decisions\":\"absent\",\"note\":\"den Pass gibt es nur fuer x86-64\"},"c);
+      }
+    } else {
+      j := StrConcat(j, "{\"pass_id\":\"vectorize\",\"timing\":\"not_instrumented\",\"decisions\":\"not_instrumented\",\"note\":\"meldet Entscheidungen erst in detailed\"},"c);
+    }
     j := StrConcat(j, "{\"pass_id\":\"inline\",\"timing\":\"not_run\",\"decisions\":\"not_run\",\"note\":\"Pass ist nicht verdrahtet\"}"c);
     j := StrConcat(j, "],\"missing_capabilities\":["c);
     j := StrConcat(j, "\"PHASE_RSS\",\"THREAD_CPU_TIME\",\"CHILD_CPU_TIME\",\"CRITICAL_PATH\","c);
-    j := StrConcat(j, "\"IO_COUNTERS\",\"ALLOCATION_COUNTERS\",\"INPUT_HASHES\",\"DECISION_EVENTS\"]}"c);
+    j := StrConcat(j, "\"IO_COUNTERS\",\"ALLOCATION_COUNTERS\",\"INPUT_HASHES\""c);
+    // DECISION_EVENTS faellt in detailed weg: dort werden sie erfasst.
+    if self.cpLevel < 2 { j := StrConcat(j, ",\"DECISION_EVENTS\""c); }
+    j := StrConcat(j, "]}"c);
     return j;
   }
 
@@ -6265,6 +6439,11 @@ pub type CompilerConfig = class {
     // gehalten worden -- vor dem Bau, wie es sein muss. Ein abgeleiteter Pfad
     // kann beide nicht treffen, er haengt den Zusatz an den Ausgabenamen.
     var pfad: pchar := self._cpZielPfad(outputFile);
+    // #2343 Schritt 2: Die Einzelliste wird ZUERST gebaut, weil sie die
+    // Trefferzahl der Filter setzt und coverage sie weiter oben im Bericht
+    // nennt. Andernfalls stuende dort der Anfangswert -- eine Zahl, die wie
+    // eine Messung aussieht und keine ist.
+    var decJson: pchar := self._cpDecisions();
 
     var j: pchar := "{\"schema_version\":\"1.0\","c;
     // Laufkennung aus Prozessnummer und Startzeitpunkt. Sie ist eindeutig je
@@ -6355,10 +6534,14 @@ pub type CompilerConfig = class {
     }
     j := StrConcat(j, "},\"spans\":"c);
     j := StrConcat(j, self._cpSpans());
-    // Entscheidungen kommen in Schritt 2. Leere Listen heissen hier NICHT
-    // "geprueft und nichts gefunden" -- das sagt coverage mit
-    // DECISION_EVENTS unter missing_capabilities.
-    j := StrConcat(j, ",\"decisions\":[],\"decision_summary\":[],\"artifacts\":["c);
+    // Einzelereignisse und Zaehler. Eine leere Liste heisst hier NICHT
+    // "geprueft und nichts gefunden": ausserhalb von detailed sagt coverage
+    // das mit DECISION_EVENTS unter missing_capabilities.
+    j := StrConcat(j, ",\"decisions\":"c);
+    j := StrConcat(j, decJson);
+    j := StrConcat(j, ",\"decision_summary\":"c);
+    j := StrConcat(j, self._cpDecSummary());
+    j := StrConcat(j, ",\"artifacts\":["c);
     if ab >= 0 {
       j := StrConcat(j, "{"c);
       j := StrConcat(j, self._cpTxt("path"c, outputFile));
@@ -6375,8 +6558,30 @@ pub type CompilerConfig = class {
     j := StrConcat(j, ","c);
     j := StrConcat(j, self._cpZahl("metrics_recorded"c, self.cpMetN));
     j := StrConcat(j, ","c);
-    j := StrConcat(j, self._cpZahl("events_dropped"c, 0));
-    j := StrConcat(j, ",\"truncated\":false,\"filtered\":false,\"warnings\":[],"c);
+    j := StrConcat(j, self._cpZahl("decisions_recorded"c, self.cpDecAnz));
+    j := StrConcat(j, ","c);
+    j := StrConcat(j, self._cpZahl("events_dropped"c, self.cpDecDrop));
+    j := StrConcat(j, ",\"event_limit\":16384,"c);
+    if self.cpDecDrop > 0 { j := StrConcat(j, "\"truncated\":true,"c); }
+    else                  { j := StrConcat(j, "\"truncated\":false,"c); }
+    var gefiltert: bool := false;
+    if self.cpFnFilter != 0 as pchar { gefiltert := true; }
+    if self.cpPassFilter != 0 as pchar { gefiltert := true; }
+    j := StrConcat(j, self._cpBool("filtered"c, gefiltert));
+    j := StrConcat(j, ",\"warnings\":["c);
+    // Die Messung beeinflusst den gemessenen Lauf. In detailed berechnet das
+    // Profil selbst Quellzeilen, und cg_lineOf zaehlt seine Aufrufe mit --
+    // lineOf_aufrufe ist dort also hoeher als ohne Schalter. Das gehoert in
+    // den Bericht; es herauszurechnen waere eine Schaetzung, die wie eine
+    // Messung aussieht.
+    if self.cpLevel >= 2 {
+      j := StrConcat(j, "\"lineOf_aufrufe enthaelt in detailed die Zeilenberechnungen des Profils selbst\""c);
+    }
+    if gefiltert {
+      if self.cpLevel >= 2 { j := StrConcat(j, ","c); }
+      j := StrConcat(j, "\"decisions ist gefiltert; decision_summary bleibt global\""c);
+    }
+    j := StrConcat(j, "],"c);
     // Die Serialisierungsdauer steht NEBEN der Compilezeit, nicht darin.
     // Sie wird gemessen, nachdem der Text steht, und ist deshalb ein Wert
     // dieses Laufs, kein herausgerechneter Messoverhead.

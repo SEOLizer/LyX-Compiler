@@ -245,5 +245,129 @@ else
   ok "11 Bericht wird vollstaendig ersetzt, keine Nachbardatei zurueck"
 fi
 
+# ---------------------------------------------------------------------------
+# Schritt 2 (#2343): Entscheidungen des Autovektorisierers.
+# ---------------------------------------------------------------------------
+
+# Eine Quelle mit genau einer vektorisierbaren Schleife (wird ANGEWANDT) und
+# einer, die abgelehnt wird. Dazu ein Import, damit Entscheidungen aus einer
+# FREMDEN Unit im Bericht stehen -- an denen haengt Pruefung 14.
+cat > "$TMP/vek.lyx" <<'EOF'
+import src.std.io;
+fn summe(n: int64): int64 {
+  var a: int64 := alloc(n * 4);
+  var b: int64 := alloc(n * 4);
+  var c: int64 := alloc(n * 4);
+  var i: int64 := 0;
+  while (i < n) { poke32(c + i * 4, peek32(a + i * 4) + peek32(b + i * 4)); i := i + 1; }
+  var s: int64 := 0;
+  i := 0;
+  while (i < n) { s := s + 1; i := i + 1; }
+  return s;
+}
+fn main(): int64 {
+  PrintStrLn("vek");
+  return summe(64) & 0;
+}
+EOF
+baueVek() { ( cd "$TMP" && "$LYXC" --std-path="$ROOT" vek.lyx -o vapp "$@" ) >"$TMP/vout.log" 2>"$TMP/verr.log"; }
+
+# 12. BEIDE Seiten. Ein Bericht, der nur Ablehnungen fuehrt, waere auch von
+#     einem Vektorisierer erfuellt, der nie etwas anwendet; einer, der nur
+#     Erfolge fuehrt, verschweigt die Gruende. Zusaetzlich: die Summe der
+#     Zaehler in decision_summary muss decisions_recorded treffen -- sonst
+#     zaehlt die Zusammenfassung etwas anderes als die Liste.
+rm -f "$TMP"/v_*.json "$TMP/vapp"
+baueVek --compile-profile="$TMP/v_det.json" --compile-profile-level=detailed
+if python3 -I -c "
+import json,sys
+d=json.load(open('$TMP/v_det.json'))
+dec=d['decisions']; sm=d['decision_summary']
+erg=set(x['outcome'] for x in dec)
+assert 'applied' in erg, 'keine angewandte Entscheidung: %r' % (erg,)
+assert 'rejected' in erg, 'keine abgelehnte Entscheidung: %r' % (erg,)
+assert all(x['pass_id']=='vectorize' for x in dec), 'fremder pass_id in decisions'
+assert all(x['reason_code'] for x in dec), 'Entscheidung ohne reason_code'
+su=sum(x['count'] for x in sm)
+rec=d['collection']['decisions_recorded']
+assert su==rec, 'Summe der Zaehler %d != decisions_recorded %d' % (su,rec)
+assert len(set((x['reason_code'],x['outcome']) for x in sm))==len(sm), 'Grund doppelt in decision_summary'
+" 2>"$TMP/p12.log"; then
+  ok "12 detailed fuehrt angewandte UND abgelehnte Entscheidungen, Zaehler treffen die Liste"
+else
+  no "12 beide Seiten" "$(tail -2 "$TMP/p12.log" | tr '\n' ' ')"
+fi
+
+# 13. Die leere Liste darf nicht als "geprueft und nichts gefunden" lesbar
+#     sein: ausserhalb von detailed sagt coverage DECISION_EVENTS, und der
+#     Pass meldet dort not_instrumented statt per_event.
+rm -f "$TMP"/v_*.json "$TMP/vapp"
+baueVek --compile-profile="$TMP/v_bas.json" --compile-profile-level=basic
+baueVek --compile-profile="$TMP/v_det.json" --compile-profile-level=detailed
+if python3 -I -c "
+import json
+b=json.load(open('$TMP/v_bas.json')); t=json.load(open('$TMP/v_det.json'))
+mb=b['coverage']['missing_capabilities']; mt=t['coverage']['missing_capabilities']
+assert b['decisions']==[] and b['decision_summary']==[], 'basic fuehrt Entscheidungen'
+assert 'DECISION_EVENTS' in mb, 'basic: leere Liste ohne DECISION_EVENTS'
+assert 'DECISION_EVENTS' not in mt, 'detailed nennt DECISION_EVENTS trotz Erfassung'
+pb=[p for p in b['coverage']['passes'] if p['pass_id']=='vectorize'][0]
+pt=[p for p in t['coverage']['passes'] if p['pass_id']=='vectorize'][0]
+assert pb['decisions']=='not_instrumented', pb
+assert pt['decisions']=='per_event', pt
+" 2>"$TMP/p13.log"; then
+  ok "13 ohne detailed keine Entscheidungen, und coverage sagt es (DECISION_EVENTS)"
+else
+  no "13 leere Liste belegt" "$(tail -2 "$TMP/p13.log" | tr '\n' ' ')"
+fi
+
+# 14. Die Stelle muss zur Datei des Eintrags gehoeren. Bis zur Messung trug
+#     JEDE Entscheidung den Pfad der Hauptdatei -- auch die aus src/std/*,
+#     mit einer Zeilennummer, die es in der Hauptdatei nicht gibt. Geprueft
+#     wird deshalb gegen die ZEILENZAHL der genannten Datei, nicht gegen das
+#     Vorhandensein eines Pfades.
+if python3 -I -c "
+import json,os
+d=json.load(open('$TMP/v_det.json'))
+root='$TMP'; haupt=os.path.realpath('$TMP/vek.lyx')
+mit=[x for x in d['decisions'] if 'file' in (x.get('location') or {})]
+assert mit, 'keine Entscheidung mit Stelle'
+fremd=0
+for x in mit:
+    f=x['location']['file']; ln=x['location']['line']
+    pf=f if os.path.isabs(f) else os.path.join(root,f)
+    assert os.path.exists(pf), 'Datei existiert nicht: %s' % f
+    n=sum(1 for _ in open(pf,'rb'))
+    assert 1<=ln<=n, 'Zeile %d liegt ausserhalb von %s (%d Zeilen)' % (ln,f,n)
+    if os.path.realpath(pf)!=haupt: fremd+=1
+assert fremd>0, 'keine Entscheidung aus einer importierten Unit -- Pruefung traegt nichts'
+" 2>"$TMP/p14.log"; then
+  ok "14 jede Stelle liegt in ihrer eigenen Datei (auch aus importierten Units)"
+else
+  no "14 Stelle gehoert zur Datei" "$(tail -2 "$TMP/p14.log" | tr '\n' ' ')"
+fi
+
+# 15. Filter beschneiden die Einzelliste, NICHT die Zusammenfassung. Sonst
+#     liest sich eine gefilterte Sicht wie der ganze Lauf.
+rm -f "$TMP/vapp"
+baueVek --compile-profile="$TMP/v_f.json" --compile-profile-level=detailed --compile-profile-function=summe
+if python3 -I -c "
+import json
+a=json.load(open('$TMP/v_det.json')); f=json.load(open('$TMP/v_f.json'))
+assert f['decisions'], 'Filter laesst nichts durch'
+assert all(x['function']=='summe' for x in f['decisions']), 'fremde Funktion trotz Filter'
+assert len(f['decisions'])<len(a['decisions']), 'Filter hat nichts beschnitten'
+assert f['decision_summary']==a['decision_summary'], 'decision_summary ist mitgefiltert'
+assert f['coverage']['filters']['matches']==len(f['decisions']), 'matches != Trefferzahl'
+assert a['coverage']['filters']['matches']==len(a['decisions']), 'matches ungefiltert falsch'
+lim=f['collection']
+assert lim['filtered'] is True, 'filtered nicht gesetzt'
+assert any('gefiltert' in w for w in lim['warnings']), 'keine Warnung zur gefilterten Liste'
+" 2>"$TMP/p15.log"; then
+  ok "15 Filter beschneidet nur die Einzelliste, decision_summary bleibt global"
+else
+  no "15 Filterwirkung" "$(tail -2 "$TMP/p15.log" | tr '\n' ' ')"
+fi
+
 echo "Ergebnis: $PASS PASS, $FAIL FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
