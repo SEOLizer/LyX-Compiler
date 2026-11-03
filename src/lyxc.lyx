@@ -119,6 +119,11 @@ con OUTPUT_TYPE_SHARED_LIB: int64 := 1;
 // Android API levels (WP-AND-03)
 con ANDROID_API_MIN:     int64 := 21;   // Android 5.0 — first 64-bit ARM
 con ANDROID_API_MAX:     int64 := 36;   // #1526: hoechste bekannte Stufe; darueber ist es ein Tippfehler
+// #2343 Schritt 3: Deckel fuer die Einzelereignisse des Compilatprofils. Die
+// Vorgabe reicht fuer den Selbstbau von lyxc.lyx (dort entstehen Zehntausende Entscheidungen), die Obergrenze haelt einen Tippfehler von einer
+// Speicheranforderung fern, die den Lauf verdraengt.
+con CP_MAX_EVENTS_DEFAULT: int64 := 16384;
+con CP_MAX_EVENTS_MAX:     int64 := 100000000;
 con ANDROID_API_DEFAULT: int64 := 26;   // Android 8.0 — current target baseline
 
 // (LicenseInfo and LIC_ERR_* are defined in src.crypto.lic_types)
@@ -507,6 +512,22 @@ pub type CompilerConfig = class {
   cpDecAnz:      int64;
   cpDecDrop:     int64;    // wegen der Puffergrenze verworfen
   cpDecTreffer:  int64;    // Entscheidungen, die die Filter passieren
+  // #2343 Schritt 3: Obergrenze der Einzelereignisse. Als Schalter, weil der
+  // sinnvolle Wert von der Quelle abhaengt: beim Selbstbau von lyxc.lyx
+  // entstehen Zehntausende Entscheidungen, bei einer kleinen Unit ein Dutzend.
+  // Es gibt KEIN "unbegrenzt": jeder Eintrag belegt Speicher im gemessenen
+  // Lauf, und ein Deckel, den man abschalten kann, ist keiner.
+  cpMaxEv:       int64;
+  cpMaxEvGesetzt: bool;
+  // #2343 Schritt 3: Anhaengepuffer fuer die Einzelliste. StrConcat legt bei
+  // jedem Aufruf eine neue Zeichenkette an und kopiert beide Seiten BYTEWEISE
+  // -- bei 16384 Eintraegen ist das quadratisch. Gemessen: der Selbstbau von
+  // lyxc.lyx wurde in detailed vom OOM-Killer getoetet, und die Uebersetzung
+  // brauchte das Elffache (1,95 s -> 22,2 s). Der Bericht darf den gemessenen
+  // Lauf nicht dominieren.
+  cpOut:         int64;
+  cpOutLen:      int64;
+  cpOutCap:      int64;
   irSourceMap:  bool;
   // #2316: Namensindex gegen die lineare Suche pruefen (beide laufen, die
   // Antworten muessen uebereinstimmen). Nur fuer den Nachweis gedacht, nicht
@@ -721,6 +742,11 @@ pub type CompilerConfig = class {
     self.cpDecAnz       := 0;
     self.cpDecDrop      := 0;
     self.cpDecTreffer   := 0 - 1;   // -1 = ohne Filter nicht gezaehlt
+    self.cpMaxEv        := CP_MAX_EVENTS_DEFAULT;
+    self.cpMaxEvGesetzt := false;
+    self.cpOut          := 0;
+    self.cpOutLen       := 0;
+    self.cpOutCap       := 0;
     self.zlEvN          := 0;
     self.zlEvCap        := 0;
     self.irSourceMap    := false;
@@ -1641,6 +1667,29 @@ pub type CompilerConfig = class {
       self.cpPassFilter := (arg + 23) as pchar;   // 23 Zeichen mit '='
       return;
     }
+    if StrStartsWith(arg, "--compile-profile-max-events=") {
+      var mev: pchar := (arg + 29) as pchar;   // 29 Zeichen mit '='
+      // Ziffern von Hand, wie bei --android-api (ParseInt verhaelt sich unter
+      // dem Seed-Bootstrap nicht zuverlaessig). Anders als dort wird hier das
+      // ENDE geprueft: "--compile-profile-max-events=12x" ist ein Tippfehler,
+      // und ein stillschweigend angenommenes 12 waere die schlimmere Antwort.
+      var q: int64 := mev as int64;
+      var v: int64 := 0;
+      var ziffern: int64 := 0;
+      while peek8(q) >= 48 && peek8(q) <= 57 {
+        v := v * 10 + peek8(q) - 48;
+        q += 1;
+        ziffern += 1;
+        if ziffern > 9 { self._rejectWert("--compile-profile-max-events"c, mev, "1..100000000"c); return; }
+      }
+      if ziffern == 0 || peek8(q) != 0 || v < 1 || v > CP_MAX_EVENTS_MAX {
+        self._rejectWert("--compile-profile-max-events"c, mev, "1..100000000"c);
+        return;
+      }
+      self.cpMaxEv := v;
+      self.cpMaxEvGesetzt := true;
+      return;
+    }
     if StrCmp(arg, "--index-gegenprobe"c) == 0 {
       self.idxGegenprobe := true;   // #2316
       return;
@@ -2075,6 +2124,7 @@ pub type CompilerConfig = class {
     PrintStrLn("  --compile-profile-level=L  basic (Vorgabe), analysis, detailed");
     PrintStrLn("  --compile-profile-function=NAME  Detaildaten auf eine Funktion beschraenken");
     PrintStrLn("  --compile-profile-pass=ID  Detaildaten auf einen Pass beschraenken");
+    PrintStrLn("  --compile-profile-max-events=N  Deckel der Einzelereignisse (Vorgabe 16384)");
     PrintStrLn("  --ir-source-map        IR Source Mapping anzeigen");
     PrintStrLn("  --index-gegenprobe     Namensindex gegen die lineare Suche pruefen (#2316, langsam)");
     PrintStrLn("  --type-reasoning       Type-Checker Reasoning anzeigen");
@@ -2766,7 +2816,10 @@ pub type CompilerConfig = class {
       // #2343 Schritt 2: Einzelentscheidungen nur in detailed. Sie kosten
       // einen Eintrag je gepruefter Schleife und eine Zeilenberechnung.
       if self.cpAktiv {
-        if self.cpLevel >= 2 { cg.cpDecAktiv := 1; }
+        if self.cpLevel >= 2 {
+          cg.cpDecAktiv := 1;
+          cg.cpDecMax   := self.cpMaxEv;   // #2343 Schritt 3
+        }
       }   // #2174: nach Init (Init setzt die Zaehler zurueck)
       cg.pNodeCount := parser.nodeCount;   // #2134: generische Funktionen
       cg.includePath := self.includePath;
@@ -6084,6 +6137,36 @@ pub type CompilerConfig = class {
     return StrConcat(StrConcat(j, grund), "\"}"c);
   }
 
+  // #2343 Schritt 3: Anhaengen in amortisiert konstanter Zeit. Der Puffer
+  // verdoppelt sich; kopiert wird mit memcpy, nicht Byte fuer Byte.
+  fn _cpAnhStart(): void {
+    self.cpOutLen := 0;
+    if self.cpOut == 0 {
+      self.cpOutCap := 65536;
+      self.cpOut    := alloc(self.cpOutCap);
+    }
+  }
+
+  fn _cpAnh(t: pchar): void {
+    var n: int64 := StrLen(t);
+    if n == 0 { return; }
+    if self.cpOutLen + n + 1 > self.cpOutCap {
+      var nc: int64 := self.cpOutCap * 2;
+      while nc < self.cpOutLen + n + 1 { nc := nc * 2; }
+      var nb: int64 := alloc(nc);
+      if self.cpOutLen > 0 { memcpy(nb, self.cpOut, self.cpOutLen); }
+      self.cpOut    := nb;
+      self.cpOutCap := nc;
+    }
+    memcpy(self.cpOut + self.cpOutLen, t as int64, n);
+    self.cpOutLen := self.cpOutLen + n;
+  }
+
+  fn _cpAnhFertig(): pchar {
+    poke8(self.cpOut + self.cpOutLen, 0);
+    return self.cpOut as pchar;
+  }
+
   // #2343 Schritt 2: passt eine Entscheidung durch die Filter? Funktions- und
   // Passfilter sind mit UND verknuepft und beschraenken NUR die Einzelliste,
   // nicht die Zusammenfassung.
@@ -6120,28 +6203,29 @@ pub type CompilerConfig = class {
   // keine erfasst wurden, damit die leere Liste nicht als "geprueft und
   // nichts gefunden" gelesen wird.
   fn _cpDecisions(): pchar {
-    var j: pchar := "["c;
-    if self.cpLevel < 2 { return StrConcat(j, "]"c); }
+    if self.cpLevel < 2 { return "[]"c; }
+    self._cpAnhStart();
+    self._cpAnh("["c);
     var i: int64 := 0;
     var n: int64 := 0;
     while i < self.cpDecAnz {
       var e: int64 := self.cpDecPtr + i * 56;
       if self._cpDecPasst(e) {
-        if n > 0 { j := StrConcat(j, ","c); }
+        if n > 0 { self._cpAnh(","c); }
         n := n + 1;
-        j := StrConcat(j, "{\"pass_id\":\"vectorize\","c);
+        self._cpAnh("{\"pass_id\":\"vectorize\","c);
         var erg: pchar := "rejected"c;
         if peek64(e + 8) != 0 { erg := "applied"c; }
-        j := StrConcat(j, self._cpTxt("outcome"c, erg));
-        j := StrConcat(j, ","c);
-        j := StrConcat(j, self._cpTxt("reason_code"c, peek64(e) as pchar));
-        j := StrConcat(j, ","c);
+        self._cpAnh(self._cpTxt("outcome"c, erg));
+        self._cpAnh(","c);
+        self._cpAnh(self._cpTxt("reason_code"c, peek64(e) as pchar));
+        self._cpAnh(","c);
         var nm: pchar := self._cpDecName(e);
         if nm == 0 as pchar {
-          j := StrConcat(j, "\"function\":null,"c);
+          self._cpAnh("\"function\":null,"c);
         } else {
-          j := StrConcat(j, self._cpTxt("function"c, nm));
-          j := StrConcat(j, ","c);
+          self._cpAnh(self._cpTxt("function"c, nm));
+          self._cpAnh(","c);
         }
         var zl: int64 := peek64(e + 16);
         // Die Datei kommt AUS DEM EINTRAG. Eine Entscheidung in einer
@@ -6150,67 +6234,97 @@ pub type CompilerConfig = class {
         var dp: pchar := peek64(e + 40) as pchar;
         var dl: int64 := peek64(e + 48);
         if zl > 0 && dp != 0 as pchar && dl > 0 {
-          j := StrConcat(j, "\"location\":{\"file\":"c);
-          j := StrConcat(j, StrConcat(StrConcat("\""c, self._cpEsc(StrSub(dp, 0, dl))), "\","c));
-          j := StrConcat(j, self._cpZahl("line"c, zl));
-          j := StrConcat(j, "}}"c);
+          self._cpAnh("\"location\":{\"file\":\""c);
+          self._cpAnh(self._cpEsc(StrSub(dp, 0, dl)));
+          self._cpAnh("\","c);
+          self._cpAnh(self._cpZahl("line"c, zl));
+          self._cpAnh("}}"c);
         } else {
-          j := StrConcat(j, self._cpFehlt("location"c, "NO_SOURCE_OFFSET"c));
-          j := StrConcat(j, "}"c);
+          self._cpAnh(self._cpFehlt("location"c, "NO_SOURCE_OFFSET"c));
+          self._cpAnh("}"c);
         }
       }
       i := i + 1;
     }
     self.cpDecTreffer := n;
-    return StrConcat(j, "]"c);
+    self._cpAnh("]"c);
+    return self._cpAnhFertig();
   }
 
   // Zaehler nach Pass, Ergebnis und Grund. Sie bleiben GLOBAL, auch wenn ein
   // Filter die Einzelliste beschneidet -- sonst sieht eine gefilterte Sicht
   // wie der ganze Lauf aus. Gruppiert wird ueber den Zeiger des Reason-Codes:
   // die Codes sind Literale, gleicher Code heisst derselbe Zeiger.
+  //
+  // #2343 Schritt 3: EIN Durchlauf gegen eine Tabelle der schon gesehenen
+  // Gruende. Die vorige Fassung verglich jeden Eintrag mit allen vorherigen --
+  // bei 16384 Eintraegen 268 Millionen Vergleiche, und das war der zweite
+  // Grund, warum der Selbstbau in detailed 22 Sekunden brauchte.
   fn _cpDecSummary(): pchar {
-    var j: pchar := "["c;
-    if self.cpLevel < 2 { return StrConcat(j, "]"c); }
+    if self.cpLevel < 2 { return "[]"c; }
+    // Je Ausstiegsstelle ein Grund, je Grund zwei Ergebnisse: die Tabelle ist
+    // durch den Code begrenzt, nicht durch die Eingabe. Laeuft sie trotzdem
+    // voll, wird das LAUT gemeldet statt stillschweigend zu zaehlen.
+    var cap: int64 := 256;
+    var tab: int64 := alloc(cap * 24);   // Code, Ergebnis, Anzahl
+    var tn: int64 := 0;
+    var voll: int64 := 0;
     var i: int64 := 0;
-    var raus: int64 := 0;
     while i < self.cpDecAnz {
       var e: int64 := self.cpDecPtr + i * 56;
       var code: int64 := peek64(e);
       var erg: int64 := peek64(e + 8);
-      // Schon ausgegeben?
       var k: int64 := 0;
-      var gesehen: bool := false;
-      while k < i {
-        var f: int64 := self.cpDecPtr + k * 56;
-        if peek64(f) == code {
-          if peek64(f + 8) == erg { gesehen := true; }
+      var gefunden: int64 := 0;
+      while k < tn {
+        var t: int64 := tab + k * 24;
+        if peek64(t) == code {
+          if peek64(t + 8) == erg {
+            poke64(t + 16, peek64(t + 16) + 1);
+            gefunden := 1;
+            k := tn;
+          }
         }
         k := k + 1;
       }
-      if !gesehen {
-        var anz: int64 := 0;
-        var m: int64 := i;
-        while m < self.cpDecAnz {
-          var g: int64 := self.cpDecPtr + m * 56;
-          if peek64(g) == code {
-            if peek64(g + 8) == erg { anz := anz + 1; }
-          }
-          m := m + 1;
+      if gefunden == 0 {
+        if tn >= cap {
+          voll := voll + 1;
+        } else {
+          var t2: int64 := tab + tn * 24;
+          poke64(t2, code);
+          poke64(t2 + 8, erg);
+          poke64(t2 + 16, 1);
+          tn := tn + 1;
         }
-        if raus > 0 { j := StrConcat(j, ","c); }
-        raus := raus + 1;
-        var en: pchar := "rejected"c;
-        if erg != 0 { en := "applied"c; }
-        j := StrConcat(j, "{\"pass_id\":\"vectorize\","c);
-        j := StrConcat(j, self._cpTxt("outcome"c, en));
-        j := StrConcat(j, ","c);
-        j := StrConcat(j, self._cpTxt("reason_code"c, code as pchar));
-        j := StrConcat(j, ","c);
-        j := StrConcat(j, self._cpZahl("count"c, anz));
-        j := StrConcat(j, "}"c);
       }
       i := i + 1;
+    }
+    var j: pchar := "["c;
+    var m: int64 := 0;
+    while m < tn {
+      var t3: int64 := tab + m * 24;
+      if m > 0 { j := StrConcat(j, ","c); }
+      var en: pchar := "rejected"c;
+      if peek64(t3 + 8) != 0 { en := "applied"c; }
+      j := StrConcat(j, "{\"pass_id\":\"vectorize\","c);
+      j := StrConcat(j, self._cpTxt("outcome"c, en));
+      j := StrConcat(j, ","c);
+      j := StrConcat(j, self._cpTxt("reason_code"c, peek64(t3) as pchar));
+      j := StrConcat(j, ","c);
+      j := StrConcat(j, self._cpZahl("count"c, peek64(t3 + 16)));
+      j := StrConcat(j, "}"c);
+      m := m + 1;
+    }
+    // Ein nicht gezaehlter Grund steht als eigener Eintrag drin. Eine
+    // Zusammenfassung, die stillschweigend Gruende weglaesst, liest sich wie
+    // eine vollstaendige.
+    if voll > 0 {
+      if tn > 0 { j := StrConcat(j, ","c); }
+      j := StrConcat(j, "{\"pass_id\":\"vectorize\",\"outcome\":\"unknown\","c);
+      j := StrConcat(j, "\"reason_code\":\"REASON_TABLE_FULL\","c);
+      j := StrConcat(j, self._cpZahl("count"c, voll));
+      j := StrConcat(j, "}"c);
     }
     return StrConcat(j, "]"c);
   }
@@ -6249,9 +6363,11 @@ pub type CompilerConfig = class {
       if self.cpLevelGesetzt { ohne := true; }
       if self.cpFnFilter != 0 as pchar { ohne := true; }
       if self.cpPassFilter != 0 as pchar { ohne := true; }
+      if self.cpMaxEvGesetzt { ohne := true; }
       if ohne {
-        EPrintStrLn("lyxc: --compile-profile-level, --compile-profile-function und");
-        EPrintStrLn("      --compile-profile-pass brauchen --compile-profile.");
+        EPrintStrLn("lyxc: --compile-profile-level, --compile-profile-function,");
+        EPrintStrLn("      --compile-profile-pass und --compile-profile-max-events");
+        EPrintStrLn("      brauchen --compile-profile.");
         return false;
       }
       return true;
@@ -6265,6 +6381,16 @@ pub type CompilerConfig = class {
       if mitFilter {
         EPrintStrLn("lyxc: Filter brauchen --compile-profile-level=analysis oder =detailed.");
         EPrintStrLn("      In basic entstehen keine Detaildaten.");
+        return false;
+      }
+    }
+    // Eine Grenze fuer Ereignisse, die in dieser Stufe nicht entstehen, ist
+    // kein Wunsch, sondern ein Irrtum -- und eine klaglos angenommene Grenze
+    // liest sich hinterher wie eine wirksame.
+    if self.cpMaxEvGesetzt {
+      if self.cpLevel < 2 {
+        EPrintStrLn("lyxc: --compile-profile-max-events braucht --compile-profile-level=detailed.");
+        EPrintStrLn("      Nur dort entstehen Einzelereignisse.");
         return false;
       }
     }
@@ -6561,7 +6687,9 @@ pub type CompilerConfig = class {
     j := StrConcat(j, self._cpZahl("decisions_recorded"c, self.cpDecAnz));
     j := StrConcat(j, ","c);
     j := StrConcat(j, self._cpZahl("events_dropped"c, self.cpDecDrop));
-    j := StrConcat(j, ",\"event_limit\":16384,"c);
+    j := StrConcat(j, ","c);
+    j := StrConcat(j, self._cpZahl("event_limit"c, self.cpMaxEv));
+    j := StrConcat(j, ","c);
     if self.cpDecDrop > 0 { j := StrConcat(j, "\"truncated\":true,"c); }
     else                  { j := StrConcat(j, "\"truncated\":false,"c); }
     var gefiltert: bool := false;
