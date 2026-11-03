@@ -5434,6 +5434,45 @@ pub type Codegen = class {
     }
   }
 
+  // #2349: Der Wert einer Feldablage wartet entweder auf dem Stapel oder in
+  // rdx. Diese zwei Funktionen sind die EINZIGE Stelle, die das entscheidet —
+  // im Ablagepfad gibt es neun Stellen, die den Wert zurueckholen, und eine
+  // davon zu vergessen waere keine falsche Zahl, sondern eine Stapel-Unwucht.
+  //
+  // Warum rdx und nicht rcx: der Struct- und der Array-Zweig setzen VOR dem
+  // Zurueckholen `lea rcx, [rax+16]`, und `rep movsb` braucht rcx als Zaehler.
+  // rdx ruehrt zwischen der Auswertung des Wertes und den Zweigen niemand an:
+  // die Basis ist ein einfaches Local (nur rax), der Index ein Local im
+  // Register (nur rbx), und die Bereichspruefung vergleicht bloss rbx gegen
+  // rax (ihr Panic-Pfad kehrt nicht zurueck).
+  // Rueckgabe ist die Registernummer, aus der die Ablage den Wert nimmt:
+  // 2 (rdx) auf dem neuen Weg, sonst `wunsch` (1 = rcx, 6 = rsi), in das der
+  // Stapelweg ihn holt. Die Ablagestellen setzen diese Nummer in ihr ModRM
+  // ein, statt den Wert erst in ein festes Register zu schieben.
+  //
+  // GEMESSEN, warum ohne Zwischenschritt: ein `mov rcx, rdx` davor spart das
+  // push/pop-Paar nicht, es tauscht es nur aus — zwei Befehle bleiben zwei
+  // Befehle, der Rumpf waechst sogar um vier Byte je Ablage. So gemessen auf
+  // i5-8250U: int32-Kern -5,3 %, int64-Kern -4,0 %, aber der pchar-Kern
+  // +0,8 % gegen einen Rauschboden von 0,35 %, gleichsinnig ueber sechs
+  // Codeversaetze. Ohne den Zwischenschritt bleibt genau ein Befehl uebrig.
+  fn cg_wertRegNr(inRdx: int64, wunsch: int64): int64 {
+    if (inRdx != 0) { return 2; }      // rdx — nichts zu emittieren
+    self.cg_e8(0x58 + wunsch);         // pop <wunsch>
+    return wunsch;
+  }
+
+  // Nur fuer die zwei Stellen, die den Wert zwingend in rsi brauchen: dort
+  // ist er die Quelle eines `rep movsb`, und rsi ist kein Wunsch, sondern
+  // Vorschrift.
+  fn cg_wertNachRsi(inRdx: int64) {
+    if (inRdx != 0) {
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xD6);   // mov rsi, rdx
+      return;
+    }
+    self.cg_e8(0x5E);                                          // pop rsi
+  }
+
   // mov rax, [rbp+off]
   fn cg_loadRax(off: int64) {
     var rlR: int64 := self.cg_rlReg(off);   // #2114
@@ -22604,7 +22643,13 @@ pub type Codegen = class {
       } else if (self.cg_nkind(lhs) == CGN_INDEX) {
         // arr[i] := rhs — three-way dispatch (same as CGN_INDEX read)
         self.cg_genExpr(rhs);              // rax = value
-        self.cg_pushRax();
+        // #2349: Der Wert wartete immer auf dem Stapel — je Ablage ein
+        // push/pop-Paar und eine Store->Load-Weiterleitung. Er darf in rdx
+        // warten, wenn bis zu seiner Verwendung NICHTS mehr ausgewertet wird,
+        // das rdx anfassen koennte: Index ein Local im Register (nur rbx),
+        // Basis ein einfaches Local (nur rax). Beides steht unten.
+        var wrBasisOff: int64 := self.cg_einfachesLocalOff(self.cg_nc0(lhs));
+        var wrWertRdx: int64 := 0;
         // #2329: Der Index ging immer ueber den Stapel — bei `c[i] := ...` in
         // einer Schleife sind das zwei Befehle je Element und eine
         // Store->Load-Weiterleitung auf dem kritischen Pfad. Liegt er in
@@ -22640,6 +22685,15 @@ pub type Codegen = class {
         if (wrIdxDirekt != 0) {
           if (self.cg_isF64Expr(rhs) != 0) { wrIdxDirekt := 0; }
         }
+        // Der Wert darf nur dann in rdx warten, wenn auch der Index ohne
+        // Auswertung auskommt — sonst laeuft zwischen beiden ein cg_genExpr,
+        // das rdx ueberschreiben darf.
+        if (wrIdxDirekt != 0 && wrBasisOff != 0) { wrWertRdx := 1; }
+        if (wrWertRdx != 0) {
+          self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC2);   // mov rdx, rax
+        } else {
+          self.cg_pushRax();
+        }
         if (wrIdxDirekt == 0) {
           self.cg_genExpr(self.cg_nc1(lhs)); // rax = index
           self.cg_pushRax();
@@ -22656,7 +22710,7 @@ pub type Codegen = class {
         self.cg_popRbx();                  // rbx = index
         }
         if (wrInlW > 0) {
-          self.cg_e8(0x5E);                // pop rsi (Wert)
+          self.cg_wertNachRsi(wrWertRdx);  // rsi = Wert (#2349)
           // #1612/#1636: Bei einem Feld mit Struct-Elementen halten die Slots
           // Zeiger (seit #1636 auch wirklich gefuellte). `c.items[i] := s`
           // darf den Zeiger nicht ueberschreiben, sonst teilen Element und
@@ -22721,8 +22775,8 @@ pub type Codegen = class {
         }
         if (lhsRowInner > 0) {
           self.cg_emitIndexBoundsCheck(lhsRowInner, 0);
-          self.cg_e8(0x5E);                                      // pop rsi (Wert)
-          self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x34); self.cg_e8(0xD8); // mov [rax+rbx*8], rsi
+          var wrR0: int64 := self.cg_wertRegNr(wrWertRdx, 6);    // #2349
+          self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x04 + wrR0 * 8); self.cg_e8(0xD8); // mov [rax+rbx*8], <wert>
           return;
         }
         if (self.cg_nkind(lhsBase) == CGN_IDENT) {
@@ -22813,19 +22867,21 @@ pub type Codegen = class {
         // falschen Platz und zerstoerte die Nachbarelemente, bei int64 ging
         // die obere Haelfte verloren (#2199).
         if (lhsIsSimd == 1 && lhsIsSimdFloat == 0) {
-          self.cg_e8(0x59);                                                      // pop rcx (Wert)
+          var wrR1: int64 := self.cg_wertRegNr(wrWertRdx, 1);                    // #2349
           if (lhsSimdBytes == 1) {
-            // mov [rax+rbx], cl        (88 0C 18)
-            self.cg_e8(0x88); self.cg_e8(0x0C); self.cg_e8(0x18);
+            // mov [rax+rbx], <wert>b   (88 /r 18); ab rsi braucht die
+            // Byteform das REX-Praefix, sonst traefe sie ah/ch/dh/bh.
+            if (wrR1 >= 4) { self.cg_e8(0x40); }
+            self.cg_e8(0x88); self.cg_e8(0x04 + wrR1 * 8); self.cg_e8(0x18);
           } else if (lhsSimdBytes == 2) {
-            // mov [rax+rbx*2], cx      (66 89 0C 58)
-            self.cg_e8(0x66); self.cg_e8(0x89); self.cg_e8(0x0C); self.cg_e8(0x58);
+            // mov [rax+rbx*2], <wert>w (66 89 /r 58)
+            self.cg_e8(0x66); self.cg_e8(0x89); self.cg_e8(0x04 + wrR1 * 8); self.cg_e8(0x58);
           } else if (lhsSimdBytes == 4) {
-            // mov [rax+rbx*4], ecx     (89 0C 98)
-            self.cg_e8(0x89); self.cg_e8(0x0C); self.cg_e8(0x98);
+            // mov [rax+rbx*4], <wert>d (89 /r 98)
+            self.cg_e8(0x89); self.cg_e8(0x04 + wrR1 * 8); self.cg_e8(0x98);
           } else {
-            // mov [rax+rbx*8], rcx     (48 89 0C D8)
-            self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x0C); self.cg_e8(0xD8);
+            // mov [rax+rbx*8], <wert>  (48 89 /r D8)
+            self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x04 + wrR1 * 8); self.cg_e8(0xD8);
           }
         } else if (lhsIsSimd == 1 && lhsSimdBytes == 8) {
           // #2199: `parallel Array<f64>[i] := wert` — 8 Byte, movsd, ohne
@@ -22833,22 +22889,22 @@ pub type Codegen = class {
           // muessen uebereinstimmen, sonst liest man anders, als man
           // geschrieben hat — genau der Fehler, den #2183 fuer f32 behoben
           // hat.
-          self.cg_e8(0x59);                                                      // pop rcx (Wert)
+          var wrR2: int64 := self.cg_wertRegNr(wrWertRdx, 1);                    // #2349
           if (self.cg_isF64Expr(rhs) != 0) {
-            // movq xmm0, rcx  (66 48 0F 6E C1)
-            self.cg_e8(0x66); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0x6E); self.cg_e8(0xC1);
+            // movq xmm0, <wert>  (66 48 0F 6E /r)
+            self.cg_e8(0x66); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0x6E); self.cg_e8(0xC0 + wrR2);
           } else {
             // Ganzzahliger Ausdruck in ein f64-Element: `v[0] := 2` legt 2.0
-            // ab. cvtsi2sd xmm0, rcx  (F2 48 0F 2A C1)
-            self.cg_e8(0xF2); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0x2A); self.cg_e8(0xC1);
+            // ab. cvtsi2sd xmm0, <wert>  (F2 48 0F 2A /r)
+            self.cg_e8(0xF2); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0x2A); self.cg_e8(0xC0 + wrR2);
           }
           // movsd [rax+rbx*8], xmm0  (F2 0F 11 04 D8)
           self.cg_e8(0xF2); self.cg_e8(0x0F); self.cg_e8(0x11); self.cg_e8(0x04); self.cg_e8(0xD8);
         } else if (lhsIsSimd == 1) {
           // WP-GPU-01: parallel Array<f32>[i] = val — movss store, 4-byte stride
           // stack: [value(rsi)]  rax=base  rbx=index
-          // pop rcx (Wert)
-          self.cg_e8(0x59);
+          // Wert aus rdx oder vom Stapel (#2349)
+          var wrR3: int64 := self.cg_wertRegNr(wrWertRdx, 1);
           if (lhsIsSimdFloat == 1) {
             // #2183: Hier stand `movd xmm0, ecx` — das legte die unteren 32 Bit
             // des f64-BITMUSTERS ab, nicht den Wert. Bei 2.0, 3.0, 7.0 sind
@@ -22858,22 +22914,22 @@ pub type Codegen = class {
             // CVTSD2SS) und Gegenstueck zum Lesepfad (cvtss2sd in cg_genExpr,
             // CGN_INDEX) — die drei muessen uebereinstimmen.
             if (self.cg_isF64Expr(rhs) != 0) {
-              // movq xmm0, rcx  (66 48 0F 6E C1)
-              self.cg_e8(0x66); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0x6E); self.cg_e8(0xC1);
+              // movq xmm0, <wert>  (66 48 0F 6E /r)
+              self.cg_e8(0x66); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0x6E); self.cg_e8(0xC0 + wrR3);
               // cvtsd2ss xmm0, xmm0  (F2 0F 5A C0)
               self.cg_e8(0xF2); self.cg_e8(0x0F); self.cg_e8(0x5A); self.cg_e8(0xC0);
             } else {
               // Ganzzahliger Ausdruck in ein f32-Element: `v[0] := 2` legt
               // 2.0f ab. Ohne diesen Zweig landete die Ganzzahl als Bitmuster
               // im Element und kam als winzige Denormalzahl zurueck.
-              // cvtsi2ss xmm0, rcx  (F3 48 0F 2A C1)
-              self.cg_e8(0xF3); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0x2A); self.cg_e8(0xC1);
+              // cvtsi2ss xmm0, <wert>  (F3 48 0F 2A /r)
+              self.cg_e8(0xF3); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0x2A); self.cg_e8(0xC0 + wrR3);
             }
           } else {
             // Ganzzahl-Elemente: rohes 32-Bit-Muster wie bisher (siehe
             // Lesepfad — die Schrittweite 4 Byte ist eine eigene Luecke).
-            // movd xmm0, ecx  (66 0F 6E C1)
-            self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x6E); self.cg_e8(0xC1);
+            // movd xmm0, <wert>d  (66 0F 6E /r)
+            self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x6E); self.cg_e8(0xC0 + wrR3);
           }
           // movss [rax+rbx*4], xmm0  (F3 0F 11 04 98)
           self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x11); self.cg_e8(0x04); self.cg_e8(0x98);
@@ -22882,7 +22938,7 @@ pub type Codegen = class {
           // kopieren. Ist der Slot noch leer (kein Objekt angelegt), bleibt es
           // beim Zeiger; das ist besser, als nach Adresse 0 zu schreiben.
           self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x48); self.cg_e8(0x10);   // lea rcx, [rax+16]
-          self.cg_e8(0x5E);                                                          // pop rsi (Quelle)
+          self.cg_wertNachRsi(wrWertRdx);                                            // rsi = Quelle (#2349)
           self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x3C); self.cg_e8(0xD9);   // mov rdi, [rcx+rbx*8]
           self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xFF);                     // test rdi, rdi
           // jz .zeiger  (Sprungweite unten eingesetzt)
@@ -22904,15 +22960,17 @@ pub type Codegen = class {
           // array<T> local: skip 16-byte header
           // lea rcx, [rax+16]
           self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x48); self.cg_e8(0x10);
-          // pop rsi (value)
-          self.cg_e8(0x5E);
-          // mov [rcx+rbx*8], rsi
-          self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x34); self.cg_e8(0xD9);
+          // Wert aus rdx oder vom Stapel (#2349) — NICHT nach rcx, dort steht
+          // die Basis.
+          var wrR4: int64 := self.cg_wertRegNr(wrWertRdx, 6);
+          // mov [rcx+rbx*8], <wert>
+          self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x04 + wrR4 * 8); self.cg_e8(0xD9);
         } else if (lhsIsPchar == 1) {
           // #1266: pchar zeigt auf BYTES. Schrittweite 1, ein Byte breit —
           // spiegelbildlich zum Lesepfad, der movzx aus [rax+rbx] holt.
-          self.cg_e8(0x5E);                                     // pop rsi (Wert)
-          self.cg_e8(0x40); self.cg_e8(0x88); self.cg_e8(0x34); self.cg_e8(0x18); // mov [rax+rbx], sil
+          var wrR5: int64 := self.cg_wertRegNr(wrWertRdx, 6);   // #2349
+          if (wrR5 >= 4) { self.cg_e8(0x40); }                 // REX fuer sil
+          self.cg_e8(0x88); self.cg_e8(0x04 + wrR5 * 8); self.cg_e8(0x18); // mov [rax+rbx], <wert>b
         } else {
           // #2131: dieselbe Grenze wie im Lesepfad (CGN_INDEX in
           // cg_genExpr) — die beiden muessen uebereinstimmen. Ein Wert, der
