@@ -5383,6 +5383,21 @@ pub type Codegen = class {
     }
   }
 
+  // mov rbx, [rbp+off] — #2329: Gegenstueck zu cg_loadRax. Dieselbe Rechnung
+  // wie dort, nur mit rbx als Ziel: in der ModRM-Form `mov r/m64, r64` steht
+  // das Ziel im r/m-Feld, also 0xE3 statt 0xE0. Die beiden muessen
+  // uebereinstimmen; wer eine neue Ablageart fuer Locals anlegt, muss BEIDE
+  // anfassen.
+  fn cg_loadRbx(off: int64) {
+    var rlB: int64 := self.cg_rlReg(off);
+    if (rlB >= 0) { self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0xE3 + (rlB << 3)); return; }   // mov rbx, r12+i
+    if (off >= -128 && off <= 127) {
+      self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x5D); self.cg_e8(off);
+    } else {
+      self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x9D); self.cg_e32(off);
+    }
+  }
+
   // mov rax, [rbp+off]
   fn cg_loadRax(off: int64) {
     var rlR: int64 := self.cg_rlReg(off);   // #2114
@@ -22571,14 +22586,56 @@ pub type Codegen = class {
         // arr[i] := rhs — three-way dispatch (same as CGN_INDEX read)
         self.cg_genExpr(rhs);              // rax = value
         self.cg_pushRax();
-        self.cg_genExpr(self.cg_nc1(lhs)); // rax = index
-        self.cg_pushRax();
+        // #2329: Der Index ging immer ueber den Stapel — bei `c[i] := ...` in
+        // einer Schleife sind das zwei Befehle je Element und eine
+        // Store->Load-Weiterleitung auf dem kritischen Pfad. Liegt er in
+        // einem Local, das die Registerzuteilung in r12..r15 gelegt hat, wird
+        // er stattdessen NACH der Basis direkt nach rbx gelesen.
+        //
+        // Nur fuer ein Local im REGISTER: dessen Slot wird nirgends als
+        // Speicher benutzt, es ist also nicht ueber eine Adresse erreichbar
+        // und die Auswertung der Basis kann es nicht mehr aendern. Dieselbe
+        // Begruendung wie beim Operandentausch in cg_binOpLocalRechts
+        // (#2247) — die beiden Stellen tragen dasselbe Argument.
+        var wrIdxOff: int64 := self.cg_einfachesLocalOff(self.cg_nc1(lhs));
+        var wrIdxDirekt: int64 := 0;
+        if (wrIdxOff != 0) {
+          if (self.cg_rlReg(wrIdxOff) >= 0) { wrIdxDirekt := 1; }
+        }
+        // GEMESSEN, nicht abgeleitet: bei einem Gleitkommawert ist der
+        // Direktweg LANGSAMER. Je Ablage fallen zwar zwei Befehle weg, aber
+        // danach geht der Wert ueber `pop rcx; movq rcx, xmm0; cvtsd2ss` nach
+        // xmm — dort liegt `mov r12, rbx` auf dem kritischen Pfad vor dem
+        // `movss`, waehrend `pop rbx` von der Stapelmaschine nebenher lief.
+        // (Die Erklaerung ist eine Vermutung, die Zahlen sind es nicht.)
+        //
+        //   parallel Array<f32>, Fuellschleife:  +1,3 % langsamer
+        //     (ueber sechs Codeversaetze stabil +0,66 bis +1,58 %, also kein
+        //      Layout-Artefakt; Befehle -8,2 %, Takte +2,1 %)
+        //   parallel Array<int32>, c[i] := a[i] + b[i]:  -8,07 % schneller
+        //     (Rauschboden +0,20 %, Pruefsumme unveraendert)
+        //
+        // Darum nur fuer Ganzzahlwerte. Wer diese Bedingung weitet, messt
+        // beide Faelle neu — eine Messung an einem von beiden haette hier das
+        // falsche Vorzeichen geliefert.
+        if (wrIdxDirekt != 0) {
+          if (self.cg_isF64Expr(rhs) != 0) { wrIdxDirekt := 0; }
+        }
+        if (wrIdxDirekt == 0) {
+          self.cg_genExpr(self.cg_nc1(lhs)); // rax = index
+          self.cg_pushRax();
+        }
         // #1052: inline `[N]T`-Feld — Adresse statt Inhalt. Vorher wurde der
         // FELDINHALT als Zieladresse genommen (bei genulltem Speicher also 0),
         // was jeden Schreibzugriff zum Segfault machte.
         var wrInlW: int64 := self.cg_emitInlineArrayAddr(self.cg_nc0(lhs));
         if (wrInlW == 0) { self.cg_genExpr(self.cg_nc0(lhs)); }  // rax = array ptr
+        // rbx = Index: aus dem Register-Local oder vom Stapel. Danach ist der
+        // Zustand in BEIDEN Faellen derselbe (rax = Basis, rbx = Index, Wert
+        // auf dem Stapel) — alle Zweige darunter bleiben unberuehrt.
+        if (wrIdxDirekt != 0) { self.cg_loadRbx(wrIdxOff); } else {
         self.cg_popRbx();                  // rbx = index
+        }
         if (wrInlW > 0) {
           self.cg_e8(0x5E);                // pop rsi (Wert)
           // #1612/#1636: Bei einem Feld mit Struct-Elementen halten die Slots
