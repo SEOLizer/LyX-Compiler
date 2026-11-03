@@ -247,7 +247,43 @@ con CG_H_MAP_STR_LEN:  int64 := 480;   // #2150: Map-Kern mit Wachstum, gemessen
 // — der Codegen bricht ab, wenn sie nicht stimmt.
 con CG_H_BUMP:         int64 := 1958;  // 1478 + 480
 con CG_H_BUMP_LEN:     int64 := 208;   // gemessen, nicht gezaehlt
-con CG_H_USER:         int64 := 2166;  // CG_H_BUMP + CG_H_BUMP_LEN
+// T1.1: _lyx_strlen_simd — 16 Byte je Durchlauf statt einem.
+//
+// WARUM EIN ZWEITER STRLEN UND NICHT DER BEI 79: dort stehen 24 Byte, und
+// der Versatz JEDES folgenden Helfers haengt daran. Der schnelle Weg liegt
+// deshalb HINTER der Arena, wie __lyx_f64_to_str_chk, der Map-Kern und
+// _lyx_bumpalloc — hinter 1372, wo win64 eigene Helfer setzt und den Rest
+// mit dem Benutzercode woertlich kopiert (win_x86.lyx, WIN_HELPERS_SZ).
+// Der kurze Helfer bei 79 bleibt woertlich stehen: er haelt die Versaetze,
+// und win64 bedient ihn mit einem eigenen Trampolin.
+//
+// Beginn auf 16 ausgerichtet (cg_emitHelpers fuellt von CG_H_BUMP +
+// CG_H_BUMP_LEN = 2166 bis hierher auf): die Schleife liest mit `movdqa`.
+con CG_H_STRLEN_SIMD:     int64 := 2176;
+con CG_H_STRLEN_SIMD_LEN: int64 := 93;    // gemessen, nicht gezaehlt
+// T1.3: _lyx_memcpy — Groessenweiche vor `rep movsb`.
+//
+// `rep movsb` hat auf dieser Familie einen Anlauf von rund 30 Takten und
+// zahlt sich erst ab etwa 64 Byte aus; GEMESSEN kostete eine Kopie von
+// 8 Byte 33 Takte, eine von 4096 Byte 176. Im Bestand sind die kurzen
+// Kopien die haeufigen (355 Aufrufstellen in src/, 38 in std/).
+//
+// Der Helfer steht hier und nicht mehr eingesetzt an jeder Aufrufstelle:
+// ein `call` ist 5 Byte, die alte Einsetzung war 13 — die Weiche kostet
+// also KEINEN Platz, sie spart welchen.
+con CG_H_MEMCPY:          int64 := 2272;
+con CG_H_MEMCPY_LEN:      int64 := 330;   // gemessen, nicht gezaehlt
+// T1.2: _lyx_streq und _lyx_startswith — 16 Byte je Durchlauf statt einem.
+//
+// Beide standen EINGESETZT an jeder Aufrufstelle (StrEquals 35, zusammen
+// mit StrStartsWith 60 im Bestand) und liefen byteweise: `mov al,[rdi];
+// cmp al,[rsi]; jne; test al,al; jz; inc; inc; jmp` — vier Befehle je
+// Byte. Als Helfer kostet der Aufruf 5 Byte, die Einsetzung war laenger.
+con CG_H_STREQ:           int64 := 2608;
+con CG_H_STREQ_LEN:       int64 := 180;   // gemessen, nicht gezaehlt
+con CG_H_STARTSW:         int64 := 2800;
+con CG_H_STARTSW_LEN:     int64 := 185;   // gemessen, nicht gezaehlt
+con CG_H_USER:         int64 := 2992;  // CG_H_STARTSW + CG_H_STARTSW_LEN, auf 16 aufgefuellt
 
 // Patch kinds
 con CG_PATCH_CALL:     int64 := 0;
@@ -3262,11 +3298,11 @@ pub type Codegen = class {
     self.cg_e8(0x57);  // push rdi (a)
     self.cg_e8(0x56);  // push rsi (b)
     var sc1pp: int64 := self.cg_emitCall();
-    poke32(self.code + sc1pp, CG_H_STRLEN - sc1pp - 4);
+    poke32(self.code + sc1pp, CG_H_STRLEN_SIMD - sc1pp - 4);
     self.cg_e8(0x50);  // push rax (len_a)
     self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x7C); self.cg_e8(0x24); self.cg_e8(0x08);  // mov rdi, [rsp+8]=b
     var sc2pp: int64 := self.cg_emitCall();
-    poke32(self.code + sc2pp, CG_H_STRLEN - sc2pp - 4);
+    poke32(self.code + sc2pp, CG_H_STRLEN_SIMD - sc2pp - 4);
     self.cg_e8(0x50);  // push rax (len_b)
     // [rsp]=len_b [rsp+8]=len_a [rsp+16]=b [rsp+24]=a
     self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x74); self.cg_e8(0x24); self.cg_e8(0x00);  // mov rsi,[rsp]=len_b
@@ -5622,7 +5658,7 @@ pub type Codegen = class {
     self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x39);                                                             // mov [rcx], rdi
     self.cg_e8(0x57);                                                                                                   // push rdi
     var ppSL: int64 := self.cg_emitCall();
-    poke32(self.code + ppSL, CG_H_STRLEN - ppSL - 4);
+    poke32(self.code + ppSL, CG_H_STRLEN_SIMD - ppSL - 4);
     self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC2);                                                             // mov rdx, rax
     self.cg_e8(0x5F);                                                                                                   // pop rdi
     self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xFE);                                                             // mov rsi, rdi
@@ -18646,7 +18682,7 @@ pub type Codegen = class {
 
     } else if (self.cg_seq(fname, fnlen, slen, 6)) {
       var pp: int64 := self.cg_emitCall();
-      var rel32: int64 := CG_H_STRLEN - pp - 4;
+      var rel32: int64 := CG_H_STRLEN_SIMD - pp - 4;
       poke32(self.code + pp, rel32);
 
     } else if (self.cg_seq(fname, fnlen, "StrSub", 6)) {
@@ -19748,7 +19784,7 @@ pub type Codegen = class {
       // Write msg to stderr: StrLen(rdi)→rax, then write(2, rdi, rax)
       self.cg_e8(0x57);                                         // push rdi (save msg)
       var ppSL: int64 := self.cg_emitCall();
-      poke32(self.code + ppSL, CG_H_STRLEN - ppSL - 4);
+      poke32(self.code + ppSL, CG_H_STRLEN_SIMD - ppSL - 4);
       self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC2);   // mov rdx, rax (length)
       self.cg_e8(0x5F);                                         // pop rdi (restore msg)
       self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xFE);   // mov rsi, rdi (buf)
@@ -20074,7 +20110,7 @@ pub type Codegen = class {
       self.cg_e8(0x5F);  // pop rdi (string ptr)
       self.cg_e8(0x57);  // push rdi (save for write)
       var trsSL: int64 := self.cg_emitCall();
-      poke32(self.code + trsSL, CG_H_STRLEN - trsSL - 4);  // call _lyx_strlen
+      poke32(self.code + trsSL, CG_H_STRLEN_SIMD - trsSL - 4);  // call _lyx_strlen
       self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC2);  // mov rdx, rax (length)
       self.cg_e8(0x5E);  // pop rsi (string ptr → rsi)
       self.cg_e8(0xBF); self.cg_e8(2); self.cg_e8(0); self.cg_e8(0); self.cg_e8(0);  // mov edi, 2
@@ -20273,19 +20309,39 @@ pub type Codegen = class {
     } else if (self.cg_seq(fname, fnlen, "memcpy", 6) ||
                self.cg_seq(fname, fnlen, "MemCopy", 7)) {
       // memcpy / MemCopy(dst, src, len): x86_64 — rdi=dst, rsi=src, rdx=len
-      // mov rcx, rdx  (len → rcx für rep movsb)
-      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xD1);
-      // cld  (Richtungsflag löschen — vorwärts kopieren)
-      self.cg_e8(0xFC);
-      // rep movsb  (kopiere RCX Bytes von [RSI] nach [RDI])
-      self.cg_e8(0xF3); self.cg_e8(0xA4);
-      // #1842: Rueckgabe ist der Zielzeiger (C-Semantik von memcpy), nicht 0.
-      // rdi ist nach dem rep um die Laenge weitergelaufen, rdx haelt sie noch —
-      // dieselbe Zusicherung wie in den IR-Backends, die den Zeiger schon
-      // zurueckgeben. Die Werte klafften bisher je Ziel auseinander; im
-      // Bestand liest sie niemand (gemessen), deshalb der Angleich hier.
-      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xF8);   // mov rax, rdi
-      self.cg_e8(0x48); self.cg_e8(0x29); self.cg_e8(0xD0);   // sub rax, rdx
+      //
+      // T1.3: Aufruf statt Einsetzung. Hier stand `mov rcx,rdx; cld; rep
+      // movsb` — 13 Byte, und ein Anlauf von rund 30 Takten, den im
+      // Bestand ueberwiegend KURZE Kopien bezahlten. Die Weiche steht
+      // jetzt einmal in _lyx_memcpy; der Aufruf ist 5 Byte und damit
+      // kuerzer als die Einsetzung war. Rueckgabe und Registerspuren
+      // (rcx, rdi, rsi, Flags) sind dieselben wie vorher.
+      //
+      // #1842: Rueckgabe ist der Zielzeiger (C-Semantik von memcpy), nicht
+      // 0 — dieselbe Zusicherung wie in den IR-Backends. Sie steckt in
+      // jedem Rueckweg des Helfers und auch im langen Weg hier.
+      //
+      // VORFILTER: ab 512 Byte bleibt `rep movsb` EINGESETZT. Der Aufruf
+      // und die Ueberlappungspruefung im Helfer kosten zusammen rund
+      // sieben Takte; bei kurzen Kopien sind sie geschenkt, bei langen
+      // waren sie GEMESSEN 4 bis 8 % Verlust. Der Filter kostet zwei
+      // Befehle und 15 Byte je Aufrufstelle. Ein Vorfilter zahlt sich nur
+      // aus, wenn die gefilterten Faelle ihn tragen — hier tun sie es,
+      // weil der lange Weg ohne ihn teurer war als vorher.
+      self.cg_e8(0x48); self.cg_e8(0x81); self.cg_e8(0xFA); self.cg_e32(512);  // cmp rdx, 512
+      self.cg_e8(0x72);                                      // jb .klein
+      var mcKl: int64 := self.codeLen; self.cg_e8(0);
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xD1);  // mov rcx, rdx
+      self.cg_e8(0xFC);                                      // cld
+      self.cg_e8(0xF3); self.cg_e8(0xA4);                    // rep movsb
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xF8);  // mov rax, rdi
+      self.cg_e8(0x48); self.cg_e8(0x29); self.cg_e8(0xD0);  // sub rax, rdx
+      self.cg_e8(0xEB);                                      // jmp .ende
+      var mcEn: int64 := self.codeLen; self.cg_e8(0);
+      cg_patchRel8(self.code, mcKl, self.codeLen);
+      var mcPp: int64 := self.cg_emitCall();
+      poke32(self.code + mcPp, CG_H_MEMCPY - mcPp - 4);
+      cg_patchRel8(self.code, mcEn, self.codeLen);
 
     } else if (self.cg_seq(fname, fnlen, "memset", 6) ||
                self.cg_seq(fname, fnlen, "MemSet", 6)) {
@@ -20363,7 +20419,7 @@ pub type Codegen = class {
     } else if (self.cg_seq(fname, fnlen, "StrLength", 9)) {
       // StrLength(s): alias for StrLen
       var ppSLen: int64 := self.cg_emitCall();
-      poke32(self.code + ppSLen, CG_H_STRLEN - ppSLen - 4);
+      poke32(self.code + ppSLen, CG_H_STRLEN_SIMD - ppSLen - 4);
 
     } else if (self.cg_seq(fname, fnlen, "StrNew", 6)) {
       // StrNew(n): n Byte aus der Bump-Arena → rax = pchar. rdi = n.
@@ -20686,54 +20742,17 @@ pub type Codegen = class {
 
     } else if (self.cg_seq(fname, fnlen, "StrEquals", 9) ||
                self.cg_seq(fname, fnlen, "StrEq", 5)) {
-      // StrEquals(a,b): rdi=a, rsi=b → rax=1 if equal, 0 otherwise
-      var seLoop: int64 := self.codeLen;
-      self.cg_e8(0x8A); self.cg_e8(0x07);  // mov al, [rdi]
-      self.cg_e8(0x3A); self.cg_e8(0x06);  // cmp al, [rsi]
-      self.cg_e8(0x75);  // jne .sene
-      var seNE: int64 := self.codeLen;
-      self.cg_e8(0);
-      self.cg_e8(0x84); self.cg_e8(0xC0);  // test al, al
-      self.cg_e8(0x74);  // jz .seeq (both zero → equal)
-      var seEQ: int64 := self.codeLen;
-      self.cg_e8(0);
-      self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC7);  // inc rdi
-      self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC6);  // inc rsi
-      self.cg_e8(0xEB);  // jmp .seloop
-      self.cg_e8(seLoop - self.codeLen - 1);
-      cg_patchRel8(self.code, seNE, self.codeLen);
-      self.cg_e8(0x31); self.cg_e8(0xC0);  // xor eax, eax (return 0)
-      self.cg_e8(0xEB);  // jmp .sedone
-      var seDone: int64 := self.codeLen;
-      self.cg_e8(0);
-      cg_patchRel8(self.code, seEQ, self.codeLen);
-      self.cg_e8(0xB8); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);  // mov eax, 1
-      cg_patchRel8(self.code, seDone, self.codeLen);
+      // StrEquals(a,b): rdi=a, rsi=b → rax=1 bei Gleichheit, sonst 0.
+      // T1.2: Aufruf statt Einsetzung — der Vergleich laeuft jetzt
+      // 16 Byte je Durchlauf in _lyx_streq.
+      var seqPp: int64 := self.cg_emitCall();
+      poke32(self.code + seqPp, CG_H_STREQ - seqPp - 4);
 
     } else if (self.cg_seq(fname, fnlen, "StrStartsWith", 13)) {
-      // StrStartsWith(s,prefix): rdi=s, rsi=prefix
-      var ssLoop: int64 := self.codeLen;
-      self.cg_e8(0x8A); self.cg_e8(0x06);  // mov al, [rsi]
-      self.cg_e8(0x84); self.cg_e8(0xC0);  // test al, al (prefix ended?)
-      self.cg_e8(0x74);  // jz .ssyes
-      var ssYes: int64 := self.codeLen;
-      self.cg_e8(0);
-      self.cg_e8(0x3A); self.cg_e8(0x07);  // cmp al, [rdi]
-      self.cg_e8(0x75);  // jne .ssno
-      var ssNo: int64 := self.codeLen;
-      self.cg_e8(0);
-      self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC6);  // inc rsi
-      self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC7);  // inc rdi
-      self.cg_e8(0xEB);  // jmp .ssloop
-      self.cg_e8(ssLoop - self.codeLen - 1);
-      cg_patchRel8(self.code, ssYes, self.codeLen);
-      self.cg_e8(0xB8); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);  // mov eax, 1
-      self.cg_e8(0xEB);  // jmp .ssdone
-      var ssDone: int64 := self.codeLen;
-      self.cg_e8(0);
-      cg_patchRel8(self.code, ssNo, self.codeLen);
-      self.cg_e8(0x31); self.cg_e8(0xC0);  // xor eax, eax
-      cg_patchRel8(self.code, ssDone, self.codeLen);
+      // StrStartsWith(s,prefix): rdi=s, rsi=prefix → rax=1/0.
+      // T1.2: Aufruf statt Einsetzung, siehe _lyx_startswith.
+      var sswPp: int64 := self.cg_emitCall();
+      poke32(self.code + sswPp, CG_H_STARTSW - sswPp - 4);
 
     } else if (self.cg_seq(fname, fnlen, "StrEndsWith", 11)) {
       // StrEndsWith(s,suffix): rdi=s, rsi=suffix
@@ -20741,12 +20760,12 @@ pub type Codegen = class {
       self.cg_e8(0x57);  // push rdi (s)
       self.cg_e8(0x56);  // push rsi (suffix)
       var sewpp1: int64 := self.cg_emitCall();
-      poke32(self.code + sewpp1, CG_H_STRLEN - sewpp1 - 4);  // strlen(s)→rax=len_s
+      poke32(self.code + sewpp1, CG_H_STRLEN_SIMD - sewpp1 - 4);  // strlen(s)→rax=len_s
       self.cg_e8(0x50);  // push rax (len_s)
       // [rsp]=len_s, [rsp+8]=suffix, [rsp+16]=s
       self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x7C); self.cg_e8(0x24); self.cg_e8(0x08);  // mov rdi, [rsp+8] = suffix
       var sewpp2: int64 := self.cg_emitCall();
-      poke32(self.code + sewpp2, CG_H_STRLEN - sewpp2 - 4);  // strlen(suffix)→rax=len_suf
+      poke32(self.code + sewpp2, CG_H_STRLEN_SIMD - sewpp2 - 4);  // strlen(suffix)→rax=len_suf
       // cmp len_s ([rsp]) with len_suf (rax): jl → no match
       self.cg_e8(0x48); self.cg_e8(0x3B); self.cg_e8(0x04); self.cg_e8(0x24);  // cmp rax, [rsp]  (len_suf vs len_s)
       self.cg_e8(0x7F);  // jg .sewno (len_suf > len_s → can't be suffix)
@@ -20891,7 +20910,7 @@ pub type Codegen = class {
       // StrCopy(s): rdi=s → rax=mmap copy
       self.cg_e8(0x57);  // push rdi (s)
       var scppp: int64 := self.cg_emitCall();
-      poke32(self.code + scppp, CG_H_STRLEN - scppp - 4);  // strlen(s)→rax=len
+      poke32(self.code + scppp, CG_H_STRLEN_SIMD - scppp - 4);  // strlen(s)→rax=len
       self.cg_e8(0x50);  // push rax (len)
       // [rsp]=len [rsp+8]=s
       self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x34); self.cg_e8(0x24);  // mov rsi, [rsp]
@@ -27463,6 +27482,10 @@ pub type Codegen = class {
     }
 
     // ---- _lyx_strlen (24 bytes, starts at offset 79) — WP-33: null-pointer guard ----
+    // T1.1: Auf Linux ruft ihn NIEMAND mehr — die Aufrufstellen zeigen auf
+    // _lyx_strlen_simd (CG_H_STRLEN_SIMD). Er bleibt trotzdem woertlich
+    // stehen: an seinen 24 Byte haengt der Versatz jedes folgenden Helfers,
+    // und win64 setzt an dieser Stelle sein eigenes Trampolin.
     // test rdi, rdi
     self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xFF);
     // jz +15 (to offset 20: xor rax,rax + ret — return 0 for null pointer)
@@ -27995,12 +28018,12 @@ pub type Codegen = class {
     self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xF5);     // mov r13, rsi
     self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0xEF);     // mov rdi, r13
     var ss1pp: int64 := self.cg_emitCall();
-    poke32(self.code + ss1pp, CG_H_STRLEN - ss1pp - 4);        // call _lyx_strlen
+    poke32(self.code + ss1pp, CG_H_STRLEN_SIMD - ss1pp - 4);        // call _lyx_strlen
     self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xC6);     // mov r14, rax
     // Block 3: strlen(s)→rax, allocate (slen+2)*8+16 bytes → r15 (56 bytes)
     self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0xE7);     // mov rdi, r12
     var ss2pp: int64 := self.cg_emitCall();
-    poke32(self.code + ss2pp, CG_H_STRLEN - ss2pp - 4);        // call _lyx_strlen
+    poke32(self.code + ss2pp, CG_H_STRLEN_SIMD - ss2pp - 4);        // call _lyx_strlen
     self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(0x02); // add rax, 2
     self.cg_e8(0x48); self.cg_e8(0x6B); self.cg_e8(0xC0); self.cg_e8(0x08); // imul rax,rax,8
     self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(0x10); // add rax, 16
@@ -28083,7 +28106,7 @@ pub type Codegen = class {
     // Block 7: .fill_last — last segment from rdi to end of s (22 bytes)
     // strlen doesn't clobber rdi, so rdi still = segment_start after call
     var ss4pp: int64 := self.cg_emitCall();
-    poke32(self.code + ss4pp, CG_H_STRLEN - ss4pp - 4);        // call _lyx_strlen
+    poke32(self.code + ss4pp, CG_H_STRLEN_SIMD - ss4pp - 4);        // call _lyx_strlen
     self.cg_e8(0x31); self.cg_e8(0xF6);                        // xor esi, esi  (start=0)
     self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC2);     // mov rdx, rax  (len)
     var ss5pp: int64 := self.cg_emitCall();
@@ -28652,6 +28675,516 @@ pub type Codegen = class {
       EPrintStrLn(" — CG_H_BUMP_LEN und CG_H_USER anpassen (#2296)"c);
       exit(1);
     }
+
+    // ---- _lyx_strlen_simd (ab CG_H_STRLEN_SIMD) — T1.1 ----
+    //
+    // rdi = Zeichenkette → rax = Laenge. Erhaelt rcx und rdx (gerettet),
+    // nutzt xmm14/xmm15: die Aufrufstellen fuehren f64-Werte in xmm0..xmm7,
+    // die hohen beiden ruehrt der Codegen nirgends an. Die Flags sind
+    // danach veraendert, wie beim Helfer bei 79.
+    //
+    // SSE2 ist auf x86-64 Grundausstattung (AMD64-ABI verlangt es), eine
+    // Merkmalsabfrage braucht es also nicht — und sie waere hier auch nicht
+    // zu bekommen: der Helfer steht in JEDEM Erzeugnis.
+    //
+    // Der Zeiger wird auf 16 abgerundet und mit `movdqa` gelesen. Genau
+    // darum kann kein Byte ueber das Ende der Belegung hinaus gelesen
+    // werden, obwohl der erste Block VOR dem Zeiger beginnt: ein
+    // 16-Byte-Zugriff auf einer 16-Byte-Grenze liegt ganz in einer Seite.
+    // Die Bytes vor dem Zeiger fallen danach per `shr eax, cl` aus der
+    // Maske. Ein unausgerichtetes `movdqu` haette diese Zusicherung nicht.
+    self.cg_fuelleBis(CG_H_STRLEN_SIMD);
+    var slsStart: int64 := self.codeLen;
+    if (slsStart != CG_H_STRLEN_SIMD) {
+      EPrintStr("codegen error: _lyx_strlen_simd beginnt bei "c); EPrintInt(slsStart);
+      EPrintStr(", erwartet "c); EPrintInt(CG_H_STRLEN_SIMD);
+      EPrintStrLn(" — CG_H_STRLEN_SIMD anpassen (T1.1)"c);
+      exit(1);
+    }
+    // test rdi, rdi / jz .null — WP-33: Nullzeiger gibt 0, wie der Helfer bei 79
+    self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xFF);
+    self.cg_e8(0x74);
+    var slsNull: int64 := self.codeLen;
+    self.cg_e8(0);
+    self.cg_e8(0x51);                                      // push rcx
+    self.cg_e8(0x52);                                      // push rdx
+    // pxor xmm15, xmm15
+    self.cg_e8(0x66); self.cg_e8(0x45); self.cg_e8(0x0F); self.cg_e8(0xEF); self.cg_e8(0xFF);
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xF9);  // mov rcx, rdi
+    self.cg_e8(0x83); self.cg_e8(0xE1); self.cg_e8(0x0F);  // and ecx, 15   (Versatz)
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xFA);  // mov rdx, rdi
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xE2); self.cg_e8(0xF0);  // and rdx, -16
+    // movdqa xmm14, [rdx] / pcmpeqb xmm14, xmm15 / pmovmskb eax, xmm14
+    self.cg_e8(0x66); self.cg_e8(0x44); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0x32);
+    self.cg_e8(0x66); self.cg_e8(0x45); self.cg_e8(0x0F); self.cg_e8(0x74); self.cg_e8(0xF7);
+    self.cg_e8(0x66); self.cg_e8(0x41); self.cg_e8(0x0F); self.cg_e8(0xD7); self.cg_e8(0xC6);
+    self.cg_e8(0xD3); self.cg_e8(0xE8);                    // shr eax, cl
+    self.cg_e8(0x85); self.cg_e8(0xC0);                    // test eax, eax
+    self.cg_e8(0x75);                                      // jnz .erst
+    var slsErst: int64 := self.codeLen;
+    self.cg_e8(0);
+    // .schleife: 16 Byte je Durchlauf
+    var slsLoop: int64 := self.codeLen;
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC2); self.cg_e8(0x10);  // add rdx, 16
+    self.cg_e8(0x66); self.cg_e8(0x44); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0x32);
+    self.cg_e8(0x66); self.cg_e8(0x45); self.cg_e8(0x0F); self.cg_e8(0x74); self.cg_e8(0xF7);
+    self.cg_e8(0x66); self.cg_e8(0x41); self.cg_e8(0x0F); self.cg_e8(0xD7); self.cg_e8(0xC6);
+    self.cg_e8(0x85); self.cg_e8(0xC0);                    // test eax, eax
+    self.cg_e8(0x74);                                      // jz .schleife
+    self.cg_e8(slsLoop - self.codeLen - 1);
+    self.cg_e8(0x0F); self.cg_e8(0xBC); self.cg_e8(0xC0);  // bsf eax, eax
+    self.cg_e8(0x48); self.cg_e8(0x01); self.cg_e8(0xC2);  // add rdx, rax  (Adresse der Null)
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xD0);  // mov rax, rdx
+    self.cg_e8(0x48); self.cg_e8(0x29); self.cg_e8(0xF8);  // sub rax, rdi
+    self.cg_e8(0x5A); self.cg_e8(0x59);                    // pop rdx / pop rcx
+    self.cg_e8(0xC3);                                      // ret
+    // .erst: die Null lag im ersten Block. `shr` hat die Bytes vor dem
+    // Zeiger entfernt — der Bitindex IST damit die Laenge.
+    cg_patchRel8(self.code, slsErst, self.codeLen);
+    self.cg_e8(0x0F); self.cg_e8(0xBC); self.cg_e8(0xC0);  // bsf eax, eax
+    self.cg_e8(0x5A); self.cg_e8(0x59);                    // pop rdx / pop rcx
+    self.cg_e8(0xC3);                                      // ret
+    // .null:
+    cg_patchRel8(self.code, slsNull, self.codeLen);
+    self.cg_e8(0x31); self.cg_e8(0xC0);                    // xor eax, eax
+    self.cg_e8(0xC3);                                      // ret
+    // Gemessen statt gezaehlt, wie bei den Helfern darueber (#1284): ein
+    // Versatz legte den Benutzercode an die falsche Stelle, und das traefe
+    // JEDES Programm.
+    if (self.codeLen - slsStart != CG_H_STRLEN_SIMD_LEN) {
+      EPrintStr("codegen error: _lyx_strlen_simd hat "c);
+      EPrintInt(self.codeLen - slsStart);
+      EPrintStr(" Byte, erwartet "c);
+      EPrintInt(CG_H_STRLEN_SIMD_LEN);
+      EPrintStrLn(" — CG_H_STRLEN_SIMD_LEN und CG_H_USER anpassen (T1.1)"c);
+      exit(1);
+    }
+    // ---- _lyx_memcpy (ab CG_H_MEMCPY) — T1.3 ----
+    //
+    // rdi = Ziel, rsi = Quelle, rdx = Laenge → rax = Ziel (C-Semantik von
+    // memcpy, wie #1842 sie fuer alle Ziele festgelegt hat).
+    //
+    // Drei Wege:
+    //   0..16    zwei ueberlappende Ganzzahlzugriffe
+    //   17..64   zwei bzw. vier ueberlappende 16-Byte-Zugriffe
+    //   ab 65    `rep movsb` wie bisher (ERMSB traegt ab dort)
+    //
+    // UEBERLAPPUNG: in den kurzen Wegen stehen ALLE Lesezugriffe VOR allen
+    // Schreibzugriffen. Damit bleibt das Ergebnis auch richtig, wenn Ziel
+    // und Quelle sich beruehren — `memcpy` sagt dazu nichts zu, aber der
+    // Bestand hat 393 Aufrufstellen, und `rep movsb` war vorwaerts
+    // ueberlappungsfest. Ein schnellerer Weg, der diese Eigenschaft
+    // aufgibt, waere ein stiller Verhaltenswechsel an 393 Stellen.
+    // Deshalb auch ab 65 Byte weiter `rep movsb` und nicht blockweise.
+    //
+    // Gelesen und geschrieben wird nur INNERHALB der angegebenen Laenge;
+    // ein Zugriff ueber das Ende hinaus (wie beim Aufrunden in
+    // _lyx_strlen_simd) findet hier nicht statt, weil die Laenge bekannt
+    // ist. xmm12..xmm15 ruehrt der Codegen nirgends an.
+    self.cg_fuelleBis(CG_H_MEMCPY);
+    var mcStart: int64 := self.codeLen;
+    if (mcStart != CG_H_MEMCPY) {
+      EPrintStr("codegen error: _lyx_memcpy beginnt bei "c); EPrintInt(mcStart);
+      EPrintStr(", erwartet "c); EPrintInt(CG_H_MEMCPY);
+      EPrintStrLn(" — CG_H_MEMCPY anpassen (T1.3)"c);
+      exit(1);
+    }
+    // UEBERLAPPUNGSWEICHE. Beruehren sich Ziel und Quelle, geht es ueber
+    // `rep movsb` — Byte fuer Byte vorwaerts, genau wie vor T1.3. Die
+    // kurzen Wege lesen ERST alles und schreiben DANN, und der mittlere
+    // Weg laeuft in 32-Byte-Schritten; bei Ueberlappung gaeben beide die
+    // alten Quellbytes weiter statt der fortgeschriebenen. Das waere an
+    // 393 Aufrufstellen ein stiller Verhaltenswechsel.
+    //
+    // Beruehrung heisst: (Ziel - Quelle) < Laenge ODER (Quelle - Ziel) <
+    // Laenge, beides VORZEICHENLOS verglichen (`jb`). Der vorzeichenlose
+    // Vergleich erledigt die Richtung mit: ist die Differenz negativ,
+    // steht sie als sehr grosse Zahl da und faellt durch. Ein `abs` waere
+    // hier falsch — `0 - n` ist keine Betragsfunktion.
+    //
+    // ALLE Verteilersprünge sind LANGE Spruenge (rel32). Mit rel8 hing die
+    // Reihenfolge der Bloecke an ihren Laengen: ein eingeschobener Zweig
+    // riss die 127-Byte-Grenze (#1915 hat es gemeldet). Ein Byte mehr je
+    // Sprung, dafuer ist der Block umstellbar, ohne nachzurechnen.
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xF9);  // mov rcx, rdi
+    self.cg_e8(0x48); self.cg_e8(0x29); self.cg_e8(0xF1);  // sub rcx, rsi
+    self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xD1);  // cmp rcx, rdx
+    self.cg_e8(0x0F); self.cg_e8(0x82);                    // jb .gross
+    var mcUe1: int64 := self.codeLen; self.cg_e32(0);
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xF1);  // mov rcx, rsi
+    self.cg_e8(0x48); self.cg_e8(0x29); self.cg_e8(0xF9);  // sub rcx, rdi
+    self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xD1);  // cmp rcx, rdx
+    self.cg_e8(0x0F); self.cg_e8(0x82);                    // jb .gross
+    var mcUe2: int64 := self.codeLen; self.cg_e32(0);
+    // Laengenverteiler
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xFA); self.cg_e8(0x10);  // cmp rdx, 16
+    self.cg_e8(0x0F); self.cg_e8(0x86);                    // jbe .bis16
+    var mcB16: int64 := self.codeLen; self.cg_e32(0);
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xFA); self.cg_e8(0x20);  // cmp rdx, 32
+    self.cg_e8(0x0F); self.cg_e8(0x86);                    // jbe .bis32
+    var mcB32: int64 := self.codeLen; self.cg_e32(0);
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xFA); self.cg_e8(0x40);  // cmp rdx, 64
+    self.cg_e8(0x0F); self.cg_e8(0x86);                    // jbe .bis64
+    var mcB64: int64 := self.codeLen; self.cg_e32(0);
+    self.cg_e8(0x48); self.cg_e8(0x81); self.cg_e8(0xFA); self.cg_e32(512); // cmp rdx, 512
+    self.cg_e8(0x0F); self.cg_e8(0x82);                    // jb .mittel
+    var mcMit: int64 := self.codeLen; self.cg_e32(0);
+    // .gross: rep movsb. Danach ist rdi um die Laenge weitergelaufen,
+    // rdx haelt sie noch — rax = urspruengliches Ziel (#1842).
+    poke32(self.code + mcUe1, self.codeLen - mcUe1 - 4);
+    poke32(self.code + mcUe2, self.codeLen - mcUe2 - 4);
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xD1);  // mov rcx, rdx
+    self.cg_e8(0xFC);                                      // cld
+    self.cg_e8(0xF3); self.cg_e8(0xA4);                    // rep movsb
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xF8);  // mov rax, rdi
+    self.cg_e8(0x48); self.cg_e8(0x29); self.cg_e8(0xD0);  // sub rax, rdx
+    self.cg_e8(0xC3);                                      // ret
+    // .mittel (65..511): 32 Byte je Schritt.
+    //
+    // WARUM HIER NICHT `rep movsb`: der Anlauf von rund 30 Takten faellt
+    // in dieser Spanne noch ins Gewicht. GEMESSEN war der Aufrufweg bei
+    // 65..4096 Byte 5 bis 7 % LANGSAMER als die alte Einsetzung, solange
+    // dieser Zweig fehlte. Ab 512 Byte traegt ERMSB, dort bleibt `rep`.
+    //
+    // Der Schwanz (die letzten 32 Byte) wird ZUERST kopiert, danach
+    // floor(len/32) ganze Schritte von vorn. Beides zusammen deckt jede
+    // Laenge ab 32 vollstaendig ab; die Ueberdeckung in der Mitte
+    // schreibt dieselben Bytes zweimal, was nichts kostet und keinen Rest
+    // uebrig laesst. Ueberlappende Bereiche kommen hier nie an.
+    poke32(self.code + mcMit, self.codeLen - mcMit - 4);
+    self.cg_e8(0xF3); self.cg_e8(0x44); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0x64); self.cg_e8(0x16); self.cg_e8(0xE0);  // movdqu xmm12,[rsi+rdx-32]
+    self.cg_e8(0xF3); self.cg_e8(0x44); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0x6C); self.cg_e8(0x16); self.cg_e8(0xF0);  // movdqu xmm13,[rsi+rdx-16]
+    self.cg_e8(0xF3); self.cg_e8(0x44); self.cg_e8(0x0F); self.cg_e8(0x7F); self.cg_e8(0x64); self.cg_e8(0x17); self.cg_e8(0xE0);  // movdqu [rdi+rdx-32],xmm12
+    self.cg_e8(0xF3); self.cg_e8(0x44); self.cg_e8(0x0F); self.cg_e8(0x7F); self.cg_e8(0x6C); self.cg_e8(0x17); self.cg_e8(0xF0);  // movdqu [rdi+rdx-16],xmm13
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xF8);  // mov rax, rdi  (Rueckgabe sichern)
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xD1);  // mov rcx, rdx
+    self.cg_e8(0x48); self.cg_e8(0xC1); self.cg_e8(0xE9); self.cg_e8(0x05);  // shr rcx, 5
+    var mcML: int64 := self.codeLen;
+    self.cg_e8(0xF3); self.cg_e8(0x44); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0x36);              // movdqu xmm14,[rsi]
+    self.cg_e8(0xF3); self.cg_e8(0x44); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0x7E); self.cg_e8(0x10);  // movdqu xmm15,[rsi+16]
+    self.cg_e8(0xF3); self.cg_e8(0x44); self.cg_e8(0x0F); self.cg_e8(0x7F); self.cg_e8(0x37);              // movdqu [rdi],xmm14
+    self.cg_e8(0xF3); self.cg_e8(0x44); self.cg_e8(0x0F); self.cg_e8(0x7F); self.cg_e8(0x7F); self.cg_e8(0x10);  // movdqu [rdi+16],xmm15
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC6); self.cg_e8(0x20);  // add rsi, 32
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC7); self.cg_e8(0x20);  // add rdi, 32
+    self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC9);                    // dec rcx
+    self.cg_e8(0x75);                                      // jnz .ml
+    self.cg_e8(mcML - self.codeLen - 1);
+    self.cg_e8(0xC3);                                      // ret
+    // .bis64: vier 16-Byte-Zugriffe, erst alle Lesezugriffe
+    poke32(self.code + mcB64, self.codeLen - mcB64 - 4);
+    self.cg_e8(0xF3); self.cg_e8(0x44); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0x26);              // movdqu xmm12,[rsi]
+    self.cg_e8(0xF3); self.cg_e8(0x44); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0x6E); self.cg_e8(0x10);  // movdqu xmm13,[rsi+16]
+    self.cg_e8(0xF3); self.cg_e8(0x44); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0x74); self.cg_e8(0x16); self.cg_e8(0xE0);  // movdqu xmm14,[rsi+rdx-32]
+    self.cg_e8(0xF3); self.cg_e8(0x44); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0x7C); self.cg_e8(0x16); self.cg_e8(0xF0);  // movdqu xmm15,[rsi+rdx-16]
+    self.cg_e8(0xF3); self.cg_e8(0x44); self.cg_e8(0x0F); self.cg_e8(0x7F); self.cg_e8(0x27);              // movdqu [rdi],xmm12
+    self.cg_e8(0xF3); self.cg_e8(0x44); self.cg_e8(0x0F); self.cg_e8(0x7F); self.cg_e8(0x6F); self.cg_e8(0x10);  // movdqu [rdi+16],xmm13
+    self.cg_e8(0xF3); self.cg_e8(0x44); self.cg_e8(0x0F); self.cg_e8(0x7F); self.cg_e8(0x74); self.cg_e8(0x17); self.cg_e8(0xE0);  // movdqu [rdi+rdx-32],xmm14
+    self.cg_e8(0xF3); self.cg_e8(0x44); self.cg_e8(0x0F); self.cg_e8(0x7F); self.cg_e8(0x7C); self.cg_e8(0x17); self.cg_e8(0xF0);  // movdqu [rdi+rdx-16],xmm15
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xF8);  // mov rax, rdi
+    self.cg_e8(0xC3);                                      // ret
+    // .bis32: zwei 16-Byte-Zugriffe
+    poke32(self.code + mcB32, self.codeLen - mcB32 - 4);
+    self.cg_e8(0xF3); self.cg_e8(0x44); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0x36);              // movdqu xmm14,[rsi]
+    self.cg_e8(0xF3); self.cg_e8(0x44); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0x7C); self.cg_e8(0x16); self.cg_e8(0xF0);  // movdqu xmm15,[rsi+rdx-16]
+    self.cg_e8(0xF3); self.cg_e8(0x44); self.cg_e8(0x0F); self.cg_e8(0x7F); self.cg_e8(0x37);              // movdqu [rdi],xmm14
+    self.cg_e8(0xF3); self.cg_e8(0x44); self.cg_e8(0x0F); self.cg_e8(0x7F); self.cg_e8(0x7C); self.cg_e8(0x17); self.cg_e8(0xF0);  // movdqu [rdi+rdx-16],xmm15
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xF8);  // mov rax, rdi
+    self.cg_e8(0xC3);                                      // ret
+    // .bis16: 0..16 Byte, absteigende Breiten. rdi und rsi bleiben
+    // unberuehrt, rax wird erst am Ende gesetzt.
+    poke32(self.code + mcB16, self.codeLen - mcB16 - 4);
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xFA); self.cg_e8(0x08);  // cmp rdx, 8
+    self.cg_e8(0x72);                                      // jb .unter8
+    var mcU8: int64 := self.codeLen; self.cg_e8(0);
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x06);  // mov rax, [rsi]
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x4C); self.cg_e8(0x16); self.cg_e8(0xF8);  // mov rcx, [rsi+rdx-8]
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x07);  // mov [rdi], rax
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x4C); self.cg_e8(0x17); self.cg_e8(0xF8);  // mov [rdi+rdx-8], rcx
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xF8);  // mov rax, rdi
+    self.cg_e8(0xC3);                                      // ret
+    // .unter8: 4..7
+    cg_patchRel8(self.code, mcU8, self.codeLen);
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xFA); self.cg_e8(0x04);  // cmp rdx, 4
+    self.cg_e8(0x72);                                      // jb .unter4
+    var mcU4: int64 := self.codeLen; self.cg_e8(0);
+    self.cg_e8(0x8B); self.cg_e8(0x06);                    // mov eax, [rsi]
+    self.cg_e8(0x8B); self.cg_e8(0x4C); self.cg_e8(0x16); self.cg_e8(0xFC);  // mov ecx, [rsi+rdx-4]
+    self.cg_e8(0x89); self.cg_e8(0x07);                    // mov [rdi], eax
+    self.cg_e8(0x89); self.cg_e8(0x4C); self.cg_e8(0x17); self.cg_e8(0xFC);  // mov [rdi+rdx-4], ecx
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xF8);  // mov rax, rdi
+    self.cg_e8(0xC3);                                      // ret
+    // .unter4: 2..3
+    cg_patchRel8(self.code, mcU4, self.codeLen);
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xFA); self.cg_e8(0x02);  // cmp rdx, 2
+    self.cg_e8(0x72);                                      // jb .unter2
+    var mcU2: int64 := self.codeLen; self.cg_e8(0);
+    self.cg_e8(0x0F); self.cg_e8(0xB7); self.cg_e8(0x06);  // movzx eax, word [rsi]
+    self.cg_e8(0x0F); self.cg_e8(0xB7); self.cg_e8(0x4C); self.cg_e8(0x16); self.cg_e8(0xFE);  // movzx ecx, word [rsi+rdx-2]
+    self.cg_e8(0x66); self.cg_e8(0x89); self.cg_e8(0x07);  // mov [rdi], ax
+    self.cg_e8(0x66); self.cg_e8(0x89); self.cg_e8(0x4C); self.cg_e8(0x17); self.cg_e8(0xFE);  // mov [rdi+rdx-2], cx
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xF8);  // mov rax, rdi
+    self.cg_e8(0xC3);                                      // ret
+    // .unter2: 0 oder 1 Byte
+    cg_patchRel8(self.code, mcU2, self.codeLen);
+    self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xD2);  // test rdx, rdx
+    self.cg_e8(0x74);                                      // jz .leer
+    var mcLeer: int64 := self.codeLen; self.cg_e8(0);
+    self.cg_e8(0x0F); self.cg_e8(0xB6); self.cg_e8(0x06);  // movzx eax, byte [rsi]
+    self.cg_e8(0x88); self.cg_e8(0x07);                    // mov [rdi], al
+    cg_patchRel8(self.code, mcLeer, self.codeLen);
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xF8);  // mov rax, rdi
+    self.cg_e8(0xC3);                                      // ret
+    if (self.codeLen - mcStart != CG_H_MEMCPY_LEN) {
+      EPrintStr("codegen error: _lyx_memcpy hat "c);
+      EPrintInt(self.codeLen - mcStart);
+      EPrintStr(" Byte, erwartet "c);
+      EPrintInt(CG_H_MEMCPY_LEN);
+      EPrintStrLn(" — CG_H_MEMCPY_LEN und CG_H_USER anpassen (T1.3)"c);
+      exit(1);
+    }
+
+    // ---- _lyx_streq (ab CG_H_STREQ) — T1.2 ----
+    //
+    // rdi = a, rsi = b → rax = 1 bei Gleichheit, sonst 0. rcx und rdx
+    // werden gerettet: die alte Einsetzung ruehrte sie nicht an, und ein
+    // Helfer darf an 35 Aufrufstellen nicht mehr Spuren hinterlassen als
+    // der Code, den er ersetzt. xmm13..xmm15 ruehrt der Codegen nirgends
+    // an.
+    //
+    // WARUM EINE SEITENPRUEFUNG UND KEIN AUFRUNDEN WIE BEI strlen: hier
+    // laufen ZWEI Zeiger, die verschieden versetzt sein koennen — beide
+    // zugleich auf 16 abzurunden geht nicht. Gelesen wird deshalb
+    // unausgerichtet, und davor steht die Frage, ob die 16 Byte noch in
+    // dieselbe Seite fallen: liegt einer der Zeiger in den letzten 15
+    // Byte seiner Seite, geht es byteweise weiter, bis er darueber ist.
+    // Ohne diese Pruefung faultet ein Vergleich zweier kurzer
+    // Zeichenketten am Seitenende — und zwar nur dann, also selten und
+    // unerklaerlich.
+    self.cg_fuelleBis(CG_H_STREQ);
+    var seStart: int64 := self.codeLen;
+    if (seStart != CG_H_STREQ) {
+      EPrintStr("codegen error: _lyx_streq beginnt bei "c); EPrintInt(seStart);
+      EPrintStr(", erwartet "c); EPrintInt(CG_H_STREQ);
+      EPrintStrLn(" — CG_H_STREQ anpassen (T1.2)"c);
+      exit(1);
+    }
+    self.cg_e8(0x51);                                      // push rcx
+    self.cg_e8(0x52);                                      // push rdx
+    self.cg_e8(0x66); self.cg_e8(0x45); self.cg_e8(0x0F); self.cg_e8(0xEF); self.cg_e8(0xFF);  // pxor xmm15,xmm15
+    var seLoop: int64 := self.codeLen;
+    // Seitenpruefung a
+    self.cg_e8(0x89); self.cg_e8(0xF9);                    // mov ecx, edi
+    self.cg_e8(0x81); self.cg_e8(0xE1); self.cg_e32(4095); // and ecx, 4095
+    self.cg_e8(0x81); self.cg_e8(0xF9); self.cg_e32(4080); // cmp ecx, 4080
+    self.cg_e8(0x0F); self.cg_e8(0x87);                    // ja .byteweise
+    var seBw1: int64 := self.codeLen; self.cg_e32(0);
+    // Seitenpruefung b
+    self.cg_e8(0x89); self.cg_e8(0xF1);                    // mov ecx, esi
+    self.cg_e8(0x81); self.cg_e8(0xE1); self.cg_e32(4095); // and ecx, 4095
+    self.cg_e8(0x81); self.cg_e8(0xF9); self.cg_e32(4080); // cmp ecx, 4080
+    self.cg_e8(0x0F); self.cg_e8(0x87);                    // ja .byteweise
+    var seBw2: int64 := self.codeLen; self.cg_e32(0);
+    self.cg_e8(0xF3); self.cg_e8(0x44); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0x37);  // movdqu xmm14,[rdi]
+    self.cg_e8(0xF3); self.cg_e8(0x44); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0x2E);  // movdqu xmm13,[rsi]
+    self.cg_e8(0x66); self.cg_e8(0x45); self.cg_e8(0x0F); self.cg_e8(0x74); self.cg_e8(0xEE);  // pcmpeqb xmm13,xmm14  (gleich)
+    self.cg_e8(0x66); self.cg_e8(0x45); self.cg_e8(0x0F); self.cg_e8(0x74); self.cg_e8(0xF7);  // pcmpeqb xmm14,xmm15  (Null in a)
+    self.cg_e8(0x66); self.cg_e8(0x41); self.cg_e8(0x0F); self.cg_e8(0xD7); self.cg_e8(0xC5);  // pmovmskb eax,xmm13
+    self.cg_e8(0x66); self.cg_e8(0x41); self.cg_e8(0x0F); self.cg_e8(0xD7); self.cg_e8(0xCE);  // pmovmskb ecx,xmm14
+    // eax = Unterschied-Bits. `xor eax,0xFFFF` statt `not eax`: `not`
+    // setzt auch die Bits 16..31, und `bsf` fiele dann auf Bit 16 statt
+    // auf die erste echte Abweichung.
+    self.cg_e8(0x35); self.cg_e32(65535);                  // xor eax, 0xFFFF
+    self.cg_e8(0x89); self.cg_e8(0xC2);                    // mov edx, eax
+    self.cg_e8(0x09); self.cg_e8(0xCA);                    // or  edx, ecx
+    self.cg_e8(0x75);                                      // jnz .entscheid
+    var seEnt: int64 := self.codeLen; self.cg_e8(0);
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC7); self.cg_e8(0x10);  // add rdi, 16
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC6); self.cg_e8(0x10);  // add rsi, 16
+    self.cg_e8(0xE9);                                      // jmp .schleife
+    var seJz: int64 := self.codeLen; self.cg_e32(0);
+    poke32(self.code + seJz, seLoop - seJz - 4);
+    // .entscheid: Das erste Ereignis im Block entscheidet. Steht dort ein
+    // UNTERSCHIED, sind die Ketten verschieden — auch dann, wenn an
+    // derselben Stelle die Null von a liegt (dann ist b laenger). Steht
+    // dort nur die Null, endeten beide gleich.
+    cg_patchRel8(self.code, seEnt, self.codeLen);
+    self.cg_e8(0x0F); self.cg_e8(0xBC); self.cg_e8(0xD2);  // bsf edx, edx
+    self.cg_e8(0x0F); self.cg_e8(0xA3); self.cg_e8(0xD0);  // bt  eax, edx
+    self.cg_e8(0x72);                                      // jc .ungleich
+    var seU1: int64 := self.codeLen; self.cg_e8(0);
+    self.cg_e8(0xE9);                                      // jmp .gleich
+    var seG1: int64 := self.codeLen; self.cg_e32(0);
+    // .byteweise: solange einer der Zeiger im letzten 16-Byte-Stueck
+    // seiner Seite steht. Nach hoechstens 16 Schritten ist er darueber.
+    poke32(self.code + seBw1, self.codeLen - seBw1 - 4);
+    poke32(self.code + seBw2, self.codeLen - seBw2 - 4);
+    var seBwLoop: int64 := self.codeLen;
+    self.cg_e8(0x8A); self.cg_e8(0x07);                    // mov al, [rdi]
+    self.cg_e8(0x3A); self.cg_e8(0x06);                    // cmp al, [rsi]
+    self.cg_e8(0x75);                                      // jne .ungleich
+    var seU2: int64 := self.codeLen; self.cg_e8(0);
+    self.cg_e8(0x84); self.cg_e8(0xC0);                    // test al, al
+    self.cg_e8(0x74);                                      // jz .gleich
+    var seG2: int64 := self.codeLen; self.cg_e8(0);
+    self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC7);  // inc rdi
+    self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC6);  // inc rsi
+    self.cg_e8(0x89); self.cg_e8(0xF9);                    // mov ecx, edi
+    self.cg_e8(0x81); self.cg_e8(0xE1); self.cg_e32(4095); // and ecx, 4095
+    self.cg_e8(0x81); self.cg_e8(0xF9); self.cg_e32(4080); // cmp ecx, 4080
+    self.cg_e8(0x77);                                      // ja .byteweise
+    self.cg_e8(seBwLoop - self.codeLen - 1);
+    self.cg_e8(0x89); self.cg_e8(0xF1);                    // mov ecx, esi
+    self.cg_e8(0x81); self.cg_e8(0xE1); self.cg_e32(4095); // and ecx, 4095
+    self.cg_e8(0x81); self.cg_e8(0xF9); self.cg_e32(4080); // cmp ecx, 4080
+    self.cg_e8(0x77);                                      // ja .byteweise
+    self.cg_e8(seBwLoop - self.codeLen - 1);
+    self.cg_e8(0xE9);                                      // jmp .schleife
+    var seJz2: int64 := self.codeLen; self.cg_e32(0);
+    poke32(self.code + seJz2, seLoop - seJz2 - 4);
+    // .ungleich
+    cg_patchRel8(self.code, seU1, self.codeLen);
+    cg_patchRel8(self.code, seU2, self.codeLen);
+    self.cg_e8(0x31); self.cg_e8(0xC0);                    // xor eax, eax
+    self.cg_e8(0x5A); self.cg_e8(0x59);                    // pop rdx / pop rcx
+    self.cg_e8(0xC3);                                      // ret
+    // .gleich
+    poke32(self.code + seG1, self.codeLen - seG1 - 4);
+    cg_patchRel8(self.code, seG2, self.codeLen);
+    self.cg_e8(0xB8); self.cg_e32(1);                      // mov eax, 1
+    self.cg_e8(0x5A); self.cg_e8(0x59);                    // pop rdx / pop rcx
+    self.cg_e8(0xC3);                                      // ret
+    if (self.codeLen - seStart != CG_H_STREQ_LEN) {
+      EPrintStr("codegen error: _lyx_streq hat "c);
+      EPrintInt(self.codeLen - seStart);
+      EPrintStr(" Byte, erwartet "c);
+      EPrintInt(CG_H_STREQ_LEN);
+      EPrintStrLn(" — CG_H_STREQ_LEN und CG_H_USER anpassen (T1.2)"c);
+      exit(1);
+    }
+
+    // ---- _lyx_startswith (ab CG_H_STARTSW) — T1.2 ----
+    //
+    // rdi = s, rsi = Praefix → rax = 1, wenn s mit dem Praefix beginnt.
+    //
+    // Derselbe Aufbau wie _lyx_streq, mit EINEM Unterschied in der
+    // Entscheidung: gezaehlt wird die Null des PRAEFIX, und wo sie zuerst
+    // steht, ist die Antwort JA — auch wenn an derselben Stelle ein
+    // Unterschied steht, denn dann ist nur s laenger. Bei _lyx_streq ist
+    // genau dieser Fall NEIN. Die beiden Entscheidungen sind
+    // spiegelbildlich; wer eine aendert, muss die andere ansehen.
+    self.cg_fuelleBis(CG_H_STARTSW);
+    var swStart: int64 := self.codeLen;
+    if (swStart != CG_H_STARTSW) {
+      EPrintStr("codegen error: _lyx_startswith beginnt bei "c); EPrintInt(swStart);
+      EPrintStr(", erwartet "c); EPrintInt(CG_H_STARTSW);
+      EPrintStrLn(" — CG_H_STARTSW anpassen (T1.2)"c);
+      exit(1);
+    }
+    self.cg_e8(0x51);                                      // push rcx
+    self.cg_e8(0x52);                                      // push rdx
+    self.cg_e8(0x66); self.cg_e8(0x45); self.cg_e8(0x0F); self.cg_e8(0xEF); self.cg_e8(0xFF);  // pxor xmm15,xmm15
+    var swLoop: int64 := self.codeLen;
+    self.cg_e8(0x89); self.cg_e8(0xF9);                    // mov ecx, edi
+    self.cg_e8(0x81); self.cg_e8(0xE1); self.cg_e32(4095);
+    self.cg_e8(0x81); self.cg_e8(0xF9); self.cg_e32(4080);
+    self.cg_e8(0x0F); self.cg_e8(0x87);                    // ja .byteweise
+    var swBw1: int64 := self.codeLen; self.cg_e32(0);
+    self.cg_e8(0x89); self.cg_e8(0xF1);                    // mov ecx, esi
+    self.cg_e8(0x81); self.cg_e8(0xE1); self.cg_e32(4095);
+    self.cg_e8(0x81); self.cg_e8(0xF9); self.cg_e32(4080);
+    self.cg_e8(0x0F); self.cg_e8(0x87);                    // ja .byteweise
+    var swBw2: int64 := self.codeLen; self.cg_e32(0);
+    self.cg_e8(0xF3); self.cg_e8(0x44); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0x37);  // movdqu xmm14,[rdi]
+    self.cg_e8(0xF3); self.cg_e8(0x44); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0x2E);  // movdqu xmm13,[rsi]
+    self.cg_e8(0x66); self.cg_e8(0x45); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0xE5);  // movdqa xmm12,xmm13
+    self.cg_e8(0x66); self.cg_e8(0x45); self.cg_e8(0x0F); self.cg_e8(0x74); self.cg_e8(0xEE);  // pcmpeqb xmm13,xmm14  (gleich)
+    self.cg_e8(0x66); self.cg_e8(0x45); self.cg_e8(0x0F); self.cg_e8(0x74); self.cg_e8(0xE7);  // pcmpeqb xmm12,xmm15  (Null im Praefix)
+    self.cg_e8(0x66); self.cg_e8(0x41); self.cg_e8(0x0F); self.cg_e8(0xD7); self.cg_e8(0xC5);  // pmovmskb eax,xmm13
+    self.cg_e8(0x66); self.cg_e8(0x41); self.cg_e8(0x0F); self.cg_e8(0xD7); self.cg_e8(0xCC);  // pmovmskb ecx,xmm12
+    self.cg_e8(0x35); self.cg_e32(65535);                  // xor eax, 0xFFFF   (Unterschied)
+    self.cg_e8(0x89); self.cg_e8(0xC2);                    // mov edx, eax
+    self.cg_e8(0x09); self.cg_e8(0xCA);                    // or  edx, ecx
+    self.cg_e8(0x75);                                      // jnz .entscheid
+    var swEnt: int64 := self.codeLen; self.cg_e8(0);
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC7); self.cg_e8(0x10);  // add rdi, 16
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC6); self.cg_e8(0x10);  // add rsi, 16
+    self.cg_e8(0xE9);
+    var swJz: int64 := self.codeLen; self.cg_e32(0);
+    poke32(self.code + swJz, swLoop - swJz - 4);
+    // .entscheid: Null des Praefix an der ersten Ereignisstelle => JA.
+    cg_patchRel8(self.code, swEnt, self.codeLen);
+    self.cg_e8(0x0F); self.cg_e8(0xBC); self.cg_e8(0xD2);  // bsf edx, edx
+    self.cg_e8(0x0F); self.cg_e8(0xA3); self.cg_e8(0xD1);  // bt  ecx, edx
+    self.cg_e8(0x72);                                      // jc .wahr
+    var swW1: int64 := self.codeLen; self.cg_e8(0);
+    self.cg_e8(0xE9);                                      // jmp .falsch
+    var swF1: int64 := self.codeLen; self.cg_e32(0);
+    // .byteweise
+    poke32(self.code + swBw1, self.codeLen - swBw1 - 4);
+    poke32(self.code + swBw2, self.codeLen - swBw2 - 4);
+    var swBwLoop: int64 := self.codeLen;
+    self.cg_e8(0x8A); self.cg_e8(0x06);                    // mov al, [rsi]   (Praefixbyte)
+    self.cg_e8(0x84); self.cg_e8(0xC0);                    // test al, al
+    self.cg_e8(0x74);                                      // jz .wahr
+    var swW2: int64 := self.codeLen; self.cg_e8(0);
+    self.cg_e8(0x3A); self.cg_e8(0x07);                    // cmp al, [rdi]
+    self.cg_e8(0x75);                                      // jne .falsch
+    var swF2: int64 := self.codeLen; self.cg_e8(0);
+    self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC7);  // inc rdi
+    self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC6);  // inc rsi
+    self.cg_e8(0x89); self.cg_e8(0xF9);                    // mov ecx, edi
+    self.cg_e8(0x81); self.cg_e8(0xE1); self.cg_e32(4095);
+    self.cg_e8(0x81); self.cg_e8(0xF9); self.cg_e32(4080);
+    self.cg_e8(0x77);
+    self.cg_e8(swBwLoop - self.codeLen - 1);
+    self.cg_e8(0x89); self.cg_e8(0xF1);                    // mov ecx, esi
+    self.cg_e8(0x81); self.cg_e8(0xE1); self.cg_e32(4095);
+    self.cg_e8(0x81); self.cg_e8(0xF9); self.cg_e32(4080);
+    self.cg_e8(0x77);
+    self.cg_e8(swBwLoop - self.codeLen - 1);
+    self.cg_e8(0xE9);
+    var swJz2: int64 := self.codeLen; self.cg_e32(0);
+    poke32(self.code + swJz2, swLoop - swJz2 - 4);
+    // .falsch
+    poke32(self.code + swF1, self.codeLen - swF1 - 4);
+    cg_patchRel8(self.code, swF2, self.codeLen);
+    self.cg_e8(0x31); self.cg_e8(0xC0);                    // xor eax, eax
+    self.cg_e8(0x5A); self.cg_e8(0x59);
+    self.cg_e8(0xC3);
+    // .wahr
+    cg_patchRel8(self.code, swW1, self.codeLen);
+    cg_patchRel8(self.code, swW2, self.codeLen);
+    self.cg_e8(0xB8); self.cg_e32(1);                      // mov eax, 1
+    self.cg_e8(0x5A); self.cg_e8(0x59);
+    self.cg_e8(0xC3);
+    if (self.codeLen - swStart != CG_H_STARTSW_LEN) {
+      EPrintStr("codegen error: _lyx_startswith hat "c);
+      EPrintInt(self.codeLen - swStart);
+      EPrintStr(" Byte, erwartet "c);
+      EPrintInt(CG_H_STARTSW_LEN);
+      EPrintStrLn(" — CG_H_STARTSW_LEN und CG_H_USER anpassen (T1.2)"c);
+      exit(1);
+    }
+
+    // Der Benutzercode beginnt auf 16 ausgerichtet.
+    self.cg_fuelleBis(CG_H_USER);
+  }
+
+  // Fuellt mit Ein-Byte-NOPs bis zum Versatz `ziel`. Nur fuer den
+  // Helferblock gedacht: dort ist jede Stelle eine Konstante, eine Fuellung
+  // zwischen zwei Helfern verschiebt also nichts, was davor liegt. Laeuft
+  // der Puffer schon darueber, bricht es ab statt stillschweigend nichts
+  // zu tun — sonst lag der Helfer an einer anderen Stelle als die
+  // Konstante behauptet.
+  fn cg_fuelleBis(ziel: int64) {
+    if (self.codeLen > ziel) {
+      EPrintStr("codegen error: Helferblock steht schon bei "c);
+      EPrintInt(self.codeLen);
+      EPrintStr(", Fuellziel war "c); EPrintInt(ziel);
+      EPrintStrLn(" (T1.1)"c);
+      exit(1);
+    }
+    while (self.codeLen < ziel) { self.cg_e8(0x90); }
   }
 
   // ------------------------------------------------------------------
