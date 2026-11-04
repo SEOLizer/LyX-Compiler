@@ -8,9 +8,15 @@
 # die Textzugriffe in den Abgleichschleifen sind der beherrschende Posten.
 #
 # DER VERSUCHSAUFBAU MUSS DEN FALL ERZEUGEN (Lehre aus #2341): nicht jeder
-# Regex-Lauf ist algorithmisch linear. Ein Suchlauf ohne Treffer probiert
-# JEDE Startposition, ist also schon im Entwurf O(n^2) und bliebe auch nach
-# der Umstellung quadratisch — als Sonde unbrauchbar.
+# Regex-Lauf ist algorithmisch linear. Ein Suchlauf ohne Treffer probiert JEDE
+# Startposition; kostet eine Position O(Resttext) — etwa `[0-9]+` auf Ziffern —
+# ist der Lauf schon im Entwurf O(n^2) und bliebe auch nach der Umstellung
+# quadratisch, als Sonde also unbrauchbar.
+# BERICHTIGUNG (#2369): fuer ein EINZELNES Atom gilt das nicht. `[0-9]` auf
+# lauter Buchstaben scheitert je Position nach O(1) Schritten, der Lauf ist
+# linear — und war trotzdem quadratisch, weil `matchHere` je Position
+# `StrLen` neu bestimmte. Diese Sonde steht in
+# tests/strlen_je_aufruf_2369_test.sh.
 # Gemessen wird deshalb ein Lauf, der algorithmisch EINEN Durchgang braucht:
 # `[0-9]+` auf einen Text aus lauter Ziffern. Der gierige Teil laeuft einmal
 # von vorn nach hinten durch; quadratisch ist daran allein der Zeichenzugriff.
