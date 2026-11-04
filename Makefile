@@ -529,6 +529,7 @@ test: lyxc
 	@bash tests/vektor_schranke_feld_2350_test.sh
 	@bash tests/strlen_schleifen_2352_test.sh
 	@bash tests/strsafecharat_url_2364_test.sh
+	@bash tests/strsafecharat_regex_2364_test.sh
 	@bash tests/voidwert_leser_2326_test.sh
 	@bash tests/ablage_alle_zweige_2349_test.sh
 	@bash tests/vektor_reduktion_2335_test.sh
