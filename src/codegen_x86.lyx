@@ -23927,6 +23927,7 @@ pub type Codegen = class {
   // einsparen, ist aber nicht Voraussetzung.
   //
   // Kasten: [0] aOff [8] bOff [16] cOff [24] nOff [32] iOff [40] Breite [48] Op
+  //         [56] Art der Schranke (0 = Local in nOff, 1 = Literal) [64] Literalwert
   fn cg_vmIdentOff(ni: int64): int64 {
     if (ni < 0 || self.cg_nkind(ni) != CGN_IDENT) { return 0; }
     return self.cg_findLocal(self.cg_nsval(ni), self.cg_nslen(ni));
@@ -24048,14 +24049,68 @@ pub type Codegen = class {
     if (self.debugMode != 0 || self.debugInfoEnabled != 0) { return self._vmNein("DEBUG_MODE"c); }
     // Bedingung: i < n, beide als Local.
     var bed: int64 := self.cg_nc0(ni);
-    if (bed < 0 || self.cg_nkind(bed) != CGN_BINOP || self.cg_nival(bed) != CGT_LT) { return self._vmNein("CONDITION_NOT_I_LT_N"c); }
+    // #2350: Die Ablehnung nennt die FORM, nicht nur ihr Scheitern. Vorher
+    // trugen 1904 Ablehnungen im Selbstbau denselben Code
+    // CONDITION_NOT_I_LT_N, und damit war nicht entscheidbar, ob dahinter
+    // `i <= n`, `i != n`, eine Und-Verknuepfung oder ueberhaupt kein
+    // Vergleich steht -- also auch nicht, welcher Eingriff wie viel bringt.
+    // Die Codes sind die Messgroesse dieses Issues; eine Sammelkategorie
+    // misst nichts.
+    if (bed < 0 || self.cg_nkind(bed) != CGN_BINOP) { return self._vmNein("CONDITION_NOT_BINOP"c); }
+    if (self.cg_nival(bed) != CGT_LT) {
+      var bop: int64 := self.cg_nival(bed);
+      if (bop == CGT_LE)  { return self._vmNein("CONDITION_OP_LE"c); }
+      if (bop == CGT_GT)  { return self._vmNein("CONDITION_OP_GT"c); }
+      if (bop == CGT_GE)  { return self._vmNein("CONDITION_OP_GE"c); }
+      if (bop == CGT_NEQ) { return self._vmNein("CONDITION_OP_NEQ"c); }
+      if (bop == CGT_EQ2) { return self._vmNein("CONDITION_OP_EQ"c); }
+      if (bop == CGT_AND) { return self._vmNein("CONDITION_OP_AND"c); }
+      if (bop == CGT_OR)  { return self._vmNein("CONDITION_OP_OR"c); }
+      return self._vmNein("CONDITION_OP_OTHER"c);
+    }
     // #2343: der Zaehler ist ein Bezeichner und traegt deshalb einen
     // Quelloffset, der while-Knoten nicht. Ab hier kann eine Entscheidung
     // also eine Zeile nennen.
     if (self.cg_nc0(bed) >= 0) { self.cpVmNi := self.cg_nc0(bed); }
     var iOff: int64 := self.cg_vmIdentOff(self.cg_nc0(bed));
     var nOff: int64 := self.cg_vmIdentOff(self.cg_nc1(bed));
-    if (iOff == 0 || nOff == 0 || iOff == nOff) { return self._vmNein("CONDITION_OPERANDS_NOT_LOCALS"c); }
+    // #2350: Zaehler und Schranke getrennt melden, und bei der Schranke die
+    // HERKUNFT nennen. Dieselbe Fehlerart ist in diesem Uebersetzer dreimal
+    // belegt (#1787, #1806, #1812): eine Aufzaehlung, woher ein Wert kommen
+    // kann, vergisst eine Herkunft. Hier sind es Literal und Feld -- im
+    // Selbstbau zusammen die Mehrheit der 1001 Sammelablehnungen.
+    if (iOff == 0) { return self._vmNein("CONDITION_COUNTER_NOT_LOCAL"c); }
+    // #2350: Die Schranke darf auch ein Ganzzahlliteral sein. Im Selbstbau
+    // waren das 329 Ablehnungen (`while bit < 8`, `while (r < 7)`) -- eine
+    // Konstante ist VOR der Schleife bekannt, also besser bekannt als ein
+    // Local, das der Rumpf theoretisch noch anfassen koennte. Sie wird nicht
+    // in nOff gelegt, weil dort ein Rahmenversatz steht; ein Literal hat
+    // keinen. Art und Wert stehen deshalb getrennt im Kasten.
+    var nArt: int64 := 0;
+    var nLit: int64 := 0;
+    if (nOff == 0) {
+      var nKn: int64 := self.cg_nc1(bed);
+      if (nKn >= 0) {
+        var nK: int64 := self.cg_nkind(nKn);
+        if (nK == CGN_LIT_INT) {
+          nLit := self.cg_nival(nKn);
+          // Eine Schranke <= 0 heisst: die Schleife laeuft nie. Dann ist der
+          // Vektorweg sinnlos, und der skalare tut das Richtige ohne
+          // Sonderfall. Die Laufzeitweiche im Vektorweg prueft dasselbe fuer
+          // den Local-Fall; hier steht es schon zur Uebersetzungszeit fest.
+          if (nLit <= 0) { return self._vmNein("CONDITION_BOUND_LITERAL_EMPTY"c); }
+          nArt := 1;
+        }
+        else if (nK == CGN_FIELD)   { return self._vmNein("CONDITION_BOUND_FIELD"c); }
+        else if (nK == CGN_CALL)    { return self._vmNein("CONDITION_BOUND_CALL"c); }
+        else if (nK == CGN_INDEX)   { return self._vmNein("CONDITION_BOUND_INDEX"c); }
+        else if (nK == CGN_BINOP)   { return self._vmNein("CONDITION_BOUND_BINOP"c); }
+        else if (nK == CGN_IDENT)   { return self._vmNein("CONDITION_BOUND_IDENT_NOT_LOCAL"c); }
+        else { return self._vmNein("CONDITION_BOUND_OTHER"c); }
+      }
+      if (nArt == 0) { return self._vmNein("CONDITION_BOUND_OTHER"c); }
+    }
+    if (nArt == 0 && iOff == nOff) { return self._vmNein("CONDITION_COUNTER_IS_BOUND"c); }
     // Rumpf: genau zwei Anweisungen — oder drei, wenn die erste eine
     // Hilfsvariable fuer den Index anlegt (#2334).
     var rumpf: int64 := self.cg_nc1(ni);
@@ -24165,7 +24220,12 @@ pub type Codegen = class {
     // Die Zeiger duerfen nicht die Schleifenvariable oder die Schranke sein —
     // sonst veraendert der Rumpf, was die Bedingung liest.
     if (aOff == iOff || bOff2 == iOff || cOff == iOff) { return self._vmNein("POINTER_IS_LOOP_VAR"c); }
-    if (aOff == nOff || bOff2 == nOff || cOff == nOff) { return self._vmNein("POINTER_IS_BOUND"c); }
+    // Beim Literal gibt es keinen Rahmenversatz, mit dem ein Zeiger
+    // zusammenfallen koennte -- nOff ist dann 0, und ein Zeiger mit Versatz 0
+    // ist oben schon ausgeschlossen.
+    if (nArt == 0) {
+      if (aOff == nOff || bOff2 == nOff || cOff == nOff) { return self._vmNein("POINTER_IS_BOUND"c); }
+    }
     poke64(kasten,      aOff);
     poke64(kasten + 8,  bOff2);
     poke64(kasten + 16, cOff);
@@ -24173,7 +24233,28 @@ pub type Codegen = class {
     poke64(kasten + 32, iOff);
     poke64(kasten + 40, breite);
     poke64(kasten + 48, op);
+    poke64(kasten + 56, nArt);
+    poke64(kasten + 64, nLit);
     return 1;
+  }
+
+  // #2350: Die Schranke nach rax -- aus dem Rahmenplatz oder als Literal.
+  // BEIDE Lesestellen im Vektorweg gehen hierueber, damit nicht eine von
+  // ihnen die neue Herkunft verpasst. Genau diese Fehlerart ist im Projekt
+  // dreimal belegt (#1799, #1803, #1806): die richtige Umsetzung steht da,
+  // die zweite Stelle wurde nicht nachgezogen.
+  //
+  // Der Reduktionserkenner weiter unten (cg_vrErkennen) hat seine eigene
+  // Pruefung auf `iOff == 0 || nOff == 0` und kennt diese Herkunft NICHT --
+  // er lehnt eine literale Schranke weiter ab, und zwar stumm. Das ist
+  // bewusst getrennt und als Rest in #2350 benannt; wer ihn nachzieht, nimmt
+  // diesen Helfer mit, statt die Fallunterscheidung zu kopieren.
+  fn cg_vmSchrankeNachRax(kasten: int64) {
+    if (peek64(kasten + 56) != 0) {
+      self.cg_movRaxImm(peek64(kasten + 64));
+      return;
+    }
+    self.cg_loadRax(peek64(kasten + 24));
   }
 
   // #2194: Vektorfassung ausgeben. Liefert die Flickstelle des Sprungs, der
@@ -24195,7 +24276,8 @@ pub type Codegen = class {
     self.cg_loadRax(aOff); self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC7);   // mov rdi, rax
     self.cg_loadRax(bOff); self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC6);   // mov rsi, rax
     self.cg_loadRax(cOff); self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC2);   // mov rdx, rax
-    self.cg_loadRax(nOff); self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC1);   // mov rcx, rax
+    self.cg_vmSchrankeNachRax(kasten);                                             // #2350
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC1);                          // mov rcx, rax
 
     // Leere oder negative Laenge: skalar. Die Vektorschleife rechnet mit
     // rcx - 16 als letztem vollen Block; mit rcx <= 0 waere das Verhalten
@@ -24250,7 +24332,7 @@ pub type Codegen = class {
     // Die skalare Schleife verliesse i mit dem ersten Wert, fuer den
     // `i < n` nicht mehr gilt — also n. Code hinter der Schleife darf das
     // sehen, deshalb hier nachziehen.
-    self.cg_loadRax(nOff);
+    self.cg_vmSchrankeNachRax(kasten);                                             // #2350
     self.cg_storeRax(iOff);
     self.cg_e8(0xE9);                                                              // jmp hinter die Schleife
     var jUeber: int64 := self.codeLen; self.cg_e32(0);
@@ -24560,7 +24642,7 @@ pub type Codegen = class {
     // skalare Fassung bleibt vollstaendig stehen — sie traegt den Fall mit
     // Ueberlappung und ist der Vergleichsweg der Tests.
     var vmUeber: int64 := 0 - 1;
-    var vmKasten: int64 := alloc(56);
+    var vmKasten: int64 := alloc(72);   // #2350: zwei Plaetze mehr fuer Art und Wert der Schranke
     if (self.cg_vmErkennen(ni, vmKasten) != 0) { vmUeber := self.cg_vmEmit(vmKasten); }
     // #2335: sonst vielleicht eine Reduktion. Die beiden Formen schliessen
     // sich aus — die eine schreibt in ein Feld, die andere in ein Local —,
