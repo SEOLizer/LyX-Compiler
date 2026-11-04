@@ -41,6 +41,11 @@
 # Paar: bei 4000 gegen 16000 lag die suche-Sonde bei 770 % und waere unter der
 # Schwelle geblieben, obwohl der Posten da war.
 #
+# Je Groesse wird der MEDIAN AUS DREI MESSUNGEN genommen. Mit einer einzelnen
+# Messung streute das Verhaeltnis zwischen 209 % und 490 % und kippte im
+# Vollauf auf 819 % — der Test war damit von der Last der Maschine abhaengig,
+# nicht vom Code.
+#
 # Die WERTE werden zuerst geprueft, sonst misst der Rest Unsinn.
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -74,22 +79,43 @@ fn baueZiffern(k: int64): pchar {
   return puf as pchar;
 }
 
-fn messeSuche(k: int64): int64 {
-  var t: pchar := baueBuchstaben(k);
-  var t0: int64 := NowUs() as int64;
-  var r: int64 := RegexSearch("[0-9]"c, t);
-  var t1: int64 := NowUs() as int64;
-  if (r != 0 - 1) { PrintStrLn("WERT_FALSCH_SUCHE"c); }
-  return t1 - t0;
+// #2369: MEDIAN AUS DREI MESSUNGEN je Groesse. Eine Einzelmessung streute
+// zwischen 209 % und 490 % und kippte im Vollauf (make test, belastete
+// Maschine) auf 819 % — ueber die Schwelle, ohne dass etwas kaputt war. Der
+// Median von drei Laeufen ist gegen einen einzelnen Ausschlag unempfindlich,
+// und die Reihenfolge klein/gross wechselt dabei nicht: beide Groessen tragen
+// dieselbe Stoerung.
+fn median3(a: int64, b: int64, c: int64): int64 {
+  if (a > b) { var t: int64 := a; a := b; b := t; }
+  if (b > c) { var t2: int64 := b; b := c; c := t2; }
+  if (a > b) { var t3: int64 := a; a := b; b := t3; }
+  return b;
 }
 
-fn messeZaehlen(k: int64): int64 {
-  var t: pchar := baueZiffern(k);
+// Der Text wird EINMAL je Groesse gebaut und dann mehrfach durchsucht. Die
+// Allokation gehoerte sonst zur Messung: std/alloc.lyx mappt je Allokation,
+// und bei der kleinen Groesse ueberwog dieser Posten das Gemessene so stark,
+// dass das Verhaeltnis auf 200 % fiel — UNTER den linearen Wert 400 %, was
+// nicht sein kann. Ein Messwert, der unter der eigenen Untergrenze liegt,
+// misst etwas anderes als gemeint.
+fn messeSucheN(t: pchar, k: int64, mal: int64): int64 {
   var t0: int64 := NowUs() as int64;
-  var n: int64 := RegexCountMatches("[0-9]"c, t);
-  var t1: int64 := NowUs() as int64;
-  if (n != k) { PrintStrLn("WERT_FALSCH_ZAEHLEN"c); }
-  return t1 - t0;
+  var w: int64 := 0;
+  while (w < mal) {
+    if (RegexSearch("[0-9]"c, t) != 0 - 1) { PrintStrLn("WERT_FALSCH_SUCHE"c); }
+    w := w + 1;
+  }
+  return (NowUs() as int64) - t0;
+}
+
+fn messeZaehlenN(t: pchar, k: int64, mal: int64): int64 {
+  var t0: int64 := NowUs() as int64;
+  var w: int64 := 0;
+  while (w < mal) {
+    if (RegexCountMatches("[0-9]"c, t) != k) { PrintStrLn("WERT_FALSCH_ZAEHLEN"c); }
+    w := w + 1;
+  }
+  return (NowUs() as int64) - t0;
 }
 
 fn main(): int64 {
@@ -112,11 +138,17 @@ fn main(): int64 {
   }
 
   // 2. Skalierung, je Sonde getrennt.
-  var warm: int64 := messeSuche(4000) + messeZaehlen(4000);
-  var ks: int64 := messeSuche(16000);
-  var gs: int64 := messeSuche(64000);
-  var kz: int64 := messeZaehlen(16000);
-  var gz: int64 := messeZaehlen(64000);
+  // Beide Groessen tragen GLEICH VIELE Wiederholungen — eine ungleiche Zahl
+  // wuerde das Verhaeltnis selbst verschieben.
+  var bk: pchar := baueBuchstaben(16000);
+  var bg: pchar := baueBuchstaben(64000);
+  var zk: pchar := baueZiffern(16000);
+  var zg: pchar := baueZiffern(64000);
+  var warm: int64 := messeSucheN(bk, 16000, 1) + messeZaehlenN(zk, 16000, 1);
+  var ks: int64 := median3(messeSucheN(bk, 16000, 5), messeSucheN(bk, 16000, 5), messeSucheN(bk, 16000, 5));
+  var gs: int64 := median3(messeSucheN(bg, 64000, 5), messeSucheN(bg, 64000, 5), messeSucheN(bg, 64000, 5));
+  var kz: int64 := median3(messeZaehlenN(zk, 16000, 5), messeZaehlenN(zk, 16000, 5), messeZaehlenN(zk, 16000, 5));
+  var gz: int64 := median3(messeZaehlenN(zg, 64000, 5), messeZaehlenN(zg, 64000, 5), messeZaehlenN(zg, 64000, 5));
   PrintStr("suche_klein_us="c);   PrintStrLn(IntToStr(ks));
   PrintStr("suche_gross_us="c);   PrintStrLn(IntToStr(gs));
   PrintStr("zaehlen_klein_us="c); PrintStrLn(IntToStr(kz));

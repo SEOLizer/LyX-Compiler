@@ -23949,6 +23949,92 @@ pub type Codegen = class {
     return 0;
   }
 
+  // #2363: Diese drei Funktionen klassifizieren einen FEHLSCHLAG. Sie laufen
+  // nur, wenn das Tor schon zu ist, kosten auf dem Erfolgsweg also nichts.
+  //
+  // Hintergrund: `STORE_WIDTH_UNKNOWN`, `HELPER_INIT_NOT_BINOP`,
+  // `HELPER_INIT_NOT_MUL` und `STORE_INDEX_FORM_MISMATCH` waren
+  // Sammelkategorien. Zusammen tragen sie im Selbstbau von src/lyxc.lyx weit
+  // ueber tausend Ablehnungen, und aus der Zahl allein ist nicht
+  // entscheidbar, welcher Eingriff wie viel bringt — in diesem Themenkreis
+  // sind die Gruende die Messgroesse (#2350). Erst aufschluesseln, dann
+  // bauen.
+
+  // Warum ist die Ablagebreite unbekannt? Der Praefixvergleich ist hier
+  // bewusst erlaubt: er vergibt kein Recht, sondern benennt nur einen
+  // Ablehnungsgrund. Entschieden wird weiter oben, mit exakten Namen.
+  fn cg_vmBreiteGrund(nm: pchar, nl: int64): pchar {
+    if (self.cg_seq(nm, nl, "poke64"c, 6)) { return "STORE_WIDTH_POKE64"c; }
+    if (nl > 4 && self.cg_seq(nm, 4, "poke"c, 4)) { return "STORE_WIDTH_POKE_OTHER"c; }
+    return "STORE_WIDTH_NOT_POKE"c;
+  }
+
+  // Welche Form hat der Initialwert der Hilfsvariablen, wenn es kein `i * K` ist?
+  fn cg_vmHelferInitGrund(ini: int64): pchar {
+    if (ini < 0) { return "HELPER_INIT_MISSING"c; }
+    var k: int64 := self.cg_nkind(ini);
+    if (k == CGN_LIT_INT)  { return "HELPER_INIT_LITERAL"c; }
+    if (k == CGN_IDENT)    { return "HELPER_INIT_IDENT"c; }
+    if (k == CGN_CALL)     { return "HELPER_INIT_CALL"c; }
+    if (k == CGN_CALL_PTR) { return "HELPER_INIT_CALL_PTR"c; }
+    if (k == CGN_INDEX)    { return "HELPER_INIT_INDEX"c; }
+    if (k == CGN_FIELD)    { return "HELPER_INIT_FIELD"c; }
+    if (k == CGN_CAST)     { return "HELPER_INIT_CAST"c; }
+    if (k == CGN_UNOP)     { return "HELPER_INIT_UNOP"c; }
+    if (k == CGN_NEW)      { return "HELPER_INIT_NEW"c; }
+    if (k == CGN_LIT_STR)  { return "HELPER_INIT_LIT_STR"c; }
+    return "HELPER_INIT_OTHER_KIND"c;
+  }
+
+  // Es ist ein Binop, aber nicht `*` — welcher Operator steht da?
+  fn cg_vmHelferOpGrund(op: int64): pchar {
+    if (op == CGT_PLUS)    { return "HELPER_INIT_OP_PLUS"c; }
+    if (op == CGT_MINUS)   { return "HELPER_INIT_OP_MINUS"c; }
+    if (op == CGT_SLASH)   { return "HELPER_INIT_OP_DIV"c; }
+    if (op == CGT_PERCENT) { return "HELPER_INIT_OP_MOD"c; }
+    if (op == CGT_SHL)     { return "HELPER_INIT_OP_SHL"c; }
+    if (op == CGT_SHR)     { return "HELPER_INIT_OP_SHR"c; }
+    if (op == CGT_BITAND)  { return "HELPER_INIT_OP_AND"c; }
+    if (op == CGT_BITOR)   { return "HELPER_INIT_OP_OR"c; }
+    return "HELPER_INIT_OP_OTHER"c;
+  }
+
+  // Warum passt die Indexform der Ablage nicht? Spiegelt cg_vmBasisVon Zweig
+  // fuer Zweig; beide muessen uebereinstimmen (vgl. cg_parseFloat /
+  // _parseFloatBits).
+  fn cg_vmIndexGrund(adr: int64, iOff: int64, breite: int64, oNm: pchar, oNl: int64): pchar {
+    if (adr < 0) { return "STORE_ADDR_MISSING"c; }
+    if (self.cg_nkind(adr) != CGN_BINOP) { return "STORE_ADDR_NOT_BINOP"c; }
+    if (self.cg_nival(adr) != CGT_PLUS) { return "STORE_ADDR_NOT_SUM"c; }
+    if (self.cg_vmIdentOff(self.cg_nc0(adr)) == 0) { return "STORE_BASE_NOT_LOCAL"c; }
+    var idx: int64 := self.cg_nc1(adr);
+    if (idx < 0) { return "STORE_INDEX_MISSING"c; }
+    var k: int64 := self.cg_nkind(idx);
+    if (k == CGN_IDENT) {
+      // Die Hilfsvariable haette oben getroffen; bleibt der nackte Zaehler
+      // (bei Breite > 1 keine Indexform dieses Feldes) oder eine fremde.
+      if (self.cg_vmIdentOff(idx) == iOff) { return "STORE_INDEX_PLAIN_LOOP_VAR"c; }
+      return "STORE_INDEX_OTHER_IDENT"c;
+    }
+    if (k == CGN_CALL)    { return "STORE_INDEX_CALL"c; }
+    if (k == CGN_LIT_INT) { return "STORE_INDEX_LITERAL"c; }
+    if (k == CGN_FIELD)   { return "STORE_INDEX_FIELD"c; }
+    if (k != CGN_BINOP)   { return "STORE_INDEX_OTHER_KIND"c; }
+    if (self.cg_nival(idx) != CGT_STAR) { return self.cg_vmIndexOpGrund(self.cg_nival(idx)); }
+    if (self.cg_vmIdentOff(self.cg_nc0(idx)) != iOff) { return "STORE_INDEX_MUL_LEFT_NOT_LOOP_VAR"c; }
+    var kN: int64 := self.cg_nc1(idx);
+    if (kN < 0 || self.cg_nkind(kN) != CGN_LIT_INT) { return "STORE_INDEX_FACTOR_NOT_LITERAL"c; }
+    return "STORE_INDEX_FACTOR_MISMATCH"c;
+  }
+
+  fn cg_vmIndexOpGrund(op: int64): pchar {
+    if (op == CGT_PLUS)  { return "STORE_INDEX_OP_PLUS"c; }
+    if (op == CGT_MINUS) { return "STORE_INDEX_OP_MINUS"c; }
+    if (op == CGT_SHL)   { return "STORE_INDEX_OP_SHL"c; }
+    if (op == CGT_SLASH) { return "STORE_INDEX_OP_DIV"c; }
+    return "STORE_INDEX_OP_OTHER"c;
+  }
+
   // Ist `adr` die Form `BASIS + idx`, wobei idx zur Schleifenvariablen passt?
   // Liefert den Rahmenversatz der Basis, sonst 0. `breite` muss zur
   // Indexform passen: bei 1 steht `i` da, sonst `i * breite`.
@@ -24174,8 +24260,10 @@ pub type Codegen = class {
     var oK: int64 := 0;
     if (s1 >= 0 && self.cg_nkind(s1) == CGN_VAR_DECL) {
       var ini: int64 := self.cg_nc1(s1);
-      if (ini < 0 || self.cg_nkind(ini) != CGN_BINOP) { return self._vmNein("HELPER_INIT_NOT_BINOP"c); }
-      if (self.cg_nival(ini) != CGT_STAR) { return self._vmNein("HELPER_INIT_NOT_MUL"c); }
+      // #2363: beide Gruende aufgeschluesselt — die Zahl allein sagte nicht,
+      // welche Form dastand.
+      if (ini < 0 || self.cg_nkind(ini) != CGN_BINOP) { return self._vmNein(self.cg_vmHelferInitGrund(ini)); }
+      if (self.cg_nival(ini) != CGT_STAR) { return self._vmNein(self.cg_vmHelferOpGrund(self.cg_nival(ini))); }
       if (self.cg_vmIdentOff(self.cg_nc0(ini)) != iOff) { return self._vmNein("HELPER_INIT_NOT_LOOP_VAR"c); }
       var kN0: int64 := self.cg_nc1(ini);
       if (kN0 < 0 || self.cg_nkind(kN0) != CGN_LIT_INT) { return self._vmNein("HELPER_FACTOR_NOT_LITERAL"c); }
@@ -24208,7 +24296,7 @@ pub type Codegen = class {
     var ruf: int64 := self.cg_nc0(s1);
     if (ruf < 0 || self.cg_nkind(ruf) != CGN_CALL) { return self._vmNein("STORE_NOT_CALL"c); }
     var breite: int64 := self.cg_vmBreiteVonName(self.cg_nsval(ruf), self.cg_nslen(ruf), 0);
-    if (breite == 0) { return self._vmNein("STORE_WIDTH_UNKNOWN"c); }
+    if (breite == 0) { return self._vmNein(self.cg_vmBreiteGrund(self.cg_nsval(ruf), self.cg_nslen(ruf))); }
     // #2334: jetzt ist die Breite bekannt — der Faktor der Hilfsvariablen
     // muss sie treffen. `var o := i * 3` bei poke16 ist keine Indexform
     // dieses Feldes und darf nicht durchfallen.
@@ -24218,7 +24306,7 @@ pub type Codegen = class {
     var wert: int64 := self.cg_nnext(adr);
     if (wert < 0 || self.cg_nnext(wert) != -1) { return self._vmNein("STORE_ARITY_MISMATCH"c); }
     var cOff: int64 := self.cg_vmBasisVon(adr, iOff, breite, oNm, oNl);
-    if (cOff == 0) { return self._vmNein("STORE_INDEX_FORM_MISMATCH"c); }
+    if (cOff == 0) { return self._vmNein(self.cg_vmIndexGrund(adr, iOff, breite, oNm, oNl)); }
     // Maske abziehen, wenn sie genau die Breite trifft — sie ist dort tot
     // (#2324), und ohne dieses Abziehen wuerde die Form nicht erkannt.
     if (self.cg_nkind(wert) == CGN_BINOP && self.cg_nival(wert) == CGT_BITAND) {
