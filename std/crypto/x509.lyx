@@ -38,6 +38,8 @@ unit std.crypto.x509;
 
 import std.alloc;
 import std.crypto.der;
+import std.crypto.sha256;
+import std.crypto.ec;
 
 con X_DER:      int64 := 0;
 con X_DERLEN:   int64 := 8;
@@ -739,4 +741,145 @@ pub fn X509ZeitGueltig(satz: int64, jetzt: int64): bool {
     if (jetzt < peek64(satz + X_NBEFORE)) { return false; }
     if (jetzt > peek64(satz + X_NAFTER)) { return false; }
     return true;
+}
+
+// ===========================================================================
+// Signatur- und Kettenpruefung (#2096)
+//
+// Fehlercodes (0 heisst gueltig; jeder andere Wert nennt den Grund, es gibt
+// keinen Zweig, der bei Unklarheit "gueltig" liefert):
+//   1  Zertifikat nicht lesbar
+//   2  ausserhalb des Gueltigkeitszeitraums
+//   3  Hostname passt nicht
+//   4  kein Aussteller gefunden (weder in der Kette noch im Trust-Store)
+//   5  Signatur falsch
+//   6  Aussteller ist kein CA-Zertifikat (basicConstraints)
+//   7  pathLenConstraint ueberschritten
+//   8  Aussteller hat keyCertSign nicht gesetzt
+//   9  Blatt hat den verlangten Zweck nicht in extKeyUsage
+//   10 Signaturverfahren oder Kurve nicht unterstuetzt
+//   11 Kette zu lang
+//   12 Blatt hat digitalSignature nicht gesetzt
+//
+// Code 10 ist wichtig: unterstuetzt wird derzeit ecdsa-with-SHA256 auf
+// secp256r1. Fuer RSA, Ed25519 und secp384r1 fehlt die Verifikation noch
+// (std/crypto/ec.lyx kennt nur secp256k1 und secp256r1) — diese Faelle
+// werden ABGEWIESEN, nicht durchgelassen.
+// ===========================================================================
+
+con X_MAX_TIEFE: int64 := 8;
+
+// Prueft die Signatur von `kind` mit dem Schluessel aus `aussteller`.
+// Liefert 0 bei gueltiger Signatur, 5 bei falscher, 10 bei nicht
+// unterstuetztem Verfahren.
+pub fn X509PruefeSignatur(kind: int64, aussteller: int64): int64 {
+    var alg: int64 := peek64(kind + X_SIGALG);
+    if (alg != 1) { return 10; }                       // nur ecdsa-with-SHA256
+    if (peek64(aussteller + X_KEYALG) != 1) { return 10; }   // nur secp256r1
+
+    var derK: int64 := peek64(kind + X_DER);
+    var derA: int64 := peek64(aussteller + X_DER);
+
+    // Oeffentlicher Punkt: 0x04 || X || Y, unkomprimiert (RFC 5480 §2.2).
+    var kLen: int64 := peek64(aussteller + X_KEYLEN);
+    if (kLen != 65) { return 10; }
+    var kPos: int64 := derA + peek64(aussteller + X_KEYPOS);
+    if ((peek8(kPos) & 0xFF) != 4) { return 10; }
+
+    var hash: int64 := alloc(32);
+    var r: int64 := alloc(32);
+    var s: int64 := alloc(32);
+    if (hash == 0 || r == 0 || s == 0) { panic("X.509: kein Speicher"); }
+
+    SHA256(derK + peek64(kind + X_TBSPOS), peek64(kind + X_TBSLEN), hash);
+    if (!EcdsaSigFromDer(derK + peek64(kind + X_SIGPOS), peek64(kind + X_SIGLEN), r, s)) {
+        free(hash, 32); free(r, 32); free(s, 32);
+        return 5;
+    }
+    var ok: bool := EcdsaVerify(EC_P256, hash, kPos + 1, kPos + 33, r, s);
+    free(hash, 32); free(r, 32); free(s, 32);
+    if (!ok) { return 5; }
+    return 0;
+}
+
+// Sucht in einer Liste von (Zeiger, Laenge)-Paaren das Zertifikat, dessen
+// Subjekt gleich dem Aussteller von `kind` ist. Liefert den Index oder -1.
+// Die Liste ist ein Block aus 16-Byte-Eintraegen.
+fn kettenSuche(kind: int64, liste: int64, n: int64, satzOut: int64): int64 {
+    var derK: int64 := peek64(kind + X_DER);
+    var i: int64 := 0;
+    while (i < n) {
+        var p: int64 := peek64(liste + i * 16);
+        var l: int64 := peek64(liste + i * 16 + 8);
+        if (X509Lies(p, l, satzOut)) {
+            if (X509NameGleich(p, peek64(satzOut + X_SUBPOS), peek64(satzOut + X_SUBLEN),
+                               derK, peek64(kind + X_ISSPOS), peek64(kind + X_ISSLEN))) {
+                return i;
+            }
+        }
+        i += 1;
+    }
+    return -1;
+}
+
+// Prueft eine Kette. `kette` ist ein Block aus 16-Byte-Eintraegen
+// (DER-Zeiger, DER-Laenge), Eintrag 0 ist das Blatt; `trust` ebenso mit den
+// Wurzeln, die der Aufrufer vertraut (kein System-Store, kein fs-Zugriff —
+// so verlangt es #2096). `zweck` ist 1 fuer serverAuth und 2 fuer clientAuth,
+// 0 prueft extKeyUsage nicht. `host` darf 0/0 sein (dann keine
+// Namenspruefung, etwa fuer Client-Zertifikate).
+pub fn X509PruefeKette(kette: int64, ketteN: int64, trust: int64, trustN: int64,
+                       host: int64, hostLen: int64, jetzt: int64, zweck: int64): int64 {
+    if (ketteN <= 0 || trustN <= 0) { return 4; }
+    if (ketteN > X_MAX_TIEFE) { return 11; }
+
+    var gr: int64 := X509Groesse();
+    var kind: int64 := alloc(gr);
+    var eltern: int64 := alloc(gr);
+    if (kind == 0 || eltern == 0) { panic("X.509: kein Speicher"); }
+
+    if (!X509Lies(peek64(kette), peek64(kette + 8), kind)) { return 1; }
+    if (!X509ZeitGueltig(kind, jetzt)) { return 2; }
+    if (host != 0 && hostLen > 0) {
+        if (!X509PasstName(kind, host, hostLen)) { return 3; }
+    }
+    if (zweck != 0) {
+        var eku: int64 := peek64(kind + X_EKU);
+        // Ist extKeyUsage gar nicht gesetzt, gilt das Zertifikat fuer jeden
+        // Zweck (RFC 5280 §4.2.1.12); ist es gesetzt, muss der Zweck oder
+        // anyExtendedKeyUsage drinstehen.
+        if (eku != 0 && (eku & zweck) == 0 && (eku & 64) == 0) { return 9; }
+    }
+    var ku: int64 := peek64(kind + X_KU);
+    if (ku != 0 && (ku & 1) == 0) { return 12; }       // digitalSignature
+
+    var tiefe: int64 := 0;
+    while (tiefe < X_MAX_TIEFE) {
+        // Erst im Trust-Store suchen: eine vertraute Wurzel beendet die Kette.
+        var ti: int64 := kettenSuche(kind, trust, trustN, eltern);
+        var ausKette: bool := false;
+        if (ti < 0) {
+            ti := kettenSuche(kind, kette, ketteN, eltern);
+            if (ti < 0) { return 4; }
+            ausKette := true;
+        }
+
+        if (!X509ZeitGueltig(eltern, jetzt)) { return 2; }
+        if (!X509IstCA(eltern)) { return 6; }
+        var eku2: int64 := peek64(eltern + X_KU);
+        if (eku2 != 0 && (eku2 & 32) == 0) { return 8; }   // keyCertSign, Bit 5
+        var pfad: int64 := peek64(eltern + X_PATHLEN);
+        if (pfad >= 0 && tiefe > pfad) { return 7; }
+
+        var rc: int64 := X509PruefeSignatur(kind, eltern);
+        if (rc != 0) { return rc; }
+
+        if (!ausKette) { return 0; }                   // vertraute Wurzel erreicht
+
+        // Weiter nach oben: das Elternteil wird das neue Kind.
+        var i: int64 := 0;
+        while (i < gr) { poke8(kind + i, peek8(eltern + i)); i := i + 1; }
+        tiefe += 1;
+    }
+    return 11;
 }
