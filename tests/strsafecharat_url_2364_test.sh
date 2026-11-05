@@ -102,12 +102,12 @@ ok "uebersetzt und laeuft"
 hol() { echo "$AUS" | sed -n "s/^$1=//p"; }
 
 # 1. Werte: k = 3 ergibt "https://example.com/" + 3 x 9 Zeichen = Pfad "/abcdefgh/abcdefgh/abcdefgh/"
-# `GetHostname` liefert einen ZEIGER IN DIE URL und schneidet nicht ab, gibt
-# also "example.com/abcdefgh/..." zurueck. Das ist VORBESTEHEND und nicht
-# Gegenstand dieser Aenderung: gegengeprueft gegen die installierte stdlib von
-# vor #2352/#2364, die wortgleich dasselbe liefert. Als eigener Punkt
-# gemeldet; hier wird deshalb der ANFANG geprueft, damit der Test nicht die
-# Eigenart festschreibt und beim Beheben rot wird.
+# `GetHostname` lieferte bis 1.2.31J einen ZEIGER IN DIE URL und schnitt nicht
+# ab, gab also "example.com/abcdefgh/..." zurueck. Das war vorbestehend, als
+# #2366 gemeldet und ist dort behoben: die Funktion liefert jetzt
+# "example.com". Die Pruefung auf den ANFANG war genau dafuer so geschrieben
+# und gilt unveraendert fuer beide Faelle — den vollstaendigen Wert prueft
+# tests/url_getter_2366_test.sh.
 case "$(hol host)" in
   example.com*) ok "GetHostname beginnt mit example.com" ;;
   *) no "host" "'$(hol host)' beginnt nicht mit example.com" ;;
