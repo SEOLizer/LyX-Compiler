@@ -1,6 +1,6 @@
-# Lyx 1.2.31H — Canonical EBNF Grammar
+# Lyx 1.2.31I — Canonical EBNF Grammar
 
-> Stand 2026-11-05, gegen lyxc 1.2.31H geprueft. Die Keyword-Liste in
+> Stand 2026-11-05, gegen lyxc 1.2.31I geprueft. Die Keyword-Liste in
 > Abschnitt 2.1 wurde Wort fuer Wort gegen den Compiler verifiziert; die
 > Typgrammatik in Abschnitt 7 ist um Funktions- und Methodenzeiger ergaenzt,
 > und die match-Produktion in Abschnitt 12 entspricht jetzt dem Parser.
