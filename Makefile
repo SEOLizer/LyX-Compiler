@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.31F
+VERSION   := 1.2.31G
 VERSION_DATE := 2026-11-05
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -1054,6 +1054,7 @@ test: lyxc
 	@echo "--- defer an der Blockgrenze (11 tests) ---"
 	@bash tests/defer_block_test.sh
 	@bash tests/defer_argument_zeitpunkt_2380_test.sh
+	@bash tests/defer_grenzen_2385_test.sh
 	@echo "OK"
 	@echo "--- Kernsprache (.lyx-Suite) ---"
 	@bash tests/run_lyx_suite.sh tests/suite-core.txt "Kernsprache"

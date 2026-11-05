@@ -160,6 +160,15 @@ con CGN_AT_IF:          int64 := 103; // WP-CS-01: @if (nach Sema-Pruning nicht 
 con CGN_AT_DIRECTIVE:   int64 := 104; // WP-CS-08: @io_check/@overflow_check; iv=kind, iv2=value
 con CGN_AT_ENERGY:      int64 := 105; // WP-EN-04: @energy(N) — iv=level(1-5)
 con CGN_DEFER:          int64 := 106; // WP-AS-07/10: defer Stmt; c0=deferred statement
+// #2385: Obergrenze fuer die beiden defer-Puffer. Sie sind nicht dazu da,
+// legitimen Code abzuweisen — 4096 aufgeschobene Anweisungen in EINER Funktion
+// schreibt niemand von Hand —, sondern damit erzeugter Code nicht in eine
+// unbegrenzte Belegung laeuft. Wird sie erreicht, scheitert die Uebersetzung
+// LAUT. Vorher verwarfen beide Puffer beim Ueberlauf stillschweigend: ein 65.
+// defer lief nie, und jenseits der Argumentgrenze wurde das Argument beim
+// Ablauf statt bei der Anmeldung ausgewertet (#1030).
+con CG_DEFER_MAX:       int64 := 4096;
+con CG_DFARG_MAX:       int64 := 16384;
 con ANNO_ENERGY_SHIFT:  int64 := 8;   // WP-EN-04: bits 8-10 of NK_FUNC_DECL iVal
 con CGN_REPEAT_UNTIL:    int64 := 77; // WP-BC-04: repeat { body } until (cond)
 con CGN_TUPLE_VAR_DECL:  int64 := 78; // WP-BC-05: var a, b := fn()
@@ -23625,6 +23634,11 @@ pub type Codegen = class {
       // vorzeitigen return. Die Vormerkung geschieht an der Stelle, an der das
       // defer im Quelltext steht — ein defer hinter einem return wird damit
       // nicht mehr ausgefuehrt, was der Blocksemantik entspricht.
+      // #2385: Puffer wachsen lassen statt den Eintrag zu verwerfen. Ein
+      // defer, das nicht angemeldet wird, LAEUFT NIE — das ist kein
+      // Engpass, sondern ein anderes Programm (nicht freigegebener
+      // Speicher, offene Dateien).
+      if (self.deferCount >= self.deferCap) { self.cg_deferPufferWachsen(); }
       if (self.deferCount < self.deferCap) {
         poke64(self.deferBuf + self.deferCount * 8, self.cg_nc0(ni));
         self.deferCount += 1;
@@ -23864,6 +23878,44 @@ pub type Codegen = class {
   // auswerten und in verdeckte Slots legen. Ohne das wuerden sie erst am
   // Blockende ausgewertet — `defer f(i)` in einer Schleife saehe dort das
   // bereits erhoehte i.
+  // #2385: Anmeldepuffer verdoppeln. Dieselbe Form wie cg_addLocal (alloc,
+  // memcpy, tauschen) — der Compiler-Allokator ist eine Arena, `free` ist
+  // dort ein No-op, der alte Block bleibt also einfach liegen.
+  fn cg_deferPufferWachsen() {
+    if (self.deferCap >= CG_DEFER_MAX) {
+      EPrintStr("lyxc: zu viele `defer` in einer Funktion (Grenze "c);
+      EPrintInt(CG_DEFER_MAX);
+      EPrintStrLn(", #2385). Die Funktion aufteilen."c);
+      exit(70);
+    }
+    var nc: int64 := self.deferCap * 2;
+    if (nc > CG_DEFER_MAX) { nc := CG_DEFER_MAX; }
+    var nb: int64 := alloc(nc * 8);
+    memcpy(nb, self.deferBuf, self.deferCount * 8);
+    self.deferBuf := nb;
+    self.deferCap := nc;
+  }
+
+  // #2385: dasselbe fuer die gesicherten Argumente. Zwei Felder, beide
+  // gleich lang — wer eines vergroessert, muss das andere mitnehmen.
+  fn cg_dfPufferWachsen() {
+    if (self.dfCap >= CG_DFARG_MAX) {
+      EPrintStr("lyxc: zu viele `defer`-Argumente in einer Funktion (Grenze "c);
+      EPrintInt(CG_DFARG_MAX);
+      EPrintStrLn(", #2385). Die Funktion aufteilen."c);
+      exit(70);
+    }
+    var nc: int64 := self.dfCap * 2;
+    if (nc > CG_DFARG_MAX) { nc := CG_DFARG_MAX; }
+    var nn: int64 := alloc(nc * 8);
+    memcpy(nn, self.dfNodes, self.dfCount * 8);
+    self.dfNodes := nn;
+    var ns: int64 := alloc(nc * 8);
+    memcpy(ns, self.dfSlots, self.dfCount * 8);
+    self.dfSlots := ns;
+    self.dfCap := nc;
+  }
+
   fn cg_captureDeferArgs(stmtNi: int64) {
     if (stmtNi < 0) { return; }
     var callNi: int64 := stmtNi;
@@ -23874,7 +23926,11 @@ pub type Codegen = class {
     var argNi: int64 := self.cg_nc0(callNi);
     if (self.cg_nival(callNi) == 1) { argNi := self.cg_nc1(callNi); }
     while (argNi >= 0) {
-      if (self.dfCount >= self.dfCap) { return; }
+      // #2385: wachsen statt verwerfen. Ohne gesicherten Slot liefert
+      // cg_deferArgIdx -1, und der aufgeschobene Aufruf wertet sein Argument
+      // beim ABLAUF aus statt bei der Anmeldung — genau der Zustand, den
+      // #1030 beseitigt hat, nur still wieder hergestellt.
+      if (self.dfCount >= self.dfCap) { self.cg_dfPufferWachsen(); }
       self.cg_genExpr(argNi);
       var off: int64 := self.cg_addLocal("__dfarg__", 9);
       self.cg_storeRax(off);
