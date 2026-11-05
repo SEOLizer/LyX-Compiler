@@ -24188,6 +24188,72 @@ pub type Codegen = class {
   // zweite Kopie waere die Fehlerart, die in diesem Uebersetzer dreimal belegt
   // ist (#1799, #1803, #1806): eine Form geht auf einem Weg und auf dem
   // anderen nicht, weil die Nachbarstelle nicht nachgezogen wurde.
+  // #2350/#2378: Ist `nKn` ein SCHLICHTES 8-Byte-Feld eines Objekts, das als
+  // einfaches Local vorliegt? Dann 0, und Objektversatz und Feldversatz
+  // landen in zellen[0] und zellen[8]. Sonst der Grundcode 1..8.
+  //
+  // Warum so eng: cg_genFieldLoad traegt sieben Sonderfaelle (sicherer
+  // Zugriff `?.`, Array-Eigenschaften, Enum-Mitglied, Typname.Feld als
+  // Konstante, inline liegendes Struct-Feld, schmale Breiten 1/2/4,
+  // @big_endian mit BSWAP). Wer CGN_FIELD pauschal durchlaesst, zieht alle
+  // sieben in einen Weg, der sie nicht kennt — die Fehlerart, die hier
+  // dreimal als unvollstaendige Aufzaehlung belegt ist (#1787, #1806, #1812).
+  //
+  // Diese Pruefung bedient ZWEI Stellen: die Schranke (#2350 Schritt 3b) und
+  // die Basis (#2378). Eine Kopie daneben waere die andere belegte Fehlerart
+  // — zwei Aufzaehlungen derselben Sache, von denen eine nicht nachgezogen
+  // wird (#1799, #1803, #1806). Zuletzt ist mir das in #2363 selbst
+  // passiert: cg_exprRein kannte die Umdeutung, cg_vmOhneZaehler nicht, und
+  // die Erweiterung wirkte an 1 von 117 Stellen.
+  fn cg_vmFeldSchlicht(nKn: int64, zellen: int64): int64 {
+    if (nKn < 0 || self.cg_nkind(nKn) != CGN_FIELD) { return 1; }
+    var fObj: int64 := self.cg_nc0(nKn);
+    if (fObj < 0) { return 2; }
+    if ((self.cg_nival(nKn) & 1) != 0) { return 3; }
+    var fObjOff: int64 := self.cg_vmIdentOff(fObj);
+    if (fObjOff == 0) { return 4; }
+    if (self.cg_identIsArray(fObj) != 0) { return 5; }
+    var fCls: int64 := self.cg_objClassIdx(fObj);
+    if (fCls < 0) { return 6; }
+    var fNm: pchar := self.cg_nsval(nKn);
+    var fNl: int64 := self.cg_nslen(nKn);
+    var fOffB: int64 := self.cg_getFieldOffset(fCls, fNm, fNl);
+    if (fOffB < 0) { return 7; }
+    // Die Flaggen entscheiden ueber die LADEFORM. Nur das schlichte
+    // 8-Byte-Feld wird angenommen; alles andere laedt anders.
+    var fFl: int64 := self.cg_getFieldBigEndian(fCls, fNm, fNl);
+    if (((fFl >> 4) & 1) != 0) { return 8; }
+    if ((fFl & 1) != 0)        { return 9; }
+    var fW: int64 := (fFl >> 8) & 0xFF;
+    if (fW == 1 || fW == 2 || fW == 4) { return 10; }
+    poke64(zellen,     fObjOff);
+    poke64(zellen + 8, fOffB);
+    return 0;
+  }
+
+  // Der Grundname zum Code. `basis` waehlt die Stelle: 0 = Schranke
+  // (#2350 Schritt 3b), 1 = Basis (#2378).
+  //
+  // Beide Namen stehen je Code in EINER Zeile. Zusammengesetzt wird nichts:
+  // ein Name, der zur Laufzeit entsteht, ist im Erzeugnis nicht mehr
+  // greppbar, und die Gruende sind die Messgroesse dieses Themenkreises
+  // (#2343). Wer eine Pruefung in cg_vmFeldSchlicht ergaenzt, sieht hier
+  // sofort, dass ihm ein Name fehlt.
+  fn cg_vmFeldGrund(code: int64, basis: int64): pchar {
+    if (code == 1)  { if (basis != 0) { return "BASE_FIELD_NOT_FIELD"c; }       return "BOUND_FIELD_NOT_FIELD"c; }
+    if (code == 2)  { if (basis != 0) { return "BASE_FIELD_NO_OBJECT"c; }       return "BOUND_FIELD_NO_OBJECT"c; }
+    if (code == 3)  { if (basis != 0) { return "BASE_FIELD_SAFE_ACCESS"c; }     return "BOUND_FIELD_SAFE_ACCESS"c; }
+    if (code == 4)  { if (basis != 0) { return "BASE_FIELD_BASE_NOT_LOCAL"c; }  return "BOUND_FIELD_BASE_NOT_LOCAL"c; }
+    if (code == 5)  { if (basis != 0) { return "BASE_FIELD_ARRAY_PROPERTY"c; }  return "BOUND_FIELD_ARRAY_PROPERTY"c; }
+    if (code == 6)  { if (basis != 0) { return "BASE_FIELD_CLASS_UNKNOWN"c; }   return "BOUND_FIELD_CLASS_UNKNOWN"c; }
+    if (code == 7)  { if (basis != 0) { return "BASE_FIELD_OFFSET_UNKNOWN"c; }  return "BOUND_FIELD_OFFSET_UNKNOWN"c; }
+    if (code == 8)  { if (basis != 0) { return "BASE_FIELD_INLINE_STRUCT"c; }   return "BOUND_FIELD_INLINE_STRUCT"c; }
+    if (code == 9)  { if (basis != 0) { return "BASE_FIELD_BIG_ENDIAN"c; }      return "BOUND_FIELD_BIG_ENDIAN"c; }
+    if (code == 10) { if (basis != 0) { return "BASE_FIELD_NARROW_WIDTH"c; }    return "BOUND_FIELD_NARROW_WIDTH"c; }
+    if (basis != 0) { return "BASE_FIELD_OTHER"c; }
+    return "BOUND_FIELD_OTHER"c;
+  }
+
   fn cg_vmIndexPasst(idx: int64, iOff: int64, breite: int64, oNm: pchar, oNl: int64): int64 {
     if (oNl != 0 && idx >= 0 && self.cg_nkind(idx) == CGN_IDENT
         && self.cg_nslen(idx) == oNl
@@ -24260,7 +24326,13 @@ pub type Codegen = class {
   // Felder und Aufrufe faellt cg_exprRein ab; sie brauchten eine Aussage
   // darueber, ob die Ablage den Objektspeicher treffen kann, und das ist eine
   // Aliasing-Frage, keine Formfrage.
-  fn cg_vmBasisKnoten(adr: int64, iOff: int64, nOff: int64, breite: int64, oNm: pchar, oNl: int64): int64 {
+  // #2378: `fZellen` nimmt Objektversatz und Feldversatz auf, wenn die Basis
+  // ein schlichtes FELD ist (`peek8(self.doneBuf + i)`), sonst zwei Nullen.
+  // Der Emitter braucht beide, um zur Laufzeit zu pruefen, dass die Ablage
+  // das Feld nicht trifft — die Vektorfassung liest es einmal, die skalare
+  // bei jedem Durchlauf.
+  fn cg_vmBasisKnoten(adr: int64, iOff: int64, nOff: int64, breite: int64, oNm: pchar, oNl: int64, fZellen: int64): int64 {
+    poke64(fZellen, 0); poke64(fZellen + 8, 0);
     if (adr < 0 || self.cg_nkind(adr) != CGN_BINOP) { return 0 - 1; }
     if (self.cg_nival(adr) != CGT_PLUS) { return 0 - 1; }
     var basis: int64 := self.cg_nc0(adr);
@@ -24268,9 +24340,19 @@ pub type Codegen = class {
     // Ein Bezeichner geht den bestehenden Weg ueber den Rahmenversatz; hier
     // wird nur behandelt, was dort durchfaellt.
     if (self.cg_vmIdentOff(basis) != 0) { return 0 - 1; }
+    if (self.cg_vmIndexPasst(self.cg_nc1(adr), iOff, breite, oNm, oNl) == 0) { return 0 - 1; }
+    // #2378: ein schlichtes Feld. Es ist nicht „rein" im Sinne von
+    // cg_exprRein — ein Feld kann sich aendern —, aber im Rumpf dieser
+    // Schleife KANN es sich nur auf einem Weg aendern: die Ablage trifft den
+    // Objektspeicher. Genau das prueft der Emitter zur Laufzeit. Eine
+    // Zuweisung an das Feld steht nicht im Rumpf, denn der besteht aus
+    // genau zwei Anweisungen (Ablage und Fortschaltung).
+    if (self.cg_nkind(basis) == CGN_FIELD) {
+      if (self.cg_vmFeldSchlicht(basis, fZellen) != 0) { return 0 - 1; }
+      return basis;
+    }
     if (self.cg_exprRein(basis, 0, 1) == 0) { return 0 - 1; }
     if (self.cg_vmOhneZaehler(basis, iOff, nOff, oNm, oNl, 0) == 0) { return 0 - 1; }
-    if (self.cg_vmIndexPasst(self.cg_nc1(adr), iOff, breite, oNm, oNl) == 0) { return 0 - 1; }
     return basis;
   }
 
@@ -24409,29 +24491,16 @@ pub type Codegen = class {
           // belegt ist (#1787, #1806, #1812). Jede Ablehnung bekommt deshalb
           // ihren eigenen Grund, statt in einer Sammelkategorie zu
           // verschwinden.
-          var fObj: int64 := self.cg_nc0(nKn);
-          if (fObj < 0) { return self._vmNein("BOUND_FIELD_NO_OBJECT"c); }
-          if ((self.cg_nival(nKn) & 1) != 0) { return self._vmNein("BOUND_FIELD_SAFE_ACCESS"c); }
-          var fObjOff: int64 := self.cg_vmIdentOff(fObj);
-          if (fObjOff == 0) { return self._vmNein("BOUND_FIELD_BASE_NOT_LOCAL"c); }
-          if (self.cg_identIsArray(fObj) != 0) { return self._vmNein("BOUND_FIELD_ARRAY_PROPERTY"c); }
-          var fCls: int64 := self.cg_objClassIdx(fObj);
-          if (fCls < 0) { return self._vmNein("BOUND_FIELD_CLASS_UNKNOWN"c); }
-          var fNm: pchar := self.cg_nsval(nKn);
-          var fNl: int64 := self.cg_nslen(nKn);
-          var fOffB: int64 := self.cg_getFieldOffset(fCls, fNm, fNl);
-          if (fOffB < 0) { return self._vmNein("BOUND_FIELD_OFFSET_UNKNOWN"c); }
-          // Die Flaggen entscheiden ueber die LADEFORM. Nur das schlichte
-          // 8-Byte-Feld wird angenommen; alles andere laedt anders, als die
-          // zwei Befehle unten es tun.
-          var fFl: int64 := self.cg_getFieldBigEndian(fCls, fNm, fNl);
-          if (((fFl >> 4) & 1) != 0) { return self._vmNein("BOUND_FIELD_INLINE_STRUCT"c); }
-          if ((fFl & 1) != 0)        { return self._vmNein("BOUND_FIELD_BIG_ENDIAN"c); }
-          var fW: int64 := (fFl >> 8) & 0xFF;
-          if (fW == 1 || fW == 2 || fW == 4) { return self._vmNein("BOUND_FIELD_NARROW_WIDTH"c); }
+          // #2378: die Pruefung selbst steht in cg_vmFeldSchlicht — dieselbe
+          // Aufzaehlung bedient jetzt auch die BASIS. Die Namen der
+          // Ablehnungsgruende bleiben hier, weil sie die Stelle benennen
+          // (Schranke), nicht die Pruefung.
+          var fZellen: int64 := alloc(16);
+          var fCode: int64 := self.cg_vmFeldSchlicht(nKn, fZellen);
+          if (fCode != 0) { return self._vmNein(self.cg_vmFeldGrund(fCode, 0)); }
           nArt := 2;
-          nObjOff := fObjOff;
-          nFOff := fOffB;
+          nObjOff := peek64(fZellen);
+          nFOff := peek64(fZellen + 8);
         }
         else if (nK == CGN_CALL)    { return self._vmNein("CONDITION_BOUND_CALL"c); }
         else if (nK == CGN_INDEX)   { return self._vmNein("CONDITION_BOUND_INDEX"c); }
@@ -24514,8 +24583,10 @@ pub type Codegen = class {
     // cOff != 0 heisst „Rahmenversatz"; genau eines von beidem gilt.
     var cOff: int64 := self.cg_vmBasisVon(adr, iOff, breite, oNm, oNl);
     var cKn: int64 := 0 - 1;
+    var cFz: int64 := alloc(16);
+    poke64(cFz, 0); poke64(cFz + 8, 0);
     if (cOff == 0) {
-      cKn := self.cg_vmBasisKnoten(adr, iOff, nOff, breite, oNm, oNl);
+      cKn := self.cg_vmBasisKnoten(adr, iOff, nOff, breite, oNm, oNl, cFz);
       if (cKn < 0) { return self._vmNein(self.cg_vmIndexGrund(adr, iOff, breite, oNm, oNl)); }
     }
     // Maske abziehen, wenn sie genau die Breite trifft — sie ist dort tot
@@ -24582,16 +24653,20 @@ pub type Codegen = class {
     // #2363: dieselbe Erweiterung fuer die beiden Leseadressen. Die Form
     // steht dort genauso (`peek8(b + off + j)`), und eine Erweiterung, die nur
     // die Schreibseite kennt, waere die halbe Umsetzung.
+    var aFz: int64 := alloc(16);
+    poke64(aFz, 0); poke64(aFz + 8, 0);
     var aOff: int64 := self.cg_vmBasisVon(la, iOff, breite, oNm, oNl);
     var aKn: int64 := 0 - 1;
     if (aOff == 0) {
-      aKn := self.cg_vmBasisKnoten(la, iOff, nOff, breite, oNm, oNl);
+      aKn := self.cg_vmBasisKnoten(la, iOff, nOff, breite, oNm, oNl, aFz);
       if (aKn < 0) { return self._vmNein("LOAD_LEFT_BASE_NOT_INVARIANT"c); }
     }
+    var bFz: int64 := alloc(16);
+    poke64(bFz, 0); poke64(bFz + 8, 0);
     var bOff2: int64 := self.cg_vmBasisVon(ra, iOff, breite, oNm, oNl);
     var bKn: int64 := 0 - 1;
     if (bOff2 == 0) {
-      bKn := self.cg_vmBasisKnoten(ra, iOff, nOff, breite, oNm, oNl);
+      bKn := self.cg_vmBasisKnoten(ra, iOff, nOff, breite, oNm, oNl, bFz);
       if (bKn < 0) { return self._vmNein("LOAD_RIGHT_BASE_NOT_INVARIANT"c); }
     }
     // Die Zeiger duerfen nicht die Schleifenvariable oder die Schranke sein —
@@ -24625,6 +24700,12 @@ pub type Codegen = class {
     poke64(kasten + 96, bKn);
     poke64(kasten + 104, cKn);
     poke64(kasten + 112, kopie);   // #2375: 1 = reine Kopie, kein Rechenbefehl
+    // #2378: je Zeiger Objekt- und Feldversatz, wenn seine Basis ein Feld
+    // ist. 0 heisst „kein Feld" — ein Objekt mit Rahmenversatz 0 gibt es
+    // nicht, der Wert ist also eindeutig.
+    poke64(kasten + 120, peek64(aFz));     poke64(kasten + 128, peek64(aFz + 8));
+    poke64(kasten + 136, peek64(bFz));     poke64(kasten + 144, peek64(bFz + 8));
+    poke64(kasten + 152, peek64(cFz));     poke64(kasten + 160, peek64(cFz + 8));
     return 1;
   }
 
@@ -24661,6 +24742,52 @@ pub type Codegen = class {
       return;
     }
     self.cg_loadRax(peek64(kasten + 24));
+  }
+
+  // #2350 Schritt 3b / #2378: Pruefen, dass die Adresse eines FELDES NICHT im
+  // beschriebenen Bereich liegt. Liefert die Flickstelle des Sprungs in die
+  // skalare Fassung.
+  //
+  // Erwartet rdx = Zielzeiger und r8 = Laenge in Byte. Benutzt r9 und r10,
+  // die der Vektorweg hier noch frei hat.
+  //
+  // WARUM ZUR LAUFZEIT. Die Vektorfassung liest das Feld EINMAL vor der
+  // Schleife, die skalare bei JEDEM Durchlauf. Beides faellt auseinander,
+  // sobald die Ablage das Feld selbst ueberschreibt — und das kann sie: die
+  // Ablage schreibt rohen Speicher, und ob der das Objekt trifft, steht zur
+  // Uebersetzungszeit nicht fest. Statt diese Moeglichkeit wegzuannehmen,
+  // wird sie geprueft; eine stille Verhaltensaenderung in einem Sonderfall
+  // waere der teurere Weg.
+  //
+  // Dieselbe Pruefung bedient die Schranke (`while (i < self.anzahl)`) und
+  // seit #2378 jede Feldbasis (`peek8(self.doneBuf + i)`). Je Feld eine
+  // Pruefung — eine gemeinsame waere nur richtig, wenn alle Felder im selben
+  // Objekt lieben, und das steht nirgends.
+  fn cg_vmFeldAusserhalb(objOff: int64, fOff: int64): int64 {
+    // r9 = Adresse des Feldes
+    self.cg_loadRax(objOff);
+    self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xC1);                        // mov r9, rax
+    if (fOff > 0) {
+      if (fOff <= 127) {
+        self.cg_e8(0x4D); self.cg_e8(0x8D); self.cg_e8(0x49); self.cg_e8(fOff);   // lea r9, [r9+off8]
+      } else {
+        self.cg_e8(0x4D); self.cg_e8(0x8D); self.cg_e8(0x89); self.cg_e32(fOff);  // lea r9, [r9+off32]
+      }
+    }
+    // r10 = Feldadresse + 8; r10 <= c  ->  das Feld liegt vor dem Bereich
+    self.cg_e8(0x4D); self.cg_e8(0x89); self.cg_e8(0xCA);                        // mov r10, r9
+    self.cg_e8(0x49); self.cg_e8(0x83); self.cg_e8(0xC2); self.cg_e8(0x08);      // add r10, 8
+    self.cg_e8(0x49); self.cg_e8(0x39); self.cg_e8(0xD2);                        // cmp r10, rdx
+    self.cg_e8(0x0F); self.cg_e8(0x86);                                          // jbe ok
+    var jOk: int64 := self.codeLen; self.cg_e32(0);
+    // sonst muss c + len <= Feldadresse gelten
+    self.cg_e8(0x4D); self.cg_e8(0x89); self.cg_e8(0xC2);                        // mov r10, r8
+    self.cg_e8(0x49); self.cg_e8(0x01); self.cg_e8(0xD2);                        // add r10, rdx
+    self.cg_e8(0x4D); self.cg_e8(0x39); self.cg_e8(0xCA);                        // cmp r10, r9
+    self.cg_e8(0x0F); self.cg_e8(0x87);                                          // ja skalar
+    var jRaus: int64 := self.codeLen; self.cg_e32(0);
+    poke32(self.code + jOk, self.codeLen - jOk - 4);
+    return jRaus;
   }
 
   // #2194: Vektorfassung ausgeben. Liefert die Flickstelle des Sprungs, der
@@ -24795,31 +24922,17 @@ pub type Codegen = class {
     // eingebaut.
     var jUeb3: int64 := 0 - 1;
     if (peek64(kasten + 56) == 2) {
-      // r9 = Adresse des Feldes
-      self.cg_loadRax(peek64(kasten + 72));
-      self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xC1);                        // mov r9, rax
-      var fo2: int64 := peek64(kasten + 80);
-      if (fo2 > 0) {
-        if (fo2 <= 127) {
-          self.cg_e8(0x4D); self.cg_e8(0x8D); self.cg_e8(0x49); self.cg_e8(fo2);   // lea r9, [r9+off8]
-        } else {
-          self.cg_e8(0x4D); self.cg_e8(0x8D); self.cg_e8(0x89); self.cg_e32(fo2);  // lea r9, [r9+off32]
-        }
-      }
-      // r10 = Feldadresse + 8; r10 <= c  ->  das Feld liegt vor dem Bereich
-      self.cg_e8(0x4D); self.cg_e8(0x89); self.cg_e8(0xCA);                        // mov r10, r9
-      self.cg_e8(0x49); self.cg_e8(0x83); self.cg_e8(0xC2); self.cg_e8(0x08);      // add r10, 8
-      self.cg_e8(0x49); self.cg_e8(0x39); self.cg_e8(0xD2);                        // cmp r10, rdx
-      self.cg_e8(0x0F); self.cg_e8(0x86);                                          // jbe ok3
-      var jOk3: int64 := self.codeLen; self.cg_e32(0);
-      // sonst muss c + len <= Feldadresse gelten
-      self.cg_e8(0x4D); self.cg_e8(0x89); self.cg_e8(0xC2);                        // mov r10, r8
-      self.cg_e8(0x49); self.cg_e8(0x01); self.cg_e8(0xD2);                        // add r10, rdx
-      self.cg_e8(0x4D); self.cg_e8(0x39); self.cg_e8(0xCA);                        // cmp r10, r9
-      self.cg_e8(0x0F); self.cg_e8(0x87);                                          // ja skalar
-      jUeb3 := self.codeLen; self.cg_e32(0);
-      poke32(self.code + jOk3, self.codeLen - jOk3 - 4);
+      jUeb3 := self.cg_vmFeldAusserhalb(peek64(kasten + 72), peek64(kasten + 80));
     }
+    // #2378: dasselbe je Zeiger, dessen Basis ein Feld ist. Die Ablage darf
+    // das Feld nicht treffen, sonst liest die Vektorfassung einen Wert, den
+    // die skalare schon ueberschrieben haette.
+    var jF1: int64 := 0 - 1;
+    var jF2: int64 := 0 - 1;
+    var jF3: int64 := 0 - 1;
+    if (peek64(kasten + 120) != 0) { jF1 := self.cg_vmFeldAusserhalb(peek64(kasten + 120), peek64(kasten + 128)); }
+    if (peek64(kasten + 136) != 0) { jF2 := self.cg_vmFeldAusserhalb(peek64(kasten + 136), peek64(kasten + 144)); }
+    if (peek64(kasten + 152) != 0) { jF3 := self.cg_vmFeldAusserhalb(peek64(kasten + 152), peek64(kasten + 160)); }
 
     // Vektorteil. Die Breitenkennung traegt die Ganzzahlmarke (#2247).
     var kennung: int64 := breite | CG_SIMD_GANZ;
@@ -24858,6 +24971,9 @@ pub type Codegen = class {
     poke32(self.code + jUeb1,  self.codeLen - jUeb1 - 4);
     poke32(self.code + jUeb2,  self.codeLen - jUeb2 - 4);
     if (jUeb3 >= 0) { poke32(self.code + jUeb3, self.codeLen - jUeb3 - 4); }   // #2350
+    if (jF1 >= 0) { poke32(self.code + jF1, self.codeLen - jF1 - 4); }         // #2378
+    if (jF2 >= 0) { poke32(self.code + jF2, self.codeLen - jF2 - 4); }
+    if (jF3 >= 0) { poke32(self.code + jF3, self.codeLen - jF3 - 4); }
     self.zlVmVektor += 1;
     // #2343: die andere Seite. Ein Bericht, der nur Ablehnungen zaehlt, waere
     // auch von einem Vektorisierer erfuellt, der nie etwas anwendet.
@@ -25159,7 +25275,7 @@ pub type Codegen = class {
     // skalare Fassung bleibt vollstaendig stehen — sie traegt den Fall mit
     // Ueberlappung und ist der Vergleichsweg der Tests.
     var vmUeber: int64 := 0 - 1;
-    var vmKasten: int64 := alloc(120);  // #2350: Art/Wert/Objekt-/Feldversatz der Schranke; #2363: [88..104] Basisknoten der drei Zeiger; #2375: [112] Kopiermarke
+    var vmKasten: int64 := alloc(168);  // #2350: Art/Wert/Objekt-/Feldversatz der Schranke; #2363: [88..104] Basisknoten der drei Zeiger; #2375: [112] Kopiermarke; #2378: [120..160] Objekt-/Feldversatz je Zeiger
     if (self.cg_vmErkennen(ni, vmKasten) != 0) { vmUeber := self.cg_vmEmit(vmKasten); }
     // #2335: sonst vielleicht eine Reduktion. Die beiden Formen schliessen
     // sich aus — die eine schreibt in ein Feld, die andere in ein Local —,
