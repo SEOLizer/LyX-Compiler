@@ -522,3 +522,29 @@ diesen Zielen 64, auf x86 32. rotl32/rotr32 liefern exakt die 32 Ergebnisbits.
 `bswap64`, `rotl` und `rotr` brauchen das obere Wort und werden laut
 abgewiesen. Esp32 benutzt nur Kernbefehle (SRC, SRLI, SRAI) — NSAU und MULL
 sind Optionen.
+
+## Bereich 560 … 563 — AES-NI (#2383)
+
+Vergeben in `src/ir_lower.lyx`; der Schnellweg (`codegen_x86`) kennt dieselben
+Namen ohne ID. Geschnitten ist auf BLOCKebene, nicht je Runde: ein Builtin je
+Runde haette den Zustand jede Runde durch den Speicher gefuehrt. Alle vier
+arbeiten auf 16-Byte-Bloecken im Speicher, weil Lyx keinen 128-Bit-Werttyp hat.
+
+| ID | Bedeutung | Lyx-Name | Ziele | Herkunft |
+|----|-----------|----------|-------|----------|
+| 560 | ganze Blockverschluesselung (`PXOR`, `AESENC`-Kette, `AESENCLAST`) | `aes_enc_block(dst, src, rk, rounds)` | x86-Familie (codegen_x86 direkt, lyxos ueber die ID); auf arm64/riscv/arm-cm/esp32 senkt ir_lower auf `IRO_PANIC` | #2383 |
+| 561 | ganze Blockentschluesselung (`AESDEC`/`AESDECLAST`, aequivalenter inverser Plan) | `aes_dec_block(dst, src, drk, rounds)` | wie 560 | #2383 |
+| 562 | `AESIMC` auf einem Block | `aes_imc(dst, src)` | wie 560 | #2383 |
+| 563 | `AESENCLAST` gegen einen Nullschluessel = tabellenfreies SubBytes | `aes_subword(dst, src)` | wie 560 | #2383 |
+
+**Warum PANIC und nicht 0.** Bei `cpu_id` (253) ist 0 die *richtige* Antwort
+auf "hat diese CPU AES-NI". Bei einer Verschluesselung gibt es keinen
+plausiblen Ersatzwert — ein stiller Default waere hier eine stille
+Fehlverschluesselung. Erreicht wird das PANIC nicht: `std/crypto/aes.lyx`
+fragt vorher `CpuHasAESNI()`, und `cpu_id` liefert auf Nicht-x86 0. Der Zweig
+steht da, damit die Einheit fuer **jedes** Ziel uebersetzt.
+
+**AESKEYGENASSIST fehlt mit Absicht.** Sein Rundenkonstanten-Operand ist ein
+`imm8`, ein Builtin-Argument ist ein Laufzeitwert. Was es leistet, leistet 563
+zusammen mit dem Rcon-XOR in Lyx, und zwar ebenso tabellenfrei. Das ist ein
+anderer Schnitt, keine Luecke.
