@@ -24059,27 +24059,85 @@ pub type Codegen = class {
   // gleichen Namens, und sie steht vor allen Verwendungen — der
   // Namensvergleich trifft damit genau die gemeinte Variable.
   // oNl == 0 heisst: keine Hilfsvariable, nur die bisherigen Formen.
-  fn cg_vmBasisVon(adr: int64, iOff: int64, breite: int64, oNm: pchar, oNl: int64): int64 {
-    if (adr < 0 || self.cg_nkind(adr) != CGN_BINOP) { return 0; }
-    if (self.cg_nival(adr) != CGT_PLUS) { return 0; }
-    var bOff: int64 := self.cg_vmIdentOff(self.cg_nc0(adr));
-    if (bOff == 0) { return 0; }
-    var idx: int64 := self.cg_nc1(adr);
+  // #2363: Die Indexform steht jetzt EINMAL hier. Vorher war sie Teil von
+  // cg_vmBasisVon; cg_vmBasisKnoten braucht genau dieselbe Pruefung, und eine
+  // zweite Kopie waere die Fehlerart, die in diesem Uebersetzer dreimal belegt
+  // ist (#1799, #1803, #1806): eine Form geht auf einem Weg und auf dem
+  // anderen nicht, weil die Nachbarstelle nicht nachgezogen wurde.
+  fn cg_vmIndexPasst(idx: int64, iOff: int64, breite: int64, oNm: pchar, oNl: int64): int64 {
     if (oNl != 0 && idx >= 0 && self.cg_nkind(idx) == CGN_IDENT
         && self.cg_nslen(idx) == oNl
         && self.cg_seq(self.cg_nsval(idx), self.cg_nslen(idx), oNm, oNl) != 0) {
-      return bOff;
+      return 1;
     }
     if (breite == 1) {
       if (self.cg_vmIdentOff(idx) != iOff) { return 0; }
-      return bOff;
+      return 1;
     }
     if (idx < 0 || self.cg_nkind(idx) != CGN_BINOP || self.cg_nival(idx) != CGT_STAR) { return 0; }
     if (self.cg_vmIdentOff(self.cg_nc0(idx)) != iOff) { return 0; }
     var kN: int64 := self.cg_nc1(idx);
     if (kN < 0 || self.cg_nkind(kN) != CGN_LIT_INT) { return 0; }
     if (self.cg_nival(kN) != breite) { return 0; }
+    return 1;
+  }
+
+  fn cg_vmBasisVon(adr: int64, iOff: int64, breite: int64, oNm: pchar, oNl: int64): int64 {
+    if (adr < 0 || self.cg_nkind(adr) != CGN_BINOP) { return 0; }
+    if (self.cg_nival(adr) != CGT_PLUS) { return 0; }
+    var bOff: int64 := self.cg_vmIdentOff(self.cg_nc0(adr));
+    if (bOff == 0) { return 0; }
+    if (self.cg_vmIndexPasst(self.cg_nc1(adr), iOff, breite, oNm, oNl) == 0) { return 0; }
     return bOff;
+  }
+
+  // #2363: Enthaelt der Teilbaum keine der Groessen, die die Schleife
+  // fortschaltet? `cg_exprRein` allein genuegt NICHT: `i + 1` ist rein und
+  // haengt doch am Zaehler. Bei `p + i + j` entscheidet genau das ueber
+  // richtig und falsch — `i` ist dort eine aeussere Variable, `j` der Zaehler.
+  //
+  // Unbekanntes faellt ab: aufgezaehlt sind die Knotenarten, die cg_exprRein
+  // zulaesst; alles andere wird abgelehnt, statt stillschweigend als
+  // invariant zu gelten.
+  fn cg_vmOhneZaehler(ni: int64, iOff: int64, nOff: int64, oNm: pchar, oNl: int64, tiefe: int64): int64 {
+    if (ni < 0) { return 0; }
+    if (tiefe > 8) { return 0; }
+    if (self.cg_tryFold(ni) != 0) { return 1; }   // konstant gefaltet = invariant
+    var k: int64 := self.cg_nkind(ni);
+    if (k == CGN_LIT_INT || k == CGN_LIT_BOOL || k == CGN_LIT_CHAR) { return 1; }
+    if (k == CGN_IDENT) {
+      var off: int64 := self.cg_vmIdentOff(ni);
+      if (off != 0 && off == iOff) { return 0; }
+      if (off != 0 && off == nOff) { return 0; }
+      if (oNl != 0 && self.cg_nslen(ni) == oNl
+          && self.cg_seq(self.cg_nsval(ni), self.cg_nslen(ni), oNm, oNl) != 0) { return 0; }
+      return 1;
+    }
+    if (k == CGN_BINOP) {
+      if (self.cg_vmOhneZaehler(self.cg_nc0(ni), iOff, nOff, oNm, oNl, tiefe + 1) == 0) { return 0; }
+      return self.cg_vmOhneZaehler(self.cg_nc1(ni), iOff, nOff, oNm, oNl, tiefe + 1);
+    }
+    return 0;
+  }
+
+  // #2363: `BASIS_AUSDRUCK + idx`, wo der Basisausdruck schleifeninvariant
+  // ist. Liefert den Knoten der Basis, sonst -1. Das ist der Fall
+  // `((result + lenA) + j)` — 133 der 166 STORE_BASE_NOT_LOCAL im Selbstbau.
+  // Felder und Aufrufe faellt cg_exprRein ab; sie brauchten eine Aussage
+  // darueber, ob die Ablage den Objektspeicher treffen kann, und das ist eine
+  // Aliasing-Frage, keine Formfrage.
+  fn cg_vmBasisKnoten(adr: int64, iOff: int64, nOff: int64, breite: int64, oNm: pchar, oNl: int64): int64 {
+    if (adr < 0 || self.cg_nkind(adr) != CGN_BINOP) { return 0 - 1; }
+    if (self.cg_nival(adr) != CGT_PLUS) { return 0 - 1; }
+    var basis: int64 := self.cg_nc0(adr);
+    if (basis < 0) { return 0 - 1; }
+    // Ein Bezeichner geht den bestehenden Weg ueber den Rahmenversatz; hier
+    // wird nur behandelt, was dort durchfaellt.
+    if (self.cg_vmIdentOff(basis) != 0) { return 0 - 1; }
+    if (self.cg_exprRein(basis, 0) == 0) { return 0 - 1; }
+    if (self.cg_vmOhneZaehler(basis, iOff, nOff, oNm, oNl, 0) == 0) { return 0 - 1; }
+    if (self.cg_vmIndexPasst(self.cg_nc1(adr), iOff, breite, oNm, oNl) == 0) { return 0 - 1; }
+    return basis;
   }
 
   // ---------------------------------------------------------------------------
@@ -24316,8 +24374,16 @@ pub type Codegen = class {
     if (adr < 0) { return self._vmNein("STORE_NO_ADDRESS"c); }
     var wert: int64 := self.cg_nnext(adr);
     if (wert < 0 || self.cg_nnext(wert) != -1) { return self._vmNein("STORE_ARITY_MISMATCH"c); }
+    // #2363: Zuerst der bestehende Weg (Basis ist ein Local, Rahmenversatz).
+    // Faellt er durch, kommt die Form `((result + lenA) + j)` in Frage: eine
+    // Basis, die ein invarianter Ausdruck ist. cKn >= 0 heisst „Ausdruck",
+    // cOff != 0 heisst „Rahmenversatz"; genau eines von beidem gilt.
     var cOff: int64 := self.cg_vmBasisVon(adr, iOff, breite, oNm, oNl);
-    if (cOff == 0) { return self._vmNein(self.cg_vmIndexGrund(adr, iOff, breite, oNm, oNl)); }
+    var cKn: int64 := 0 - 1;
+    if (cOff == 0) {
+      cKn := self.cg_vmBasisKnoten(adr, iOff, nOff, breite, oNm, oNl);
+      if (cKn < 0) { return self._vmNein(self.cg_vmIndexGrund(adr, iOff, breite, oNm, oNl)); }
+    }
     // Maske abziehen, wenn sie genau die Breite trifft — sie ist dort tot
     // (#2324), und ohne dieses Abziehen wuerde die Form nicht erkannt.
     if (self.cg_nkind(wert) == CGN_BINOP && self.cg_nival(wert) == CGT_BITAND) {
@@ -24355,17 +24421,36 @@ pub type Codegen = class {
     var ra: int64 := self.cg_nc0(rN);
     if (la < 0 || ra < 0) { return self._vmNein("LOAD_NO_ADDRESS"c); }
     if (self.cg_nnext(la) != -1 || self.cg_nnext(ra) != -1) { return self._vmNein("LOAD_ARITY_MISMATCH"c); }
+    // #2363: dieselbe Erweiterung fuer die beiden Leseadressen. Die Form
+    // steht dort genauso (`peek8(b + off + j)`), und eine Erweiterung, die nur
+    // die Schreibseite kennt, waere die halbe Umsetzung.
     var aOff: int64 := self.cg_vmBasisVon(la, iOff, breite, oNm, oNl);
+    var aKn: int64 := 0 - 1;
+    if (aOff == 0) {
+      aKn := self.cg_vmBasisKnoten(la, iOff, nOff, breite, oNm, oNl);
+      if (aKn < 0) { return self._vmNein("LOAD_LEFT_BASE_NOT_INVARIANT"c); }
+    }
     var bOff2: int64 := self.cg_vmBasisVon(ra, iOff, breite, oNm, oNl);
-    if (aOff == 0 || bOff2 == 0) { return self._vmNein("LOAD_INDEX_FORM_MISMATCH"c); }
+    var bKn: int64 := 0 - 1;
+    if (bOff2 == 0) {
+      bKn := self.cg_vmBasisKnoten(ra, iOff, nOff, breite, oNm, oNl);
+      if (bKn < 0) { return self._vmNein("LOAD_RIGHT_BASE_NOT_INVARIANT"c); }
+    }
     // Die Zeiger duerfen nicht die Schleifenvariable oder die Schranke sein —
     // sonst veraendert der Rumpf, was die Bedingung liest.
-    if (aOff == iOff || bOff2 == iOff || cOff == iOff) { return self._vmNein("POINTER_IS_LOOP_VAR"c); }
+    // #2363: Die Pruefung gilt fuer Zeiger mit Rahmenversatz. Eine
+    // Ausdrucksbasis hat keinen Versatz, der zusammenfallen koennte, und
+    // cg_vmOhneZaehler hat Zaehler und Schranke darin schon ausgeschlossen.
+    if (aOff != 0 && aOff == iOff) { return self._vmNein("POINTER_IS_LOOP_VAR"c); }
+    if (bOff2 != 0 && bOff2 == iOff) { return self._vmNein("POINTER_IS_LOOP_VAR"c); }
+    if (cOff != 0 && cOff == iOff) { return self._vmNein("POINTER_IS_LOOP_VAR"c); }
     // Beim Literal gibt es keinen Rahmenversatz, mit dem ein Zeiger
     // zusammenfallen koennte -- nOff ist dann 0, und ein Zeiger mit Versatz 0
     // ist oben schon ausgeschlossen.
     if (nArt == 0) {
-      if (aOff == nOff || bOff2 == nOff || cOff == nOff) { return self._vmNein("POINTER_IS_BOUND"c); }
+      if (aOff != 0 && aOff == nOff) { return self._vmNein("POINTER_IS_BOUND"c); }
+      if (bOff2 != 0 && bOff2 == nOff) { return self._vmNein("POINTER_IS_BOUND"c); }
+      if (cOff != 0 && cOff == nOff) { return self._vmNein("POINTER_IS_BOUND"c); }
     }
     poke64(kasten,      aOff);
     poke64(kasten + 8,  bOff2);
@@ -24378,6 +24463,9 @@ pub type Codegen = class {
     poke64(kasten + 64, nLit);
     poke64(kasten + 72, nObjOff);
     poke64(kasten + 80, nFOff);
+    poke64(kasten + 88, aKn);    // #2363: -1 = Rahmenversatz gilt, sonst Knoten
+    poke64(kasten + 96, bKn);
+    poke64(kasten + 104, cKn);
     return 1;
   }
 
@@ -24427,14 +24515,39 @@ pub type Codegen = class {
     var iOff: int64 := peek64(kasten + 32);
     var breite: int64 := peek64(kasten + 40);
     var op: int64 := peek64(kasten + 48);
+    var aKn: int64 := peek64(kasten + 88);    // #2363: -1 = Rahmenversatz, sonst Knoten
+    var bKn: int64 := peek64(kasten + 96);
+    var cKn: int64 := peek64(kasten + 104);
     var schub: int64 := 0;
     if (breite == 2) { schub := 1; }
     if (breite == 4) { schub := 2; }
 
     // rdi = a, rsi = b, rdx = c, rcx = n
-    self.cg_loadRax(aOff); self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC7);   // mov rdi, rax
-    self.cg_loadRax(bOff); self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC6);   // mov rsi, rax
-    self.cg_loadRax(cOff); self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC2);   // mov rdx, rax
+    if (aKn < 0 && bKn < 0 && cKn < 0) {
+      // Bestehender Weg, Byte fuer Byte unveraendert: alle drei Zeiger sind
+      // Locals. Dass dieser Zweig gleich bleibt, ist der Grund, warum der
+      // Bestand nach #2363 bitgleich uebersetzt.
+      self.cg_loadRax(aOff); self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC7);   // mov rdi, rax
+      self.cg_loadRax(bOff); self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC6);   // mov rsi, rax
+      self.cg_loadRax(cOff); self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC2);   // mov rdx, rax
+    } else {
+      // #2363: Mindestens ein Zeiger ist ein invarianter AUSDRUCK und muss
+      // ausgewertet werden. `cg_genExpr` belegt rdi und rsi als Halteregister
+      // (#2228) — wer die erste Basis nach rdi legt und dann die zweite
+      // auswertet, verliert sie still. Deshalb erst alle drei auswerten und
+      // ueber den Stapel sichern, dann in umgekehrter Folge in die Register.
+      // Die Auswertung steht VOR der Schleife; dass sie dort stehen darf, ist
+      // genau die Zusicherung von cg_vmOhneZaehler.
+      if (aKn >= 0) { self.cg_genExpr(aKn); } else { self.cg_loadRax(aOff); }
+      self.cg_e8(0x50);                                                            // push rax
+      if (bKn >= 0) { self.cg_genExpr(bKn); } else { self.cg_loadRax(bOff); }
+      self.cg_e8(0x50);                                                            // push rax
+      if (cKn >= 0) { self.cg_genExpr(cKn); } else { self.cg_loadRax(cOff); }
+      self.cg_e8(0x50);                                                            // push rax
+      self.cg_e8(0x5A);                                                            // pop rdx  (c)
+      self.cg_e8(0x5E);                                                            // pop rsi  (b)
+      self.cg_e8(0x5F);                                                            // pop rdi  (a)
+    }
     self.cg_vmSchrankeNachRax(kasten);                                             // #2350
     self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC1);                          // mov rcx, rax
 
@@ -24842,7 +24955,7 @@ pub type Codegen = class {
     // skalare Fassung bleibt vollstaendig stehen — sie traegt den Fall mit
     // Ueberlappung und ist der Vergleichsweg der Tests.
     var vmUeber: int64 := 0 - 1;
-    var vmKasten: int64 := alloc(88);   // #2350: Art, Wert, Objektversatz und Feldversatz der Schranke
+    var vmKasten: int64 := alloc(112);  // #2350: Art/Wert/Objekt-/Feldversatz der Schranke; #2363: [88..104] Basisknoten der drei Zeiger
     if (self.cg_vmErkennen(ni, vmKasten) != 0) { vmUeber := self.cg_vmEmit(vmKasten); }
     // #2335: sonst vielleicht eine Reduktion. Die beiden Formen schliessen
     // sich aus — die eine schreibt in ein Feld, die andere in ein Local —,
