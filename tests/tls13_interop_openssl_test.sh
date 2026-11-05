@@ -13,6 +13,9 @@
 #      Client-Zertifikat durchlaesst.
 #   3. Unser Client gegen `openssl s_server`, einmal ohne und einmal mit
 #      Client-Zertifikat (mTLS); openssl muss unsere Kette verifizieren.
+#   5. Alle drei Schluesselarten des Servers in beiden Rollen: EC P-256,
+#      RSA-2048 (rsa_pss_rsae_sha256) und Ed25519. openssl muss das jeweils
+#      verwendete Signaturverfahren melden und die Kette verifizieren.
 #
 # Ohne openssl im Pfad wird der Test uebersprungen (SKIP), ohne freie Ports
 # ebenfalls — ein roter Test aus Umgebungsgruenden sagt nichts ueber den Code.
@@ -85,6 +88,106 @@ oU0nVjQBYMN7nm7Wtlp5f/Xb16uhRANCAAQQTvnNJvH7YFb84aPQ2rgyIrx1XKoj
 -----END PRIVATE KEY-----
 PEMEOF
 
+cat > "$TMP/certs/rsaca.pem" <<'PEMEOF'
+-----BEGIN CERTIFICATE-----
+MIIC+zCCAeOgAwIBAgIDAIABMA0GCSqGSIb3DQEBCwUAMCwxFTATBgNVBAMMDEF1
+cnVtIFJTQSBDQTETMBEGA1UECgwKQXVydW0gVGVzdDAeFw0yNjAxMDEwMDAwMDBa
+Fw0zNjAxMDEwMDAwMDBaMCwxFTATBgNVBAMMDEF1cnVtIFJTQSBDQTETMBEGA1UE
+CgwKQXVydW0gVGVzdDCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAMNY
+L12Zbv5N0k8v3oEeQA7bpOLta/GcVQ9Y3nGTlceZ6AElTZ2KgJ36rwHGZUuy6DR9
+v76AG3vRzCIgmbgRhWsKAR4W8vj2DnU/BRpsJEMY/AzSMNBQaTzdoVLTKfDwqnOk
+duaHrF9PL+9kJpZiojUDgb4uCKhS5lmrjpAo3tyZyUD/Ba362O+wa6hAnhcF28pI
+SFnvbTdtQuqgBiWfyK74654zk3ZP2XMvLDTyvbxFlJJRP5+x/Ne45fnTycu4BykP
++acI6WKyrVvBu5fnQDV8TDV+XdJmtwIBktnYvSYzkKvX9IvehLaneQFo1WGBmVMJ
+2bgoYWEnA8XdrwPTTe0CAwEAAaMmMCQwEgYDVR0TAQH/BAgwBgEB/wIBATAOBgNV
+HQ8BAf8EBAMCAYYwDQYJKoZIhvcNAQELBQADggEBAHKOVOLii1lKGodeumMSX2Ik
+qU8Lljn5lEPCEGibm1T4xP5Dr+0jCb++VYIfhht/0kseKI/wOwLXP9TuquAd3lJh
+k/E1wxmnipYf60PWZkc2F6A29xJA5CGcfGH3pRlRRXMNdcKT7qmHQJNQkgamC0j6
+oeT/2eMgpPdbLXhrdQ9GrPOe1vq4tDATgTJrORy/X8f8bntjn91N8Nx0h48dq5/5
+6icXM2m4fq+MIJb3NveTwglM/JdN0WScgg4pTxHDr2QyPlfxZ12+eaw8tZFaRu0z
+4SmyCG/Mt4p2AueVOIQQHCzP/KYpf076fOrfsxZcuLuqau+rKtDjmaDnv86wzrM=
+-----END CERTIFICATE-----
+PEMEOF
+cat > "$TMP/certs/rsaleaf.pem" <<'PEMEOF'
+-----BEGIN CERTIFICATE-----
+MIIDITCCAgmgAwIBAgIDAIACMA0GCSqGSIb3DQEBCwUAMCwxFTATBgNVBAMMDEF1
+cnVtIFJTQSBDQTETMBEGA1UECgwKQXVydW0gVGVzdDAeFw0yNjAxMDEwMDAwMDBa
+Fw0zNjAxMDEwMDAwMDBaMCsxFDASBgNVBAMMC3JzYS5leGFtcGxlMRMwEQYDVQQK
+DApBdXJ1bSBUZXN0MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAze84
+br/Pbm9QIPB/lbkrfwUprsebl15/BpHArICq0iPzvgpnx9/wJi6V8AapGK70BreY
+qkF3AjdVgbT9GiFv9lks+zNf7sk8g184fkB3brHPrCZaQhmsB3ZFupU3i/8tM3NO
+VdEi8hfEK0LzEms4trJbGAmM2YUpVD8aJ2iI2k6FnQAgrs2YWUrmE8+TLvSRmJFP
+96Q5sUeaVnbWWuqx/Nf3ZhMqPjx4rrWUGV393vn5nDG2X7hZJjpFjZF/en658uDJ
+Rjbkm4a0YTAnsCnqmj7ss4i1z7DDsdNSF3/PPLN+P095bMcvG88/5PfFgXu4Dydx
+b5+EZ84Mmn4mgcuIxwIDAQABo00wSzAMBgNVHRMBAf8EAjAAMA4GA1UdDwEB/wQE
+AwIHgDATBgNVHSUEDDAKBggrBgEFBQcDATAWBgNVHREEDzANggtyc2EuZXhhbXBs
+ZTANBgkqhkiG9w0BAQsFAAOCAQEATO6VZwgMCQ7K8ccc1kA42hS5teBRxFRTGN7S
+a4qmxpWhxLOdz0cawRi783+l4zTqQm77C/fUdTIi7X64uCNlJzUWC5eF//H+cQY3
+MqgDvfbQo31Wx01dtdGJ8l/bM2hlosV+OY02+J8nI1u3PmBSmbnLZD7TbF7FV2lA
+UYx1FPy9uPMXtu8qT/WeDOfcGG/cgZ1i50DfuYajmeERov7tyXrbZ8iHI4GMUZ2W
+VAdoF4mBtVkAZgQwb2fpHogopyLkUbSXltqh2ry2MMt0OF63upn1fE2l9R0P6N/Y
+54lY16gjpYGHDOBHElyJ/4KUIxVezN4TcoDW/DcPcXZ1mZSk2g==
+-----END CERTIFICATE-----
+PEMEOF
+cat > "$TMP/certs/rsaleafkey.pem" <<'PEMEOF'
+-----BEGIN PRIVATE KEY-----
+MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDN7zhuv89ub1Ag
+8H+VuSt/BSmux5uXXn8GkcCsgKrSI/O+CmfH3/AmLpXwBqkYrvQGt5iqQXcCN1WB
+tP0aIW/2WSz7M1/uyTyDXzh+QHdusc+sJlpCGawHdkW6lTeL/y0zc05V0SLyF8Qr
+QvMSazi2slsYCYzZhSlUPxonaIjaToWdACCuzZhZSuYTz5Mu9JGYkU/3pDmxR5pW
+dtZa6rH81/dmEyo+PHiutZQZXf3e+fmcMbZfuFkmOkWNkX96frny4MlGNuSbhrRh
+MCewKeqaPuyziLXPsMOx01IXf888s34/T3lsxy8bzz/k98WBe7gPJ3Fvn4Rnzgya
+fiaBy4jHAgMBAAECggEAAZc9vIi6RagPc6xav/O1ldETPHj4L15QJn7SP6xMB2TA
+cu35r9hrkuaFf/0lVvA87JLKdbiVbQSLgarH6krMf7EKvK0B4aqCIj0I1KoYMca6
+6iF2f3+hgSyz84Dt5TZFKNzNYKO+BLfA/MAYIuiK+Lq2w5YfxS3W647MwoJjXump
+tgtVs2PwJJPjWGA/KcU1vWTBet0ouBfrn5ayVZ7tX+2rd2oV5jxFQDMWFkzXhOKf
+67Lrz1II+HVFi3vjX5fWsNxeJ1WiQvUeaO5e5KVwhXaCR6rzucYo32bsTqe2Un/8
+d1REn4mRUbqY8lTtUJ3PGRNxXWvWP3yHV5sKfdGyAQKBgQD5p+XqRVVCmYRmfjsT
+UMiQdMuRXrvpYGYXYPjQzQMlNZRoG8fpDSfJCSc0PwTa7Xw9VUDnYWapwB0XDi19
+nvpNSvZdLfkivUhNs9rD7n9RuquQcPWsGwVNVYpZjUMFbBJ0r3kOnixhd8+bZGPZ
+g3NXvjvIQJqYARndtPaQdJKbxwKBgQDTKuYWp2J1yr7pn11OgumNgE7dsfok1EVP
+7QgM1IbhEiaL6ogapdNRPprfDsGOL2DfEIHJ8YSIIh9DJ9Gm64Mmh3QY28v08xdo
+RJyAPoI8qXQFBrVLUG0Bvd1M2pSKCEunsr6YZXJr/qVH9cUNQCnvT76rwEOGzi64
+6E93eX2rAQKBgQD5oBiy4zp6Cjgpp0P4b0jrr+yv4RJxKpNKAwsm9CaV+Pn4EvcT
+nrTOPdm2UuDO6rDUPr9T278kMlSj7egseF58FF08FDDMvIhkMVannHwvwz+ygFAV
+Ezt89PAN1MJT1JirlZysshlcJ8ks7fcs0VPuQudRts8c99TeKwhyriy9lwKBgQCo
+adJPxvdz0lson/0enLIANJCxpzxFGzacZALDmMxpvLwZYtdhyVcbuL5zn6Um7Qpp
+XRTmJkT4/Z3JRXyjj7lthSJGoSWtGiNU+UOH1FKyZsMtLwhwJJiLhw10Oe+1lqAg
+AyKXEHGNR+4x0gVyZ/YJ8qOy/wfb/5yrxDt8odxkAQKBgAEz9spSdlNqjjG+2+SH
+/ySovIDYtkb4vHsp/Ef1GRuZdRQu/80mVMGBfVEbWRrV5iWnPoRyiIm8IqLrR094
+q7MY993+r82G7rjPp4YfCJClfvt23PIJSxVR4TZVw2+a8z3G08f/S1sRw/rIPZCJ
+lwtkmkHbrvf9ndAQeZScfjTu
+-----END PRIVATE KEY-----
+PEMEOF
+cat > "$TMP/certs/edca.pem" <<'PEMEOF'
+-----BEGIN CERTIFICATE-----
+MIIBLDCB36ADAgECAgMAgBAwBQYDK2VwMCsxFDASBgNVBAMMC0F1cnVtIEVkIENB
+MRMwEQYDVQQKDApBdXJ1bSBUZXN0MB4XDTI2MDEwMTAwMDAwMFoXDTM2MDEwMTAw
+MDAwMFowKzEUMBIGA1UEAwwLQXVydW0gRWQgQ0ExEzARBgNVBAoMCkF1cnVtIFRl
+c3QwKjAFBgMrZXADIQA113hCHuvVJF15Yz5gsoo5yOywjVUubpWcSL/wiawWo6Mm
+MCQwEgYDVR0TAQH/BAgwBgEB/wIBATAOBgNVHQ8BAf8EBAMCAYYwBQYDK2VwA0EA
+UHeajnBDcteueP+Q23Ycwm8ULcWLGsaheXthMr9fcV8Ij+AZhkUCoGtSVOKd4O+m
+OrWE7j7cUq+JHw/6rbL6BQ==
+-----END CERTIFICATE-----
+PEMEOF
+cat > "$TMP/certs/edleaf.pem" <<'PEMEOF'
+-----BEGIN CERTIFICATE-----
+MIIBUjCCAQSgAwIBAgIDAIARMAUGAytlcDArMRQwEgYDVQQDDAtBdXJ1bSBFZCBD
+QTETMBEGA1UECgwKQXVydW0gVGVzdDAeFw0yNjAxMDEwMDAwMDBaFw0zNjAxMDEw
+MDAwMDBaMCoxEzARBgNVBAMMCmVkLmV4YW1wbGUxEzARBgNVBAoMCkF1cnVtIFRl
+c3QwKjAFBgMrZXADIQDf1FSJtjEDCYedH3RmQPAY1+wp/M3c5q1U6UqOSCzUwKNM
+MEowDAYDVR0TAQH/BAIwADAOBgNVHQ8BAf8EBAMCB4AwEwYDVR0lBAwwCgYIKwYB
+BQUHAwEwFQYDVR0RBA4wDIIKZWQuZXhhbXBsZTAFBgMrZXADQQCJLq49hU50Nlu7
+i52toVqxjHj9Ns2J4FxavsgbOS+1jOJvlM2hucgpVFZO8e4qgEcZpDidURxOkAsB
+zmGd8moH
+-----END CERTIFICATE-----
+PEMEOF
+cat > "$TMP/certs/edleafkey.pem" <<'PEMEOF'
+-----BEGIN PRIVATE KEY-----
+MC4CAQAwBQYDK2VwBCIEIFD4PnGAF9NwCKEQ50+xruut4Mv/aYarhDZ1AH/369qK
+-----END PRIVATE KEY-----
+PEMEOF
+
 cat > "$TMP/srv.lyx" <<'LYXEOF'
 unit main;
 import std.io;
@@ -108,9 +211,25 @@ fn main(): int64 {
   // GetArg liefert einen Zeiger auf die Zeichenkette, keine Zahl — ohne
   // StrToInt landet das Programm auf einem zufaelligen Port.
   var port: int64 := StrToInt(GetArg(1) as pchar);
-  var dSrv: int64 := alloc(4096); var lSrv := ladeDer(StrConcat(basis, "/tlssrv.pem"c), "CERTIFICATE"c, dSrv);
-  var dCa: int64 := alloc(4096);  var lCa := ladeDer(StrConcat(basis, "/tlsca.pem"c), "CERTIFICATE"c, dCa);
-  var dSk: int64 := alloc(4096);  var lSk := ladeDer(StrConcat(basis, "/tlssrvkey.pem"c), "PRIVATE KEY"c, dSk);
+  // Zertifikatssatz: ohne weiteres Argument EC P-256, mit "rsa" RSA-2048,
+  // mit "ed" Ed25519.
+  var satzBlatt: pchar := "/tlssrv.pem"c;
+  var satzKey: pchar := "/tlssrvkey.pem"c;
+  var satzCa: pchar := "/tlsca.pem"c;
+  if (GetArgC() > 2) {
+    var w: pchar := GetArg(2) as pchar;
+    // "rsa", "ed" oder "ec" — das zweite Zeichen entscheidet, weil "ec" und
+    // "ed" beide mit 'e' anfangen.
+    if (StrCharAt(w, 0) == 114) {
+      satzBlatt := "/rsaleaf.pem"c; satzKey := "/rsaleafkey.pem"c; satzCa := "/rsaca.pem"c;
+    }
+    if (StrCharAt(w, 0) == 101 && StrCharAt(w, 1) == 100) {
+      satzBlatt := "/edleaf.pem"c; satzKey := "/edleafkey.pem"c; satzCa := "/edca.pem"c;
+    }
+  }
+  var dSrv: int64 := alloc(8192); var lSrv := ladeDer(StrConcat(basis, satzBlatt), "CERTIFICATE"c, dSrv);
+  var dCa: int64 := alloc(8192);  var lCa := ladeDer(StrConcat(basis, satzCa), "CERTIFICATE"c, dCa);
+  var dSk: int64 := alloc(8192);  var lSk := ladeDer(StrConcat(basis, satzKey), "PRIVATE KEY"c, dSk);
   if (lSrv <= 0 || lSk <= 0) { PrintLn("LADEFEHLER"); return 1; }
   var kette: int64 := alloc(32);
   poke64(kette, dSrv); poke64(kette + 8, lSrv);
@@ -123,7 +242,7 @@ fn main(): int64 {
   TlsConfigAlpn(cfg, alpn as int64, StrLen(alpn));
   TlsConfigZeit(cfg, 1800000000);
   // Zweites Argument: Client-Zertifikat verlangen (mTLS)
-  if (GetArgC() > 2) {
+  if (GetArgC() > 3) {
     var trust: int64 := alloc(16);
     poke64(trust, dCa); poke64(trust + 8, lCa);
     TlsConfigTrust(cfg, trust, 1);
@@ -188,6 +307,7 @@ fn main(): int64 {
   TCPListenerClose(l);
   return 0;
 }
+
 LYXEOF
 cat > "$TMP/cli.lyx" <<'LYXEOF'
 unit main;
@@ -210,15 +330,27 @@ fn ladeDer(pfad: pchar, label: pchar, derOut: int64): int64 {
 fn main(): int64 {
   var basis: pchar := "CERTDIRMARKER"c;
   var port: int64 := StrToInt(GetArg(1) as pchar);
-  var mtls: int64 := GetArgC() - 2;
-  var dCa: int64 := alloc(4096);  var lCa := ladeDer(StrConcat(basis, "/tlsca.pem"c), "CERTIFICATE"c, dCa);
+  var mtls: int64 := 0;
+  if (GetArgC() > 3) { mtls := 1; }
+  // Wurzel und erwarteter Name nach dem zweiten Argument: EC, rsa oder ed.
+  var caPfad: pchar := "/tlsca.pem"c;
+  var erwartet: pchar := "nexus.example"c;
+  if (GetArgC() > 2) {
+    var w: pchar := GetArg(2) as pchar;
+    // zweites Zeichen pruefen: "ec" und "ed" fangen beide mit 'e' an.
+    if (StrCharAt(w, 0) == 114) { caPfad := "/rsaca.pem"c; erwartet := "rsa.example"c; }
+    if (StrCharAt(w, 0) == 101 && StrCharAt(w, 1) == 100) {
+      caPfad := "/edca.pem"c; erwartet := "ed.example"c;
+    }
+  }
+  var dCa: int64 := alloc(8192);  var lCa := ladeDer(StrConcat(basis, caPfad), "CERTIFICATE"c, dCa);
   var dCli: int64 := alloc(4096); var lCli := ladeDer(StrConcat(basis, "/tlscli.pem"c), "CERTIFICATE"c, dCli);
   var dCk: int64 := alloc(4096);  var lCk := ladeDer(StrConcat(basis, "/tlsclikey.pem"c), "PRIVATE KEY"c, dCk);
   var trust: int64 := alloc(16); poke64(trust, dCa); poke64(trust + 8, lCa);
   var kette: int64 := alloc(16); poke64(kette, dCli); poke64(kette + 8, lCli);
 
   var cfg: int64 := alloc(TlsConfigGroesse());
-  var host: pchar := "nexus.example"c;
+  var host: pchar := erwartet;
   var alpn: pchar := "http/1.1"c;
   TlsConfigNeu(cfg, 2);
   TlsConfigTrust(cfg, trust, 1);
@@ -275,6 +407,7 @@ fn main(): int64 {
   TCPConnClose(conn);
   return 0;
 }
+
 LYXEOF
 sed -i "s|CERTDIRMARKER|$TMP/certs|" "$TMP/srv.lyx" "$TMP/cli.lyx"
 
@@ -323,7 +456,7 @@ done
 
 # --- 2. unser Server mit verlangtem Client-Zertifikat ---
 p="$(freierPort)"; PORT=$((PORT+1))
-( ulimit -v 4000000 -c 0; "$TMP/srv" "$p" mtls > "$TMP/srv_mtls.txt" 2>&1 ) &
+( ulimit -v 4000000 -c 0; "$TMP/srv" "$p" ec mtls > "$TMP/srv_mtls.txt" 2>&1 ) &
 sleep 1.5
 printf 'GET / HTTP/1.0\r\n\r\n' | timeout 25 openssl s_client -connect "127.0.0.1:$p" \
    -servername nexus.example -CAfile "$TMP/certs/tlsca.pem" \
@@ -336,7 +469,7 @@ grep -q "Verify return code: 0 (ok)" "$TMP/os_mtls.txt" || ok=0
 pruefe "Server verlangt Client-Zertifikat: mit Zertifikat Erfolg" "$ok"
 
 p="$(freierPort)"; PORT=$((PORT+1))
-( ulimit -v 4000000 -c 0; "$TMP/srv" "$p" mtls > "$TMP/srv_mtls2.txt" 2>&1 ) &
+( ulimit -v 4000000 -c 0; "$TMP/srv" "$p" ec mtls > "$TMP/srv_mtls2.txt" 2>&1 ) &
 sleep 1.5
 printf 'x' | timeout 25 openssl s_client -connect "127.0.0.1:$p" \
    -CAfile "$TMP/certs/tlsca.pem" -tls1_3 > "$TMP/os_mtls2.txt" 2>&1
@@ -360,9 +493,9 @@ for modus in ohne mit; do
   ( printf 'pong aus openssl\n'; sleep 8 ) > "$TMP/fifo_$modus" &
   sleep 1.5
   if [ "$modus" = mit ]; then
-    ( ulimit -v 4000000 -c 0; timeout 25 "$TMP/cli" "$p" mtls ) > "$TMP/cli_$modus.txt" 2>&1
+    ( ulimit -v 4000000 -c 0; timeout 25 "$TMP/cli" "$p" ec mtls ) > "$TMP/cli_$modus.txt" 2>&1
   else
-    ( ulimit -v 4000000 -c 0; timeout 25 "$TMP/cli" "$p" ) > "$TMP/cli_$modus.txt" 2>&1
+    ( ulimit -v 4000000 -c 0; timeout 25 "$TMP/cli" "$p" ec ) > "$TMP/cli_$modus.txt" 2>&1
   fi
   pkill -f "s_server -accept $p" 2>/dev/null
   ok=1
@@ -375,6 +508,51 @@ for modus in ohne mit; do
   pruefe "Client gegen s_server, $modus Client-Zertifikat" "$ok"
   if [ "$ok" != 1 ]; then echo "  lyx: $(tr '\n' ' ' < "$TMP/cli_$modus.txt")"; fi
 done
+
+# --- 5. Schluesselarten: unser Server mit RSA- und Ed25519-Zertifikat ---
+for satz in "rsa rsaca rsa.example" "ed edca ed.example"; do
+  set -- $satz; art=$1; ca=$2; host=$3
+  p="$(freierPort)"; PORT=$((PORT+1))
+  ( ulimit -v 4000000 -c 0; "$TMP/srv" "$p" "$art" > "$TMP/srv_$art.txt" 2>&1 ) &
+  sleep 1.5
+  ( printf 'GET / HTTP/1.0\r\n\r\n'; sleep 3 ) | timeout 25 openssl s_client \
+     -connect "127.0.0.1:$p" -ign_eof -servername "$host" \
+     -CAfile "$TMP/certs/$ca.pem" -tls1_3 > "$TMP/os_$art.txt" 2>&1
+  wait
+  ok=1
+  grep -q "Verify return code: 0 (ok)" "$TMP/os_$art.txt" || ok=0
+  grep -q "Lyx TLS 1.3" "$TMP/os_$art.txt" || ok=0
+  if [ "$art" = rsa ]; then
+    grep -q "Peer signing digest: SHA256" "$TMP/os_$art.txt" || true
+    grep -qE "Peer signature type: (RSA-PSS|rsa_pss_rsae_sha256)" "$TMP/os_$art.txt" || ok=0
+  else
+    grep -qE "Peer signature type: (ED25519|ed25519|Ed25519)" "$TMP/os_$art.txt" || ok=0
+  fi
+  pruefe "Server mit $art-Zertifikat gegen s_client" "$ok"
+  if [ "$ok" != 1 ]; then
+    echo "  openssl: $(grep -E 'Peer signature type|Verify return code' "$TMP/os_$art.txt" | tr '\n' ' ')"
+    echo "  lyx:     $(tr '\n' ' ' < "$TMP/srv_$art.txt")"
+  fi
+
+  # dieselbe Art in der Client-Rolle gegen s_server
+  p="$(freierPort)"; PORT=$((PORT+1))
+  blatt="rsaleaf"; key="rsaleafkey"
+  if [ "$art" = ed ]; then blatt="edleaf"; key="edleafkey"; fi
+  rm -f "$TMP/fifo_$art"; mkfifo "$TMP/fifo_$art"
+  openssl s_server -accept "$p" -cert "$TMP/certs/$blatt.pem" -key "$TMP/certs/$key.pem" \
+    -tls1_3 -quiet < "$TMP/fifo_$art" > "$TMP/os_srv_$art.txt" 2>&1 &
+  ( printf 'pong aus openssl\n'; sleep 8 ) > "$TMP/fifo_$art" &
+  sleep 1.5
+  ( ulimit -v 4000000 -c 0; timeout 25 "$TMP/cli" "$p" "$art" ) > "$TMP/cli_$art.txt" 2>&1
+  pkill -f "s_server -accept $p" 2>/dev/null
+  ok=1
+  grep -q "handschlag-fertig suite 4865" "$TMP/cli_$art.txt" || ok=0
+  grep -q "serverzertifikat-geprueft 1" "$TMP/cli_$art.txt" || ok=0
+  grep -q "antwort 17 pong aus openssl" "$TMP/cli_$art.txt" || ok=0
+  pruefe "Client gegen s_server mit $art-Zertifikat" "$ok"
+  if [ "$ok" != 1 ]; then echo "  lyx: $(tr '\n' ' ' < "$TMP/cli_$art.txt")"; fi
+done
+
 
 echo "--- $PASS PASS, $FAIL FAIL"
 if [ "$FAIL" != 0 ]; then exit 1; fi

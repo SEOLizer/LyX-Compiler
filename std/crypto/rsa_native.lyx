@@ -1,0 +1,520 @@
+// std/crypto/rsa_native.lyx — RSA-Signaturen nach RFC 8017, nativ in Lyx
+//
+// Teil von #2096. std/crypto/rsa.lyx ist ein OpenSSL-FFI-Wrapper und bleibt
+// bestehen; diese Unit kommt ohne Fremdbibliothek aus und laeuft damit auch
+// unter --target=lyxos. Der Name `rsa_native` haelt beide Units
+// nebeneinander benutzbar (flacher Namensraum).
+//
+// Enthalten:
+//   RSASSA-PKCS1-v1_5  Signieren und Pruefen (SHA-256/384/512)
+//   RSASSA-PSS         Signieren und Pruefen (MGF1 mit demselben Hash,
+//                      Salzlaenge = Hashlaenge, wie TLS 1.3 es vorschreibt)
+//   Schluessel lesen   SPKI, RSAPublicKey, PKCS#8, PKCS#1
+//
+// Moduluslaengen 1024..4096 Bit (RK_MAX_GLIEDER). Der Hash wird wie in
+// std.crypto.hkdf ueber seine LAENGE gewaehlt: 32, 48 oder 64. Jeder andere
+// Wert wird abgewiesen, nicht auf SHA-256 gerundet.
+//
+// Konstante Laufzeit: das Signieren rechnet den Modexp ueber BnModExpCT
+// (geheimer Exponent, Fensterauswahl liest alle Tabelleneintraege). Der
+// Vergleich beim Pruefen laeuft ueber CTMemEqual. Das Pruefen selbst
+// verarbeitet nur oeffentliche Werte.
+//
+// NICHT enthalten und darum ausdruecklich benannt: der chinesische Restsatz
+// beim Signieren (gemessen 38 ms je Signatur ohne CRT, rund 10 ms waeren es
+// mit — eigener Schritt), Verschluesselung (OAEP/PKCS#1-v1.5-Padding fuer
+// Transport), Schluesselerzeugung.
+//
+// Oeffentliche API:
+//   RsaSchluesselGroesse()
+//   RsaPubAusSpki(der, derLen, key): bool
+//   RsaPubAusDer(der, derLen, key): bool
+//   RsaPrivAusPkcs8(der, derLen, key): bool
+//   RsaPrivAusPkcs1(der, derLen, key): bool
+//   RsaBytes(key) / RsaBits(key) / RsaHatPrivat(key)
+//   RsaVerifyPkcs1(key, hashLen, hash, sig, sigLen): bool
+//   RsaVerifyPss(key, hashLen, hash, sig, sigLen): bool
+//   RsaSignPkcs1(key, hashLen, hash, sigOut): int64
+//   RsaSignPss(key, hashLen, hash, sigOut): int64
+
+unit std.crypto.rsa_native;
+
+import std.alloc;
+import std.crypto.bignum;
+import std.crypto.ct;
+import std.crypto.sha256;
+import std.crypto.sha512;
+import std.crypto.rand;
+import std.crypto.der;
+
+con RK_MAX_GLIEDER: int64 := 64;        // 4096 Bit
+con RK_MAX_BYTES:   int64 := 512;
+
+con RK_GLIEDER: int64 := 0;
+con RK_BITS:    int64 := 8;
+con RK_E:       int64 := 16;
+con RK_HASPRIV: int64 := 24;
+con RK_N:       int64 := 32;                    // 64 Glieder
+con RK_D:       int64 := 544;                   // 64 Glieder
+con RK_SIZE:    int64 := 1056;
+
+pub fn RsaSchluesselGroesse(): int64 { return RK_SIZE; }
+
+pub fn RsaBits(key: int64): int64 { return peek64(key + RK_BITS); }
+pub fn RsaBytes(key: int64): int64 { return (peek64(key + RK_BITS) + 7) / 8; }
+pub fn RsaHatPrivat(key: int64): bool { return peek64(key + RK_HASPRIV) != 0; }
+
+// ---------------------------------------------------------------------------
+// Kratzbereich (ein alloc je Programmlauf, feste Unterbereiche je Funktion —
+// kein alloc/free je Aufruf, kein defer; vgl. #2380 und den Befund in #2096)
+// ---------------------------------------------------------------------------
+
+// Jeder Bereich gehoert genau einer Rolle. Das ist kein Schoenheitspunkt:
+// in der ersten Fassung lagen der MGF1-Hashblock und sein eigener Seed auf
+// derselben Adresse, und der Seed war nach dem ersten Block zerstoert.
+con RS_EM:     int64 := 0;        // 512 kodierte Nachricht (EM)
+con RS_DB:     int64 := 512;      // 512 Datenblock (DB)
+con RS_MASK:   int64 := 1024;     // 512 dbMask
+con RS_SOLL:   int64 := 1536;     // 512 Vergleichsfassung (PKCS#1)
+con RS_SALT:   int64 := 2048;     // 64 Salz
+con RS_MHASH:  int64 := 2112;     // 64 Nachrichtenhash (Kopie)
+con RS_H:      int64 := 2176;     // 64 H aus EM
+con RS_H2:     int64 := 2240;     // 64 H' zum Vergleich
+con RS_MGFB:   int64 := 2304;     // 64 Hashblock in MGF1
+con RS_MPUF:   int64 := 2368;     // 200 Eingabe fuer H (8 + 2*hashLen)
+con RS_SPUF:   int64 := 2568;     // 128 MGF1-Seed bzw. DER-Felder
+con RS_PREF:   int64 := 2696;     // 32 DigestInfo-Praefix
+con RS_BNS:    int64 := 2728;     // 512 Bignum: Signatur
+con RS_BNM:    int64 := 3240;     // 512 Bignum: Nachricht
+con RS_E:      int64 := 3752;     // 64 oeffentlicher Exponent als Langzahl
+con RS_GROESSE: int64 := 3816;
+
+var _rsaScr: int64 := 0;
+
+fn rsaScr(): int64 {
+    if (_rsaScr != 0) { return _rsaScr; }
+    var p: int64 := alloc(RS_GROESSE);
+    if (p == 0) { panic("rsa: kein Speicher fuer den Kratzbereich"); }
+    _rsaScr := p;
+    return p;
+}
+
+fn rsaHash(hashLen: int64, daten: int64, len: int64, out: int64): bool {
+    if (hashLen == 32) { SHA256(daten, len, out); return true; }
+    if (hashLen == 48) { Sha384(daten, len, out); return true; }
+    if (hashLen == 64) { Sha512(daten, len, out); return true; }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// Schluessel lesen
+// ---------------------------------------------------------------------------
+
+// 1.2.840.113549.1.1.1 rsaEncryption
+fn rsaOid(p: int64): int64 {
+    poke8(p + 0, 0x2a); poke8(p + 1, 0x86); poke8(p + 2, 0x48); poke8(p + 3, 0x86);
+    poke8(p + 4, 0xf7); poke8(p + 5, 0x0d); poke8(p + 6, 0x01); poke8(p + 7, 0x01);
+    poke8(p + 8, 0x01);
+    return 9;
+}
+
+// Setzt Modulus und Bitlaenge aus einem DER-INTEGER (fuehrende Null erlaubt).
+fn rsaSetzeModulus(key: int64, der: int64, pos: int64, len: int64): bool {
+    var p: int64 := pos;
+    var l: int64 := len;
+    while (l > 0 && (peek8(der + p) & 0xFF) == 0) { p += 1; l -= 1; }
+    if (l < 64 || l > RK_MAX_BYTES) { return false; }      // 512..4096 Bit
+    var glieder: int64 := (l + 7) / 8;
+    if (!BnFromBytes(key + RK_N, glieder, der + p, l)) { return false; }
+    poke64(key + RK_GLIEDER, glieder);
+    poke64(key + RK_BITS, BnBitLen(key + RK_N, glieder));
+    // Der Modulus muss ungerade sein (Montgomery) und die oberste Stelle
+    // besetzen; beides gilt fuer echte RSA-Moduli und wird hier geprueft,
+    // statt spaeter still falsch zu rechnen.
+    if ((peek64(key + RK_N) & 1) == 0) { return false; }
+    return true;
+}
+
+fn rsaSetzeD(key: int64, der: int64, pos: int64, len: int64): bool {
+    var p: int64 := pos;
+    var l: int64 := len;
+    while (l > 0 && (peek8(der + p) & 0xFF) == 0) { p += 1; l -= 1; }
+    if (l <= 0 || l > RK_MAX_BYTES) { return false; }
+    if (!BnFromBytes(key + RK_D, peek64(key + RK_GLIEDER), der + p, l)) { return false; }
+    poke64(key + RK_HASPRIV, 1);
+    return true;
+}
+
+// RSAPublicKey ::= SEQUENCE { modulus INTEGER, publicExponent INTEGER }
+pub fn RsaPubAusDer(der: int64, derLen: int64, key: int64): bool {
+    var i: int64 := 0;
+    while (i < RK_SIZE) { poke8(key + i, 0); i := i + 1; }
+    var fg: int64 := DerFeldGroesse();
+    var f: int64 := rsaScr() + RS_SPUF;        // Feld passt in den Kratzbereich
+    var k: int64 := f + fg;
+    if (!DerLies(der, derLen, 0, f)) { return false; }
+    if (DerTag(f) != 0x30) { return false; }
+    var ende: int64 := DerInhalt(f) + DerInhaltLen(f);
+    if (!DerLies(der, ende, DerInhalt(f), k)) { return false; }
+    if (DerTag(k) != 0x02) { return false; }
+    if (!rsaSetzeModulus(key, der, DerInhalt(k), DerInhaltLen(k))) { return false; }
+    if (!DerLies(der, ende, DerNaechste(k), k)) { return false; }
+    if (DerTag(k) != 0x02) { return false; }
+    var e: int64 := DerGanzzahl(der, ende, k);
+    if (e <= 2) { return false; }               // 3, 17, 65537 — nie 0 oder 1
+    poke64(key + RK_E, e);
+    return true;
+}
+
+// SubjectPublicKeyInfo mit rsaEncryption
+pub fn RsaPubAusSpki(der: int64, derLen: int64, key: int64): bool {
+    var fg: int64 := DerFeldGroesse();
+    var f: int64 := rsaScr() + RS_SPUF;
+    var g: int64 := f + fg;
+    var h: int64 := g + fg;
+    var ob: int64 := rsaScr() + RS_PREF;
+    var pp: int64 := rsaScr() + RS_SALT;        // zwei int64 als Rueckgabe
+    var ll: int64 := pp + 8;
+    if (!DerLies(der, derLen, 0, f)) { return false; }
+    if (DerTag(f) != 0x30) { return false; }
+    var ende: int64 := DerInhalt(f) + DerInhaltLen(f);
+    if (!DerLies(der, ende, DerInhalt(f), g)) { return false; }
+    if (DerTag(g) != 0x30) { return false; }
+    var algEnde: int64 := DerInhalt(g) + DerInhaltLen(g);
+    if (!DerLies(der, algEnde, DerInhalt(g), h)) { return false; }
+    if (DerTag(h) != 0x06) { return false; }
+    if (!DerOidGleich(der, h, ob, rsaOid(ob))) { return false; }
+    if (!DerLies(der, ende, DerNaechste(g), h)) { return false; }
+    if (DerTag(h) != 0x03) { return false; }
+    if (!DerBitKette(der, h, pp, ll)) { return false; }
+    return RsaPubAusDer(der + peek64(pp), peek64(ll), key);
+}
+
+// RSAPrivateKey ::= SEQUENCE { version, n, e, d, p, q, dp, dq, qinv }
+// p..qinv werden gelesen und verworfen: ohne CRT werden sie nicht gebraucht,
+// und ein halber CRT-Pfad waere ein stiller Default.
+pub fn RsaPrivAusPkcs1(der: int64, derLen: int64, key: int64): bool {
+    var i: int64 := 0;
+    while (i < RK_SIZE) { poke8(key + i, 0); i := i + 1; }
+    var fg: int64 := DerFeldGroesse();
+    var f: int64 := rsaScr() + RS_SPUF;
+    var k: int64 := f + fg;
+    if (!DerLies(der, derLen, 0, f)) { return false; }
+    if (DerTag(f) != 0x30) { return false; }
+    var ende: int64 := DerInhalt(f) + DerInhaltLen(f);
+    if (!DerLies(der, ende, DerInhalt(f), k)) { return false; }
+    if (DerTag(k) != 0x02) { return false; }
+    if (DerGanzzahl(der, ende, k) != 0) { return false; }     // version 0
+    if (!DerLies(der, ende, DerNaechste(k), k)) { return false; }
+    if (DerTag(k) != 0x02) { return false; }
+    if (!rsaSetzeModulus(key, der, DerInhalt(k), DerInhaltLen(k))) { return false; }
+    if (!DerLies(der, ende, DerNaechste(k), k)) { return false; }
+    if (DerTag(k) != 0x02) { return false; }
+    var e: int64 := DerGanzzahl(der, ende, k);
+    if (e <= 2) { return false; }
+    poke64(key + RK_E, e);
+    if (!DerLies(der, ende, DerNaechste(k), k)) { return false; }
+    if (DerTag(k) != 0x02) { return false; }
+    return rsaSetzeD(key, der, DerInhalt(k), DerInhaltLen(k));
+}
+
+// PrivateKeyInfo mit rsaEncryption
+pub fn RsaPrivAusPkcs8(der: int64, derLen: int64, key: int64): bool {
+    var fg: int64 := DerFeldGroesse();
+    var f: int64 := rsaScr() + RS_SPUF;
+    var g: int64 := f + fg;
+    var h: int64 := g + fg;
+    var ob: int64 := rsaScr() + RS_PREF;
+    if (!DerLies(der, derLen, 0, f)) { return false; }
+    if (DerTag(f) != 0x30) { return false; }
+    var ende: int64 := DerInhalt(f) + DerInhaltLen(f);
+    if (!DerLies(der, ende, DerInhalt(f), g)) { return false; }
+    if (DerTag(g) != 0x02) { return false; }
+    if (DerGanzzahl(der, ende, g) != 0) { return false; }
+    if (!DerLies(der, ende, DerNaechste(g), g)) { return false; }
+    if (DerTag(g) != 0x30) { return false; }
+    var algEnde: int64 := DerInhalt(g) + DerInhaltLen(g);
+    if (!DerLies(der, algEnde, DerInhalt(g), h)) { return false; }
+    if (DerTag(h) != 0x06) { return false; }
+    if (!DerOidGleich(der, h, ob, rsaOid(ob))) { return false; }
+    if (!DerLies(der, ende, DerNaechste(g), g)) { return false; }
+    if (DerTag(g) != 0x04) { return false; }
+    return RsaPrivAusPkcs1(der + DerInhalt(g), DerInhaltLen(g), key);
+}
+
+// ---------------------------------------------------------------------------
+// MGF1 (RFC 8017 §B.2.1)
+// ---------------------------------------------------------------------------
+
+fn mgf1(hashLen: int64, seed: int64, seedLen: int64, maske: int64, maskeLen: int64): bool {
+    var scr: int64 := rsaScr();
+    var puf: int64 := scr + RS_SPUF;
+    var blk: int64 := scr + RS_MGFB;
+    if (seedLen + 4 > 72) { return false; }
+    var i: int64 := 0;
+    while (i < seedLen) { poke8(puf + i, peek8(seed + i)); i := i + 1; }
+    var zaehler: int64 := 0;
+    var geschrieben: int64 := 0;
+    while (geschrieben < maskeLen) {
+        poke8(puf + seedLen + 0, (zaehler >> 24) & 0xFF);
+        poke8(puf + seedLen + 1, (zaehler >> 16) & 0xFF);
+        poke8(puf + seedLen + 2, (zaehler >> 8) & 0xFF);
+        poke8(puf + seedLen + 3, zaehler & 0xFF);
+        if (!rsaHash(hashLen, puf, seedLen + 4, blk)) { return false; }
+        var nimm: int64 := hashLen;
+        if (maskeLen - geschrieben < nimm) { nimm := maskeLen - geschrieben; }
+        var j: int64 := 0;
+        while (j < nimm) { poke8(maske + geschrieben + j, peek8(blk + j)); j := j + 1; }
+        geschrieben += nimm;
+        zaehler += 1;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Kodierungen
+// ---------------------------------------------------------------------------
+
+// DigestInfo-Praefix fuer EMSA-PKCS1-v1_5 (RFC 8017 §9.2, Anmerkung 1).
+// Liefert die Laenge oder 0 bei unbekanntem Hash.
+fn digestInfoPraefix(hashLen: int64, out: int64): int64 {
+    if (hashLen == 32) {
+        poke8(out + 0, 0x30); poke8(out + 1, 0x31); poke8(out + 2, 0x30);
+        poke8(out + 3, 0x0d); poke8(out + 4, 0x06); poke8(out + 5, 0x09);
+        poke8(out + 6, 0x60); poke8(out + 7, 0x86); poke8(out + 8, 0x48);
+        poke8(out + 9, 0x01); poke8(out + 10, 0x65); poke8(out + 11, 0x03);
+        poke8(out + 12, 0x04); poke8(out + 13, 0x02); poke8(out + 14, 0x01);
+        poke8(out + 15, 0x05); poke8(out + 16, 0x00); poke8(out + 17, 0x04);
+        poke8(out + 18, 0x20);
+        return 19;
+    }
+    if (hashLen == 48) {
+        poke8(out + 0, 0x30); poke8(out + 1, 0x41); poke8(out + 2, 0x30);
+        poke8(out + 3, 0x0d); poke8(out + 4, 0x06); poke8(out + 5, 0x09);
+        poke8(out + 6, 0x60); poke8(out + 7, 0x86); poke8(out + 8, 0x48);
+        poke8(out + 9, 0x01); poke8(out + 10, 0x65); poke8(out + 11, 0x03);
+        poke8(out + 12, 0x04); poke8(out + 13, 0x02); poke8(out + 14, 0x02);
+        poke8(out + 15, 0x05); poke8(out + 16, 0x00); poke8(out + 17, 0x04);
+        poke8(out + 18, 0x30);
+        return 19;
+    }
+    if (hashLen == 64) {
+        poke8(out + 0, 0x30); poke8(out + 1, 0x51); poke8(out + 2, 0x30);
+        poke8(out + 3, 0x0d); poke8(out + 4, 0x06); poke8(out + 5, 0x09);
+        poke8(out + 6, 0x60); poke8(out + 7, 0x86); poke8(out + 8, 0x48);
+        poke8(out + 9, 0x01); poke8(out + 10, 0x65); poke8(out + 11, 0x03);
+        poke8(out + 12, 0x04); poke8(out + 13, 0x02); poke8(out + 14, 0x03);
+        poke8(out + 15, 0x05); poke8(out + 16, 0x00); poke8(out + 17, 0x04);
+        poke8(out + 18, 0x40);
+        return 19;
+    }
+    return 0;
+}
+
+// EM = 0x00 || 0x01 || PS (0xFF...) || 0x00 || DigestInfo || H
+fn emsaPkcs1(hashLen: int64, hash: int64, emLen: int64, em: int64): bool {
+    var praefix: int64 := rsaScr() + RS_PREF;
+    var pl: int64 := digestInfoPraefix(hashLen, praefix);
+    if (pl == 0) { return false; }
+    var tLen: int64 := pl + hashLen;
+    if (emLen < tLen + 11) { return false; }
+    poke8(em, 0);
+    poke8(em + 1, 1);
+    var i: int64 := 2;
+    while (i < emLen - tLen - 1) { poke8(em + i, 0xFF); i := i + 1; }
+    poke8(em + i, 0);
+    i += 1;
+    var j: int64 := 0;
+    while (j < pl) { poke8(em + i + j, peek8(praefix + j)); j := j + 1; }
+    j := 0;
+    while (j < hashLen) { poke8(em + i + pl + j, peek8(hash + j)); j := j + 1; }
+    return true;
+}
+
+// EMSA-PSS-ENCODE (RFC 8017 §9.1.1), Salzlaenge = hashLen.
+fn emsaPssEncode(hashLen: int64, mHash: int64, salt: int64, emBits: int64,
+                 em: int64): bool {
+    var scr: int64 := rsaScr();
+    var emLen: int64 := (emBits + 7) / 8;
+    if (emLen < hashLen + hashLen + 2) { return false; }
+
+    // H = Hash(0x00 x8 || mHash || salt)
+    var mpuf: int64 := scr + RS_MPUF;
+    var i: int64 := 0;
+    while (i < 8) { poke8(mpuf + i, 0); i := i + 1; }
+    i := 0;
+    while (i < hashLen) { poke8(mpuf + 8 + i, peek8(mHash + i)); i := i + 1; }
+    i := 0;
+    while (i < hashLen) { poke8(mpuf + 8 + hashLen + i, peek8(salt + i)); i := i + 1; }
+    var H: int64 := scr + RS_H;
+    if (!rsaHash(hashLen, mpuf, 8 + 2 * hashLen, H)) { return false; }
+
+    // DB = PS || 0x01 || salt
+    var db: int64 := scr + RS_DB;
+    var dbLen: int64 := emLen - hashLen - 1;
+    i := 0;
+    while (i < dbLen - hashLen - 1) { poke8(db + i, 0); i := i + 1; }
+    poke8(db + dbLen - hashLen - 1, 1);
+    i := 0;
+    while (i < hashLen) { poke8(db + dbLen - hashLen + i, peek8(salt + i)); i := i + 1; }
+
+    var maske: int64 := scr + RS_MASK;
+    if (!mgf1(hashLen, H, hashLen, maske, dbLen)) { return false; }
+    i := 0;
+    while (i < dbLen) {
+        poke8(em + i, peek8(db + i) ^ peek8(maske + i));
+        i += 1;
+    }
+    // oberste 8*emLen - emBits Bit auf 0
+    var ueberzaehlig: int64 := 8 * emLen - emBits;
+    if (ueberzaehlig > 0) {
+        poke8(em, peek8(em) & ((0xFF >> ueberzaehlig) & 0xFF));
+    }
+    i := 0;
+    while (i < hashLen) { poke8(em + dbLen + i, peek8(H + i)); i := i + 1; }
+    poke8(em + emLen - 1, 0xbc);
+    return true;
+}
+
+// EMSA-PSS-VERIFY (RFC 8017 §9.1.2). Liefert false bei jeder Abweichung;
+// es gibt keinen Zweig, der bei Unklarheit "gueltig" sagt.
+fn emsaPssVerify(hashLen: int64, mHash: int64, em: int64, emBits: int64): bool {
+    var scr: int64 := rsaScr();
+    var emLen: int64 := (emBits + 7) / 8;
+    if (emLen < hashLen + hashLen + 2) { return false; }
+    if ((peek8(em + emLen - 1) & 0xFF) != 0xbc) { return false; }
+
+    var dbLen: int64 := emLen - hashLen - 1;
+    var H: int64 := scr + RS_H;
+    var i: int64 := 0;
+    while (i < hashLen) { poke8(H + i, peek8(em + dbLen + i)); i := i + 1; }
+
+    var ueberzaehlig: int64 := 8 * emLen - emBits;
+    if (ueberzaehlig > 0) {
+        if ((peek8(em) & (((0xFF << (8 - ueberzaehlig)) & 0xFF))) != 0) { return false; }
+    }
+
+    var maske: int64 := scr + RS_MASK;
+    if (!mgf1(hashLen, H, hashLen, maske, dbLen)) { return false; }
+    var db: int64 := scr + RS_DB;
+    i := 0;
+    while (i < dbLen) { poke8(db + i, peek8(em + i) ^ peek8(maske + i)); i := i + 1; }
+    if (ueberzaehlig > 0) {
+        poke8(db, peek8(db) & ((0xFF >> ueberzaehlig) & 0xFF));
+    }
+
+    // PS muss 0 sein, dann genau ein 0x01
+    i := 0;
+    while (i < dbLen - hashLen - 1) {
+        if ((peek8(db + i) & 0xFF) != 0) { return false; }
+        i += 1;
+    }
+    if ((peek8(db + dbLen - hashLen - 1) & 0xFF) != 1) { return false; }
+
+    // H' = Hash(0x00 x8 || mHash || salt)
+    var salt: int64 := db + dbLen - hashLen;
+    var mpuf: int64 := scr + RS_MPUF;
+    i := 0;
+    while (i < 8) { poke8(mpuf + i, 0); i := i + 1; }
+    i := 0;
+    while (i < hashLen) { poke8(mpuf + 8 + i, peek8(mHash + i)); i := i + 1; }
+    i := 0;
+    while (i < hashLen) { poke8(mpuf + 8 + hashLen + i, peek8(salt + i)); i := i + 1; }
+    var H2: int64 := scr + RS_H2;
+    if (!rsaHash(hashLen, mpuf, 8 + 2 * hashLen, H2)) { return false; }
+    return CTMemEqual(H, H2, hashLen) == -1;
+}
+
+// ---------------------------------------------------------------------------
+// Signieren und Pruefen
+// ---------------------------------------------------------------------------
+
+// s = m^d mod n (geheimer Exponent) bzw. m = s^e mod n (oeffentlich).
+fn rsaPrivOp(key: int64, em: int64, k: int64, out: int64): bool {
+    var glieder: int64 := peek64(key + RK_GLIEDER);
+    var scr: int64 := rsaScr();
+    var bm: int64 := scr + RS_BNM;
+    var bs: int64 := scr + RS_BNS;
+    if (!BnFromBytes(bm, glieder, em, k)) { return false; }
+    if (BnCmp(bm, key + RK_N, glieder) >= 0) { return false; }
+    BnModExpCT(bs, bm, key + RK_D, peek64(key + RK_BITS), key + RK_N, glieder);
+    BnToBytes(out, bs, glieder);
+    return true;
+}
+
+fn rsaPubOp(key: int64, sig: int64, sigLen: int64, out: int64): bool {
+    var glieder: int64 := peek64(key + RK_GLIEDER);
+    var scr: int64 := rsaScr();
+    var bs: int64 := scr + RS_BNS;
+    var bm: int64 := scr + RS_BNM;
+    var e: int64 := scr + RS_E;
+    if (!BnFromBytes(bs, glieder, sig, sigLen)) { return false; }
+    if (BnCmp(bs, key + RK_N, glieder) >= 0) { return false; }
+    BnZero(e, glieder);
+    poke64(e, peek64(key + RK_E));
+    var eBits: int64 := BnBitLen(e, glieder);
+    BnModExp(bm, bs, e, eBits, key + RK_N, glieder);
+    BnToBytes(out, bm, glieder);
+    return true;
+}
+
+// Schreibt RsaBytes(key) Byte Signatur nach sigOut; liefert die Laenge oder 0.
+pub fn RsaSignPkcs1(key: int64, hashLen: int64, hash: int64, sigOut: int64): int64 {
+    if (!RsaHatPrivat(key)) { return 0; }
+    var k: int64 := RsaBytes(key);
+    var em: int64 := rsaScr() + RS_EM;
+    if (!emsaPkcs1(hashLen, hash, k, em)) { return 0; }
+    if (!rsaPrivOp(key, em, k, sigOut)) { return 0; }
+    return k;
+}
+
+pub fn RsaVerifyPkcs1(key: int64, hashLen: int64, hash: int64,
+                      sig: int64, sigLen: int64): bool {
+    var k: int64 := RsaBytes(key);
+    if (sigLen != k) { return false; }
+    var scr: int64 := rsaScr();
+    var em: int64 := scr + RS_EM;
+    var soll: int64 := scr + RS_SOLL;
+    if (!rsaPubOp(key, sig, sigLen, em)) { return false; }
+    if (!emsaPkcs1(hashLen, hash, k, soll)) { return false; }
+    return CTMemEqual(em, soll, k) == -1;
+}
+
+// Salz wird frisch gezogen (Laenge = hashLen, wie RFC 8446 §4.2.3 fuer
+// rsa_pss_rsae_* verlangt).
+pub fn RsaSignPss(key: int64, hashLen: int64, hash: int64, sigOut: int64): int64 {
+    if (!RsaHatPrivat(key)) { return 0; }
+    var k: int64 := RsaBytes(key);
+    var scr: int64 := rsaScr();
+    var salt: int64 := scr + RS_SALT;
+    if (RandBytesExact(salt, hashLen) != hashLen) { return 0; }
+    var em: int64 := scr + RS_EM;
+    var emBits: int64 := peek64(key + RK_BITS) - 1;
+    if (!emsaPssEncode(hashLen, hash, salt, emBits, em)) { return 0; }
+    var emLen: int64 := (emBits + 7) / 8;
+    // Bei emBits = 8k-1 ist emLen = k-1; dann vorne ein Nullbyte ergaenzen.
+    if (emLen < k) {
+        var i: int64 := k - 1;
+        while (i >= k - emLen) { poke8(em + i, peek8(em + i - (k - emLen))); i -= 1; }
+        i := 0;
+        while (i < k - emLen) { poke8(em + i, 0); i := i + 1; }
+    }
+    if (!rsaPrivOp(key, em, k, sigOut)) { return 0; }
+    SecureZero(salt, hashLen);
+    return k;
+}
+
+pub fn RsaVerifyPss(key: int64, hashLen: int64, hash: int64,
+                    sig: int64, sigLen: int64): bool {
+    var k: int64 := RsaBytes(key);
+    if (sigLen != k) { return false; }
+    var em: int64 := rsaScr() + RS_EM;
+    if (!rsaPubOp(key, sig, sigLen, em)) { return false; }
+    var emBits: int64 := peek64(key + RK_BITS) - 1;
+    var emLen: int64 := (emBits + 7) / 8;
+    var ab: int64 := em + (k - emLen);          // fuehrendes Nullbyte ueberspringen
+    if (emLen < k) {
+        if ((peek8(em) & 0xFF) != 0) { return false; }
+    }
+    return emsaPssVerify(hashLen, hash, ab, emBits);
+}

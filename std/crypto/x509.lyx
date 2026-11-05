@@ -39,7 +39,10 @@ unit std.crypto.x509;
 import std.alloc;
 import std.crypto.der;
 import std.crypto.sha256;
+import std.crypto.sha512;
 import std.crypto.ec;
+import std.crypto.rsa_native;
+import std.crypto.ed25519;
 
 con X_DER:      int64 := 0;
 con X_DERLEN:   int64 := 8;
@@ -74,13 +77,32 @@ con X_SIZE:     int64 := 208;
 //
 // Jede Funktion hier braucht ein paar DER-Felder als Zwischenablage. Die
 // entstehen EINMAL je Programmlauf, mit einem festen Bereich je Funktion —
-// kein alloc/free je Aufruf und vor allem kein `defer`: mit mehreren defer je
-// Funktion gab lyxc 1.2.31A gemessen einen Block zu frueh frei, zwei alloc(8)
-// bekamen dieselbe Adresse, und jeder ZWEITE Aufruf von X509PasstName lief
-// danach auf Muell (Hostname "passt nicht" bei gueltigem Zertifikat).
+// kein alloc/free je Aufruf und kein `defer`.
+//
+// GEMESSEN ist dazu nur das: in der Fassung mit alloc und je einem `defer`
+// scheiterte jeder ZWEITE Aufruf von X509PasstName (in TLS: jeder zweite
+// Handschlag an der Hostnamenspruefung, Hostname "passt nicht" bei gueltigem
+// Zertifikat), kp und kl in X509Lies bekamen dieselbe Adresse, und X_KEYPOS
+// trug danach die Schluessellaenge statt der Position. Mit dieser Fassung ist
+// es weg, sechs Handschlaege in Folge gruen.
+//
+// Die URSACHE ist nicht belegt. Der Weg, der dazu passt, ist #2380: am
+// Ausnahme-Landepunkt werden alle je angemeldeten defers einer Funktion neu
+// aufgeloest, auch die aus verlassenen Bloecken. Das bricht laut ab, wenn
+// n >= k+1 (k = Locals im Block vor der defer-Variablen, n = Locals nach dem
+// Block), und liest sonst still einen toten Rahmenplatz — X509Lies lag mit
+// seinen blocklokalen defers in oidF/wF genau in der stillen Haelfte. Nicht
+// erklaerend ist #2386 (Argumentzeitpunkt am Rueckgabepunkt): keine der
+// defer-Variablen wurde nach der Anmeldung neu belegt, nachgezaehlt an der
+// alten Fassung.
+//
+// Unabhaengig davon bleibt der Kratzbereich richtig: #2096 verlangt "kein
+// Heap-Wachstum je Record".
+//
 // Die Bereiche sind disjunkt, weil die Funktionen sich gegenseitig aufrufen:
 // X509PruefeKette -> X509Lies -> ext*/algKennung, X509PasstName -> X509SanAt.
-// Rekursion gibt es keine.
+// Rekursion gibt es keine. Und: ein Bereich gehoert genau EINER Rolle — die
+// Ueberlappung zweier Rollen war in dieser Arbeit der haeufigste Fehler.
 // ---------------------------------------------------------------------------
 
 con XS_LIES:     int64 := 0;      // 10 Felder: 320
@@ -94,13 +116,15 @@ con XS_SANANZ:   int64 := 1056;   // 32
 con XS_SANAT:    int64 := 1088;   // 32
 con XS_PASST:    int64 := 1120;   // 24
 con XS_CN:       int64 := 1152;   // 176
-con XS_GROESSE:  int64 := 1408;
+con XS_HASH:     int64 := 1344;   // 64 Byte Hash des TBS
+con XS_RSAKEY:   int64 := 1408;   // Platz fuer einen RSA-Schluessel
+con XS_GROESSE:  int64 := 2560;
 
 var _x509Scr: int64 := 0;
 
 fn x509Scr(): int64 {
     if (_x509Scr != 0) { return _x509Scr; }
-    var p: int64 := alloc(XS_GROESSE);
+    var p: int64 := alloc(XS_GROESSE + RsaSchluesselGroesse());
     if (p == 0) { panic("X.509: kein Speicher fuer den Kratzbereich"); }
     _x509Scr := p;
     return p;
@@ -353,11 +377,11 @@ pub fn X509Lies(der: int64, derLen: int64, satz: int64): bool {
     poke64(satz + X_PATHLEN, -1);
     poke64(satz + X_VERSION, 1);
 
-    // EIN Kratzblock fuer alle Felder: ein alloc, ein defer. Vorher stand je
-    // Feld ein eigenes defer (neun in dieser Funktion) — gemessen mit lyxc
-    // 1.2.31A lief dann eines zu frueh, kp und kl bekamen dieselbe Adresse und
-    // X_KEYPOS trug danach die Schluessellaenge statt der Position. Wenige
-    // defer je Funktion, und keines in einer Schleife oder einem inneren Block.
+    // EIN Kratzblock fuer alle Felder dieser Funktion. Vorher stand je Feld
+    // ein eigenes `defer` (dreizehn in dieser Funktion, zwei davon auf
+    // blocklokalen Namen in der Erweiterungsschleife); dabei bekamen kp und
+    // kl dieselbe Adresse, und X_KEYPOS trug die Schluessellaenge statt der
+    // Position. Siehe den Kopf dieser Datei und #2380 — Ursache offen.
     var fg: int64 := DerFeldGroesse();
     var kratz: int64 := x509Scr() + XS_LIES;
     var cert: int64 := kratz;
@@ -759,14 +783,16 @@ pub fn X509ZeitGueltig(satz: int64, jetzt: int64): bool {
 //   7  pathLenConstraint ueberschritten
 //   8  Aussteller hat keyCertSign nicht gesetzt
 //   9  Blatt hat den verlangten Zweck nicht in extKeyUsage
-//   10 Signaturverfahren oder Kurve nicht unterstuetzt
+//   10 Signaturverfahren oder Kurve nicht unterstuetzt (heute: ecdsa mit
+//      secp384r1, weil std/crypto/ec.lyx die Kurve nicht kennt, und PSS
+//      ohne lesbare Hashangabe in den Parametern)
 //   11 Kette zu lang
 //   12 Blatt hat digitalSignature nicht gesetzt
 //
-// Code 10 ist wichtig: unterstuetzt wird derzeit ecdsa-with-SHA256 auf
-// secp256r1. Fuer RSA, Ed25519 und secp384r1 fehlt die Verifikation noch
-// (std/crypto/ec.lyx kennt nur secp256k1 und secp256r1) — diese Faelle
-// werden ABGEWIESEN, nicht durchgelassen.
+// Unterstuetzt werden ecdsa-with-SHA256 auf secp256r1,
+// sha256/384/512WithRSAEncryption, RSASSA-PSS (Hash aus den Parametern) und
+// Ed25519. Was fehlt — ecdsa-with-SHA384, weil std/crypto/ec.lyx secp384r1
+// nicht kennt — ergibt Code 10 und gilt NICHT als gueltig.
 // ===========================================================================
 
 con X_MAX_TIEFE: int64 := 8;
@@ -776,28 +802,111 @@ con X_MAX_TIEFE: int64 := 8;
 // unterstuetztem Verfahren.
 pub fn X509PruefeSignatur(kind: int64, aussteller: int64): int64 {
     var alg: int64 := peek64(kind + X_SIGALG);
-    if (alg != 1) { return 10; }                       // nur ecdsa-with-SHA256
-    if (peek64(aussteller + X_KEYALG) != 1) { return 10; }   // nur secp256r1
-
+    var keyAlg: int64 := peek64(aussteller + X_KEYALG);
     var derK: int64 := peek64(kind + X_DER);
     var derA: int64 := peek64(aussteller + X_DER);
+    var tbs: int64 := derK + peek64(kind + X_TBSPOS);
+    var tbsLen: int64 := peek64(kind + X_TBSLEN);
+    var sig: int64 := derK + peek64(kind + X_SIGPOS);
+    var sigLen: int64 := peek64(kind + X_SIGLEN);
+    var scr: int64 := x509Scr();
+    var hash: int64 := scr + XS_HASH;
 
-    // Oeffentlicher Punkt: 0x04 || X || Y, unkomprimiert (RFC 5480 §2.2).
-    var kLen: int64 := peek64(aussteller + X_KEYLEN);
-    if (kLen != 65) { return 10; }
-    var kPos: int64 := derA + peek64(aussteller + X_KEYPOS);
-    if ((peek8(kPos) & 0xFF) != 4) { return 10; }
-
-    var hash: int64 := x509Scr() + XS_SIG;
-    var r: int64 := hash + 32;
-    var s: int64 := r + 32;
-
-    SHA256(derK + peek64(kind + X_TBSPOS), peek64(kind + X_TBSLEN), hash);
-    if (!EcdsaSigFromDer(derK + peek64(kind + X_SIGPOS), peek64(kind + X_SIGLEN), r, s)) {
-        return 5;
+    // ecdsa-with-SHA256 auf secp256r1
+    if (alg == 1) {
+        if (keyAlg != 1) { return 10; }
+        if (peek64(aussteller + X_KEYLEN) != 65) { return 10; }
+        var kPos: int64 := derA + peek64(aussteller + X_KEYPOS);
+        if ((peek8(kPos) & 0xFF) != 4) { return 10; }
+        var r: int64 := scr + XS_SIG;
+        var sv: int64 := r + 32;
+        SHA256(tbs, tbsLen, hash);
+        if (!EcdsaSigFromDer(sig, sigLen, r, sv)) { return 5; }
+        if (!EcdsaVerify(EC_P256, hash, kPos + 1, kPos + 33, r, sv)) { return 5; }
+        return 0;
     }
-    var ok: bool := EcdsaVerify(EC_P256, hash, kPos + 1, kPos + 33, r, s);
-    if (!ok) { return 5; }
+
+    // RSA: PKCS#1 v1.5 mit SHA-256/384/512 (alg 3/4/5) und PSS (alg 6)
+    if (alg == 3 || alg == 4 || alg == 5 || alg == 6) {
+        if (keyAlg != 3) { return 10; }
+        var key: int64 := scr + XS_RSAKEY;
+        if (!RsaPubAusDer(derA + peek64(aussteller + X_KEYPOS),
+                          peek64(aussteller + X_KEYLEN), key)) { return 10; }
+        var hl: int64 := 32;
+        if (alg == 4) { hl := 48; }
+        if (alg == 5) { hl := 64; }
+        if (alg == 6) {
+            // RSASSA-PSS: die Hashwahl steht in den Parametern des
+            // AlgorithmIdentifier. Ohne lesbare Parameter wird abgewiesen,
+            // nicht auf SHA-256 geraten.
+            hl := pssHashLaenge(kind);
+            if (hl == 0) { return 10; }
+        }
+        if (hl == 32) { SHA256(tbs, tbsLen, hash); }
+        if (hl == 48) { Sha384(tbs, tbsLen, hash); }
+        if (hl == 64) { Sha512(tbs, tbsLen, hash); }
+        var ok: bool := false;
+        if (alg == 6) { ok := RsaVerifyPss(key, hl, hash, sig, sigLen); }
+        else { ok := RsaVerifyPkcs1(key, hl, hash, sig, sigLen); }
+        if (!ok) { return 5; }
+        return 0;
+    }
+
+    // Ed25519 (RFC 8410): signiert die Nachricht selbst, kein Vorhash.
+    if (alg == 7) {
+        if (keyAlg != 4) { return 10; }
+        if (peek64(aussteller + X_KEYLEN) != 32) { return 10; }
+        if (sigLen != 64) { return 5; }
+        if (!Ed25519Verify(sig, tbs, tbsLen,
+                           derA + peek64(aussteller + X_KEYPOS))) { return 5; }
+        return 0;
+    }
+
+    // ecdsa-with-SHA384 braucht secp384r1; std/crypto/ec.lyx kennt die Kurve
+    // nicht. Abgewiesen, nicht durchgelassen.
+    return 10;
+}
+
+// Hashlaenge aus den PSS-Parametern des signatureAlgorithm (RFC 4055 §3.1).
+// Die Parameter sind eine SEQUENCE mit [0] hashAlgorithm; fehlt sie, gilt
+// laut RFC SHA-1 — das wird hier NICHT unterstuetzt und als 0 gemeldet.
+fn pssHashLaenge(kind: int64): int64 {
+    var der: int64 := peek64(kind + X_DER);
+    var derLen: int64 := peek64(kind + X_DERLEN);
+    var fg: int64 := DerFeldGroesse();
+    var scr: int64 := x509Scr();
+    var f: int64 := scr + XS_ALG;
+    var g: int64 := f + fg;
+    var h: int64 := g + fg;
+    var ob: int64 := scr + XS_KU;
+    // signatureAlgorithm steht direkt hinter dem TBS.
+    var pos: int64 := peek64(kind + X_TBSPOS) + peek64(kind + X_TBSLEN);
+    if (!DerLies(der, derLen, pos, f)) { return 0; }
+    if (DerTag(f) != 0x30) { return 0; }
+    var ende: int64 := DerInhalt(f) + DerInhaltLen(f);
+    if (!DerLies(der, ende, DerInhalt(f), g)) { return 0; }   // OID
+    if (DerNaechste(g) >= ende) { return 0; }                 // keine Parameter
+    if (!DerLies(der, ende, DerNaechste(g), g)) { return 0; }
+    if (DerTag(g) != 0x30) { return 0; }
+    var pEnde: int64 := DerInhalt(g) + DerInhaltLen(g);
+    if (!DerLies(der, pEnde, DerInhalt(g), h)) { return 0; }
+    if (DerTag(h) != 0xA0) { return 0; }                      // [0] hashAlgorithm
+    var innen: int64 := DerInhalt(h) + DerInhaltLen(h);
+    if (!DerLies(der, innen, DerInhalt(h), h)) { return 0; }
+    if (DerTag(h) != 0x30) { return 0; }
+    var aEnde: int64 := DerInhalt(h) + DerInhaltLen(h);
+    if (!DerLies(der, aEnde, DerInhalt(h), h)) { return 0; }
+    if (DerTag(h) != 0x06) { return 0; }
+    // 2.16.840.1.101.3.4.2.{1,2,3} = SHA-256/384/512
+    poke8(ob + 0, 0x60); poke8(ob + 1, 0x86); poke8(ob + 2, 0x48);
+    poke8(ob + 3, 0x01); poke8(ob + 4, 0x65); poke8(ob + 5, 0x03);
+    poke8(ob + 6, 0x04); poke8(ob + 7, 0x02);
+    poke8(ob + 8, 0x01);
+    if (DerOidGleich(der, h, ob, 9)) { return 32; }
+    poke8(ob + 8, 0x02);
+    if (DerOidGleich(der, h, ob, 9)) { return 48; }
+    poke8(ob + 8, 0x03);
+    if (DerOidGleich(der, h, ob, 9)) { return 64; }
     return 0;
 }
 

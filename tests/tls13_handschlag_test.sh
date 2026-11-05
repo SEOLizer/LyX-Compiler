@@ -330,7 +330,7 @@ falscher-hostname -6
 unbekannte-wurzel -6
 gekipptes-byte -5
 verfaelschter-record -5
-speicher-je-verbindung 105808
+speicher-je-verbindung 115440
 SOLLEOF
 
 if ! ( ulimit -v 4000000; timeout 300 "$TMP/s" > "$TMP/ist.txt" 2>"$TMP/err.txt" ); then

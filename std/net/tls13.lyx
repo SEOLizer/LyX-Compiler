@@ -26,13 +26,16 @@
 //   Cipher-Suites    TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384,
 //                    TLS_CHACHA20_POLY1305_SHA256
 //   Schluesseltausch X25519
-//   Signaturen       ecdsa_secp256r1_sha256 (eigene Signatur und Pruefung)
+//   Signaturen       ecdsa_secp256r1_sha256, rsa_pss_rsae_sha256/384/512,
+//                    ed25519 — je mit eigener Signatur und Pruefung
 //   Erweiterungen    supported_versions, supported_groups, key_share,
 //                    server_name (SNI), application_layer_protocol_negotiation
 //   Nicht enthalten  HelloRetryRequest, PSK/0-RTT, Tickets, TLS 1.2,
-//                    secp256r1-Schluesseltausch, RSA- und Ed25519-Signaturen.
+//                    secp256r1 als Schluesseltausch, ecdsa_secp384r1_sha384.
 //                    Jeder dieser Faelle wird mit einem benannten Fehler
-//                    abgewiesen, nicht still uebergangen.
+//                    abgewiesen, nicht still uebergangen. rsa_pkcs1_* ist in
+//                    CertificateVerify nach RFC 8446 §4.2.3 verboten und
+//                    wird darum auch abgewiesen.
 
 unit std.net.tls13;
 
@@ -49,6 +52,8 @@ import std.crypto.ct;
 import std.crypto.der;
 import std.crypto.x509;
 import std.crypto.pkey;
+import std.crypto.rsa_native;
+import std.crypto.ed25519;
 
 // ---------------------------------------------------------------------------
 // Rueckgabewerte von TlsSchritt / TlsLese / TlsSchreibe
@@ -287,7 +292,7 @@ con B_CH:   int64 := 2048;
 // Eintraegen je Funktion und in verschachtelten Rahmen gemessen zu frueh
 // freigab — zwei alloc(8) bekamen dieselbe Adresse, und der Schaden fiel erst
 // im zweiten Handschlag auf.
-con O_SCR:  int64 := 77952;      // 2048 Byte kleine Puffer
+con O_SCR:  int64 := 77952;      // 2432 Byte kleine Puffer
 con S_TP:    int64 := 0;         // Typ/Position/Laenge beim Nachrichtenlesen
 con S_PP:    int64 := 8;
 con S_LP:    int64 := 16;
@@ -314,13 +319,28 @@ con S_WUNSCH:int64 := 1424;      // 3 Suites in Server-Vorliebe
 con S_EXP1:  int64 := 1448;      // 64 Byte Exporter-Zwischenwert
 con S_EXP2:  int64 := 1512;      // 64 Byte Exporter-Kontexthash
 con S_FK:    int64 := 1576;      // 64 Byte finished_key
+con S_SIGBUF: int64 := 1640;     // 512 Byte fertige Signatur (RSA bis 4096 Bit)
+con S_SEED:  int64 := 2152;      // 32 Byte Ed25519-Seed
 
-con O_REC:  int64 := 80000;      // 17408 Byte Recordzusammenbau
-con O_MSG:  int64 := 97408;      // 8192 Byte Nachrichtenzusammenbau
+con O_REC:  int64 := 80384;      // 17408 Byte Recordzusammenbau
+con O_MSG:  int64 := 97792;      // 8192 Byte Nachrichtenzusammenbau
 con B_MSG:  int64 := 8192;
-con V_SIZE: int64 := 105600;
+// Das Zertifikat der Gegenseite wird HIERHER kopiert, bevor es gelesen wird.
+// Der X509-Satz haelt nur Positionen in seinem DER-Puffer; stand dieser
+// Puffer im Empfangsbereich, zeigte der Satz nach dem naechsten Record auf
+// fremde Byte. Gemessen: mit ECDSA und Ed25519 fiel es nicht auf (die
+// folgende CertificateVerify-Nachricht ist kurz), mit RSA wurde der Modulus
+// ueberschrieben und die Pruefung lehnte den eigenen Partner ab.
+con O_CERT:   int64 := 105984;      // 8192 Byte Blattzertifikat
+con B_CERT:   int64 := 8192;
+// Dahinter der RSA-Schluessel der eigenen Seite; seine Groesse kommt aus der
+// Unit, darum als Summe in TlsSpeicherBedarf.
+con O_RSAKEY: int64 := 114176;
+con V_SIZE: int64 := 114176;
 
-pub fn TlsSpeicherBedarf(): int64 { return V_SIZE + X509Groesse(); }
+pub fn TlsSpeicherBedarf(): int64 {
+    return V_SIZE + RsaSchluesselGroesse() + X509Groesse();
+}
 
 fn pIn(c: int64): int64  { return c + O_IN; }
 fn pOut(c: int64): int64 { return c + O_OUT; }
@@ -330,15 +350,17 @@ fn pCh(c: int64): int64  { return c + O_CH; }
 fn pScr(c: int64): int64 { return c + O_SCR; }
 fn pRec(c: int64): int64 { return c + O_REC; }
 fn pMsg(c: int64): int64 { return c + O_MSG; }
+fn pRsa(c: int64): int64 { return c + O_RSAKEY; }
+fn pCert(c: int64): int64 { return c + O_CERT; }
 
 pub fn TlsNeu(cfg: int64): int64 {
-    var c: int64 := alloc(V_SIZE + X509Groesse());
+    var c: int64 := alloc(TlsSpeicherBedarf());
     if (c == 0) { return 0; }
     var i: int64 := 0;
     while (i < V_KOPF) { poke8(c + i, 0); i := i + 1; }
     poke64(c + V_CFG, cfg);
     poke64(c + V_ROLLE, peek64(cfg + C_ROLLE));
-    poke64(c + V_PEERCERT, c + V_SIZE);
+    poke64(c + V_PEERCERT, c + V_SIZE + RsaSchluesselGroesse());
     if (peek64(cfg + C_ROLLE) == 1) {
         poke64(c + V_ZUSTAND, Z_WARTE_CH);
     } else {
@@ -351,7 +373,7 @@ pub fn TlsFrei(c: int64): void {
     if (c == 0) { return; }
     // Schluessel und Geheimnisse nicht im Speicher liegen lassen.
     SecureZero(c + V_SEC_HS, V_KOPF - V_SEC_HS);
-    free(c, V_SIZE + X509Groesse());
+    free(c, TlsSpeicherBedarf());
 }
 
 pub fn TlsZustand(c: int64): int64 { return peek64(c + V_ZUSTAND); }
@@ -868,9 +890,15 @@ fn clientHelloSenden(c: int64): int64 {
     p := w16(buf, p, 36);
     p := w16(buf, p, 0x001d); p := w16(buf, p, 32);
     p := wBytes(buf, p, c + V_EPH_PK, 32);
-    // signature_algorithms: ecdsa_secp256r1_sha256
-    p := w16(buf, p, 13); p := w16(buf, p, 4);
-    p := w16(buf, p, 2); p := w16(buf, p, 0x0403);
+    // signature_algorithms (RFC 8446 §4.2.3), in unserer Vorliebe:
+    // ecdsa_secp256r1_sha256, rsa_pss_rsae_sha256/384/512, ed25519
+    p := w16(buf, p, 13); p := w16(buf, p, 12);
+    p := w16(buf, p, 10);
+    p := w16(buf, p, 0x0403);
+    p := w16(buf, p, 0x0804);
+    p := w16(buf, p, 0x0805);
+    p := w16(buf, p, 0x0806);
+    p := w16(buf, p, 0x0807);
     // server_name
     var hostLen: int64 := peek64(cfg + C_HOSTLEN);
     if (peek64(cfg + C_HOST) != 0 && hostLen > 0) {
@@ -941,8 +969,13 @@ fn certRequestSenden(c: int64): int64 {
     p += 2;
     var extStart: int64 := p;
     // signature_algorithms ist Pflicht in CertificateRequest (§4.3.2)
-    p := w16(buf, p, 13); p := w16(buf, p, 4);
-    p := w16(buf, p, 2); p := w16(buf, p, 0x0403);
+    p := w16(buf, p, 13); p := w16(buf, p, 12);
+    p := w16(buf, p, 10);
+    p := w16(buf, p, 0x0403);
+    p := w16(buf, p, 0x0804);
+    p := w16(buf, p, 0x0805);
+    p := w16(buf, p, 0x0806);
+    p := w16(buf, p, 0x0807);
     w16(buf, extLenPos, p - extStart);
     return hsSenden(c, HS_CERT_REQUEST, buf, p);
 }
@@ -986,34 +1019,76 @@ fn signaturInhalt(c: int64, serverRolle: bool, out: int64): int64 {
     return p;
 }
 
-fn certVerifySenden(c: int64, serverRolle: bool): int64 {
+// Eigene Schluesselart bestimmen: 1 = EC secp256r1, 3 = RSA, 4 = Ed25519,
+// 0 = nicht lesbar. Die Reihenfolge der Versuche ist festgelegt, damit ein
+// Schluessel nicht zufaellig als etwas anderes gelesen wird.
+fn eigeneSchluesselart(c: int64): int64 {
     var cfg: int64 := peek64(c + V_CFG);
+    var der: int64 := peek64(cfg + C_KEY);
+    var len: int64 := peek64(cfg + C_KEYLEN);
+    if (der == 0 || len <= 0) { return 0; }
     var priv: int64 := pScr(c) + S_PRIV;
-    var kurve: int64 := PkeyLiesEcPrivat(peek64(cfg + C_KEY), peek64(cfg + C_KEYLEN), priv);
-    if (kurve != 1) {                                     // nur secp256r1
+    if (PkeyLiesEcPrivat(der, len, priv) == 1) { return 1; }
+    if (RsaPrivAusPkcs8(der, len, pRsa(c))) { return 3; }
+    if (RsaPrivAusPkcs1(der, len, pRsa(c))) { return 3; }
+    if (Ed25519PrivAusPkcs8(der, len, pScr(c) + S_SEED)) { return 4; }
+    return 0;
+}
+
+fn certVerifySenden(c: int64, serverRolle: bool): int64 {
+    var scr: int64 := pScr(c);
+    var art: int64 := eigeneSchluesselart(c);
+    if (art == 0) { return E_KONFIG; }
+
+    var inhalt: int64 := scr + S_SIG;
+    var len: int64 := signaturInhalt(c, serverRolle, inhalt);
+    var buf: int64 := scr + S_CVBUF;
+    var sigBuf: int64 := scr + S_SIGBUF;
+
+    if (art == 1) {
+        // ecdsa_secp256r1_sha256
+        var priv: int64 := scr + S_PRIV;
+        var hash: int64 := scr + S_HASH;
+        var r: int64 := scr + S_R;
+        var s: int64 := scr + S_S;
+        var der: int64 := scr + S_DER;
+        SHA256(inhalt, len, hash);
+        if (!EcdsaSign(EC_P256, hash, priv, r, s)) { SecureZero(priv, 48); return E_SIGNATUR; }
+        var derLen: int64 := EcdsaSigToDer(r, s, der);
+        var p1: int64 := w16(buf, 0, 0x0403);
+        p1 := w16(buf, p1, derLen);
+        p1 := wBytes(buf, p1, der, derLen);
         SecureZero(priv, 48);
-        return E_UNTERSTUETZT;
+        return hsSenden(c, HS_CERT_VERIFY, buf, p1);
     }
 
-    var inhalt: int64 := pScr(c) + S_SIG;
-    var hash: int64 := pScr(c) + S_HASH;
-    var r: int64 := pScr(c) + S_R;
-    var s: int64 := pScr(c) + S_S;
-    var der: int64 := pScr(c) + S_DER;
-    var buf: int64 := pScr(c) + S_CVBUF;
-    var len: int64 := signaturInhalt(c, serverRolle, inhalt);
-    SHA256(inhalt, len, hash);
-    if (!EcdsaSign(EC_P256, hash, priv, r, s)) {
-        SecureZero(priv, 48);
-        return E_SIGNATUR;
+    if (art == 3) {
+        // rsa_pss_rsae_sha256 (RFC 8446 §4.2.3: PSS ist fuer TLS 1.3 Pflicht,
+        // PKCS#1 v1.5 ist dort NICHT erlaubt)
+        var hash2: int64 := scr + S_HASH;
+        SHA256(inhalt, len, hash2);
+        var sl: int64 := RsaSignPss(pRsa(c), 32, hash2, sigBuf);
+        if (sl <= 0) { return E_SIGNATUR; }
+        if (sl > 480) { return E_PUFFER; }
+        var p2: int64 := w16(buf, 0, 0x0804);
+        p2 := w16(buf, p2, sl);
+        // Der Rumpf passt nicht in S_CVBUF (128 Byte) — darum direkt in den
+        // Nachrichtenpuffer schreiben.
+        var mb: int64 := pMsg(c) + 4096;
+        var p3: int64 := w16(mb, 0, 0x0804);
+        p3 := w16(mb, p3, sl);
+        p3 := wBytes(mb, p3, sigBuf, sl);
+        return hsSenden(c, HS_CERT_VERIFY, mb, p3);
     }
-    var derLen: int64 := EcdsaSigToDer(r, s, der);
-    var p: int64 := w16(buf, 0, 0x0403);                  // ecdsa_secp256r1_sha256
-    p := w16(buf, p, derLen);
-    p := wBytes(buf, p, der, derLen);
-    var rc: int64 := hsSenden(c, HS_CERT_VERIFY, buf, p);
-    SecureZero(priv, 48);
-    return rc;
+
+    // Ed25519 signiert den Inhalt selbst, ohne Vorhash.
+    var seed: int64 := scr + S_SEED;
+    Ed25519Sign(seed, inhalt, len, sigBuf);
+    SecureZero(seed, 32);
+    var p4: int64 := w16(buf, 0, 0x0807);
+    p4 := w16(buf, p4, 64);
+    p4 := wBytes(buf, p4, sigBuf, 64);
+    return hsSenden(c, HS_CERT_VERIFY, buf, p4);
 }
 
 // verify_data = HMAC(finished_key, Transcript-Hash) (§4.4.4)
@@ -1266,7 +1341,13 @@ fn certLesen(c: int64, pos: int64, len: int64, serverSeite: bool): int64 {
     }
     if (n == 0) { return E_FORMAT; }
 
-    if (!X509Lies(peek64(kette), peek64(kette + 8), peek64(c + V_PEERCERT))) {
+    // Das Blatt in den Verbindungsblock kopieren: der Satz lebt laenger als
+    // der Empfangspuffer, aus dem es gerade stammt.
+    var bl: int64 := peek64(kette + 8);
+    if (bl > B_CERT) { return E_PUFFER; }
+    var kop: int64 := 0;
+    while (kop < bl) { poke8(pCert(c) + kop, peek8(peek64(kette) + kop)); kop += 1; }
+    if (!X509Lies(pCert(c), bl, peek64(c + V_PEERCERT))) {
         return E_ZERTIFIKAT;
     }
     poke64(c + V_PEERCERTOK, 1);
@@ -1291,29 +1372,56 @@ fn certLesen(c: int64, pos: int64, len: int64, serverSeite: bool): int64 {
 // CertificateVerify gegen den Schluessel aus dem Zertifikat der Gegenseite.
 fn certVerifyLesen(c: int64, pos: int64, len: int64, gegenseiteIstServer: bool): int64 {
     if (len < 4) { return E_FORMAT; }
-    if (r16(pos, 0) != 0x0403) { return E_UNTERSTUETZT; }   // nur ecdsa_secp256r1_sha256
+    var schema: int64 := r16(pos, 0);
     var sigLen: int64 := r16(pos, 2);
     if (4 + sigLen > len) { return E_FORMAT; }
+    var sig: int64 := pos + 4;
 
     var satz: int64 := peek64(c + V_PEERCERT);
     if (peek64(c + V_PEERCERTOK) == 0) { return E_ABLAUF; }
-    if (X509KeyAlg(satz) != 1) { return E_UNTERSTUETZT; }
     var der: int64 := X509DerPuffer(satz);
     var kPos: int64 := der + X509PubKeyPos(satz);
-    if (X509PubKeyLen(satz) != 65 || (peek8(kPos) & 0xFF) != 4) { return E_UNTERSTUETZT; }
+    var kLen: int64 := X509PubKeyLen(satz);
+    var keyAlg: int64 := X509KeyAlg(satz);
 
-    var inhalt: int64 := pScr(c) + S_SIG;
-    var hash: int64 := pScr(c) + S_HASH;
-    var r: int64 := pScr(c) + S_R;
-    var s: int64 := pScr(c) + S_S;
+    var scr: int64 := pScr(c);
+    var inhalt: int64 := scr + S_SIG;
     var l: int64 := signaturInhalt(c, gegenseiteIstServer, inhalt);
-    SHA256(inhalt, l, hash);
-    var ok: bool := false;
-    if (EcdsaSigFromDer(pos + 4, sigLen, r, s)) {
-        ok := EcdsaVerify(EC_P256, hash, kPos + 1, kPos + 33, r, s);
+    var hash: int64 := scr + S_HASH;
+
+    if (schema == 0x0403) {
+        if (keyAlg != 1 || kLen != 65 || (peek8(kPos) & 0xFF) != 4) { return E_UNTERSTUETZT; }
+        var r: int64 := scr + S_R;
+        var s: int64 := scr + S_S;
+        SHA256(inhalt, l, hash);
+        if (!EcdsaSigFromDer(sig, sigLen, r, s)) { return E_SIGNATUR; }
+        if (!EcdsaVerify(EC_P256, hash, kPos + 1, kPos + 33, r, s)) { return E_SIGNATUR; }
+        return 0;
     }
-    if (!ok) { return E_SIGNATUR; }
-    return 0;
+
+    if (schema == 0x0804 || schema == 0x0805 || schema == 0x0806) {
+        if (keyAlg != 3) { return E_UNTERSTUETZT; }
+        if (!RsaPubAusDer(kPos, kLen, pRsa(c))) { return E_UNTERSTUETZT; }
+        var hl: int64 := 32;
+        if (schema == 0x0805) { hl := 48; }
+        if (schema == 0x0806) { hl := 64; }
+        if (hl == 32) { SHA256(inhalt, l, hash); }
+        if (hl == 48) { Sha384(inhalt, l, hash); }
+        if (hl == 64) { Sha512(inhalt, l, hash); }
+        if (!RsaVerifyPss(pRsa(c), hl, hash, sig, sigLen)) { return E_SIGNATUR; }
+        return 0;
+    }
+
+    if (schema == 0x0807) {
+        if (keyAlg != 4 || kLen != 32) { return E_UNTERSTUETZT; }
+        if (sigLen != 64) { return E_SIGNATUR; }
+        if (!Ed25519Verify(sig, inhalt, l, kPos)) { return E_SIGNATUR; }
+        return 0;
+    }
+
+    // Alles andere — darunter rsa_pkcs1_*, das RFC 8446 §4.2.3 fuer
+    // CertificateVerify ausdruecklich verbietet — wird abgewiesen.
+    return E_UNTERSTUETZT;
 }
 
 fn finishedLesen(c: int64, pos: int64, len: int64, secret: int64): int64 {
@@ -1453,6 +1561,7 @@ fn serverClientHello(c: int64): int64 {
         || peek64(cfg + C_KEY) == 0) {
         return fehlerSetzen(c, E_KONFIG);
     }
+    if (eigeneSchluesselart(c) == 0) { return fehlerSetzen(c, E_KONFIG); }
     var tp: int64 := pScr(c) + S_TP;
     var pp: int64 := pScr(c) + S_PP;
     var lp: int64 := pScr(c) + S_LP;
