@@ -8781,6 +8781,90 @@ pub type Codegen = class {
     return 1;
   }
 
+  // #2375: Die reine KOPIE als eigener Kern — laden und speichern, ohne
+  // Rechenbefehl und ohne Aufruf.
+  //
+  // WARUM NICHT `_lyx_memcpy`. Der Helfer (T1.3) kopiert dasselbe und hat
+  // eine gemessene Groessenweiche; eine Weiche darauf war die erste Fassung
+  // dieses Schrittes. Sie kostet aber einen Aufruf samt Laengenaufbau, und
+  // der traegt sich erst ab rund zehn Byte. GEMESSEN (i5-8250U, taskset -c 2,
+  // 7 A/B-Paare, Median, gleiche Gesamtarbeit je Groesse), Weiche auf den
+  // Helfer gegen die skalare Schleife:
+  //
+  //      n Byte          2      4      6      8     12     16     64   1024
+  //      Weiche       0,36x  0,59x  0,73x  0,91x  1,20x  1,25x  1,86x  2,39x
+  //      dieser Kern  (Schwelle: skalar)              1,42x  2,01x  2,43x
+  //
+  // Der Kern ist oberhalb eines Blocks durchgehend schneller als die Weiche
+  // (kein Aufruf), und unterhalb laeuft er gar nicht: die Schwelle in
+  // cg_vmEmit schickt kurze Kopien in die skalare Fassung, BEVOR die
+  // Ueberlappungspruefungen stehen. Ohne diese Schwelle lag der Kern bei
+  // zwei Byte auf 0,46x — der Aufbau allein kostet dort mehr als die
+  // ganze Kopie.
+  //
+  // Geladen und gespeichert wird mit MOVDQU (#2372): die Basis kann ein
+  // beliebig ausgerichteter Zeiger sein.
+  //
+  // Aufbau wie cg_emitSSE2Neg, nur ohne den xorps-Schritt: 16 Byte je
+  // Durchlauf, danach Element fuer Element (#2184 — sonst liest und schreibt
+  // der letzte Block hinter das Ende).
+  fn cg_emitSSE2Kopie(bytes: int64) {
+    if (bytes != 1 && bytes != 2 && bytes != 4 && bytes != 8) {
+      EPrintStrLn("lyxc: interner Fehler (#2375): Kopierschleife mit einer Elementbreite, die es nicht gibt."c);
+      exit(70);
+    }
+    var schub: int64 := 2;
+    if (bytes == 1) { schub := 0; }
+    if (bytes == 2) { schub := 1; }
+    if (bytes == 8) { schub := 3; }
+    self.cg_e8(0x31); self.cg_e8(0xC0);                                      // xor eax, eax
+    if (schub > 0) { self.cg_e8(0x48); self.cg_e8(0xC1); self.cg_e8(0xE1); self.cg_e8(schub); }  // shl rcx, schub
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xE9); self.cg_e8(0x10);  // sub rcx, 16
+
+    // ---- Vektorteil: while (rax <= rcx), unten geprueft (#2215) ----
+    self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xC8);                    // cmp rax, rcx
+    self.cg_e8(0x7F); var jgPos: int64 := self.codeLen; self.cg_e8(0);       // jg .tail
+    var vecBody: int64 := self.codeLen;
+    self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0x04); self.cg_e8(0x07);  // movdqu xmm0, [rdi+rax]
+    self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x7F); self.cg_e8(0x04); self.cg_e8(0x02);  // movdqu [rdx+rax], xmm0
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(0x10);  // add rax, 16
+    // #2339: Fuellung VOR den Rumpf, nicht hinein.
+    vecBody := vecBody + self.cg_rumpfAusrichten(vecBody, 5);
+    self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xC8);                    // cmp rax, rcx
+    self.cg_e8(0x7E); var vecBackPos: int64 := self.codeLen;
+    self.cg_e8(vecBody - (vecBackPos + 1));                                  // jle Rumpf
+
+    // ---- Rest: Element fuer Element ----
+    var tailStart: int64 := self.codeLen;
+    // #2339: ausdruecklich gegen jgPos gerechnet, nicht gegen vecBody — eine
+    // Fuellung vor dem Rumpf bricht sonst den Sprung.
+    cg_patchRel8Wert(self.code, jgPos, tailStart - (jgPos + 1));
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC1); self.cg_e8(0x10);  // add rcx, 16
+    var scalarStart: int64 := self.codeLen;
+    self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xC8);                    // cmp rax, rcx
+    self.cg_e8(0x7D); var jgePos: int64 := self.codeLen; self.cg_e8(0);      // jge .done
+    var scalarBody: int64 := self.codeLen;
+    // r8 = [rdi+rax], dann [rdx+rax] = r8 — nur die Breite selbst, damit
+    // nichts neben das Element geschrieben wird (#2199). Dieselben
+    // Bytefolgen wie in cg_emitGanzRestOp; wer eine Breite aendert, muss
+    // beide Stellen anfassen.
+    if (bytes == 1)      { self.cg_e8(0x44); self.cg_e8(0x8A); self.cg_e8(0x04); self.cg_e8(0x07); }                   // mov r8b, [rdi+rax]
+    else if (bytes == 2) { self.cg_e8(0x66); self.cg_e8(0x44); self.cg_e8(0x8B); self.cg_e8(0x04); self.cg_e8(0x07); } // mov r8w, [rdi+rax]
+    else if (bytes == 4) { self.cg_e8(0x44); self.cg_e8(0x8B); self.cg_e8(0x04); self.cg_e8(0x07); }                   // mov r8d, [rdi+rax]
+    else                 { self.cg_e8(0x4C); self.cg_e8(0x8B); self.cg_e8(0x04); self.cg_e8(0x07); }                   // mov r8,  [rdi+rax]
+    if (bytes == 1)      { self.cg_e8(0x44); self.cg_e8(0x88); self.cg_e8(0x04); self.cg_e8(0x02); }
+    else if (bytes == 2) { self.cg_e8(0x66); self.cg_e8(0x44); self.cg_e8(0x89); self.cg_e8(0x04); self.cg_e8(0x02); }
+    else if (bytes == 4) { self.cg_e8(0x44); self.cg_e8(0x89); self.cg_e8(0x04); self.cg_e8(0x02); }
+    else                 { self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0x04); self.cg_e8(0x02); }
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(bytes); // add rax, Breite
+    self.cg_e8(0xEB); var scalarBackPos: int64 := self.codeLen;
+    self.cg_e8(scalarStart - (scalarBackPos + 1));                           // jmp .scalarStart
+
+    var donePos: int64 := self.codeLen;
+    cg_patchRel8Wert(self.code, jgePos, donePos - scalarBody);
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xD0);                    // mov rax, rdx
+  }
+
   fn cg_emitSSE2BinOp(op: int64, kennung: int64) {
     // #2199: Bytezahl = Elementzahl * Elementbreite; der 16-Byte-Block fasst
     // vier f32 oder zwei f64. Die packed-Form waehlt das Praefix (kein
@@ -24396,23 +24480,47 @@ pub type Codegen = class {
         if (mv == soll) { wert := self.cg_nc0(wert); }
       }
     }
-    if (wert < 0 || self.cg_nkind(wert) != CGN_BINOP) { return self._vmNein("VALUE_NOT_BINOP"c); }
-    var op: int64 := self.cg_nival(wert);
-    if (op != CGT_PLUS && op != CGT_MINUS && op != CGT_STAR) { return self._vmNein("OP_NOT_VECTORIZABLE"c); }
-    var vOpc: int64 := self.cg_sseGanzOpcode(op, breite);
+    // #2375: Die reine KOPIE hat keinen Operator — der Wert ist ein
+    // einzelnes `peekW` derselben Breite. Sie wird als Sonderfall gefuehrt
+    // und nicht als Binop mit neutralem Element: ein `+ 0` daneben waere ein
+    // zweiter Ladebefehl und ein Rechenbefehl, die beide nichts tun.
+    //
+    // `kopie` traegt den Fall bis in den Emitter. Die rechte Leseseite wird
+    // auf DIESELBE gesetzt wie die linke; damit laufen die
+    // Ueberlappungspruefungen weiter ueber beide Paare, das zweite Paar ist
+    // dann nur dieselbe Aussage zweimal — richtig, aber redundant.
+    var kopie: int64 := 0;
+    if (wert >= 0 && self.cg_nkind(wert) == CGN_CALL
+        && self.cg_vmBreiteVonName(self.cg_nsval(wert), self.cg_nslen(wert), 1) == breite) {
+      kopie := 1;
+    }
+    if (kopie == 0 && (wert < 0 || self.cg_nkind(wert) != CGN_BINOP)) { return self._vmNein("VALUE_NOT_BINOP"c); }
+    var op: int64 := CGT_PLUS;
+    if (kopie == 0) { op := self.cg_nival(wert); }
+    if (kopie == 0 && op != CGT_PLUS && op != CGT_MINUS && op != CGT_STAR) { return self._vmNein("OP_NOT_VECTORIZABLE"c); }
+    // #2375: Die Kopie braucht keinen Rechenbefehl, also auch keine Zusage
+    // ueber einen. Die drei Pruefungen darunter gelten nur fuer die
+    // Rechenform; fuer die Kopie waeren sie eine Forderung ohne Gegenstand.
+    var vOpc: int64 := 0;
+    if (kopie == 0) { vOpc := self.cg_sseGanzOpcode(op, breite); }
     // #2336: fuer `int8 *` gibt es keinen gepackten Befehl, aber einen
     // eigenen Weg (Entpacken, PMULLW, Zurueckpacken).
-    if (vOpc < 0 && self.cg_sseGanzSonderweg(op, breite) == 0) { return self._vmNein("NO_VECTOR_OPCODE"c); }
+    if (kopie == 0 && vOpc < 0 && self.cg_sseGanzSonderweg(op, breite) == 0) { return self._vmNein("NO_VECTOR_OPCODE"c); }
     // #2194: Befehle aus der 0F-38-Gruppe (PMULLD) brauchen die sse4-Zusage.
     // Bei `parallel Array` ist ein Abbruch dort richtig — wer Vektoren
     // schreibt, hat sie verlangt. Hier wird AUTOMATISCH umgeformt: eine
     // CPU-Forderung zu erheben, die im Quelltext niemand gestellt hat,
     // machte aus einem uebersetzbaren Programm einen Fehler. Deckt die
     // Ziel-CPU es nicht, bleibt es bei der skalaren Schleife.
-    if (vOpc > 255 && self.cg_cpuHat(1) == 0) { return self._vmNein("NO_SSE4_FOR_PMULLD"c); }
+    if (kopie == 0 && vOpc > 255 && self.cg_cpuHat(1) == 0) { return self._vmNein("NO_SSE4_FOR_PMULLD"c); }
     // Beide Leseseiten: peekW derselben Breite auf derselben Indexform.
-    var lN: int64 := self.cg_nc0(wert);
-    var rN: int64 := self.cg_nc1(wert);
+    // #2375: bei der Kopie ist der Wert selbst die (einzige) Leseseite.
+    var lN: int64 := wert;
+    var rN: int64 := wert;
+    if (kopie == 0) {
+      lN := self.cg_nc0(wert);
+      rN := self.cg_nc1(wert);
+    }
     if (lN < 0 || rN < 0) { return self._vmNein("LOAD_SIDE_MISSING"c); }
     if (self.cg_nkind(lN) != CGN_CALL || self.cg_nkind(rN) != CGN_CALL) { return self._vmNein("LOAD_NOT_CALL"c); }
     if (self.cg_vmBreiteVonName(self.cg_nsval(lN), self.cg_nslen(lN), 1) != breite) { return self._vmNein("LOAD_LEFT_WIDTH_MISMATCH"c); }
@@ -24466,6 +24574,7 @@ pub type Codegen = class {
     poke64(kasten + 88, aKn);    // #2363: -1 = Rahmenversatz gilt, sonst Knoten
     poke64(kasten + 96, bKn);
     poke64(kasten + 104, cKn);
+    poke64(kasten + 112, kopie);   // #2375: 1 = reine Kopie, kein Rechenbefehl
     return 1;
   }
 
@@ -24522,6 +24631,25 @@ pub type Codegen = class {
     if (breite == 2) { schub := 1; }
     if (breite == 4) { schub := 2; }
 
+    // #2375: Bei der KOPIE wird zuerst die Laenge geprueft und erst dann der
+    // Zeigeraufbau erzeugt. Der Aufbau sind drei Ladevorgaenge, und sie
+    // liefen sonst bei JEDEM Schleifeneintritt — auch dann, wenn die
+    // Schwelle gleich danach in die skalare Fassung schickt. GEMESSEN kostete
+    // genau das unter der Schwelle noch 9 bis 18 %.
+    //
+    // Fuer die Rechenform bleibt die Folge unveraendert (Zeiger, dann
+    // Schranke, dann Vergleich): dieser Zweig muss bitgleich bleiben.
+    var kopie: int64 := peek64(kasten + 112);
+    var jKlein: int64 := 0 - 1;
+    if (kopie != 0) {
+      self.cg_vmSchrankeNachRax(kasten);                                           // #2350
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC1);                        // mov rcx, rax
+      // Ein voller Vektorblock, also 16/Breite Elemente. Darunter traegt der
+      // Vektorweg sich nicht; die Zahlen stehen an cg_emitSSE2Kopie.
+      self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xF9); self.cg_e8(16 >> schub);  // cmp rcx, 16/Breite
+      self.cg_e8(0x0F); self.cg_e8(0x8C);                                          // jl skalar
+      jKlein := self.codeLen; self.cg_e32(0);
+    }
     // rdi = a, rsi = b, rdx = c, rcx = n
     if (aKn < 0 && bKn < 0 && cKn < 0) {
       // Bestehender Weg, Byte fuer Byte unveraendert: alle drei Zeiger sind
@@ -24548,20 +24676,33 @@ pub type Codegen = class {
       self.cg_e8(0x5E);                                                            // pop rsi  (b)
       self.cg_e8(0x5F);                                                            // pop rdi  (a)
     }
-    self.cg_vmSchrankeNachRax(kasten);                                             // #2350
-    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC1);                          // mov rcx, rax
+    if (kopie != 0) {
+      // #2375: rcx noch einmal setzen. Oben steht die Schranke schon in rcx,
+      // damit die Schwelle VOR dem Zeigeraufbau greift — aber bei einer
+      // Ausdrucksbasis (#2363) laeuft dazwischen `cg_genExpr`, und das darf
+      // rcx benutzen. Auf rcx zu vertrauen waere eine stille Annahme ueber
+      // fremden Code. Die zweite Ladung kostet nur den Vektorweg; der kurze
+      // Weg ist oben schon abgebogen.
+      self.cg_vmSchrankeNachRax(kasten);                                           // #2350
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC1);                        // mov rcx, rax
+    }
+    if (kopie == 0) {
+      self.cg_vmSchrankeNachRax(kasten);                                           // #2350
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC1);                        // mov rcx, rax
 
-    // Leere oder negative Laenge: skalar. Die Vektorschleife rechnet mit
-    // rcx - 16 als letztem vollen Block; mit rcx <= 0 waere das Verhalten
-    // nicht offensichtlich, und Offensichtlichkeit ist hier mehr wert als
-    // ein gesparter Vergleich.
-    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xF9); self.cg_e8(0x01);        // cmp rcx, 1
-    self.cg_e8(0x0F); self.cg_e8(0x8C);                                            // jl skalar
-    var jKlein: int64 := self.codeLen; self.cg_e32(0);
+      // Leere oder negative Laenge: skalar. Die Vektorschleife rechnet mit
+      // rcx - 16 als letztem vollen Block; mit rcx <= 0 waere das Verhalten
+      // nicht offensichtlich, und Offensichtlichkeit ist hier mehr wert als
+      // ein gesparter Vergleich.
+      self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xF9); self.cg_e8(0x01);      // cmp rcx, 1
+      self.cg_e8(0x0F); self.cg_e8(0x8C);                                          // jl skalar
+      jKlein := self.codeLen; self.cg_e32(0);
+    }
 
     // r8 = Laenge in Byte = rcx << schub
     self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xC8);                          // mov r8, rcx
     if (schub > 0) { self.cg_e8(0x49); self.cg_e8(0xC1); self.cg_e8(0xE0); self.cg_e8(schub); }  // shl r8, schub
+
 
     // Ueberlappung Ziel/links: erlaubt, wenn c + len <= a ODER a + len <= c.
     // r9 = c + len, r10 = a + len
@@ -24637,9 +24778,22 @@ pub type Codegen = class {
     // internen Fehler von cg_emitAVX2BinOp (Opcode -1) und BRAECHE die
     // Uebersetzung ab — ein Abbruch waere hier schlimmer als die schmalere
     // Fassung. Eine AVX2-Folge ist moeglich und als Rest gefuehrt.
+    if (peek64(kasten + 112) != 0) {
+      // #2375: reine Kopie — eigener Kern, kein Aufruf. Warum nicht die
+      // Weiche auf `_lyx_memcpy`: siehe cg_emitSSE2Kopie, dort stehen die
+      // Messzahlen beider Fassungen.
+      //
+      // Nur SSE2, keine CPU-Forderung: eine automatische Umformung darf aus
+      // einem uebersetzbaren Programm keinen Fehler machen (wie #2327 bei
+      // PMULLD). Eine AVX2-Fassung waere moeglich; oberhalb des letzten
+      // Caches entscheidet aber die Speicherbandbreite, und dort hat die
+      // doppelte Breite in #2205 nichts gebracht. Als Rest gefuehrt.
+      self.cg_emitSSE2Kopie(breite);
+    } else {
     var sonder: int64 := self.cg_sseGanzSonderweg(op, breite);
     if (self.cg_cpuHat(2) != 0 && sonder == 0) { self.cg_emitAVX2BinOp(op, kennung); }
     else                                       { self.cg_emitSSE2BinOp(op, kennung); }
+    }
 
     // Die skalare Schleife verliesse i mit dem ersten Wert, fuer den
     // `i < n` nicht mehr gilt — also n. Code hinter der Schleife darf das
@@ -24955,7 +25109,7 @@ pub type Codegen = class {
     // skalare Fassung bleibt vollstaendig stehen — sie traegt den Fall mit
     // Ueberlappung und ist der Vergleichsweg der Tests.
     var vmUeber: int64 := 0 - 1;
-    var vmKasten: int64 := alloc(112);  // #2350: Art/Wert/Objekt-/Feldversatz der Schranke; #2363: [88..104] Basisknoten der drei Zeiger
+    var vmKasten: int64 := alloc(120);  // #2350: Art/Wert/Objekt-/Feldversatz der Schranke; #2363: [88..104] Basisknoten der drei Zeiger; #2375: [112] Kopiermarke
     if (self.cg_vmErkennen(ni, vmKasten) != 0) { vmUeber := self.cg_vmEmit(vmKasten); }
     // #2335: sonst vielleicht eine Reduktion. Die beiden Formen schliessen
     // sich aus — die eine schreibt in ein Feld, die andere in ein Local —,

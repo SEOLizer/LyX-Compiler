@@ -73,12 +73,19 @@ lauf() { # $1 = Name, $2 = zusaetzliche Schalter
 
 gruende() { # $1 = Name — Zeilen "outcome reason count" des Vektorisierers
   ( cd "$TMP" && timeout 200 "$LYXC" --std-path="$ROOT" --compile-profile --compile-profile-level=detailed "$1.lyx" -o "$1.p" ) >"$TMP/$1.plog" 2>&1 || { echo "BAUFEHLER"; return; }
-  python3 - "$TMP/$1.p.lyxc-profile.json" <<'PY'
+  python3 - "$TMP/$1.p.lyxc-profile.json" "$1.lyx" <<'PY'
 import json,sys
 d=json.load(open(sys.argv[1]))
-for x in d.get('decision_summary',[]):
-    if x.get('pass_id')=='vectorize':
-        print('%s %s %d' % (x.get('outcome'), x.get('reason_code'), x.get('count')))
+# NUR Entscheidungen aus der eigenen Quelldatei. decision_summary zaehlt die
+# GANZE Uebersetzung, also auch die importierten Einheiten -- seit #2375 wird
+# eine Kopierschleife in std/io.lyx (ReadLine) vektorisiert, womit jedes
+# Programm ein `applied` enthaelt und jede Gegenprobe stumm gruen waere.
+eigen = sys.argv[2]
+for x in d.get('decisions',[]):
+    if x.get('pass_id')!='vectorize': continue
+    f = (x.get('location') or {}).get('file') or ''
+    if f.endswith(eigen):
+        print('%s %s' % (x.get('outcome'), x.get('reason_code')))
 PY
 }
 

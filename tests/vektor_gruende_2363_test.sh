@@ -54,12 +54,19 @@ EOF
 # Liefert die Gruende des Vektorisierers aus dem Profil, einer je Zeile.
 gruende() { # $1 = Name
   ( cd "$TMP" && "$LYXC" --std-path="$ROOT" --compile-profile --compile-profile-level=detailed "$1.lyx" -o "$1" ) >"$TMP/$1.blog" 2>&1 || { echo "BAUFEHLER"; return; }
-  python3 - "$TMP/$1.lyxc-profile.json" <<'PY'
+  python3 - "$TMP/$1.lyxc-profile.json" "$1.lyx" <<'PY'
 import json,sys
 d=json.load(open(sys.argv[1]))
-for x in d.get('decision_summary',[]):
-    if x.get('pass_id')=='vectorize':
-        print('%s %s %d' % (x.get('outcome'), x.get('reason_code'), x.get('count')))
+# NUR Entscheidungen aus der eigenen Quelldatei. decision_summary zaehlt die
+# GANZE Uebersetzung, also auch die importierten Einheiten -- seit #2375 wird
+# eine Kopierschleife in std/io.lyx (ReadLine) vektorisiert, womit jedes
+# Programm ein `applied` enthaelt und jede Gegenprobe stumm gruen waere.
+eigen = sys.argv[2]
+for x in d.get('decisions',[]):
+    if x.get('pass_id')!='vectorize': continue
+    f = (x.get('location') or {}).get('file') or ''
+    if f.endswith(eigen):
+        print('%s %s' % (x.get('outcome'), x.get('reason_code')))
 PY
 }
 
@@ -70,14 +77,14 @@ pruefe() { # $1 = Name, $2 = erwarteter Grund, $3 = Rumpf
     no "$1" "uebersetzt nicht: $(grep -m1 -iE 'error|lyxc:' "$TMP/$1.blog")"
     return
   fi
-  if echo "$G" | grep -q "rejected $2 "; then
+  if echo "$G" | grep -qx "rejected $2"; then
     ok "$1 -> $2"
   else
     no "$1" "erwartet '$2', Profil nennt: $(echo "$G" | tr '\n' '; ')"
   fi
   # Gegenprobe: kein alter Sammelname mehr.
   for alt in STORE_WIDTH_UNKNOWN HELPER_INIT_NOT_MUL HELPER_INIT_NOT_BINOP STORE_INDEX_FORM_MISMATCH; do
-    if echo "$G" | grep -q " $alt "; then no "$1/Sammelname" "$alt steht noch im Profil"; fi
+    if echo "$G" | grep -qx "rejected $alt"; then no "$1/Sammelname" "$alt steht noch im Profil"; fi
   done
 }
 
