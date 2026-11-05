@@ -86,8 +86,16 @@ pruefe poke64 STORE_WIDTH_POKE64 '  while (i < n) { poke64(c + i * 8, i); i := i
 pruefe kein_poke STORE_WIDTH_NOT_POKE '  while (i < n) { hilf(i); i := i + 1; }'
 
 # ── STORE_INDEX_* / STORE_BASE_* ─────────────────────────────────────────
-# `c + k + i` ist `((c + k) + i)`: der linke Summand ist kein Bezeichner mehr.
-pruefe basis_summe STORE_BASE_NOT_LOCAL '  while (i < n) { poke8(c + k + i, i); i := i + 1; }'
+# `c + i + i` ist `((c + i) + i)`: der linke Summand ist kein Bezeichner mehr
+# UND haengt am Zaehler.
+#
+# Hier stand bis Schritt 2 von #2363 `c + k + i`, also eine Basis, die nur
+# kein Bezeichner war. Schritt 2 nimmt diese Form an (`cg_vmBasisKnoten`), der
+# Fall waere also rot geworden — ein Test darf nicht voraussetzen, dass eine
+# Luecke offen bleibt. Der Zaehler in der Basis bleibt abgelehnt, und zwar
+# begruendet: eine Basis, die sich je Durchlauf aendert, darf nicht vor die
+# Schleife gezogen werden.
+pruefe basis_summe STORE_BASE_NOT_LOCAL '  while (i < n) { poke8(c + i + i, i); i := i + 1; }'
 # poke16 mit nacktem Zaehler: Schrittweite 1 Byte bei 2 Byte Ablage.
 pruefe index_nackt STORE_INDEX_PLAIN_LOOP_VAR '  while (i < n) { poke16(c + i, i); i := i + 1; }'
 
