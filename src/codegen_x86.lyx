@@ -1299,12 +1299,22 @@ pub type Codegen = class {
   zlVrVektor: int64;             // #2335: auf den Vektorweg gelegte Reduktionen
   zlDivKonst: int64;             // #2330: Divisionen durch Zweierpotenz ohne idiv
   zlDivMagie: int64;             // #2330: Divisionen durch konstanten Divisor ohne idiv
+  zlDivMagieU: int64;            // #2333: dasselbe vorzeichenlos
+  // #2321: Merktabelle fuer cg_findMethodDeclNi. Eintrag 48 Byte:
+  // {pNodes, topLevelHead+1, classIdx+1, Namenszeiger, Namenslaenge, Knoten}
+  mdniTab: int64; mdniCap: int64;
   // #2330: Rueckgabewerte der Magie-Rechnung. Lyx kennt nur einen
   // Rueckgabewert, die Nebenergebnisse liegen deshalb hier.
   dblRest: int64;                // cg_dblMod: reduzierter Rest
   udivRest: int64;               // cg_udiv: Rest der vorzeichenlosen Division
   magieM: int64;                 // cg_magieVz: Faktor (Bitmuster, darf negativ sein)
   magieS: int64;                 // cg_magieVz: Rechtsshift
+  // #2333: dasselbe fuer die VORZEICHENLOSE Division. Eigene Felder, weil
+  // der Faktor anders gerechnet wird und eine dritte Angabe dazukommt.
+  uqRest: int64;                 // cg_uDivMod: Rest
+  magieUM: int64;                // cg_magieUnsig: Faktor (Bitmuster)
+  magieUS: int64;                // cg_magieUnsig: Rechtsshift
+  magieUA: int64;                // cg_magieUnsig: 1 = Zusatzstufe mit Uebertrag
   // #2175: Funktionsindex der obersten Ebene je (Knotentabelle, Kopf,
   // Quelltext), siehe cg_tlEintrag. Eintrag 48 Byte.
   tlTab: int64; tlAnz: int64; tlCap: int64; tlLetzt: int64;
@@ -9407,6 +9417,20 @@ pub type Codegen = class {
     if (self.cg_tryFold(rhsNi) == 0) { return 0; }
     var c: int64 := self.foldBuf;
     if (c <= 0) { return 0; }                 // null, negativ: nicht hier
+    // #2333 (Nebenbefund): Divisor 1 lief bis 1.2.31K in den `idiv` — die
+    // Schleife unten schiebt bis t == 1 und liefert k == 0, was `k < 1`
+    // abweist. `x / 1` ist x und `x % 1` ist 0, fuer BEIDE Vorzeichen und
+    // auch fuer den kleinstmoeglichen int64. Der negative Divisor -1 bleibt
+    // absichtlich bei der Division: dort ist INT64_MIN / -1 ein Ueberlauf,
+    // den die Division meldet und eine Negation still falsch rechnen wuerde.
+    if (c == 1) {
+      self.cg_genExpr(lhsNi);                 // rax = Dividend
+      if (op == CGT_PERCENT) {
+        self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xC0);   // xor rax, rax
+      }
+      self.zlDivKonst += 1;
+      return 1;
+    }
     // Zweierpotenz? Und k so klein, dass (2^k - 1) als 32-Bit-Direktwert
     // passt — darueber waere ein weiterer Ladebefehl noetig, und der Fall
     // kommt in der Praxis nicht vor.
@@ -9558,14 +9582,136 @@ pub type Codegen = class {
     return 1;
   }
 
+  // ── #2333: vorzeichenlose Hilfsrechnungen ─────────────────────────────────
+  //
+  // Lyx rechnet in int64, und `>>` ist arithmetisch. Fuer `magicu` nach
+  // Warren (Hacker's Delight, Kap. 10-9) werden Werte bis 2^64-1 gebraucht:
+  // `nc` liegt dicht unter 2^64 und `M` ueberschreitet regelmaessig 2^63.
+  // Alle Werte unten sind deshalb BITMUSTER, und jeder Vergleich laeuft ueber
+  // cg_uLt. cg_dblMod und cg_udiv taugen hier NICHT: beide setzen einen
+  // Modulus <= 2^63-1 voraus.
+
+  // Vorzeichenloser Kleinervergleich zweier Bitmuster. Das oberste Bit beider
+  // Werte umgedreht, dann vorzeichenbehaftet verglichen -- die Ordnung der
+  // umgedrehten Werte ist genau die vorzeichenlose Ordnung der Originale.
+  fn cg_uLt(a: int64, b: int64): int64 {
+    var SB: int64 := 1 << 63;
+    if ((a ^ SB) < (b ^ SB)) { return 1; }
+    return 0;
+  }
+
+  // Vorzeichenlose Division a / b fuer BELIEBIGE Bitmuster (b != 0), Schieben
+  // und Abziehen in 64 Runden. Rest in self.uqRest.
+  //
+  // Der Uebertrag ist der Punkt, an dem eine naive Fassung falsch wird: hat
+  // `r` das oberste Bit gesetzt, dann verliert `r << 1` dieses Bit, der wahre
+  // Wert ist 2r+bit >= 2^64 und damit in jedem Fall >= b. Dann MUSS abgezogen
+  // werden, ohne zu vergleichen -- der Vergleich am gekappten Bitmuster wuerde
+  // das Gegenteil sagen. Eine einzige Subtraktion genuegt, weil r < b gilt:
+  // 2r+bit < 2b+1 <= 2^64 + b.
+  fn cg_uDivMod(a: int64, b: int64): int64 {
+    var SB: int64 := 1 << 63;
+    var q: int64 := 0;
+    var r: int64 := 0;
+    var i: int64 := 63;
+    while (i >= 0) {
+      var bit: int64 := (a >> i) & 1;
+      var ueber: int64 := 0;
+      if ((r & SB) != 0) { ueber := 1; }
+      r := (r << 1) | bit;
+      if (ueber != 0 || self.cg_uLt(r, b) == 0) {
+        r := r - b;
+        q := (q << 1) | 1;
+      } else {
+        q := q << 1;
+      }
+      i := i - 1;
+    }
+    self.uqRest := r;
+    return q;
+  }
+
+  // Faktor, Shift und Merkbit fuer die VORZEICHENLOSE Division durch d
+  // (3 <= d < 2^63, keine Zweierpotenz). Verfahren `magicu` aus Hacker's
+  // Delight, 64-Bit-Breite, ohne 128-Bit-Arithmetik.
+  //
+  // Rueckgabe 1 bei Erfolg: self.magieUM, self.magieUS, self.magieUA gesetzt.
+  // self.magieUA == 1 heisst, dass der Faktor nicht in 64 Bit passt und die
+  // Zusatzstufe mit Uebertrag gebraucht wird -- das ist bei etwa der Haelfte
+  // der Divisoren so.
+  //
+  // Verdopplungen stehen bewusst als `x - (m - x)` bzw. `x + x` da, nie als
+  // `2 * x`: so laeuft die Rechnung auch unter `--overflow-checks` nicht in
+  // einen gemeldeten Ueberlauf (dieselbe Disziplin wie cg_dblMod).
+  fn cg_magieUnsig(d: int64): int64 {
+    var SB: int64 := 1 << 63;                 // 2^63
+    var IMAX: int64 := 0 - 1 - SB;            // 2^63-1
+    var ALLE: int64 := 0 - 1;                 // 2^64-1 als Bitmuster
+    if (d < 3) { return 0; }                  // 0/1/2 und (als Muster) alles >= 2^63
+    var a: int64 := 0;
+
+    // nc = (2^64-1) - ((2^64 - d) mod d)
+    self.cg_uDivMod(0 - d, d);
+    var nc: int64 := ALLE - self.uqRest;
+
+    var q1: int64 := self.cg_uDivMod(SB, nc);
+    var r1: int64 := self.uqRest;
+    var q2: int64 := self.cg_uDivMod(IMAX, d);
+    var r2: int64 := self.uqRest;
+
+    var p: int64 := 63;
+    var fertig: int64 := 0;
+    while (fertig == 0) {
+      p := p + 1;
+      if (p > 127) { return 0; }              // laeuft nicht zusammen
+      // q1 := 2*q1 (+1), r1 := 2*r1 mod nc
+      if (self.cg_uLt(r1, nc - r1) == 0) {
+        q1 := (q1 << 1) | 1;
+        r1 := r1 - (nc - r1);
+      } else {
+        q1 := q1 << 1;
+        r1 := r1 + r1;
+      }
+      // q2 := 2*q2 (+1), r2 := (2*r2 + 1) mod d; dabei den Ueberlauf von q2
+      // merken -- genau er bedeutet "Faktor passt nicht in 64 Bit".
+      if (self.cg_uLt(r2 + 1, d - r2) == 0) {
+        if (self.cg_uLt(q2, IMAX) == 0) { a := 1; }
+        q2 := (q2 << 1) | 1;
+        r2 := (r2 + 1) - (d - r2);
+      } else {
+        if (self.cg_uLt(q2, SB) == 0) { a := 1; }
+        q2 := q2 << 1;
+        r2 := r2 + r2 + 1;
+      }
+      var delta: int64 := d - 1 - r2;
+      if (self.cg_uLt(q1, delta) != 0) { fertig := 0; }
+      else if (q1 == delta && r1 == 0) { fertig := 0; }
+      else { fertig := 1; }
+    }
+
+    var s: int64 := p - 64;
+    if (s < 0 || s > 63) { return 0; }
+    // Die Zusatzstufe schiebt um s-1. Bei s == 0 gaebe das einen Shift um -1
+    // -- der Befehl `shr rax, 255` wuerde etwas voellig anderes tun. Lieber
+    // laut ablehnen und bei `div` bleiben, als still falsch rechnen.
+    if (a != 0 && s < 1) { return 0; }
+    self.magieUM := q2 + 1;
+    self.magieUS := s;
+    self.magieUA := a;
+    return 1;
+  }
+
   // Erzeugt `/` bzw. `%` mit konstantem Divisor als Multiplikation.
   // Rueckgabe 1, wenn Code erzeugt wurde (rax traegt das Ergebnis).
   fn cg_divKonstMagie(op: int64, lhsNi: int64, rhsNi: int64): int64 {
     if (op != CGT_SLASH && op != CGT_PERCENT) { return 0; }
     if (lhsNi < 0 || rhsNi < 0) { return 0; }
     if (self.cg_isF64Expr(lhsNi) != 0 || self.cg_isF64Expr(rhsNi) != 0) { return 0; }
-    // vorzeichenlos bleibt bei `div` (anderer Faktor, Zusatzstufe)
-    if (self.cg_isUnsignedExpr(lhsNi) != 0) { return 0; }
+    // #2333: der vorzeichenlose Fall hat einen eigenen Faktor und eine
+    // Zusatzstufe; er laeuft seit 1.2.31L durch cg_divKonstMagieUnsig.
+    if (self.cg_isUnsignedExpr(lhsNi) != 0) {
+      return self.cg_divKonstMagieUnsig(op, lhsNi, rhsNi);
+    }
     if (self.cg_tryFold(rhsNi) == 0) { return 0; }
     var d: int64 := self.foldBuf;
     if (d < 3) { return 0; }                  // 0, negativ, 1, 2: nicht hier
@@ -9602,6 +9748,66 @@ pub type Codegen = class {
     self.cg_e8(0x48); self.cg_e8(0x29); self.cg_e8(0xD3);                      // sub rbx, rdx
     self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xD8);                      // mov rax, rbx
     self.zlDivMagie += 1;
+    return 1;
+  }
+
+  // #2333: `/` bzw. `%` mit konstantem Divisor fuer einen VORZEICHENLOSEN
+  // Dividenden. Rueckgabe 1, wenn Code erzeugt wurde (rax traegt das
+  // Ergebnis), sonst 0 -- dann bleibt der Aufrufer bei `div`.
+  //
+  // Unterschiede zum vorzeichenbehafteten Weg (cg_divKonstMagie):
+  //   * `mul rcx` (48 F7 E1) statt `imul rcx` -- vorzeichenlose Multiplikation.
+  //   * keine Vorzeichenkorrektur (`sar rax,63` / `sub rdx,rax` entfallen).
+  //   * bei magieUA == 1 vier Befehle statt einem Shift, weil der Faktor nicht
+  //     in 64 Bit passt: q = ((n - t) >>u 1 + t) >>u (s-1), mit t = hohe
+  //     64 Bit des Produkts. Der Zwischenschritt verhindert den Ueberlauf von
+  //     n + t, den eine Addition vor dem Schieben haette.
+  fn cg_divKonstMagieUnsig(op: int64, lhsNi: int64, rhsNi: int64): int64 {
+    if (self.cg_tryFold(rhsNi) == 0) { return 0; }
+    var d: int64 := self.foldBuf;
+    if (d < 3) { return 0; }                  // 0/1/2 und als Muster alles >= 2^63
+    if ((d & (d - 1)) == 0) { return 0; }     // Zweierpotenz: Schritt 1 (#2330)
+    if (self.cg_magieUnsig(d) == 0) { return 0; }
+    var M: int64 := self.magieUM;
+    var sh: int64 := self.magieUS;
+    var zus: int64 := self.magieUA;
+
+    self.cg_genExpr(lhsNi);                                                    // rax = n
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC3);                      // mov rbx, rax (n sichern)
+    self.cg_e8(0x48); self.cg_e8(0xB9); self.cg_e64(M);                        // movabs rcx, M
+    self.cg_e8(0x48); self.cg_e8(0xF7); self.cg_e8(0xE1);                      // mul rcx -> rdx:rax
+    if (zus == 0) {
+      if (sh > 0) {
+        self.cg_e8(0x48); self.cg_e8(0xC1); self.cg_e8(0xEA); self.cg_e8(sh);  // shr rdx, sh
+      }
+    } else {
+      // t liegt in rdx. q = ((n - t) >> 1 + t) >> (sh-1)
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xD8);                    // mov rax, rbx (n)
+      self.cg_e8(0x48); self.cg_e8(0x29); self.cg_e8(0xD0);                    // sub rax, rdx
+      self.cg_e8(0x48); self.cg_e8(0xD1); self.cg_e8(0xE8);                    // shr rax, 1
+      self.cg_e8(0x48); self.cg_e8(0x01); self.cg_e8(0xD0);                    // add rax, rdx
+      if (sh > 1) {
+        self.cg_e8(0x48); self.cg_e8(0xC1); self.cg_e8(0xE8); self.cg_e8(sh - 1); // shr rax, sh-1
+      }
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC2);                    // mov rdx, rax (q)
+    }
+    // q steht jetzt in rdx, n in rbx.
+    if (op == CGT_SLASH) {
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xD0);                    // mov rax, rdx
+      self.zlDivMagieU += 1;
+      return 1;
+    }
+    // Rest: n - q*d. Die unteren 64 Bit sind bei vorzeichenloser wie bei
+    // vorzeichenbehafteter Multiplikation dieselben, `imul` genuegt also.
+    if (d >= 0 - (1 << 31) && d < (1 << 31)) {
+      self.cg_e8(0x48); self.cg_e8(0x69); self.cg_e8(0xD2); self.cg_e32(d);    // imul rdx, rdx, d
+    } else {
+      self.cg_e8(0x48); self.cg_e8(0xB9); self.cg_e64(d);                      // movabs rcx, d
+      self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xAF); self.cg_e8(0xD1);  // imul rdx, rcx
+    }
+    self.cg_e8(0x48); self.cg_e8(0x29); self.cg_e8(0xD3);                      // sub rbx, rdx
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xD8);                      // mov rax, rbx
+    self.zlDivMagieU += 1;
     return 1;
   }
 
@@ -16952,21 +17158,92 @@ pub type Codegen = class {
   // eine Methode mit zwei Parametern, der zweite trug, was im Register stand.
   // Gesucht wird bei der Klasse, die die Methode DEKLARIERT — bei einer
   // geerbten Methode steht der Rumpf und damit die Vorgabe in der Basisklasse.
+  // #2321: Die Suche nach dem Deklarationsknoten einer Methode lief fuer
+  // JEDEN Methodenaufruf die AST-Geschwisterliste der Klasse ab und trug
+  // damit 3,39 % der Takte des Selbstbaus (Rest aus #2316).
+  //
+  // Gemessen wurde vor dem Bauen, wie #2320 es vormacht — und die Messung hat
+  // die Loesung umgedreht: beim Uebersetzen von src/lyxc.lyx fallen
+  // **91 302 Aufrufe mit 4 164 137 Namensvergleichen** an, also **45,6
+  // Vergleiche je Aufruf**, aber nur **2 163 unmittelbare Wiederholungen
+  // (2,4 %)**. Ein Ein-Eintrag-Merker wie in #2320 (dort 57 % Wiederholungen)
+  // haette hier also fast nichts gebracht; gebraucht wird eine Tabelle, die
+  // ALLE bisherigen Antworten behaelt.
+  //
+  // Schluessel ist {pNodes, topLevelHead, classIdx, Namenszeiger,
+  // Namenslaenge}. `pNodes` und `topLevelHead` gehoeren dazu, weil dieselbe
+  // Knotennummer in einer anderen Knotentabelle etwas anderes bedeutet
+  // (#2176, drei Tabellen je Unit) — denselben Schluessel benutzt schon
+  // cg_klassenDeklNi. Der Namenszeiger darf als Identitaet dienen, weil die
+  // Knotenarena nichts freigibt: dieselbe Adresse ist derselbe Name.
+  //
+  // -1 ("keine Deklaration") wird MITGEMERKT. Ein Merker, der nur Treffer
+  // behaelt, laeuft fuer jeden Fehlschlag wieder die ganze Liste ab, und das
+  // sind hier die langen Laeufe.
+  fn cg_mdniSlot(classIdx: int64, mname: pchar, mlen: int64): int64 {
+    var h: int64 := classIdx * 131 + mlen * 31;
+    h := h + ((mname as int64) >> 3) + (self.pNodes >> 7) + self.topLevelHead;
+    if (h < 0) { h := 0 - h; }
+    return (h & (self.mdniCap - 1)) * 48;
+  }
+
   fn cg_findMethodDeclNi(classIdx: int64, mname: pchar, mlen: int64): int64 {
     if (classIdx < 0 || self.topLevelHead < 0) { return 0 - 1; }
+    // #2321: Tabelle beim ersten Aufruf anlegen. Direkt abgebildet, ein
+    // Eintrag je Schluessel-Hash; eine Kollision ueberschreibt, kostet also
+    // nur den naechsten Durchlauf und nie ein falsches Ergebnis (der ganze
+    // Schluessel wird beim Lesen verglichen).
+    if (self.mdniTab == 0) {
+      self.mdniCap := 4096;
+      self.mdniTab := alloc(self.mdniCap * 48);
+      if (self.mdniTab == 0) { self.mdniCap := 0; }
+      else {
+        // Der Arena-Allokator des Compilers (src/std/alloc.lyx) gibt den
+        // Speicher NICHT genullt heraus. Ein Eintrag mit zufaelligem Inhalt
+        // waere kein falsches Ergebnis (der Schluessel wird vollstaendig
+        // verglichen), aber pNodes == 0 ist der Leer-Marker und muss stimmen.
+        var z: int64 := 0;
+        while (z < self.mdniCap * 48) { poke64(self.mdniTab + z, 0); z := z + 8; }
+      }
+    }
+    var slot: int64 := 0 - 1;
+    if (self.mdniTab != 0) {
+      slot := self.cg_mdniSlot(classIdx, mname, mlen);
+      var e: int64 := self.mdniTab + slot;
+      if (peek64(e) == self.pNodes
+          && peek64(e + 8) == self.topLevelHead + 1
+          && peek64(e + 16) == classIdx + 1
+          && peek64(e + 24) == (mname as int64)
+          && peek64(e + 32) == mlen) {
+        return peek64(e + 40);
+      }
+    }
     var ownIdx: int64 := self.cg_findMethodOwner(classIdx, mname, mlen);
     if (ownIdx < 0) { ownIdx := classIdx; }
     var decl: int64 := self.cg_klassenDeklNi(ownIdx);
-    if (decl < 0) { return 0 - 1; }
-    var m: int64 := self.cg_nc1(decl);
-    while (m >= 0) {
-      if (self.cg_nslen(m) == mlen
-          && self.cg_seq(self.cg_nsval(m), self.cg_nslen(m), mname, mlen) != 0) {   // #2176
-        return m;
+    var erg: int64 := 0 - 1;
+    if (decl >= 0) {
+      var m: int64 := self.cg_nc1(decl);
+      while (m >= 0) {
+        if (self.cg_nslen(m) == mlen
+            && self.cg_seq(self.cg_nsval(m), self.cg_nslen(m), mname, mlen) != 0) {   // #2176
+          erg := m;
+          m := 0 - 1;
+        } else {
+          m := self.cg_nnext(m);
+        }
       }
-      m := self.cg_nnext(m);
     }
-    return 0 - 1;
+    if (slot >= 0) {
+      var e2: int64 := self.mdniTab + slot;
+      poke64(e2, self.pNodes);
+      poke64(e2 + 8, self.topLevelHead + 1);
+      poke64(e2 + 16, classIdx + 1);
+      poke64(e2 + 24, mname as int64);
+      poke64(e2 + 32, mlen);
+      poke64(e2 + 40, erg);
+    }
+    return erg;
   }
 
   // #2173: Knoten der Typdeklaration von Klasse ci in der AKTUELLEN

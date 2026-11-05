@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.31K
+VERSION   := 1.2.31L
 VERSION_DATE := 2026-11-05
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -341,6 +341,10 @@ test: lyxc
 	@bash tests/std_path_autoritativ_test.sh
 	@echo "--- std.cpu.features gegen die echte CPU, beide Richtungen (#2187) ---"
 	@bash tests/cpu_features_test.sh
+	@echo "--- vorzeichenlose Division durch konstanten Divisor ohne div (#2333) ---"
+	@bash tests/div_magie_unsig_2333_test.sh
+	@echo "--- Merktabelle fuer die Methodendeklaration, Schluessel (#2321) ---"
+	@bash tests/methodmerker_2321_test.sh
 	@echo "--- std.url: Getter liefern Bestandteile, nicht den Rest (#2366) ---"
 	@bash tests/url_getter_2366_test.sh
 	@echo "--- TCP-Zeitlimits: Wirkung und Gegenrichtung (#2294) ---"
