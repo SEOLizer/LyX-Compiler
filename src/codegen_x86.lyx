@@ -10188,7 +10188,7 @@ pub type Codegen = class {
   // Funktion rufen, die alle vier ueberschreibt (SysV: vom Aufrufer zu
   // sichern). Dieselbe Ueberlegung, die r11 in #2114 zulaessig gemacht hat.
   fn cg_lhsRhsNachRbxRax(lhsNi: int64, rhsNi: int64) {
-    if (self.r11Belegt < 5 && self.cg_exprRein(rhsNi, 0) != 0) {
+    if (self.r11Belegt < 5 && self.cg_exprRein(rhsNi, 0, 0) != 0) {
       var h: int64 := self.r11Belegt;
       self.cg_genExpr(lhsNi);
       self.cg_movHalteRax(h);                                      // mov <Halteregister h>, rax
@@ -10222,7 +10222,25 @@ pub type Codegen = class {
     else { EPrintStrLn("lyxc: interner Fehler (#2228): Halteregister ausserhalb 0..4"c); exit(70); }
   }
 
-  fn cg_exprRein(ni: int64, tiefe: int64): int64 {
+  // #2363: `zeigerOk` laesst zusaetzlich ein Local vom Typ `pchar` als rein
+  // gelten. Das ist KEINE Lockerung der Reinheit: ein pchar-Local liegt im
+  // selben Rahmenplatz wie ein int64 und wird genauso gelesen, ohne
+  // Seiteneffekt. Es ist eine Erweiterung der TYPLISTE, und sie gilt nur
+  // dort, wo der Wert als ADRESSE gebraucht wird — `peek8(src + start + i)`
+  // in StrSubstr ist der Fall, der sie verlangt hat: ohne sie fiel die
+  // Schleife mit LOAD_LEFT_BASE_NOT_INVARIANT durch, obwohl `src` so
+  // invariant ist wie jede Ganzzahl daneben.
+  //
+  // Der andere Aufrufer (die r11-Haltewahl) gibt 0 und bleibt damit auf dem
+  // alten Stand — dort geht es um gerechnete Werte, nicht um Adressen, und
+  // ein unveraenderter Zweig ist der Grund, warum der Bestand bitgleich
+  // uebersetzt.
+  //
+  // Eine zweite Reinheitspruefung daneben waere die Fehlerart, die hier
+  // dreimal belegt ist (#1799, #1803, #1806): zwei Aufzaehlungen derselben
+  // Sache, von denen eine nicht nachgezogen wird. Deshalb ein Schalter an
+  // DIESER Stelle statt einer Kopie.
+  fn cg_exprRein(ni: int64, tiefe: int64, zeigerOk: int64): int64 {
     if (ni < 0 || tiefe > 6) { return 0; }
     if (self.cg_tryFold(ni) != 0) { return 1; }
     var k: int64 := self.cg_nkind(ni);
@@ -10236,7 +10254,29 @@ pub type Codegen = class {
       var tp: pchar := peek64(tb) as pchar;
       var tl: int64 := peek64(tb + CG_LOCTYPE_OFF_LEN);
       if (tp == 0 as pchar || tl <= 0) { return 0; }
-      return cg_istGanzzahlTypName(tp, tl);
+      if (cg_istGanzzahlTypName(tp, tl) != 0) { return 1; }
+      if (zeigerOk != 0 && tl == 5 && self.cg_seq(tp, tl, "pchar"c, 5) != 0) { return 1; }
+      return 0;
+    }
+    // #2363: `(clsP as int64) + i` — eine Umdeutung zwischen zwei 64-Bit-Arten
+    // aendert den Wert nicht und hat keinen Seiteneffekt. Im Bestand ist das
+    // die haeufigste Schreibweise einer Zeigerbasis: `peek8((clsP as int64) + i)`
+    // steht so in _methodMangle, lowerCall und an 14 weiteren Stellen.
+    //
+    // Eng gefasst auf `int64` und `pchar` als ZIEL: beide sind 64 Bit, die
+    // Umdeutung ist dort wertgleich. Eine Umdeutung auf eine schmalere Art
+    // schneidet ab; sie waere als Basis wahrscheinlich auch richtig, aber
+    // „wahrscheinlich" ist in einer Reinheitspruefung das falsche Wort.
+    if (zeigerOk != 0 && k == CGN_CAST) {
+      var ctn: int64 := self.cg_nc1(ni);
+      if (ctn < 0) { return 0; }
+      var cl: int64 := self.cg_nslen(ctn);
+      var cp: pchar := self.cg_nsval(ctn);
+      var breit: int64 := 0;
+      if (cl == 5 && self.cg_seq(cp, cl, "int64"c, 5) != 0) { breit := 1; }
+      if (cl == 5 && self.cg_seq(cp, cl, "pchar"c, 5) != 0) { breit := 1; }
+      if (breit == 0) { return 0; }
+      return self.cg_exprRein(self.cg_nc0(ni), tiefe + 1, zeigerOk);
     }
     if (k == CGN_BINOP) {
       var op: int64 := self.cg_nival(ni);
@@ -10245,8 +10285,8 @@ pub type Codegen = class {
       if (op >= CGT_EQ2 && op <= CGT_GE) { ok := 1; }
       if (op == CGT_BITAND || op == CGT_BITOR || op == 89 || op == CGT_SHL || op == CGT_SHR) { ok := 1; }
       if (ok == 0) { return 0; }
-      if (self.cg_exprRein(self.cg_nc0(ni), tiefe + 1) == 0) { return 0; }
-      return self.cg_exprRein(self.cg_nc1(ni), tiefe + 1);
+      if (self.cg_exprRein(self.cg_nc0(ni), tiefe + 1, zeigerOk) == 0) { return 0; }
+      return self.cg_exprRein(self.cg_nc1(ni), tiefe + 1, zeigerOk);
     }
     return 0;
   }
@@ -24201,6 +24241,16 @@ pub type Codegen = class {
       if (self.cg_vmOhneZaehler(self.cg_nc0(ni), iOff, nOff, oNm, oNl, tiefe + 1) == 0) { return 0; }
       return self.cg_vmOhneZaehler(self.cg_nc1(ni), iOff, nOff, oNm, oNl, tiefe + 1);
     }
+    // Eine Umdeutung haengt genau dann am Zaehler, wenn ihr Wert es tut —
+    // `(clsP as int64)` ist so invariant wie `clsP`. Dass dieser Fall hier
+    // zunaechst fehlte, war die Fehlerart, vor der der Kommentar an
+    // cg_vmIndexPasst warnt: ZWEI Aufzaehlungen derselben Sache. cg_exprRein
+    // nahm die Umdeutung an, diese Stelle lehnte sie ab, und das Ergebnis war
+    // eine Erweiterung, die GEMESSEN nichts bewegte (1 von 117 statt 117).
+    // Wer cg_exprRein um eine Knotenart erweitert, muss hier nachsehen.
+    if (k == CGN_CAST) {
+      return self.cg_vmOhneZaehler(self.cg_nc0(ni), iOff, nOff, oNm, oNl, tiefe + 1);
+    }
     return 0;
   }
 
@@ -24218,7 +24268,7 @@ pub type Codegen = class {
     // Ein Bezeichner geht den bestehenden Weg ueber den Rahmenversatz; hier
     // wird nur behandelt, was dort durchfaellt.
     if (self.cg_vmIdentOff(basis) != 0) { return 0 - 1; }
-    if (self.cg_exprRein(basis, 0) == 0) { return 0 - 1; }
+    if (self.cg_exprRein(basis, 0, 1) == 0) { return 0 - 1; }
     if (self.cg_vmOhneZaehler(basis, iOff, nOff, oNm, oNl, 0) == 0) { return 0 - 1; }
     if (self.cg_vmIndexPasst(self.cg_nc1(adr), iOff, breite, oNm, oNl) == 0) { return 0 - 1; }
     return basis;
