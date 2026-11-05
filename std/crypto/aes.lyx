@@ -4,6 +4,7 @@
 unit std.crypto.aes;
 
 import std.alloc;
+import std.cpu.features;   // #2383: CpuHasAESNI
 
 // ============================================================================
 // Constants
@@ -294,9 +295,30 @@ fn SetWordByte(w: int64, idx: int64, b: int64): int64 {
     return (w & 0xFFFFFF00) | b;
 }
 
+// #2383: SubWord fuer die Schluesselexpansion, eine Entscheidungsstelle.
+//
+// Mit AES-NI tabellenfrei ueber AESENCLAST (AESNISubWord), sonst ueber die
+// S-Box wie bisher. Beide Zweige liefern dasselbe Wort — tests/aes_ni_test.sh
+// vergleicht die ganzen Schluesselplaene byteweise, nicht nur das Ergebnis
+// einer Verschluesselung.
+//
+// Die Schluesselexpansion ist nicht der heisse Pfad, der Grund ist hier auch
+// nicht Geschwindigkeit: die S-Box-Zugriffe haengen am SCHLUESSEL, und genau
+// das ist die Zeitseitenkanal, die #2383 nennt.
+fn _aesKeySubWord(w: int64, scratch: pchar, useni: int64): int64 {
+    if (useni != 0) { return AESNISubWord(w, scratch); }
+    return BytesToWord(SubByte((w >> 24) & 255), SubByte((w >> 16) & 255),
+                       SubByte((w >> 8) & 255), SubByte(w & 255));
+}
+
 // AES-128 Key Expansion: 16 bytes -> 176 bytes (11 round keys)
 // Output: 11 * 16 = 176 bytes
 pub fn AES128KeyExpand(key: pchar, expanded_key: pchar): int64 {
+    // #2383: Kratzbereich fuer den tabellenfreien SubWord-Weg. Einmal je
+    // Expansion, nicht je Wort; ohne AES-NI wird er nicht angefasst.
+    var ke_ni: int64 := AESNIAvailable();
+    var ke_scratch: pchar := 0 as pchar;
+    if (ke_ni != 0) { ke_scratch := alloc(64) as pchar; }
     var i: int64 := 0;
     var j: int64 := 4;
     var round: int64 := 1;
@@ -342,8 +364,10 @@ pub fn AES128KeyExpand(key: pchar, expanded_key: pchar): int64 {
             // 77ffd5a8...). Die gleichnamige Funktion RotWord() daneben war
             // richtig, wurde hier aber nicht benutzt.
             t := prev0; prev0 := prev1; prev1 := prev2; prev2 := prev3; prev3 := t;
-            prev0 := SubByte(prev0); prev1 := SubByte(prev1);
-            prev2 := SubByte(prev2); prev3 := SubByte(prev3);
+            var sw: int64 := _aesKeySubWord(BytesToWord(prev0, prev1, prev2, prev3),
+                                            ke_scratch, ke_ni);
+            prev0 := (sw >> 24) & 255; prev1 := (sw >> 16) & 255;
+            prev2 := (sw >> 8) & 255;  prev3 := sw & 255;
             prev0 := prev0 ^ Rcon(round);
             round += 1;
         }
@@ -361,6 +385,11 @@ pub fn AES128KeyExpand(key: pchar, expanded_key: pchar): int64 {
 
 // AES-256 Key Expansion: 32 bytes -> 240 bytes (15 round keys)
 pub fn AES256KeyExpand(key: pchar, expanded_key: pchar): int64 {
+    // #2383: Kratzbereich fuer den tabellenfreien SubWord-Weg. Einmal je
+    // Expansion, nicht je Wort; ohne AES-NI wird er nicht angefasst.
+    var ke_ni: int64 := AESNIAvailable();
+    var ke_scratch: pchar := 0 as pchar;
+    if (ke_ni != 0) { ke_scratch := alloc(64) as pchar; }
     var i: int64 := 0;
     var j: int64 := 8;
     var round: int64 := 1;
@@ -408,13 +437,17 @@ pub fn AES256KeyExpand(key: pchar, expanded_key: pchar): int64 {
             // 77ffd5a8...). Die gleichnamige Funktion RotWord() daneben war
             // richtig, wurde hier aber nicht benutzt.
             t := prev0; prev0 := prev1; prev1 := prev2; prev2 := prev3; prev3 := t;
-            prev0 := SubByte(prev0); prev1 := SubByte(prev1);
-            prev2 := SubByte(prev2); prev3 := SubByte(prev3);
+            var sw: int64 := _aesKeySubWord(BytesToWord(prev0, prev1, prev2, prev3),
+                                            ke_scratch, ke_ni);
+            prev0 := (sw >> 24) & 255; prev1 := (sw >> 16) & 255;
+            prev2 := (sw >> 8) & 255;  prev3 := sw & 255;
             prev0 := prev0 ^ Rcon(round); round := round + 1;
         } else {
             if ((j & 7) == 4) {
-                prev0 := SubByte(prev0); prev1 := SubByte(prev1);
-                prev2 := SubByte(prev2); prev3 := SubByte(prev3);
+                var sw4: int64 := _aesKeySubWord(BytesToWord(prev0, prev1, prev2, prev3),
+                                                 ke_scratch, ke_ni);
+                prev0 := (sw4 >> 24) & 255; prev1 := (sw4 >> 16) & 255;
+                prev2 := (sw4 >> 8) & 255;  prev3 := sw4 & 255;
             }
         }
         w4_0 := w4_0 ^ prev0; w4_1 := w4_1 ^ prev1;
@@ -449,6 +482,15 @@ fn AddRoundKey(state: pchar, expanded_key: pchar, round: int64): pchar {
 // ============================================================================
 
 pub fn AESEncryptBlockWithKey(block: pchar, expanded_key: pchar, rounds: int64): pchar {
+    // #2383: AES-NI, wenn die CPU sie hat. Gleiches Ergebnis, ein Befehl je
+    // Runde statt SubBytes/ShiftRows/MixColumns in Lyx, und kein
+    // datenabhaengiger Tabellenzugriff. Auf allem anderen weiter der
+    // Rechenweg darunter — er bleibt die Referenz, gegen die der
+    // Schnellweg in tests/aes_ni_test.sh gemessen wird.
+    if (AESNIAvailable() != 0 && rounds >= 1) {
+        aes_enc_block(block as int64, block as int64, expanded_key as int64, rounds);
+        return block;
+    }
     var state: pchar := block;
     
     // Initial round
@@ -470,6 +512,21 @@ pub fn AESEncryptBlockWithKey(block: pchar, expanded_key: pchar, rounds: int64):
     state := AddRoundKey(state, expanded_key, rounds);
     
     return block;
+}
+
+// #2383: eine Entscheidungsstelle fuer die Blockentschluesselung.
+//
+// AESDEC braucht den aequivalenten inversen Schluesselplan, nicht den
+// Vorwaertsplan — er entsteht einmal je Schluessel, nicht je Block. Die
+// CBC-Schleifen legen ihn deshalb vorher an und geben ihn hier herein;
+// `dec_key` 0 heisst "keiner da", dann wird gerechnet. Ohne diese
+// Trennung haette jeder Block 13 AESIMC obendrauf bekommen.
+fn _aesBlockDecrypt(block: pchar, expanded_key: pchar, dec_key: int64, rounds: int64): pchar {
+    if (dec_key != 0 && AESNIAvailable() != 0 && rounds >= 1) {
+        aes_dec_block(block as int64, block as int64, dec_key, rounds);
+        return block;
+    }
+    return AESDecryptBlockWithKey(block, expanded_key, rounds);
 }
 
 pub fn AESDecryptBlockWithKey(block: pchar, expanded_key: pchar, rounds: int64): pchar {
@@ -604,7 +661,16 @@ pub fn AES128CBCDecrypt(key: pchar, iv: pchar, input: pchar, input_len: int64, o
     // der Ausgabe des aufrufenden Programms.
     var expanded_key: pchar := alloc(256) as pchar;
     AES128KeyExpand(key, expanded_key);
-    
+
+    // #2383: Entschluessel-Plan einmal je Schluessel, nicht je Block.
+    // 0 heisst "keiner" — dann rechnet _aesBlockDecrypt.
+    var dec_key: int64 := 0;
+    if (AESNIAvailable() != 0) {
+        var dk: pchar := alloc(256) as pchar;
+        AESNIDecKeySchedule(expanded_key, 10, dk);
+        dec_key := dk as int64;
+    }
+
     var prev_block: pchar := alloc(32) as pchar;
     var work: pchar := alloc(32) as pchar;
     var plain_block: pchar := alloc(32) as pchar;
@@ -634,7 +700,7 @@ pub fn AES128CBCDecrypt(key: pchar, iv: pchar, input: pchar, input_len: int64, o
             StrSetChar(plain_block, i, StrCharAt(work, i));
             i += 1;
         }
-        AESDecryptBlockWithKey(plain_block, expanded_key, 10);
+        _aesBlockDecrypt(plain_block, expanded_key, dec_key, 10);
         
         // XOR with previous cipher block
         XORBlocks(plain_block, prev_block, plain_block);
@@ -760,7 +826,16 @@ pub fn AES256CBCDecrypt(key: pchar, iv: pchar, input: pchar, input_len: int64, o
     // der Ausgabe des aufrufenden Programms.
     var expanded_key: pchar := alloc(256) as pchar;
     AES256KeyExpand(key, expanded_key);
-    
+
+    // #2383: Entschluessel-Plan einmal je Schluessel, nicht je Block.
+    // 0 heisst "keiner" — dann rechnet _aesBlockDecrypt.
+    var dec_key: int64 := 0;
+    if (AESNIAvailable() != 0) {
+        var dk: pchar := alloc(256) as pchar;
+        AESNIDecKeySchedule(expanded_key, 14, dk);
+        dec_key := dk as int64;
+    }
+
     var prev_block: pchar := alloc(32) as pchar;
     var work: pchar := alloc(32) as pchar;
     var plain_block: pchar := alloc(32) as pchar;
@@ -787,7 +862,7 @@ pub fn AES256CBCDecrypt(key: pchar, iv: pchar, input: pchar, input_len: int64, o
             StrSetChar(plain_block, i, StrCharAt(work, i));
             i += 1;
         }
-        AESDecryptBlockWithKey(plain_block, expanded_key, 14);
+        _aesBlockDecrypt(plain_block, expanded_key, dec_key, 14);
         
         XORBlocks(plain_block, prev_block, plain_block);
         
@@ -1040,3 +1115,147 @@ pub fn AES256CTRDRBGGenerate(state: int64, out: int64, len: int64) {
 // ============================================================================
 // End
 // ============================================================================
+// ============================================================================
+// AES-NI (#2383)
+// ============================================================================
+//
+// Bis 1.2.31E rechnete jede AES-Nutzung in dieser Einheit ueber die
+// S-Box-Tabellen in SubByte/InvSubByte. Zwei Nachteile, die mit AES-NI
+// beide wegfallen: die Rundenfunktion kostet ein Vielfaches, und der
+// Tabellenzugriff ist datenabhaengig — also eine Cache-Zeitseitenkanal.
+//
+// Die vier Builtins (siehe src/backend/_builtin_ids.md, IDs 560…563) sind auf
+// BLOCKebene geschnitten: aes_enc_block macht alle Runden eines Blocks in
+// xmm0, ohne den Zustand zwischen den Runden durch den Speicher zu fuehren.
+//
+// Reihenfolge der Pruefung, und zwar in dieser:
+//   1. CpuHasAESNI() — CPUID-Blatt 1, ecx Bit 25. Auf jeder Nicht-x86-
+//      Architektur liefert cpu_id 0, damit ist die Antwort dort auch 0.
+//   2. Nur dann werden die Builtins ueberhaupt erreicht. Auf arm64/riscv
+//      senkt ir_lower sie zu PANIC, nicht zu einem Ersatzwert — eine still
+//      falsch verschluesselte Nachricht ist der schlimmere Fehler.
+//
+// Was NICHT dasteht: AESKEYGENASSIST. Sein Rcon-Operand ist ein imm8, ein
+// Builtin-Argument ist ein Laufzeitwert. SubWord leistet aes_subword
+// (AESENCLAST gegen einen Nullschluessel; bei vier gleichen Spalten ist
+// ShiftRows die Identitaet, es bleibt reines SubBytes), das Rcon-XOR steht
+// in Lyx. Ergebnis ist dasselbe und ebenfalls tabellenfrei.
+
+// Ergebnis von CpuHasAESNI, einmal gemessen. Das Flag ist noetig, weil 0 ein
+// gueltiges Ergebnis ist (dieselbe Begruendung wie in std/cpu/features.lyx).
+var aesniCache: int64 := 0;
+var aesniProbed: int64 := 0;
+
+// Umschalter auf den Rechenweg, auch wenn die CPU AES-NI hat.
+//
+// Er ist nicht fuer Anwender da, sondern damit der Rechenweg ueberhaupt
+// MESSBAR bleibt: auf einer CPU mit AES-NI fuehrt nach #2383 kein Aufruf
+// mehr durch SubBytes/MixColumns, eine Regression dort waere also auf
+// genau den Maschinen unsichtbar, auf denen entwickelt wird. Mit dem
+// Umschalter prueft tests/aes_ni_test.sh beide Wege gegeneinander.
+var aesniForceSoft: int64 := 0;
+
+// 1 = ab jetzt rechnen statt AESENC. 0 = wieder die CPU fragen.
+pub fn AESForceSoftware(on: int64): int64 {
+    aesniForceSoft := on;
+    return aesniForceSoft;
+}
+
+// Hat diese CPU AES-NI (und ist der Rechenweg nicht erzwungen)? 1 oder 0.
+// Auf Nicht-x86 immer 0.
+pub fn AESNIAvailable(): int64 {
+    if (aesniForceSoft != 0) { return 0; }
+    if (aesniProbed != 0) { return aesniCache; }
+    var v: int64 := 0;
+    if (CpuHasAESNI() != 0) { v := 1; }
+    aesniCache := v;
+    aesniProbed := 1;
+    return v;
+}
+
+// Einen Block verschluesseln, Rundenschluessel wie von AES128KeyExpand /
+// AES256KeyExpand abgelegt (rounds+1 Bloecke a 16 Byte, hintereinander).
+// Arbeitet an Ort und Stelle. Vorbedingung: AESNIAvailable() != 0 und
+// rounds >= 1 — beides wird hier geprueft, weil der Builtin selbst keine
+// Meldung ausgeben kann (die Schleife im Erzeugnis ist eine do-while, ein
+// rounds von 0 waere ein Durchlauf zu viel).
+// Die vier AESNI*-Funktionen sind ausdrueckliche Hardware-Aufrufe und fragen
+// deshalb CpuHasAESNI() direkt, nicht AESNIAvailable() — der Umschalter
+// AESForceSoftware waehlt den Weg der ALLGEMEINEN Funktionen, er macht die
+// Befehle nicht unerreichbar.
+pub fn AESNIEncryptBlock(block: pchar, expanded_key: pchar, rounds: int64): pchar {
+    if (rounds < 1) { panic("AESNIEncryptBlock: rounds < 1"); }
+    if (CpuHasAESNI() == 0) { panic("AESNIEncryptBlock: keine AES-NI"); }
+    aes_enc_block(block as int64, block as int64, expanded_key as int64, rounds);
+    return block;
+}
+
+// Aequivalenter inverser Schluesselplan fuer aes_dec_block.
+//
+// AESDEC erwartet nicht den Vorwaertsplan rueckwaerts gelesen, sondern den
+// aequivalenten inversen: erster und letzter Rundenschluessel unveraendert,
+// alle dazwischen durch AESIMC. Abgelegt wird in der Reihenfolge, in der die
+// Entschluesselung sie braucht — rk[rounds], IMC(rk[rounds-1]), …,
+// IMC(rk[1]), rk[0] —, damit aes_dec_block derselbe Rumpf wie
+// aes_enc_block sein kann.
+//
+// `out` braucht (rounds+1)*16 Byte. Rueckgabe: geschriebene Bytes.
+pub fn AESNIDecKeySchedule(expanded_key: pchar, rounds: int64, out: pchar): int64 {
+    if (rounds < 1) { panic("AESNIDecKeySchedule: rounds < 1"); }
+    if (CpuHasAESNI() == 0) { panic("AESNIDecKeySchedule: keine AES-NI"); }
+    var ek: int64 := expanded_key as int64;
+    var ou: int64 := out as int64;
+    // Erster: der LETZTE Vorwaertsschluessel, unveraendert.
+    var i: int64 := 0;
+    while (i < 16) { poke8(ou + i, peek8(ek + rounds * 16 + i)); i := i + 1; }
+    // Mitte: AESIMC, von hinten nach vorn.
+    var r: int64 := rounds - 1;
+    var pos: int64 := 16;
+    while (r >= 1) {
+        aes_imc(ou + pos, ek + r * 16);
+        pos := pos + 16;
+        r := r - 1;
+    }
+    // Letzter: der ERSTE Vorwaertsschluessel, unveraendert.
+    i := 0;
+    while (i < 16) { poke8(ou + pos + i, peek8(ek + i)); i := i + 1; }
+    return (rounds + 1) * 16;
+}
+
+// Einen Block entschluesseln. `dec_key` ist der von AESNIDecKeySchedule
+// erzeugte Plan, NICHT der Vorwaertsplan. Arbeitet an Ort und Stelle.
+pub fn AESNIDecryptBlockPrepared(block: pchar, dec_key: pchar, rounds: int64): pchar {
+    if (rounds < 1) { panic("AESNIDecryptBlockPrepared: rounds < 1"); }
+    if (CpuHasAESNI() == 0) { panic("AESNIDecryptBlockPrepared: keine AES-NI"); }
+    aes_dec_block(block as int64, block as int64, dec_key as int64, rounds);
+    return block;
+}
+
+// SubWord ohne Tabelle: AESENCLAST gegen einen Nullschluessel.
+//
+// `scratch` braucht 32 Byte und gehoert dem Aufrufer (die Einheit haelt
+// keinen eigenen Kratzbereich: ein unit-globaler Puffer waere bei zwei
+// gleichzeitigen Schluesselexpansionen genau der Fehler, den er sparen
+// soll). Bytes 0…15 sind die Eingabe, 16…31 das Ergebnis.
+//
+// Das Wort steht in allen vier Spalten; damit ist ShiftRows die Identitaet
+// und es bleibt SubBytes auf jedem Byte. Gelesen wird Spalte 0.
+pub fn AESNISubWord(w: int64, scratch: pchar): int64 {
+    if (CpuHasAESNI() == 0) { panic("AESNISubWord: keine AES-NI"); }
+    var s: int64 := scratch as int64;
+    var b0: int64 := (w >> 24) & 255;
+    var b1: int64 := (w >> 16) & 255;
+    var b2: int64 := (w >> 8) & 255;
+    var b3: int64 := w & 255;
+    var c: int64 := 0;
+    while (c < 4) {
+        poke8(s + c * 4, b0);
+        poke8(s + c * 4 + 1, b1);
+        poke8(s + c * 4 + 2, b2);
+        poke8(s + c * 4 + 3, b3);
+        c := c + 1;
+    }
+    aes_subword(s + 16, s);
+    return ((peek8(s + 16) << 24) | (peek8(s + 17) << 16) |
+            (peek8(s + 18) << 8) | peek8(s + 19)) & 0xFFFFFFFF;
+}

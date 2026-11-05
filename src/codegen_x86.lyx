@@ -19219,6 +19219,76 @@ pub type Codegen = class {
       self.cg_e8(0x48); self.cg_e8(0xC1); self.cg_e8(0xE2); self.cg_e8(0x20);  // shl rdx, 32
       self.cg_e8(0x48); self.cg_e8(0x09); self.cg_e8(0xD0);                    // or rax, rdx
 
+    } else if (self.cg_seq(fname, fnlen, "aes_enc_block", 13) ||
+               self.cg_seq(fname, fnlen, "aes_dec_block", 13)) {
+      // #2383: AES-NI, eine ganze Blockverschluesselung je Aufruf.
+      // rdi = Ziel (16 Byte), rsi = Quelle (16 Byte), rdx = Rundenschluessel
+      // (rounds+1 Bloecke, hintereinander), rcx = Rundenzahl.
+      //
+      // Der Zustand bleibt in xmm0 ueber alle Runden; nur die
+      // Rundenschluessel werden nachgeladen. Je Runde ein Builtin-Aufruf
+      // haette den Zustand jedes Mal durch den Speicher geschickt.
+      //
+      // Entschluesselt wird mit demselben Rumpf und AESDEC/AESDECLAST
+      // (DE/DF statt DC/DD). Der Plan in rdx muss dafuer der
+      // aequivalente inverse sein, in umgekehrter Reihenfolge und mit
+      // AESIMC auf den mittleren Schluesseln — das stellt
+      // std/crypto/aes.lyx her (AESNIDecKeySchedule), nicht dieser Code.
+      //
+      // Verzweigungsfrei im Datenpfad: die einzige Verzweigung zaehlt die
+      // Runden, ihre Zahl haengt an der Schluessellaenge, nicht am Klartext.
+      // Keine Tabelle, also auch kein datenabhaengiger Cachezugriff.
+      //
+      // rounds >= 1 ist Vorbedingung (die Schleife ist eine do-while);
+      // geprueft wird das beim Aufrufer in std/crypto/aes.lyx, weil hier
+      // kein Platz fuer eine Meldung ist. Fuer AES gilt rounds 10/12/14.
+      //
+      // Dieselben Bytes stehen in emit_lyxos (IDs 560/561) — die beiden
+      // muessen uebereinstimmen.
+      var aesLast: int64 := 0xDD;                                                // AESENCLAST
+      var aesMid:  int64 := 0xDC;                                                // AESENC
+      if (self.cg_seq(fname, fnlen, "aes_dec_block", 13)) {
+        aesMid := 0xDE; aesLast := 0xDF;                                         // AESDEC / AESDECLAST
+      }
+      self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0x06);    // movdqu xmm0, [rsi]
+      self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0x0A);    // movdqu xmm1, [rdx]
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0xEF); self.cg_e8(0xC1);    // pxor xmm0, xmm1
+      self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC2); self.cg_e8(0x10);    // add rdx, 16
+      self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC9);                      // dec rcx
+      var aesTop: int64 := self.codeLen;
+      self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0x0A);    // movdqu xmm1, [rdx]
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x38); self.cg_e8(aesMid); self.cg_e8(0xC1);
+      self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC2); self.cg_e8(0x10);    // add rdx, 16
+      self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC9);                      // dec rcx
+      self.cg_e8(0x75);                                                          // jnz kurz zurueck
+      self.cg_e8((aesTop - (self.codeLen + 1)) & 0xFF);
+      self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0x0A);    // movdqu xmm1, [rdx]
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x38); self.cg_e8(aesLast); self.cg_e8(0xC1);
+      self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x7F); self.cg_e8(0x07);    // movdqu [rdi], xmm0
+      self.cg_zeroRax();
+
+    } else if (self.cg_seq(fname, fnlen, "aes_imc", 7)) {
+      // #2383: AESIMC — InvMixColumns auf einem Block. rdi = Ziel, rsi = Quelle.
+      // Gebraucht wird es fuer den aequivalenten inversen Schluesselplan;
+      // der erste und der letzte Rundenschluessel bleiben unangetastet.
+      self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0x06);    // movdqu xmm0, [rsi]
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x38); self.cg_e8(0xDB); self.cg_e8(0xC0);  // aesimc xmm0, xmm0
+      self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x7F); self.cg_e8(0x07);    // movdqu [rdi], xmm0
+      self.cg_zeroRax();
+
+    } else if (self.cg_seq(fname, fnlen, "aes_subword", 11)) {
+      // #2383: SubBytes auf einem Block, tabellenfrei — AESENCLAST gegen einen
+      // Nullschluessel ist SubBytes danach ShiftRows. Stehen in allen vier
+      // Spalten dieselben vier Bytes, ist ShiftRows die Identitaet; dann ist
+      // das Ergebnis viermal SubWord dieses Wortes. So ersetzt es
+      // AESKEYGENASSIST, dessen Rcon-Operand ein imm8 ist und darum nicht aus
+      // einem Builtin-Argument kommen kann. rdi = Ziel, rsi = Quelle.
+      self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0x06);    // movdqu xmm0, [rsi]
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0xEF); self.cg_e8(0xC9);    // pxor xmm1, xmm1
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x38); self.cg_e8(0xDD); self.cg_e8(0xC1);  // aesenclast xmm0, xmm1
+      self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x7F); self.cg_e8(0x07);    // movdqu [rdi], xmm0
+      self.cg_zeroRax();
+
     } else if (self.cg_seq(fname, fnlen, "fence_sfence", 12)) {
       self.cg_e8(0x0F); self.cg_e8(0xAE); self.cg_e8(0xF8);  // sfence
       self.cg_zeroRax();

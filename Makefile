@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.31G
+VERSION   := 1.2.31H
 VERSION_DATE := 2026-11-05
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -341,6 +341,8 @@ test: lyxc
 	@bash tests/std_path_autoritativ_test.sh
 	@echo "--- std.cpu.features gegen die echte CPU, beide Richtungen (#2187) ---"
 	@bash tests/cpu_features_test.sh
+	@echo "--- AES-NI: FIPS-197-Vektoren, beide Wege gleich, Bytemuster (#2383) ---"
+	@bash tests/aes_ni_test.sh
 	@echo "--- Vektorarena: kein Wachstum, kein Syscall je Operation (#2206) ---"
 	@bash tests/vektorarena_test.sh
 	@echo "--- VEX-Encoder: Kodierungen zurueckgelesen (#2192, Schnitt 1) ---"
