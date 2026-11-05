@@ -69,6 +69,43 @@ con X_SANPOS:   int64 := 192;
 con X_SANLEN:   int64 := 200;
 con X_SIZE:     int64 := 208;
 
+// ---------------------------------------------------------------------------
+// Kratzspeicher der Unit
+//
+// Jede Funktion hier braucht ein paar DER-Felder als Zwischenablage. Die
+// entstehen EINMAL je Programmlauf, mit einem festen Bereich je Funktion —
+// kein alloc/free je Aufruf und vor allem kein `defer`: mit mehreren defer je
+// Funktion gab lyxc 1.2.31A gemessen einen Block zu frueh frei, zwei alloc(8)
+// bekamen dieselbe Adresse, und jeder ZWEITE Aufruf von X509PasstName lief
+// danach auf Muell (Hostname "passt nicht" bei gueltigem Zertifikat).
+// Die Bereiche sind disjunkt, weil die Funktionen sich gegenseitig aufrufen:
+// X509PruefeKette -> X509Lies -> ext*/algKennung, X509PasstName -> X509SanAt.
+// Rekursion gibt es keine.
+// ---------------------------------------------------------------------------
+
+con XS_LIES:     int64 := 0;      // 10 Felder: 320
+con XS_BC:       int64 := 320;    // 64
+con XS_KU:       int64 := 384;    // 32
+con XS_EKU:      int64 := 416;    // 80
+con XS_ALG:      int64 := 496;    // 48
+con XS_SIG:      int64 := 544;    // 96
+con XS_KETTE:    int64 := 640;    // 416
+con XS_SANANZ:   int64 := 1056;   // 32
+con XS_SANAT:    int64 := 1088;   // 32
+con XS_PASST:    int64 := 1120;   // 24
+con XS_CN:       int64 := 1152;   // 176
+con XS_GROESSE:  int64 := 1408;
+
+var _x509Scr: int64 := 0;
+
+fn x509Scr(): int64 {
+    if (_x509Scr != 0) { return _x509Scr; }
+    var p: int64 := alloc(XS_GROESSE);
+    if (p == 0) { panic("X.509: kein Speicher fuer den Kratzbereich"); }
+    _x509Scr := p;
+    return p;
+}
+
 pub fn X509Groesse(): int64 { return X_SIZE; }
 
 pub fn X509TbsPos(s: int64): int64 { return peek64(s + X_TBSPOS); }
@@ -194,9 +231,8 @@ fn oidCN(p: int64): int64 {
 //                                pathLenConstraint INTEGER OPTIONAL }
 fn extBasicConstraints(der: int64, derLen: int64, wertPos: int64, wertLen: int64,
                        satz: int64): bool {
-    var f: int64 := alloc(DerFeldGroesse());
-    var k: int64 := alloc(DerFeldGroesse());
-    if (f == 0 || k == 0) { panic("X.509: kein Speicher"); }
+    var f: int64 := x509Scr() + XS_BC;
+    var k: int64 := f + DerFeldGroesse();
     poke64(satz + X_HASBC, 1);
     poke64(satz + X_ISCA, 0);
     poke64(satz + X_PATHLEN, -1);
@@ -224,16 +260,13 @@ fn extBasicConstraints(der: int64, derLen: int64, wertPos: int64, wertLen: int64
             poke64(satz + X_PATHLEN, v);
         }
     }
-    free(f, DerFeldGroesse());
-    free(k, DerFeldGroesse());
     return true;
 }
 
 // keyUsage ::= BIT STRING; Bit 0 ist das hoechste Bit des ersten Byte.
 fn extKeyUsage(der: int64, derLen: int64, wertPos: int64, wertLen: int64,
                satz: int64): bool {
-    var f: int64 := alloc(DerFeldGroesse());
-    if (f == 0) { panic("X.509: kein Speicher"); }
+    var f: int64 := x509Scr() + XS_KU;
     if (!DerLies(der, wertPos + wertLen, wertPos, f)) { return false; }
     if (DerTag(f) != 0x03) { return false; }
     var len: int64 := DerInhaltLen(f);
@@ -252,17 +285,15 @@ fn extKeyUsage(der: int64, derLen: int64, wertPos: int64, wertLen: int64,
         byteN += 1;
     }
     poke64(satz + X_KU, bits);
-    free(f, DerFeldGroesse());
     return true;
 }
 
 // extKeyUsage ::= SEQUENCE OF OBJECT IDENTIFIER
 fn extEku(der: int64, derLen: int64, wertPos: int64, wertLen: int64,
           satz: int64): bool {
-    var f: int64 := alloc(DerFeldGroesse());
-    var k: int64 := alloc(DerFeldGroesse());
-    var ob: int64 := alloc(16);
-    if (f == 0 || k == 0 || ob == 0) { panic("X.509: kein Speicher"); }
+    var f: int64 := x509Scr() + XS_EKU;
+    var k: int64 := f + DerFeldGroesse();
+    var ob: int64 := k + DerFeldGroesse();
     if (!DerLies(der, wertPos + wertLen, wertPos, f)) { return false; }
     if (DerTag(f) != 0x30) { return false; }
     var ende: int64 := DerInhalt(f) + DerInhaltLen(f);
@@ -288,9 +319,6 @@ fn extEku(der: int64, derLen: int64, wertPos: int64, wertLen: int64,
         p := DerNaechste(k);
     }
     poke64(satz + X_EKU, bits);
-    free(f, DerFeldGroesse());
-    free(k, DerFeldGroesse());
-    free(ob, 16);
     return true;
 }
 
@@ -299,9 +327,8 @@ fn extEku(der: int64, derLen: int64, wertPos: int64, wertLen: int64,
 // ---------------------------------------------------------------------------
 
 fn algKennung(der: int64, ende: int64, algFeld: int64): int64 {
-    var k: int64 := alloc(DerFeldGroesse());
-    var ob: int64 := alloc(16);
-    if (k == 0 || ob == 0) { panic("X.509: kein Speicher"); }
+    var k: int64 := x509Scr() + XS_ALG;
+    var ob: int64 := k + DerFeldGroesse();
     var erg: int64 := 0;
     if (DerErstesKind(der, ende, algFeld, k) && DerTag(k) == 0x06) {
         if (DerOidGleich(der, k, ob, oidEcdsaSha256(ob))) { erg := 1; }
@@ -312,8 +339,6 @@ fn algKennung(der: int64, ende: int64, algFeld: int64): int64 {
         if (erg == 0 && DerOidGleich(der, k, ob, oidRsaPss(ob)))    { erg := 6; }
         if (erg == 0 && DerOidGleich(der, k, ob, oidEd25519(ob)))   { erg := 7; }
     }
-    free(k, DerFeldGroesse());
-    free(ob, 16);
     return erg;
 }
 
@@ -328,13 +353,23 @@ pub fn X509Lies(der: int64, derLen: int64, satz: int64): bool {
     poke64(satz + X_PATHLEN, -1);
     poke64(satz + X_VERSION, 1);
 
+    // EIN Kratzblock fuer alle Felder: ein alloc, ein defer. Vorher stand je
+    // Feld ein eigenes defer (neun in dieser Funktion) — gemessen mit lyxc
+    // 1.2.31A lief dann eines zu frueh, kp und kl bekamen dieselbe Adresse und
+    // X_KEYPOS trug danach die Schluessellaenge statt der Position. Wenige
+    // defer je Funktion, und keines in einer Schleife oder einem inneren Block.
     var fg: int64 := DerFeldGroesse();
-    var cert: int64 := alloc(fg);
-    var tbs: int64 := alloc(fg);
-    var f: int64 := alloc(fg);
-    var g: int64 := alloc(fg);
-    var h: int64 := alloc(fg);
-    if (cert == 0 || tbs == 0 || f == 0 || g == 0 || h == 0) { panic("X.509: kein Speicher"); }
+    var kratz: int64 := x509Scr() + XS_LIES;
+    var cert: int64 := kratz;
+    var tbs: int64 := kratz + fg;
+    var f: int64 := kratz + fg * 2;
+    var g: int64 := kratz + fg * 3;
+    var h: int64 := kratz + fg * 4;
+    var kurve: int64 := kratz + fg * 5;
+    var sanF: int64 := kratz + fg * 6;
+    var ob: int64 := kratz + fg * 7;
+    var kp: int64 := kratz + fg * 7 + 16;
+    var kl: int64 := kratz + fg * 7 + 24;
 
     if (!DerLies(der, derLen, 0, cert)) { return false; }
     if (DerTag(cert) != 0x30) { return false; }
@@ -407,9 +442,6 @@ pub fn X509Lies(der: int64, derLen: int64, satz: int64): bool {
     var spkiEnde: int64 := DerInhalt(f) + DerInhaltLen(f);
     if (!DerLies(der, spkiEnde, DerInhalt(f), g)) { return false; }   // algorithm
     if (DerTag(g) != 0x30) { return false; }
-    var ob: int64 := alloc(16);
-    var kurve: int64 := alloc(DerFeldGroesse());
-    if (ob == 0 || kurve == 0) { panic("X.509: kein Speicher"); }
     var algEnde: int64 := DerInhalt(g) + DerInhaltLen(g);
     if (!DerLies(der, algEnde, DerInhalt(g), h)) { return false; }
     if (DerTag(h) != 0x06) { return false; }
@@ -428,18 +460,13 @@ pub fn X509Lies(der: int64, derLen: int64, satz: int64): bool {
         if (keyAlg == 0) { return false; }
     }
     poke64(satz + X_KEYALG, keyAlg);
-    free(kurve, DerFeldGroesse());
 
     // subjectPublicKey BIT STRING steht hinter dem algorithm-SEQUENCE.
     if (!DerLies(der, spkiEnde, DerNaechste(g), h)) { return false; }
     if (DerTag(h) != 0x03) { return false; }
-    var kp: int64 := alloc(8);
-    var kl: int64 := alloc(8);
-    if (kp == 0 || kl == 0) { panic("X.509: kein Speicher"); }
     if (!DerBitKette(der, h, kp, kl)) { return false; }
     poke64(satz + X_KEYPOS, peek64(kp));
     poke64(satz + X_KEYLEN, peek64(kl));
-    free(kp, 8); free(kl, 8);
     p := DerNaechste(f);
 
     // --- extensions [3] (nur v3) ---
@@ -454,9 +481,8 @@ pub fn X509Lies(der: int64, derLen: int64, satz: int64): bool {
                 if (!DerLies(der, exEnde, q, h)) { return false; }
                 if (DerTag(h) != 0x30) { return false; }
                 var innen: int64 := DerInhalt(h) + DerInhaltLen(h);
-                var oidF: int64 := alloc(DerFeldGroesse());
-                var wF: int64 := alloc(DerFeldGroesse());
-                if (oidF == 0 || wF == 0) { panic("X.509: kein Speicher"); }
+                var oidF: int64 := kratz + fg * 8;
+                var wF: int64 := kratz + fg * 9;
                 if (!DerLies(der, innen, DerInhalt(h), oidF)) { return false; }
                 if (DerTag(oidF) != 0x06) { return false; }
                 var r: int64 := DerNaechste(oidF);
@@ -484,19 +510,14 @@ pub fn X509Lies(der: int64, derLen: int64, satz: int64): bool {
                             if (!extEku(der, derLen, wPos, wLen, satz)) { return false; }
                         } else {
                             if (DerOidGleich(der, oidF, ob, oidExt(ob, 17))) {
-                                var sanF: int64 := alloc(DerFeldGroesse());
-                                if (sanF == 0) { panic("X.509: kein Speicher"); }
                                 if (!DerLies(der, wPos + wLen, wPos, sanF)) { return false; }
                                 if (DerTag(sanF) != 0x30) { return false; }
                                 poke64(satz + X_SANPOS, DerInhalt(sanF));
                                 poke64(satz + X_SANLEN, DerInhaltLen(sanF));
-                                free(sanF, DerFeldGroesse());
                             }
                         }
                     }
                 }
-                free(oidF, DerFeldGroesse());
-                free(wF, DerFeldGroesse());
                 q := DerNaechste(h);
             }
         }
@@ -513,16 +534,9 @@ pub fn X509Lies(der: int64, derLen: int64, satz: int64): bool {
     poke64(satz + X_SIGALG, sigAlg);
 
     if (!DerLies(der, certEnde, DerNaechste(f), g)) { return false; }
-    var sp: int64 := alloc(8);
-    var sl: int64 := alloc(8);
-    if (sp == 0 || sl == 0) { panic("X.509: kein Speicher"); }
-    if (!DerBitKette(der, g, sp, sl)) { return false; }
-    poke64(satz + X_SIGPOS, peek64(sp));
-    poke64(satz + X_SIGLEN, peek64(sl));
-    free(sp, 8); free(sl, 8);
-
-    free(cert, fg); free(tbs, fg); free(f, fg); free(g, fg); free(h, fg);
-    free(ob, 16);
+    if (!DerBitKette(der, g, kp, kl)) { return false; }
+    poke64(satz + X_SIGPOS, peek64(kp));
+    poke64(satz + X_SIGLEN, peek64(kl));
     return true;
 }
 
@@ -535,17 +549,15 @@ pub fn X509SanAnzahl(satz: int64): int64 {
     var pos: int64 := peek64(satz + X_SANPOS);
     var len: int64 := peek64(satz + X_SANLEN);
     if (pos == 0 || len <= 0) { return 0; }
-    var f: int64 := alloc(DerFeldGroesse());
-    if (f == 0) { panic("X.509: kein Speicher"); }
+    var f: int64 := x509Scr() + XS_SANANZ;
     var ende: int64 := pos + len;
     var p: int64 := pos;
     var n: int64 := 0;
     while (p < ende) {
-        if (!DerLies(der, ende, p, f)) { free(f, DerFeldGroesse()); return n; }
+        if (!DerLies(der, ende, p, f)) { return n; }
         n += 1;
         p := DerNaechste(f);
     }
-    free(f, DerFeldGroesse());
     return n;
 }
 
@@ -557,25 +569,22 @@ pub fn X509SanAt(satz: int64, idx: int64, artPtr: int64,
     var pos: int64 := peek64(satz + X_SANPOS);
     var len: int64 := peek64(satz + X_SANLEN);
     if (pos == 0 || len <= 0 || idx < 0) { return false; }
-    var f: int64 := alloc(DerFeldGroesse());
-    if (f == 0) { panic("X.509: kein Speicher"); }
+    var f: int64 := x509Scr() + XS_SANAT;
     var ende: int64 := pos + len;
     var p: int64 := pos;
     var n: int64 := 0;
     while (p < ende) {
-        if (!DerLies(der, ende, p, f)) { free(f, DerFeldGroesse()); return false; }
+        if (!DerLies(der, ende, p, f)) { return false; }
         if (n == idx) {
             // GeneralName ist CONTEXT-spezifisch: 0x80 | Nummer.
             poke64(artPtr, DerTag(f) & 0x1F);
             poke64(posPtr, DerInhalt(f));
             poke64(lenPtr, DerInhaltLen(f));
-            free(f, DerFeldGroesse());
             return true;
         }
         n += 1;
         p := DerNaechste(f);
     }
-    free(f, DerFeldGroesse());
     return false;
 }
 
@@ -636,10 +645,9 @@ fn passtWildcard(musterPos: int64, musterLen: int64,
 pub fn X509PasstName(satz: int64, host: int64, hostLen: int64): bool {
     if (host == 0 || hostLen <= 0) { return false; }
     var der: int64 := peek64(satz + X_DER);
-    var art: int64 := alloc(8);
-    var pos: int64 := alloc(8);
-    var len: int64 := alloc(8);
-    if (art == 0 || pos == 0 || len == 0) { panic("X.509: kein Speicher"); }
+    var art: int64 := x509Scr() + XS_PASST;
+    var pos: int64 := art + 8;
+    var len: int64 := pos + 8;
 
     var n: int64 := X509SanAnzahl(satz);
     var hatDns: bool := false;
@@ -657,7 +665,6 @@ pub fn X509PasstName(satz: int64, host: int64, hostLen: int64): bool {
         }
         i += 1;
     }
-    free(art, 8); free(pos, 8); free(len, 8);
     if (hatDns) { return treffer; }
 
     // Kein dNSName: Rueckfall auf den commonName im Subjekt.
@@ -672,15 +679,12 @@ pub fn X509CnPasst(satz: int64, host: int64, hostLen: int64): bool {
     var len: int64 := peek64(satz + X_SUBLEN);
     if (pos == 0 || len <= 0) { return false; }
     var fg: int64 := DerFeldGroesse();
-    var name: int64 := alloc(fg);
-    var rdn: int64 := alloc(fg);
-    var atv: int64 := alloc(fg);
-    var oid: int64 := alloc(fg);
-    var wert: int64 := alloc(fg);
-    var ob: int64 := alloc(16);
-    if (name == 0 || rdn == 0 || atv == 0 || oid == 0 || wert == 0 || ob == 0) {
-        panic("X.509: kein Speicher");
-    }
+    var name: int64 := x509Scr() + XS_CN;
+    var rdn: int64 := name + fg;
+    var atv: int64 := rdn + fg;
+    var oid: int64 := atv + fg;
+    var wert: int64 := oid + fg;
+    var ob: int64 := wert + fg;
     var treffer: bool := false;
     if (DerLies(der, pos + len, pos, name) && DerTag(name) == 0x30) {
         var ende: int64 := DerInhalt(name) + DerInhaltLen(name);
@@ -709,8 +713,6 @@ pub fn X509CnPasst(satz: int64, host: int64, hostLen: int64): bool {
             }
         }
     }
-    free(name, fg); free(rdn, fg); free(atv, fg); free(oid, fg); free(wert, fg);
-    free(ob, 16);
     return treffer;
 }
 
@@ -786,18 +788,15 @@ pub fn X509PruefeSignatur(kind: int64, aussteller: int64): int64 {
     var kPos: int64 := derA + peek64(aussteller + X_KEYPOS);
     if ((peek8(kPos) & 0xFF) != 4) { return 10; }
 
-    var hash: int64 := alloc(32);
-    var r: int64 := alloc(32);
-    var s: int64 := alloc(32);
-    if (hash == 0 || r == 0 || s == 0) { panic("X.509: kein Speicher"); }
+    var hash: int64 := x509Scr() + XS_SIG;
+    var r: int64 := hash + 32;
+    var s: int64 := r + 32;
 
     SHA256(derK + peek64(kind + X_TBSPOS), peek64(kind + X_TBSLEN), hash);
     if (!EcdsaSigFromDer(derK + peek64(kind + X_SIGPOS), peek64(kind + X_SIGLEN), r, s)) {
-        free(hash, 32); free(r, 32); free(s, 32);
         return 5;
     }
     var ok: bool := EcdsaVerify(EC_P256, hash, kPos + 1, kPos + 33, r, s);
-    free(hash, 32); free(r, 32); free(s, 32);
     if (!ok) { return 5; }
     return 0;
 }
@@ -834,9 +833,8 @@ pub fn X509PruefeKette(kette: int64, ketteN: int64, trust: int64, trustN: int64,
     if (ketteN > X_MAX_TIEFE) { return 11; }
 
     var gr: int64 := X509Groesse();
-    var kind: int64 := alloc(gr);
-    var eltern: int64 := alloc(gr);
-    if (kind == 0 || eltern == 0) { panic("X.509: kein Speicher"); }
+    var kind: int64 := x509Scr() + XS_KETTE;
+    var eltern: int64 := kind + gr;
 
     if (!X509Lies(peek64(kette), peek64(kette + 8), kind)) { return 1; }
     if (!X509ZeitGueltig(kind, jetzt)) { return 2; }
