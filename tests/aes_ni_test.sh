@@ -29,6 +29,7 @@
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT" || exit 1
 LYXC="${LYXC:-$ROOT/lyxc}"
+_g="$(dirname "$0")/lib/lyxc_guard.sh"; [ -f "$_g" ] || _g="$(dirname "$0")/../lib/lyxc_guard.sh"; . "$_g"   # #1294: Ressourcengrenze um jeden lyxc-Aufruf
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 P=0; F=0
 ok()  { echo "PASS: $1"; P=$((P+1)); }
