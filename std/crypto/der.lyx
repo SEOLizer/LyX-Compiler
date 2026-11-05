@@ -1,0 +1,330 @@
+// std/crypto/der.lyx — DER-Leser (X.690) und PEM-Dekodierer
+//
+// Teil von #2096 (natives TLS ohne OpenSSL): X.509-Zertifikate, SPKI,
+// PKCS#8-Schluessel und ECDSA-Signaturen sind DER. std/net/asn1.lyx ist BER
+// fuer SNMP und schreibt vor allem; hier wird gelesen, und zwar streng:
+//
+//   - nur bestimmte Laengen (unbestimmte Laenge wird abgewiesen),
+//   - nur die kuerzeste Laengendarstellung (DER-Pflicht, X.690 §10.1),
+//   - jede Laenge gegen das Pufferende geprueft,
+//   - keine Laenge > 2^31, damit kein Zwischenwert negativ wird.
+//
+// Das ist bewusst keine fail-open-Pruefung: ein Zertifikatsparser, der bei
+// unklarer Kodierung "irgendwas Plausibles" tut, ist eine Sicherheitsluecke.
+// Alle Funktionen liefern false bzw. -1 und schreiben nichts, wenn die
+// Kodierung nicht stimmt.
+//
+// Oeffentliche API:
+//   DerFeldGroesse()                            — Groesse eines Feldeintrags
+//   DerLies(buf, bufLen, pos, feld): bool       — ein TLV ab pos
+//   DerTag(feld) / DerInhalt(feld) / DerInhaltLen(feld) / DerNaechste(feld)
+//   DerErstesKind(buf, bufLen, feld, kind): bool
+//   DerIstKonstruiert(tag): bool
+//   DerGanzzahl(buf, bufLen, feld): int64       — kleine INTEGER (<= 8 Byte)
+//   DerOidGleich(buf, feld, oid, oidLen): bool
+//   DerBitKette(buf, feld, outPos, outLen): bool — BIT STRING ohne Restbits
+//   DerZeitUnix(buf, feld): int64               — UTCTime/GeneralizedTime
+//   PemDekodiere(pem, pemLen, label, labelLen, out, outCap): int64
+
+unit std.crypto.der;
+
+import std.alloc;
+
+// Feldeintrag (32 Byte): Tag, Inhaltsanfang, Inhaltslaenge, Position danach.
+con DER_F_TAG:   int64 := 0;
+con DER_F_POS:   int64 := 8;
+con DER_F_LEN:   int64 := 16;
+con DER_F_NEXT:  int64 := 24;
+con DER_F_SIZE:  int64 := 32;
+
+// Grenze fuer jede Laengenangabe. Grosszuegig fuer Zertifikatsketten und weit
+// unter 2^31, damit pos + len niemals ueberlaeuft oder negativ wird.
+con DER_MAX_LEN: int64 := 16777216;
+
+pub fn DerFeldGroesse(): int64 {
+    return DER_F_SIZE;
+}
+
+pub fn DerTag(feld: int64): int64 {
+    return peek64(feld + DER_F_TAG);
+}
+
+pub fn DerInhalt(feld: int64): int64 {
+    return peek64(feld + DER_F_POS);
+}
+
+pub fn DerInhaltLen(feld: int64): int64 {
+    return peek64(feld + DER_F_LEN);
+}
+
+pub fn DerNaechste(feld: int64): int64 {
+    return peek64(feld + DER_F_NEXT);
+}
+
+// Bit 6 des Tagbyte (0x20) unterscheidet konstruiert von primitiv.
+pub fn DerIstKonstruiert(tag: int64): bool {
+    return (tag & 0x20) != 0;
+}
+
+// Liest das TLV ab pos. pos und alle abgeleiteten Groessen sind Indizes in
+// buf, nicht Adressen.
+pub fn DerLies(buf: int64, bufLen: int64, pos: int64, feld: int64): bool {
+    if (pos < 0 || bufLen < 0) { return false; }
+    if (pos + 2 > bufLen) { return false; }            // Tag und ein Laengenbyte
+
+    var tag: int64 := peek8(buf + pos) & 0xFF;
+    // Mehrbytige Tags (0x1F in den unteren fuenf Bit) kommen in X.509 nicht
+    // vor und werden abgewiesen, statt still falsch gelesen zu werden.
+    if ((tag & 0x1F) == 0x1F) { return false; }
+
+    var p: int64 := pos + 1;
+    var b0: int64 := peek8(buf + p) & 0xFF;
+    p += 1;
+    var len: int64 := 0;
+
+    if (b0 < 0x80) {
+        len := b0;
+    } else {
+        if (b0 == 0x80) { return false; }              // unbestimmte Laenge
+        if (b0 == 0xFF) { return false; }              // reserviert
+        var n: int64 := b0 & 0x7F;
+        if (n > 4) { return false; }                   // > 2^32 gibt es hier nicht
+        if (p + n > bufLen) { return false; }
+        var i: int64 := 0;
+        while (i < n) {
+            len := (len << 8) | (peek8(buf + p + i) & 0xFF);
+            i += 1;
+        }
+        p += n;
+        // DER verlangt die kuerzeste Form: 1 Byte unter 128, und das erste
+        // Laengenbyte darf nicht 0 sein.
+        if (len < 128) { return false; }
+        if ((peek8(buf + pos + 2) & 0xFF) == 0) { return false; }
+    }
+
+    if (len < 0 || len > DER_MAX_LEN) { return false; }
+    if (p + len > bufLen) { return false; }
+
+    poke64(feld + DER_F_TAG,  tag);
+    poke64(feld + DER_F_POS,  p);
+    poke64(feld + DER_F_LEN,  len);
+    poke64(feld + DER_F_NEXT, p + len);
+    return true;
+}
+
+// Erstes Kind eines konstruierten Feldes.
+pub fn DerErstesKind(buf: int64, bufLen: int64, feld: int64, kind: int64): bool {
+    if (!DerIstKonstruiert(DerTag(feld))) { return false; }
+    var ende: int64 := DerInhalt(feld) + DerInhaltLen(feld);
+    if (ende > bufLen) { return false; }
+    return DerLies(buf, ende, DerInhalt(feld), kind);
+}
+
+// INTEGER als int64. Liefert bei mehr als acht Inhaltsbyte, bei leerem
+// Inhalt oder bei nicht minimaler Kodierung -1 — der Aufrufer muss diesen
+// Fall also behandeln und bekommt keinen stillen Ersatzwert. Negative
+// INTEGER kommen in X.509 nur fehlerhaft vor und geben ebenfalls -1.
+pub fn DerGanzzahl(buf: int64, bufLen: int64, feld: int64): int64 {
+    if (DerTag(feld) != 0x02) { return -1; }
+    var len: int64 := DerInhaltLen(feld);
+    var pos: int64 := DerInhalt(feld);
+    if (len <= 0 || len > 9) { return -1; }
+    var erst: int64 := peek8(buf + pos) & 0xFF;
+    if ((erst & 0x80) != 0) { return -1; }             // negativ
+    if (len > 1) {
+        // Fuehrende Null nur erlaubt, wenn das naechste Byte das Vorzeichenbit
+        // setzt (X.690 §8.3.2).
+        if (erst == 0 && (peek8(buf + pos + 1) & 0x80) == 0) { return -1; }
+        if (erst != 0 && len > 8) { return -1; }
+    }
+    var v: int64 := 0;
+    var i: int64 := 0;
+    while (i < len) {
+        v := (v << 8) | (peek8(buf + pos + i) & 0xFF);
+        i += 1;
+    }
+    return v;
+}
+
+// Vergleicht den Inhalt eines OBJECT IDENTIFIER mit einer vorgegebenen
+// Bytefolge (die kodierten OID-Byte ohne Tag und Laenge).
+pub fn DerOidGleich(buf: int64, feld: int64, oid: int64, oidLen: int64): bool {
+    if (DerTag(feld) != 0x06) { return false; }
+    if (DerInhaltLen(feld) != oidLen) { return false; }
+    var i: int64 := 0;
+    while (i < oidLen) {
+        if ((peek8(buf + DerInhalt(feld) + i) & 0xFF) != (peek8(oid + i) & 0xFF)) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+// BIT STRING: erstes Inhaltsbyte zaehlt die unbenutzten Bits. Alles ausser 0
+// wird abgewiesen — in Zertifikaten sind alle fuer uns interessanten
+// BIT STRINGs (Signatur, SPKI) ganze Byte. outPos/outLen sind Zeiger auf je
+// einen int64.
+pub fn DerBitKette(buf: int64, feld: int64, outPos: int64, outLen: int64): bool {
+    if (DerTag(feld) != 0x03) { return false; }
+    var len: int64 := DerInhaltLen(feld);
+    if (len < 1) { return false; }
+    if ((peek8(buf + DerInhalt(feld)) & 0xFF) != 0) { return false; }
+    poke64(outPos, DerInhalt(feld) + 1);
+    poke64(outLen, len - 1);
+    return true;
+}
+
+// Tage seit 1970-01-01 fuer ein gueltiges Datum (proleptischer gregorianischer
+// Kalender). Rechnung ueber die Tage seit dem Jahr 0, wie in std/time.lyx.
+fn derTageSeitEpoche(jahr: int64, monat: int64, tag: int64): int64 {
+    var y: int64 := jahr;
+    var m: int64 := monat;
+    if (m <= 2) { y -= 1; m += 12; }
+    var era: int64 := y / 400;
+    if (y < 0) { era := (y - 399) / 400; }
+    var yoe: int64 := y - era * 400;
+    var doy: int64 := (153 * (m - 3) + 2) / 5 + tag - 1;
+    var doe: int64 := yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + doe - 719468;
+}
+
+fn derZwei(buf: int64, pos: int64): int64 {
+    var a: int64 := peek8(buf + pos) & 0xFF;
+    var b: int64 := peek8(buf + pos + 1) & 0xFF;
+    if (a < 48 || a > 57 || b < 48 || b > 57) { return -1; }
+    return (a - 48) * 10 + (b - 48);
+}
+
+// UTCTime (0x17, YYMMDDHHMMSSZ) und GeneralizedTime (0x18, YYYYMMDDHHMMSSZ)
+// als Unix-Zeit. Andere Formen (Zeitzonenversatz, Bruchteile, fehlende
+// Sekunden) liefern -1: RFC 5280 §4.1.2.5 schreibt genau diese beiden Formen
+// mit 'Z' vor.
+pub fn DerZeitUnix(buf: int64, feld: int64): int64 {
+    var tag: int64 := DerTag(feld);
+    var pos: int64 := DerInhalt(feld);
+    var len: int64 := DerInhaltLen(feld);
+    var jahr: int64 := 0;
+    var off: int64 := 0;
+
+    if (tag == 0x17) {
+        if (len != 13) { return -1; }
+        var yy: int64 := derZwei(buf, pos);
+        if (yy < 0) { return -1; }
+        // RFC 5280: 00..49 heisst 2000..2049, 50..99 heisst 1950..1999.
+        if (yy < 50) { jahr := 2000 + yy; } else { jahr := 1900 + yy; }
+        off := pos + 2;
+    } else {
+        if (tag != 0x18) { return -1; }
+        if (len != 15) { return -1; }
+        var h1: int64 := derZwei(buf, pos);
+        var h2: int64 := derZwei(buf, pos + 2);
+        if (h1 < 0 || h2 < 0) { return -1; }
+        jahr := h1 * 100 + h2;
+        off := pos + 4;
+    }
+
+    if ((peek8(buf + pos + len - 1) & 0xFF) != 90) { return -1; }   // 'Z'
+
+    var monat: int64 := derZwei(buf, off);
+    var tagM:  int64 := derZwei(buf, off + 2);
+    var std:   int64 := derZwei(buf, off + 4);
+    var min:   int64 := derZwei(buf, off + 6);
+    var sek:   int64 := derZwei(buf, off + 8);
+    if (monat < 1 || monat > 12) { return -1; }
+    if (tagM < 1 || tagM > 31) { return -1; }
+    if (std < 0 || std > 23) { return -1; }
+    if (min < 0 || min > 59) { return -1; }
+    if (sek < 0 || sek > 60) { return -1; }            // Schaltsekunde erlaubt
+
+    return derTageSeitEpoche(jahr, monat, tagM) * 86400 + std * 3600 + min * 60 + sek;
+}
+
+// ---------------------------------------------------------------------------
+// PEM
+// ---------------------------------------------------------------------------
+
+fn pemB64Wert(c: int64): int64 {
+    if (c >= 65 && c <= 90)  { return c - 65; }        // A-Z
+    if (c >= 97 && c <= 122) { return c - 97 + 26; }   // a-z
+    if (c >= 48 && c <= 57)  { return c - 48 + 52; }   // 0-9
+    if (c == 43) { return 62; }                        // '+'
+    if (c == 47) { return 63; }                        // '/'
+    return -1;
+}
+
+fn pemGleich(buf: int64, pos: int64, bufLen: int64, s: int64, sLen: int64): bool {
+    if (pos + sLen > bufLen) { return false; }
+    var i: int64 := 0;
+    while (i < sLen) {
+        if ((peek8(buf + pos + i) & 0xFF) != (peek8(s + i) & 0xFF)) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+// Sucht den ersten Block "-----BEGIN <label>-----" ... "-----END <label>-----"
+// und schreibt die dekodierten Byte nach out. Liefert die Laenge, oder -1 bei
+// fehlendem Block, ungueltigem Base64 oder zu kleinem Puffer.
+pub fn PemDekodiere(pem: int64, pemLen: int64, label: int64, labelLen: int64,
+                    out: int64, outCap: int64): int64 {
+    var anf: pchar := "-----BEGIN "c;
+    var end: pchar := "-----END "c;
+
+    // Anfangszeile finden.
+    var start: int64 := -1;
+    var p: int64 := 0;
+    while (p < pemLen) {
+        if (pemGleich(pem, p, pemLen, anf as int64, 11)
+            && pemGleich(pem, p + 11, pemLen, label, labelLen)
+            && pemGleich(pem, p + 11 + labelLen, pemLen, "-----"c as int64, 5)) {
+            start := p + 11 + labelLen + 5;
+            p := pemLen;
+        } else {
+            p += 1;
+        }
+    }
+    if (start < 0) { return -1; }
+
+    // Ende der Nutzlast finden.
+    var stop: int64 := -1;
+    p := start;
+    while (p < pemLen) {
+        if (pemGleich(pem, p, pemLen, end as int64, 9)
+            && pemGleich(pem, p + 9, pemLen, label, labelLen)) {
+            stop := p;
+            p := pemLen;
+        } else {
+            p += 1;
+        }
+    }
+    if (stop < 0) { return -1; }
+
+    // Base64 dekodieren, Zeilenumbrueche und Leerraum ueberspringen.
+    var acc: int64 := 0;
+    var bits: int64 := 0;
+    var geschrieben: int64 := 0;
+    var pad: int64 := 0;
+    var i: int64 := start;
+    while (i < stop) {
+        var c: int64 := peek8(pem + i) & 0xFF;
+        i += 1;
+        if (c == 10 || c == 13 || c == 32 || c == 9) { continue; }
+        if (c == 61) { pad += 1; continue; }           // '='
+        if (pad > 0) { return -1; }                    // Daten nach dem Padding
+        var v: int64 := pemB64Wert(c);
+        if (v < 0) { return -1; }
+        acc := (acc << 6) | v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            if (geschrieben >= outCap) { return -1; }
+            poke8(out + geschrieben, (acc >> bits) & 0xFF);
+            geschrieben += 1;
+        }
+    }
+    if (pad > 2) { return -1; }
+    // Uebrige Bits muessen null sein, sonst war die Kodierung falsch.
+    if (bits > 0 && (acc & ((1 << bits) - 1)) != 0) { return -1; }
+    return geschrieben;
+}
