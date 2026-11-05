@@ -125,8 +125,14 @@ pruefsumme() {
 # zaehler BINARY ARGS...  — eine Zeile mit den perf-Werten, oder leer.
 # Ist OPS gesetzt (Zahl der Operationen des laufenden Kerns: Elemente mal
 # Wiederholungen, bzw. Viertelrunden), stehen die Werte JE OPERATION da —
-# das, was #2195 verlangt. Sie enthalten Anlage und Prozessstart mit; bei
-# den gewaehlten Groessen ist das unter einem Prozent.
+# das, was #2195 verlangt. Sie enthalten Anlage und Prozessstart mit.
+# #2322: dieser Anteil ist zu MESSEN, nicht anzunehmen. Gemessen am
+# 2026-11-05 (i5-8250U): ein Lauf mit 1e5 Runden kostet 6,2 ms bei den
+# dynamisch gegen libc gebundenen C-Fassungen und 3,2 ms beim statischen
+# Lyx-Erzeugnis — die Grundkosten sind also NICHT gleich und begünstigen
+# die Fassung mit der teureren Anlage nicht, sondern die andere. Wer einen
+# Kern hinzufuegt, waehlt die Groesse so, dass dieser Posten unter 5 %
+# bleibt, und belegt das mit einem Lauf bei kleiner Groesse.
 # uOps: uops_issued.any (Intel). Fehlt das Ereignis, bleibt die Angabe weg.
 zaehler() {
   [ "$HAT_PERF" -eq 1 ] || return 0
@@ -199,6 +205,15 @@ kern() {
     bins["lyxc avx2"]="$TMP/$name.lyx.avx2"
   fi
   if gcc -O2 -o "$TMP/$name.gcc2" "$cq" 2>/dev/null; then bins["gcc -O2"]="$TMP/$name.gcc2"; fi
+  # #2322: eine ZWEITE C-Quelle in idiomatischer Schreibweise, als eigene
+  # Zeile. Die gespiegelte Fassung ($cq) baut absichtlich die Form von Lyx
+  # nach; gcc zieht sie nicht immer zu demselben Befehl zusammen wie die
+  # idiomatische (bei chacha_qr: kein `rol`). Ohne diese Zeile vergleicht das
+  # Protokoll gegen "C in unserer Schreibweise" und stellt uns zu gut dar.
+  if [ -n "${CQ2:-}" ] && [ -f "$CQ2" ]; then
+    if gcc -O2 -o "$TMP/$name.gcc2i" "$CQ2" 2>/dev/null; then bins["gcc -O2 idiomatisch"]="$TMP/$name.gcc2i"; fi
+    if gcc -O3 -march=native -o "$TMP/$name.gcc3i" "$CQ2" 2>/dev/null; then bins["gcc -O3 -march=native idiomatisch"]="$TMP/$name.gcc3i"; fi
+  fi
   if gcc -O3 -march=native -o "$TMP/$name.gcc3" "$cq" 2>/dev/null; then bins["gcc -O3 -march=native"]="$TMP/$name.gcc3"; fi
   if [ "$HAT_CLANG" -eq 1 ]; then
     if clang -O2 -o "$TMP/$name.cl2" "$cq" 2>/dev/null; then bins["clang -O2"]="$TMP/$name.cl2"; fi
@@ -228,7 +243,9 @@ kern() {
 
   # 2. und 3. Zeit und Zaehler.
   local referenz=""
-  for k in "lyxc baseline" "lyxc avx2" "gcc -O2" "gcc -O3 -march=native" "clang -O2" "clang -O3 -march=native"; do
+  for k in "lyxc baseline" "lyxc avx2" "gcc -O2" "gcc -O3 -march=native" \
+           "gcc -O2 idiomatisch" "gcc -O3 -march=native idiomatisch" \
+           "clang -O2" "clang -O3 -march=native"; do
     [ -n "${bins[$k]:-}" ] || continue
     local r
     r=$(messe "${bins[$k]}" "${args[@]}") || { echo "  $k: LAUFFEHLER"; FEHLER=1; continue; }
@@ -256,7 +273,15 @@ kern() {
 
 if [ -z "$KERN" ] || [ "$KERN" = "chacha" ]; then
   # Ganzzahlkern: haengt an Rotationen, nicht an Speicher — eine Groesse genuegt.
-  OPS=2000000 kern "chacha_qr" "bench/chacha_qr.lyx" "$ROOT/bench/chacha_qr.c" 2000000
+  # #2322: 2e7 statt 2e6 Runden. Bei 2e6 war der Prozessstart kein
+  # Rundungsfehler, sondern ein Posten: gemessen rund 6 ms fuer die dynamisch
+  # gegen libc gebundenen C-Fassungen und 2-3 ms fuer das statische
+  # Lyx-Erzeugnis (Leerlauf bei 1e5 Runden). Das sind bei 2e6 Runden bis zu
+  # 40 % der Messung -- und es trifft die SCHNELLERE Fassung haerter, stellt
+  # unser Erzeugnis also zu gut dar. Bei 2e7 Runden liegt der Anteil unter
+  # 5 %; die Zahl ist gemessen, nicht angenommen.
+  CQ2="$ROOT/bench/chacha_qr_u32.c" OPS=20000000 \
+    kern "chacha_qr" "bench/chacha_qr.lyx" "$ROOT/bench/chacha_qr.c" 20000000
 fi
 
 if [ -z "$KERN" ] || [ "$KERN" = "arr_add_f32" ]; then
