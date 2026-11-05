@@ -10,6 +10,7 @@ unit std.hash;
 
 import std.alloc;
 import std.string;
+import std.crypto.sha512;  // #2096: SHA-512-Kern, hier nur weitergeleitet
 
 // FFI: libcrypt (bcrypt via crypt())
 extern fn crypt(key: int64, setting: int64): int64 link "libcrypt.so.1";
@@ -2704,222 +2705,34 @@ pub fn PBKDF2HMACSHA256Bytes(password: int64, passwordLen: int64,
 
 // ============================================================================
 // WP-1: SHA-512 / SHA-384 — FIPS 180-4 (1.2)
-// Context layout (208 bytes):
-//   +0:   h0..h7 (8 × int64 = 64 bytes)
-//   +64:  total bytes processed (int64)
-//   +72:  partial block fill level (int64)
-//   +80:  128-byte block buffer
+//
+// #2096: Die Kompression steht nur noch in std/crypto/sha512.lyx. Hier blieben
+// die eingefuehrten Namen als Weiterleitung, damit der Bestand unveraendert
+// baut; die Rechnung lag vorher zweimal im Baum, und genau so war #2094 (der
+// arithmetische Rechtsshift in sigma) nur an einer von zwei Stellen zu finden.
+// Zustandslayout und -groesse sind dieselben wie dort (208 Byte).
 // ============================================================================
 
 con SHA512_CTX_SIZE: int64 := 208;
-con SHA512_H_OFF:    int64 := 0;
-con SHA512_LEN_OFF:  int64 := 64;
-con SHA512_FILL_OFF: int64 := 72;
-con SHA512_BUF_OFF:  int64 := 80;
-
-// #2094: Rotation und sigma brauchen den LOGISCHEN Rechtsshift. `x` ist
-// int64, `>>` darauf ist seit #1125 arithmetisch (SAR): bei gesetztem Bit 63
-// fuellten Einsen die oberen Bits, und JEDER Digest war falsch — auch der der
-// leeren Nachricht. Dieselbe Schreibweise wie xxh_rotl64 und murmur in
-// dieser Datei: `(x as uint64) >> n`.
-// #2228: Builtin rotr (#2190); Weiten 1..61, dort dieselbe Rotation.
-fn sha512_rotr(x: int64, n: int64): int64 {
-  return rotr(x, n);
-}
-
-fn sha512_ch(x: int64, y: int64, z: int64): int64 {
-  return (x & y) ^ ((x ^ 0xFFFFFFFFFFFFFFFF) & z);
-}
-
-fn sha512_maj(x: int64, y: int64, z: int64): int64 {
-  return (x & y) ^ (x & z) ^ (y & z);
-}
-
-fn sha512_S0(x: int64): int64 {
-  return sha512_rotr(x, 28) ^ sha512_rotr(x, 34) ^ sha512_rotr(x, 39);
-}
-
-fn sha512_S1(x: int64): int64 {
-  return sha512_rotr(x, 14) ^ sha512_rotr(x, 18) ^ sha512_rotr(x, 41);
-}
-
-fn sha512_G0(x: int64): int64 {
-  return sha512_rotr(x, 1) ^ sha512_rotr(x, 8) ^ ((x as uint64) >> 7);     // #2094
-}
-
-fn sha512_G1(x: int64): int64 {
-  return sha512_rotr(x, 19) ^ sha512_rotr(x, 61) ^ ((x as uint64) >> 6);   // #2094
-}
-
-fn sha512_k(i: int64): int64 {
-  if (i == 0)  { return 0x428a2f98d728ae22; } if (i == 1)  { return 0x7137449123ef65cd; }
-  if (i == 2)  { return 0xb5c0fbcfec4d3b2f; } if (i == 3)  { return 0xe9b5dba58189dbbc; }
-  if (i == 4)  { return 0x3956c25bf348b538; } if (i == 5)  { return 0x59f111f1b605d019; }
-  if (i == 6)  { return 0x923f82a4af194f9b; } if (i == 7)  { return 0xab1c5ed5da6d8118; }
-  if (i == 8)  { return 0xd807aa98a3030242; } if (i == 9)  { return 0x12835b0145706fbe; }
-  if (i == 10) { return 0x243185be4ee4b28c; } if (i == 11) { return 0x550c7dc3d5ffb4e2; }
-  if (i == 12) { return 0x72be5d74f27b896f; } if (i == 13) { return 0x80deb1fe3b1696b1; }
-  if (i == 14) { return 0x9bdc06a725c71235; } if (i == 15) { return 0xc19bf174cf692694; }
-  if (i == 16) { return 0xe49b69c19ef14ad2; } if (i == 17) { return 0xefbe4786384f25e3; }
-  if (i == 18) { return 0x0fc19dc68b8cd5b5; } if (i == 19) { return 0x240ca1cc77ac9c65; }
-  if (i == 20) { return 0x2de92c6f592b0275; } if (i == 21) { return 0x4a7484aa6ea6e483; }
-  if (i == 22) { return 0x5cb0a9dcbd41fbd4; } if (i == 23) { return 0x76f988da831153b5; }
-  if (i == 24) { return 0x983e5152ee66dfab; } if (i == 25) { return 0xa831c66d2db43210; }
-  if (i == 26) { return 0xb00327c898fb213f; } if (i == 27) { return 0xbf597fc7beef0ee4; }
-  if (i == 28) { return 0xc6e00bf33da88fc2; } if (i == 29) { return 0xd5a79147930aa725; }
-  if (i == 30) { return 0x06ca6351e003826f; } if (i == 31) { return 0x142929670a0e6e70; }
-  if (i == 32) { return 0x27b70a8546d22ffc; } if (i == 33) { return 0x2e1b21385c26c926; }
-  if (i == 34) { return 0x4d2c6dfc5ac42aed; } if (i == 35) { return 0x53380d139d95b3df; }
-  if (i == 36) { return 0x650a73548baf63de; } if (i == 37) { return 0x766a0abb3c77b2a8; }
-  if (i == 38) { return 0x81c2c92e47edaee6; } if (i == 39) { return 0x92722c851482353b; }
-  if (i == 40) { return 0xa2bfe8a14cf10364; } if (i == 41) { return 0xa81a664bbc423001; }
-  if (i == 42) { return 0xc24b8b70d0f89791; } if (i == 43) { return 0xc76c51a30654be30; }
-  if (i == 44) { return 0xd192e819d6ef5218; } if (i == 45) { return 0xd69906245565a910; }
-  if (i == 46) { return 0xf40e35855771202a; } if (i == 47) { return 0x106aa07032bbd1b8; }
-  if (i == 48) { return 0x19a4c116b8d2d0c8; } if (i == 49) { return 0x1e376c085141ab53; }
-  if (i == 50) { return 0x2748774cdf8eeb99; } if (i == 51) { return 0x34b0bcb5e19b48a8; }
-  if (i == 52) { return 0x391c0cb3c5c95a63; } if (i == 53) { return 0x4ed8aa4ae3418acb; }
-  if (i == 54) { return 0x5b9cca4f7763e373; } if (i == 55) { return 0x682e6ff3d6b2b8a3; }
-  if (i == 56) { return 0x748f82ee5defb2fc; } if (i == 57) { return 0x78a5636f43172f60; }
-  if (i == 58) { return 0x84c87814a1f0ab72; } if (i == 59) { return 0x8cc702081a6439ec; }
-  if (i == 60) { return 0x90befffa23631e28; } if (i == 61) { return 0xa4506cebde82bde9; }
-  if (i == 62) { return 0xbef9a3f7b2c67915; } if (i == 63) { return 0xc67178f2e372532b; }
-  if (i == 64) { return 0xca273eceea26619c; } if (i == 65) { return 0xd186b8c721c0c207; }
-  if (i == 66) { return 0xeada7dd6cde0eb1e; } if (i == 67) { return 0xf57d4f7fee6ed178; }
-  if (i == 68) { return 0x06f067aa72176fba; } if (i == 69) { return 0x0a637dc5a2c898a6; }
-  if (i == 70) { return 0x113f9804bef90dae; } if (i == 71) { return 0x1b710b35131c471b; }
-  if (i == 72) { return 0x28db77f523047d84; } if (i == 73) { return 0x32caab7b40c72493; }
-  if (i == 74) { return 0x3c9ebe0a15c9bebc; } if (i == 75) { return 0x431d67c49c100d4c; }
-  if (i == 76) { return 0x4cc5d4becb3e42b6; } if (i == 77) { return 0x597f299cfc657e2a; }
-  if (i == 78) { return 0x5fcb6fab3ad6faec; } if (i == 79) { return 0x6c44198c4a475817; }
-  return 0;
-}
-
-fn sha512_compress(ctx: int64, block: int64) {
-  var w: int64 := alloc(80 * 8);
-  var i: int64 := 0;
-  while (i < 16) {
-    var off: int64 := i * 8;
-    var val: int64 := ((peek8(block + off) << 56) | (peek8(block + off + 1) << 48) |
-                       (peek8(block + off + 2) << 40) | (peek8(block + off + 3) << 32) |
-                       (peek8(block + off + 4) << 24) | (peek8(block + off + 5) << 16) |
-                       (peek8(block + off + 6) << 8)  |  peek8(block + off + 7));
-    poke64(w + i * 8, val);
-    i += 1;
-  }
-  while (i < 80) {
-    var w2:  int64 := peek64(w + (i - 2)  * 8);
-    var w7:  int64 := peek64(w + (i - 7)  * 8);
-    var w15: int64 := peek64(w + (i - 15) * 8);
-    var w16: int64 := peek64(w + (i - 16) * 8);
-    poke64(w + i * 8, sha512_G1(w2) + w7 + sha512_G0(w15) + w16);
-    i += 1;
-  }
-  var a: int64 := peek64(ctx + SHA512_H_OFF);
-  var b: int64 := peek64(ctx + SHA512_H_OFF + 8);
-  var c: int64 := peek64(ctx + SHA512_H_OFF + 16);
-  var d: int64 := peek64(ctx + SHA512_H_OFF + 24);
-  var e: int64 := peek64(ctx + SHA512_H_OFF + 32);
-  var f: int64 := peek64(ctx + SHA512_H_OFF + 40);
-  var g: int64 := peek64(ctx + SHA512_H_OFF + 48);
-  var h: int64 := peek64(ctx + SHA512_H_OFF + 56);
-  i := 0;
-  while (i < 80) {
-    var t1: int64 := h + sha512_S1(e) + sha512_ch(e, f, g) + sha512_k(i) + peek64(w + i * 8);
-    var t2: int64 := sha512_S0(a) + sha512_maj(a, b, c);
-    h := g; g := f; f := e; e := d + t1;
-    d := c; c := b; b := a; a := t1 + t2;
-    i += 1;
-  }
-  poke64(ctx + SHA512_H_OFF,      peek64(ctx + SHA512_H_OFF)      + a);
-  poke64(ctx + SHA512_H_OFF + 8,  peek64(ctx + SHA512_H_OFF + 8)  + b);
-  poke64(ctx + SHA512_H_OFF + 16, peek64(ctx + SHA512_H_OFF + 16) + c);
-  poke64(ctx + SHA512_H_OFF + 24, peek64(ctx + SHA512_H_OFF + 24) + d);
-  poke64(ctx + SHA512_H_OFF + 32, peek64(ctx + SHA512_H_OFF + 32) + e);
-  poke64(ctx + SHA512_H_OFF + 40, peek64(ctx + SHA512_H_OFF + 40) + f);
-  poke64(ctx + SHA512_H_OFF + 48, peek64(ctx + SHA512_H_OFF + 48) + g);
-  poke64(ctx + SHA512_H_OFF + 56, peek64(ctx + SHA512_H_OFF + 56) + h);
-  free(w, 80 * 8);
-}
 
 pub fn SHA512Init(ctx: int64) {
-  poke64(ctx + SHA512_H_OFF,      0x6a09e667f3bcc908);
-  poke64(ctx + SHA512_H_OFF + 8,  0xbb67ae8584caa73b);
-  poke64(ctx + SHA512_H_OFF + 16, 0x3c6ef372fe94f82b);
-  poke64(ctx + SHA512_H_OFF + 24, 0xa54ff53a5f1d36f1);
-  poke64(ctx + SHA512_H_OFF + 32, 0x510e527fade682d1);
-  poke64(ctx + SHA512_H_OFF + 40, 0x9b05688c2b3e6c1f);
-  poke64(ctx + SHA512_H_OFF + 48, 0x1f83d9abfb41bd6b);
-  poke64(ctx + SHA512_H_OFF + 56, 0x5be0cd19137e2179);
-  poke64(ctx + SHA512_LEN_OFF, 0);
-  poke64(ctx + SHA512_FILL_OFF, 0);
+  Sha512Init(ctx);
 }
 
 pub fn SHA384Init(ctx: int64) {
-  poke64(ctx + SHA512_H_OFF,      0xcbbb9d5dc1059ed8);
-  poke64(ctx + SHA512_H_OFF + 8,  0x629a292a367cd507);
-  poke64(ctx + SHA512_H_OFF + 16, 0x9159015a3070dd17);
-  poke64(ctx + SHA512_H_OFF + 24, 0x152fecd8f70e5939);
-  poke64(ctx + SHA512_H_OFF + 32, 0x67332667ffc00b31);
-  poke64(ctx + SHA512_H_OFF + 40, 0x8eb44a8768581511);
-  poke64(ctx + SHA512_H_OFF + 48, 0xdb0c2e0d64f98fa7);
-  poke64(ctx + SHA512_H_OFF + 56, 0x47b5481dbefa4fa4);
-  poke64(ctx + SHA512_LEN_OFF, 0);
-  poke64(ctx + SHA512_FILL_OFF, 0);
+  Sha384Init(ctx);
 }
 
 pub fn SHA512Update(ctx: int64, data: int64, len: int64) {
-  var fill: int64 := peek64(ctx + SHA512_FILL_OFF);
-  var i: int64 := 0;
-  while (i < len) {
-    poke8(ctx + SHA512_BUF_OFF + fill, peek8(data + i));
-    fill += 1;
-    if (fill == 128) {
-      sha512_compress(ctx, ctx + SHA512_BUF_OFF);
-      poke64(ctx + SHA512_LEN_OFF, peek64(ctx + SHA512_LEN_OFF) + 128);
-      fill := 0;
-    }
-    i += 1;
-  }
-  poke64(ctx + SHA512_FILL_OFF, fill);
+  Sha512Update(ctx, data, len);
 }
 
+// Schreibt 64 Byte — auch nach SHA384Init, wie bisher. Wer nur 48 Byte Platz
+// hat, nimmt Sha384Final aus std.crypto.sha512.
 pub fn SHA512Final(ctx: int64, outBuf: int64) {
-  var fill: int64 := peek64(ctx + SHA512_FILL_OFF);
-  var totalLen: int64 := peek64(ctx + SHA512_LEN_OFF) + fill;
-  var bitLen: int64 := totalLen * 8;
-  poke8(ctx + SHA512_BUF_OFF + fill, 0x80);
-  fill += 1;
-  if (fill > 112) {
-    while (fill < 128) { poke8(ctx + SHA512_BUF_OFF + fill, 0); fill := fill + 1; }
-    sha512_compress(ctx, ctx + SHA512_BUF_OFF);
-    fill := 0;
-  }
-  while (fill < 112) { poke8(ctx + SHA512_BUF_OFF + fill, 0); fill := fill + 1; }
-  // 16-byte big-endian bit length: upper 64 bits are 0 for msgs < 2^61 bytes
-  var j: int64 := 0;
-  while (j < 8)  { poke8(ctx + SHA512_BUF_OFF + 112 + j, 0); j := j + 1; }
-  j := 0;
-  while (j < 8)  {
-    poke8(ctx + SHA512_BUF_OFF + 120 + (7 - j), (bitLen >> (j * 8)) & 0xFF);
-    j += 1;
-  }
-  sha512_compress(ctx, ctx + SHA512_BUF_OFF);
-  var hi: int64 := 0;
-  while (hi < 8) {
-    var word: int64 := peek64(ctx + SHA512_H_OFF + hi * 8);
-    var base: int64 := hi * 8;
-    poke8(outBuf + base + 0, (word >> 56) & 0xFF);
-    poke8(outBuf + base + 1, (word >> 48) & 0xFF);
-    poke8(outBuf + base + 2, (word >> 40) & 0xFF);
-    poke8(outBuf + base + 3, (word >> 32) & 0xFF);
-    poke8(outBuf + base + 4, (word >> 24) & 0xFF);
-    poke8(outBuf + base + 5, (word >> 16) & 0xFF);
-    poke8(outBuf + base + 6, (word >> 8)  & 0xFF);
-    poke8(outBuf + base + 7,  word        & 0xFF);
-    hi += 1;
-  }
+  Sha512Final(ctx, outBuf);
 }
+
 
 pub fn SHA512Hash(data: pchar): int64 {
   var ctx: int64 := alloc(SHA512_CTX_SIZE);
@@ -2933,10 +2746,11 @@ pub fn SHA512Hash(data: pchar): int64 {
 
 pub fn SHA384Hash(data: pchar): int64 {
   var ctx: int64 := alloc(SHA512_CTX_SIZE);
-  SHA384Init(ctx);
-  SHA512Update(ctx, data as int64, StrLen(data));
+  Sha384Init(ctx);
+  Sha512Update(ctx, data as int64, StrLen(data));
   var out: int64 := alloc(48);
-  SHA512Final(ctx, out);
+  // #2096: hier stand SHA512Final — das schrieb 64 Byte in einen 48-Byte-Block.
+  Sha384Final(ctx, out);
   free(ctx, SHA512_CTX_SIZE);
   return out;
 }

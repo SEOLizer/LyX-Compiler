@@ -255,3 +255,105 @@ pub fn SHA256Str(data: pchar, len: int64, out: int64): void {
 pub fn HashSHA256Bytes(data: int64, len: int64, out: int64): void {
     SHA256(data, len, out);
 }
+
+// ============================================================================
+// Schrittweises SHA-256 (#2096)
+//
+// TLS 1.3 braucht den Transkript-Hash ueber viele Teilstuecke, bevor die
+// Nachricht vollstaendig ist — das geht mit der Einzelaufruf-Form oben nicht.
+// Beide Formen rechnen dieselbe Kompression (sha256Block); wer eine aendert,
+// muss die andere nachziehen.
+//
+// Zustandslayout (112 Byte):
+//   +0   h0..h7           8 x int64 (je 32 Bit genutzt)
+//   +32  verarbeitete Byte (ohne Teilblock)
+//   +40  Fuellstand des Teilblocks
+//   +48  64-Byte-Blockpuffer
+// ============================================================================
+
+con S256_H_OFF:    int64 := 0;
+con S256_LEN_OFF:  int64 := 32;
+con S256_FILL_OFF: int64 := 40;
+con S256_BUF_OFF:  int64 := 48;
+con S256_CTX_SIZE: int64 := 112;
+
+// Groesse des Zustands in Byte. Als Funktion, weil ein `pub con` ueber
+// Unit-Grenzen still -1 liefern kann (#2102).
+pub fn Sha256CtxSize(): int64 {
+    return S256_CTX_SIZE;
+}
+
+pub fn Sha256Init(ctx: int64): void {
+    poke32(ctx + S256_H_OFF +  0, 0x6a09e667);
+    poke32(ctx + S256_H_OFF +  4, 0xbb67ae85);
+    poke32(ctx + S256_H_OFF +  8, 0x3c6ef372);
+    poke32(ctx + S256_H_OFF + 12, 0xa54ff53a);
+    poke32(ctx + S256_H_OFF + 16, 0x510e527f);
+    poke32(ctx + S256_H_OFF + 20, 0x9b05688c);
+    poke32(ctx + S256_H_OFF + 24, 0x1f83d9ab);
+    poke32(ctx + S256_H_OFF + 28, 0x5be0cd19);
+    poke64(ctx + S256_LEN_OFF, 0);
+    poke64(ctx + S256_FILL_OFF, 0);
+}
+
+pub fn Sha256Update(ctx: int64, data: int64, len: int64): void {
+    if (len <= 0) { return; }
+    var fill: int64 := peek64(ctx + S256_FILL_OFF);
+    var pos: int64 := 0;
+
+    if (fill > 0) {
+        while (fill < 64 && pos < len) {
+            poke8(ctx + S256_BUF_OFF + fill, peek8(data + pos));
+            fill += 1;
+            pos += 1;
+        }
+        if (fill == 64) {
+            sha256Block(ctx + S256_H_OFF, ctx + S256_BUF_OFF);
+            poke64(ctx + S256_LEN_OFF, peek64(ctx + S256_LEN_OFF) + 64);
+            fill := 0;
+        }
+    }
+
+    while (pos + 64 <= len) {
+        sha256Block(ctx + S256_H_OFF, data + pos);
+        poke64(ctx + S256_LEN_OFF, peek64(ctx + S256_LEN_OFF) + 64);
+        pos += 64;
+    }
+
+    while (pos < len) {
+        poke8(ctx + S256_BUF_OFF + fill, peek8(data + pos));
+        fill += 1;
+        pos += 1;
+    }
+    poke64(ctx + S256_FILL_OFF, fill);
+}
+
+// 32 Byte Digest nach out. Der Zustand ist danach verbraucht.
+pub fn Sha256Final(ctx: int64, out: int64): void {
+    var fill: int64 := peek64(ctx + S256_FILL_OFF);
+    var bitLen: int64 := (peek64(ctx + S256_LEN_OFF) + fill) * 8;
+
+    poke8(ctx + S256_BUF_OFF + fill, 0x80);
+    fill += 1;
+    if (fill > 56) {
+        while (fill < 64) { poke8(ctx + S256_BUF_OFF + fill, 0); fill := fill + 1; }
+        sha256Block(ctx + S256_H_OFF, ctx + S256_BUF_OFF);
+        fill := 0;
+    }
+    while (fill < 56) { poke8(ctx + S256_BUF_OFF + fill, 0); fill := fill + 1; }
+
+    var j: int64 := 0;
+    while (j < 8) {
+        poke8(ctx + S256_BUF_OFF + 56 + (7 - j), ((bitLen as uint64) >> (j * 8)) & 0xFF);
+        j += 1;
+    }
+    sha256Block(ctx + S256_H_OFF, ctx + S256_BUF_OFF);
+
+    var i: int64 := 0;
+    while (i < 32) {
+        var word: int64 := peek32(ctx + S256_H_OFF + (i / 4) * 4) & 0xFFFFFFFF;
+        var shift: int64 := 24 - (i % 4) * 8;
+        poke8(out + i, ((word as uint64) >> shift) & 0xFF);
+        i += 1;
+    }
+}
