@@ -20,7 +20,19 @@
 // AES-NI, AVX2, BMI1/2, FMA, POPCNT, SSE2 und SSE4.1 — und ohne SHA-NI und
 // AVX-512, damit auch die Gegenrichtung belegt ist.
 
-@description("CPU-Faehigkeiten ueber CPUID: SSE2 bis AVX-512, AES-NI, BMI, FMA, SHA")
+// #2384: Dazugekommen sind die kryptographischen Erweiterungen — PCLMULQDQ,
+// RDRAND, RDSEED, VAES, VPCLMULQDQ, Key Locker, SHA512, SM3, SM4. Zwei
+// Angaben der Epic-Beschreibung stimmten nicht und sind hier nach Intel SDM
+// und den Kernel-Definitionen (arch/x86/include/asm/cpufeatures.h) gesetzt:
+//
+//   * Key Locker steht in CPUID.(EAX=7,ECX=0):ECX Bit 23, nicht in
+//     Blatt 7 Unterblatt 1 EAX Bit 23 — dort liegt AVX-IFMA.
+//   * Ein SHA-3-Bit gibt es auf x86 nicht. Blatt 7 Unterblatt 1 EAX Bit 1 ist
+//     SM3 (Bit 0 SHA512, Bit 2 SM4).
+//
+// Die Erkennung sagt nur, was die CPU KANN; Schnellwege, die diese Befehle
+// nutzen, sind eigene Vorgaenge.
+@description("CPU-Faehigkeiten ueber CPUID: SSE2 bis AVX-512, AES-NI, BMI, FMA, SHA, Krypto-Erweiterungen")
 @author("Andreas Röne")
 @copyright("2025 Andreas Röne")
 unit std.cpu.features;
@@ -44,6 +56,17 @@ pub con CPU_FEAT_BMI2:    int64 := 512;
 pub con CPU_FEAT_SHANI:   int64 := 1024;
 pub con CPU_FEAT_AVX512F: int64 := 2048;
 pub con CPU_FEAT_LZCNT:   int64 := 4096;
+
+// #2384: kryptographische Erweiterungen.
+pub con CPU_FEAT_PCLMUL:    int64 := 8192;      // CPUID.1:ECX Bit 1
+pub con CPU_FEAT_RDRAND:    int64 := 16384;     // CPUID.1:ECX Bit 30
+pub con CPU_FEAT_RDSEED:    int64 := 32768;     // CPUID.7.0:EBX Bit 18
+pub con CPU_FEAT_VAES:      int64 := 65536;     // CPUID.7.0:ECX Bit 9
+pub con CPU_FEAT_VPCLMUL:   int64 := 131072;    // CPUID.7.0:ECX Bit 10
+pub con CPU_FEAT_KEYLOCKER: int64 := 262144;    // CPUID.7.0:ECX Bit 23
+pub con CPU_FEAT_SHA512:    int64 := 524288;    // CPUID.7.1:EAX Bit 0
+pub con CPU_FEAT_SM3:       int64 := 1048576;   // CPUID.7.1:EAX Bit 1
+pub con CPU_FEAT_SM4:       int64 := 2097152;   // CPUID.7.1:EAX Bit 2
 
 // Ermittelte Bitmaske. Das Flag ist noetig, weil 0 ein gueltiges Ergebnis ist:
 // eine CPU ohne jede dieser Faehigkeiten (oder eine andere Architektur) liefert
@@ -77,6 +100,8 @@ pub fn CpuFeatureDetect(): int64 {
     if (((ecx1 >> 20) & 1) != 0) { feats := feats | CPU_FEAT_SSE42; }
     if (((ecx1 >> 23) & 1) != 0) { feats := feats | CPU_FEAT_POPCNT; }
     if (((ecx1 >> 25) & 1) != 0) { feats := feats | CPU_FEAT_AESNI; }
+    if (((ecx1 >> 1)  & 1) != 0) { feats := feats | CPU_FEAT_PCLMUL; }
+    if (((ecx1 >> 30) & 1) != 0) { feats := feats | CPU_FEAT_RDRAND; }
 
     // AVX, FMA und alles Breitere brauchen ZWEI Zusagen: die CPU muss den
     // Befehlssatz haben UND das Betriebssystem muss den erweiterten
@@ -100,6 +125,30 @@ pub fn CpuFeatureDetect(): int64 {
       if (((ebx7 >> 3)  & 1) != 0) { feats := feats | CPU_FEAT_BMI1; }
       if (((ebx7 >> 8)  & 1) != 0) { feats := feats | CPU_FEAT_BMI2; }
       if (((ebx7 >> 29) & 1) != 0) { feats := feats | CPU_FEAT_SHANI; }
+      if (((ebx7 >> 18) & 1) != 0) { feats := feats | CPU_FEAT_RDSEED; }
+
+      // #2384: VAES und VPCLMULQDQ sind die 256/512-Bit-Formen von AESENC
+      // bzw. PCLMULQDQ; ohne gesicherten YMM-Zustand ist der erste Zugriff
+      // nach einem Kontextwechsel ein Fault, also dieselbe Doppelzusage wie
+      // bei AVX. Key Locker haengt nicht am Registerzustand und wird roh
+      // gelesen.
+      var ecx7: int64 := cpu_id(7, 0, 2);
+      if (ymmOk != 0 && ((ecx7 >> 9)  & 1) != 0) { feats := feats | CPU_FEAT_VAES; }
+      if (ymmOk != 0 && ((ecx7 >> 10) & 1) != 0) { feats := feats | CPU_FEAT_VPCLMUL; }
+      if (((ecx7 >> 23) & 1) != 0) { feats := feats | CPU_FEAT_KEYLOCKER; }
+
+      // --- Blatt 7, Unterblatt 1 ---------------------------------------
+      // Blatt 7 nennt seine hoechste Unterblattnummer in eax von
+      // Unterblatt 0. Ohne diese Frage liest man auf einer CPU, die nur
+      // Unterblatt 0 kennt, dessen eigene Bits erneut und deutet sie als
+      // SHA512/SM3/SM4.
+      var maxSub: int64 := cpu_id(7, 0, 0);
+      if (maxSub >= 1) {
+        var eax71: int64 := cpu_id(7, 1, 0);
+        if (((eax71 >> 0) & 1) != 0) { feats := feats | CPU_FEAT_SHA512; }
+        if (((eax71 >> 1) & 1) != 0) { feats := feats | CPU_FEAT_SM3; }
+        if (((eax71 >> 2) & 1) != 0) { feats := feats | CPU_FEAT_SM4; }
+      }
       if (ymmOk != 0 && ((ebx7 >> 5) & 1) != 0) { feats := feats | CPU_FEAT_AVX2; }
 
       // AVX-512 braucht zusaetzlich die Maskenregister (XCR0 Bit 5) und beide
@@ -140,6 +189,15 @@ pub fn CpuHasBMI1(): int64    { return (CpuFeatureDetect() & CPU_FEAT_BMI1)    !
 pub fn CpuHasBMI2(): int64    { return (CpuFeatureDetect() & CPU_FEAT_BMI2)    != 0; }
 pub fn CpuHasSHANI(): int64   { return (CpuFeatureDetect() & CPU_FEAT_SHANI)   != 0; }
 pub fn CpuHasAVX512F(): int64 { return (CpuFeatureDetect() & CPU_FEAT_AVX512F) != 0; }
+pub fn CpuHasPCLMUL(): int64    { return (CpuFeatureDetect() & CPU_FEAT_PCLMUL)    != 0; }
+pub fn CpuHasRDRAND(): int64    { return (CpuFeatureDetect() & CPU_FEAT_RDRAND)    != 0; }
+pub fn CpuHasRDSEED(): int64    { return (CpuFeatureDetect() & CPU_FEAT_RDSEED)    != 0; }
+pub fn CpuHasVAES(): int64      { return (CpuFeatureDetect() & CPU_FEAT_VAES)      != 0; }
+pub fn CpuHasVPCLMUL(): int64   { return (CpuFeatureDetect() & CPU_FEAT_VPCLMUL)   != 0; }
+pub fn CpuHasKeyLocker(): int64 { return (CpuFeatureDetect() & CPU_FEAT_KEYLOCKER) != 0; }
+pub fn CpuHasSHA512(): int64    { return (CpuFeatureDetect() & CPU_FEAT_SHA512)    != 0; }
+pub fn CpuHasSM3(): int64       { return (CpuFeatureDetect() & CPU_FEAT_SM3)       != 0; }
+pub fn CpuHasSM4(): int64       { return (CpuFeatureDetect() & CPU_FEAT_SM4)       != 0; }
 
 // Ist diese Architektur ueberhaupt x86? CPUID gibt es nur dort; auf arm64,
 // riscv und den Mikrocontroller-Zielen liefert das Builtin 0, und Blatt 0

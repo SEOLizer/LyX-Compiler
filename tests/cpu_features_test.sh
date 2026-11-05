@@ -22,7 +22,7 @@ QEMU="$QEMU_ARM64"
 
 # Referenzliste der Flags dieser Maschine. lscpu zuerst, weil es die Flags
 # aufbereitet; /proc/cpuinfo als Rueckfall.
-REF="$(lscpu 2>/dev/null | sed -n 's/^Flags:\s*//p')"
+REF="$(LC_ALL=C lscpu 2>/dev/null | sed -n 's/^Flags:\s*//p')"
 if [ -z "$REF" ]; then
   REF="$(sed -n 's/^flags\s*:\s*//p' /proc/cpuinfo 2>/dev/null | head -1)"
 fi
@@ -34,27 +34,36 @@ hat_ref() { # flagname → 0 = ja
   printf ' %s ' "$REF" | grep -q " $1 "
 }
 
-cat > "$TMP/f.lyx" <<'EOF'
-import src.std.io;
-import std.cpu.features;
-fn main(): int64 {
-  PrintStr("cpuid "c);   PrintLn(CpuHasCpuid());
-  PrintStr("sse2 "c);    PrintLn(CpuHasSSE2());
-  PrintStr("sse4_1 "c);  PrintLn(CpuHasSSE41());
-  PrintStr("sse4_2 "c);  PrintLn(CpuHasSSE42());
-  PrintStr("popcnt "c);  PrintLn(CpuHasPOPCNT());
-  PrintStr("abm "c);     PrintLn(CpuHasLZCNT());
-  PrintStr("aes "c);     PrintLn(CpuHasAESNI());
-  PrintStr("avx "c);     PrintLn(CpuHasAVX());
-  PrintStr("avx2 "c);    PrintLn(CpuHasAVX2());
-  PrintStr("fma "c);     PrintLn(CpuHasFMA());
-  PrintStr("bmi1 "c);    PrintLn(CpuHasBMI1());
-  PrintStr("bmi2 "c);    PrintLn(CpuHasBMI2());
-  PrintStr("sha_ni "c);  PrintLn(CpuHasSHANI());
-  PrintStr("avx512f "c); PrintLn(CpuHasAVX512F());
-  return 0;
-}
-EOF
+# #2384: gemessen wird das Werkzeug src/tools/cpu_features_dump.lyx selbst,
+# nicht eine Kopie davon — sonst prueft der Test eine zweite Aufzaehlung und
+# das Werkzeug verrottet unbemerkt.
+SRC="$ROOT/src/tools/cpu_features_dump.lyx"
+cp "$SRC" "$TMP/f.lyx"
+
+# Jede Faehigkeitskonstante muss ein eigenes Bit sein. Zwei Konstanten mit
+# demselben Wert wuerden zwei Faehigkeiten verschmelzen, und der Abgleich
+# unten waere davon erfuellt, solange beide CPUs sie gemeinsam haben.
+BITS="$(sed -n 's/^pub con CPU_FEAT_[A-Z0-9_]*: *int64 *:= *\([0-9]*\);.*/\1/p' "$ROOT/std/cpu/features.lyx")"
+anz="$(printf '%s\n' "$BITS" | wc -l)"
+uniq_anz="$(printf '%s\n' "$BITS" | sort -u | wc -l)"
+pot="$(printf '%s\n' "$BITS" | awk '{ if ($1 <= 0 || and($1, $1-1) != 0) c++ } END { print c+0 }')"
+if [ "$anz" = "$uniq_anz" ] && [ "$pot" = "0" ]; then
+  echo "PASS $anz Faehigkeitsbits, alle verschieden und je eine Zweierpotenz"; PASS=$((PASS+1))
+else
+  echo "FAIL Faehigkeitsbits: $anz Konstanten, $uniq_anz verschiedene, $pot keine Zweierpotenz"; FAIL=$((FAIL+1))
+fi
+
+# Jede Abfragefunktion der Unit muss im Werkzeug vorkommen — sonst waechst die
+# Unit und die Ausgabe bleibt zurueck (zweite Aufzaehlung, #2384).
+fehlt=""
+for fnname in $(sed -n 's/^pub fn \(CpuHas[A-Za-z0-9_]*\)().*/\1/p' "$ROOT/std/cpu/features.lyx"); do
+  grep -q "$fnname()" "$SRC" || fehlt="$fehlt $fnname"
+done
+if [ -z "$fehlt" ]; then
+  echo "PASS das Werkzeug zeigt jede Abfrage der Unit"; PASS=$((PASS+1))
+else
+  echo "FAIL im Werkzeug fehlen:$fehlt"; FAIL=$((FAIL+1))
+fi
 
 if ! (cd "$ROOT" && timeout 200 "$LYXC" --std-path="$ROOT" "$TMP/f.lyx" -o "$TMP/f" >"$TMP/f.log" 2>&1); then
   echo "FAIL x86-64 uebersetzte nicht"; sed -n '1,5p' "$TMP/f.log"; echo "Ergebnis: $PASS PASS, $((FAIL+1)) FAIL"; exit 1
