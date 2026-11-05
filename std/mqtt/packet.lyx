@@ -1,0 +1,729 @@
+// std/mqtt/packet.lyx — Pakete nach MQTT 3.1.1 und MQTT 5.0.
+//
+// Netzfrei: der Rumpf kommt aus dem Framing (std.mqtt.wire), das Ergebnis ist
+// ein Ergebnisblock mit Offsets in den Rumpf — es wird nichts kopiert
+// (R-05: Besitzer bleibt der Eingangspuffer).
+//
+// Jede Fassung wird getrennt geprueft: eine MQTT-5-Form in einem 3.1.1-Paket
+// ist ein Fehler, nicht ein zu ignorierender Rest (API-03).
+//
+// Normbezug: MQTT 3.1.1 §3; MQTT 5.0 §3.
+unit std.mqtt.packet;
+
+import std.mqtt.topic;
+import std.mqtt.wire;
+import std.mqtt.props;
+
+// --- Fehlercodes (Bereich -280..-319) --------------------------------------
+pub con MQ_E_PROTONAME: int64     := -280;  // Protocol Name nicht "MQTT"
+pub con MQ_E_PROTOLEVEL: int64    := -281;  // Protocol Level unbekannt
+pub con MQ_E_CONNFLAGS: int64     := -282;  // reserviertes Bit oder Will-Widerspruch
+pub con MQ_E_PKTID_NULL: int64    := -283;  // Packet Identifier 0
+pub con MQ_E_PKTID_FEHLT: int64   := -284;  // bei QoS > 0 verlangt
+pub con MQ_E_REST: int64          := -285;  // Bytes hinter dem Paketende
+pub con MQ_E_LEER: int64          := -286;  // Liste ohne Eintrag
+pub con MQ_E_SUBOPT: int64        := -287;  // Subscription-Options unzulaessig
+pub con MQ_E_SUBOPT_V5: int64     := -288;  // MQTT-5-Option unter 3.1.1
+pub con MQ_E_NL_SHARED: int64     := -289;  // No Local auf Shared Subscription
+pub con MQ_E_SESSION_FLAGS: int64 := -290;  // CONNACK-Flags != 0/1
+pub con MQ_E_REMLEN: int64        := -291;  // Rumpflaenge passt nicht zum Typ
+pub con MQ_E_VERSION: int64       := -292;  // Paket in dieser Fassung unbekannt
+
+// --- Ergebnisblock ---------------------------------------------------------
+pub con MQ_R_TYP: int64        := 0;
+pub con MQ_R_FLAGS: int64      := 8;
+pub con MQ_R_VERSION: int64    := 16;
+pub con MQ_R_PKTID: int64      := 24;   // 0 == keiner
+pub con MQ_R_QOS: int64        := 32;
+pub con MQ_R_DUP: int64        := 40;
+pub con MQ_R_RETAIN: int64     := 48;
+pub con MQ_R_TOPIC_OFF: int64  := 56;
+pub con MQ_R_TOPIC_LEN: int64  := 64;
+pub con MQ_R_NUTZ_OFF: int64   := 72;   // Payload (PUBLISH) bzw. Listenbeginn
+pub con MQ_R_NUTZ_LEN: int64   := 80;
+pub con MQ_R_PROPS_OFF: int64  := 88;   // Beginn des Property-Blocks, 0 == keiner
+pub con MQ_R_PROPS_ANZ: int64  := 96;
+pub con MQ_R_REASON: int64     := 104;
+pub con MQ_R_SESSION: int64    := 112;  // CONNACK Session Present
+pub con MQ_R_LEVEL: int64      := 120;  // CONNECT Protocol Level
+pub con MQ_R_KEEPALIVE: int64  := 128;
+pub con MQ_R_CFLAGS: int64     := 136;  // CONNECT Connect Flags
+pub con MQ_R_GROESSE: int64    := 144;
+
+pub fn MqErgGroesse(): int64 { return MQ_R_GROESSE; }
+
+fn _leere(r: int64) {
+  var i: int64 := 0;
+  while (i < MQ_R_GROESSE) { poke64(r + i, 0); i := i + 8; }
+}
+
+// --- Subscription Options (MQTT 5.0 §3.8.3.1) ------------------------------
+pub con MQ_RH_SEND: int64        := 0;   // Retain Handling
+pub con MQ_RH_SEND_IF_NEW: int64 := 1;
+pub con MQ_RH_SEND_NIE: int64    := 2;
+
+pub fn MqSubOptQos(o: int64): int64 { return o & 0x03; }
+pub fn MqSubOptNoLocal(o: int64): bool { return (o & 0x04) != 0; }
+pub fn MqSubOptRap(o: int64): bool { return (o & 0x08) != 0; }
+pub fn MqSubOptRetainHandling(o: int64): int64 { return (o / 16) & 0x03; }
+
+pub fn MqSubOptBaue(qos: int64, noLocal: bool, rap: bool,
+                    retainHandling: int64): int64 {
+  var o: int64 := qos & 0x03;
+  if (noLocal) { o := o | 0x04; }
+  if (rap) { o := o | 0x08; }
+  o := o | ((retainHandling & 0x03) * 16);
+  return o;
+}
+
+// Prueft Subscription Options fassungsabhaengig. `istShared` entscheidet
+// ueber No Local (MQTT 5.0 §3.8.3.1: No Local 1 auf Shared ist Protokollfehler).
+pub fn MqSubOptPruefe(o: int64, version: int64, istShared: bool): int64 {
+  if ((o & 0x03) == 3) { return MQ_E_SUBOPT; }
+  if (version == MQ_V311) {
+    if ((o & 0xFC) != 0) { return MQ_E_SUBOPT_V5; }
+    return MQ_OK;
+  }
+  if ((o & 0xC0) != 0) { return MQ_E_SUBOPT; }          // reservierte Bits 6/7
+  if (MqSubOptRetainHandling(o) == 3) { return MQ_E_SUBOPT; }
+  if (istShared && MqSubOptNoLocal(o)) { return MQ_E_NL_SHARED; }
+  return MQ_OK;
+}
+
+// ===========================================================================
+// Dekodieren
+// ===========================================================================
+// `rumpf`/`rumpfLen` ist der Rumpf aus dem Framing, `typ`/`flags` der Fixed
+// Header, `version` MQ_V311 oder MQ_V5. `r` ist der Ergebnisblock,
+// `tab`/`tabMax` eine Property-Tabelle (0 erlaubt).
+// Rueckgabe: MQ_OK oder Fehlercode.
+pub fn MqPaketLies(rumpf: int64, rumpfLen: int64, typ: int64, flags: int64,
+                   version: int64, r: int64, tab: int64, tabMax: int64): int64 {
+  if (!MqTypGueltig(typ, version)) { return MQ_E_VERSION; }
+  var rcf: int64 := MqFlagsPruefe(typ, flags);
+  if (rcf != MQ_OK) { return rcf; }
+  _leere(r);
+  poke64(r + MQ_R_TYP, typ);
+  poke64(r + MQ_R_FLAGS, flags);
+  poke64(r + MQ_R_VERSION, version);
+
+  var h: int64 := alloc(16);
+  var anz: int64 := alloc(8);
+  var p: int64 := 0;
+  var rc: int64 := MQ_OK;
+
+  if (typ == MQ_PINGREQ || typ == MQ_PINGRESP) {
+    free(h, 16); free(anz, 8);
+    if (rumpfLen != 0) { return MQ_E_REMLEN; }
+    return MQ_OK;
+  }
+
+  if (typ == MQ_CONNECT) {
+    p := MqStrLies(rumpf, rumpfLen, 0, h);
+    if (p < 0) { free(h, 16); free(anz, 8); return p; }
+    var nOff: int64 := peek64(h + 0);
+    var nLen: int64 := peek64(h + 8);
+    if (nLen != 4) { free(h, 16); free(anz, 8); return MQ_E_PROTONAME; }
+    if ((peek8(rumpf + nOff + 0) & 0xFF) != 77 ||
+        (peek8(rumpf + nOff + 1) & 0xFF) != 81 ||
+        (peek8(rumpf + nOff + 2) & 0xFF) != 84 ||
+        (peek8(rumpf + nOff + 3) & 0xFF) != 84) {
+      free(h, 16); free(anz, 8); return MQ_E_PROTONAME;
+    }
+    p := MqU8Lies(rumpf, rumpfLen, p, h);
+    if (p < 0) { free(h, 16); free(anz, 8); return p; }
+    var level: int64 := peek64(h);
+    if (level != version) { free(h, 16); free(anz, 8); return MQ_E_PROTOLEVEL; }
+    poke64(r + MQ_R_LEVEL, level);
+    p := MqU8Lies(rumpf, rumpfLen, p, h);
+    if (p < 0) { free(h, 16); free(anz, 8); return p; }
+    var cf: int64 := peek64(h);
+    if ((cf & 0x01) != 0) { free(h, 16); free(anz, 8); return MQ_E_CONNFLAGS; }
+    var willFlag: int64 := (cf / 4) & 0x01;
+    var willQos: int64 := (cf / 8) & 0x03;
+    var willRetain: int64 := (cf / 32) & 0x01;
+    if (willFlag == 0 && (willQos != 0 || willRetain != 0)) {
+      free(h, 16); free(anz, 8); return MQ_E_CONNFLAGS;
+    }
+    if (willQos == 3) { free(h, 16); free(anz, 8); return MQ_E_CONNFLAGS; }
+    poke64(r + MQ_R_CFLAGS, cf);
+    p := MqU16Lies(rumpf, rumpfLen, p, h);
+    if (p < 0) { free(h, 16); free(anz, 8); return p; }
+    poke64(r + MQ_R_KEEPALIVE, peek64(h));
+    if (version == MQ_V5) {
+      poke64(r + MQ_R_PROPS_OFF, p);
+      p := MqPropsLies(rumpf, rumpfLen, p, MQ_CONNECT, tab, tabMax, anz);
+      if (p < 0) { free(h, 16); free(anz, 8); return p; }
+      poke64(r + MQ_R_PROPS_ANZ, peek64(anz));
+    }
+    // Client Identifier; Will, Username und Password bleiben als Nutzbereich
+    // stehen und werden vom Protokollteil ausgewertet.
+    p := MqStrLies(rumpf, rumpfLen, p, h);
+    if (p < 0) { free(h, 16); free(anz, 8); return p; }
+    poke64(r + MQ_R_TOPIC_OFF, peek64(h + 0));      // Client Identifier
+    poke64(r + MQ_R_TOPIC_LEN, peek64(h + 8));
+    poke64(r + MQ_R_NUTZ_OFF, p);
+    poke64(r + MQ_R_NUTZ_LEN, rumpfLen - p);
+    free(h, 16); free(anz, 8);
+    return MQ_OK;
+  }
+
+  if (typ == MQ_CONNACK) {
+    p := MqU8Lies(rumpf, rumpfLen, 0, h);
+    if (p < 0) { free(h, 16); free(anz, 8); return p; }
+    var ack: int64 := peek64(h);
+    if (ack > 1) { free(h, 16); free(anz, 8); return MQ_E_SESSION_FLAGS; }
+    poke64(r + MQ_R_SESSION, ack);
+    p := MqU8Lies(rumpf, rumpfLen, p, h);
+    if (p < 0) { free(h, 16); free(anz, 8); return p; }
+    poke64(r + MQ_R_REASON, peek64(h));
+    if (version == MQ_V5) {
+      poke64(r + MQ_R_PROPS_OFF, p);
+      p := MqPropsLies(rumpf, rumpfLen, p, MQ_CONNACK, tab, tabMax, anz);
+      if (p < 0) { free(h, 16); free(anz, 8); return p; }
+      poke64(r + MQ_R_PROPS_ANZ, peek64(anz));
+    }
+    free(h, 16); free(anz, 8);
+    if (p != rumpfLen) { return MQ_E_REST; }
+    return MQ_OK;
+  }
+
+  if (typ == MQ_PUBLISH) {
+    var qos: int64 := (flags / 2) & 0x03;
+    poke64(r + MQ_R_QOS, qos);
+    poke64(r + MQ_R_DUP, (flags / 8) & 0x01);
+    poke64(r + MQ_R_RETAIN, flags & 0x01);
+    if (qos == 0 && ((flags / 8) & 0x01) != 0) {
+      free(h, 16); free(anz, 8); return MQ_E_FLAGS;   // DUP bei QoS 0
+    }
+    p := MqStrLies(rumpf, rumpfLen, 0, h);
+    if (p < 0) { free(h, 16); free(anz, 8); return p; }
+    var tOff: int64 := peek64(h + 0);
+    var tLen: int64 := peek64(h + 8);
+    // Topic Name darf keine Wildcards tragen; leer ist nur mit Topic Alias
+    // zulaessig, das entscheidet der Protokollteil anhand der Properties.
+    if (tLen > 0) {
+      var rct: int64 := MqTopicNamePruefe(rumpf + tOff, tLen, false);
+      if (rct != MQ_OK) { free(h, 16); free(anz, 8); return rct; }
+    } else if (version == MQ_V311) {
+      free(h, 16); free(anz, 8); return MQ_E_TOPIC_EMPTY;
+    }
+    poke64(r + MQ_R_TOPIC_OFF, tOff);
+    poke64(r + MQ_R_TOPIC_LEN, tLen);
+    if (qos > 0) {
+      p := MqU16Lies(rumpf, rumpfLen, p, h);
+      if (p < 0) { free(h, 16); free(anz, 8); return p; }
+      var pid: int64 := peek64(h);
+      if (pid == 0) { free(h, 16); free(anz, 8); return MQ_E_PKTID_NULL; }
+      poke64(r + MQ_R_PKTID, pid);
+    }
+    if (version == MQ_V5) {
+      poke64(r + MQ_R_PROPS_OFF, p);
+      p := MqPropsLies(rumpf, rumpfLen, p, MQ_PUBLISH, tab, tabMax, anz);
+      if (p < 0) { free(h, 16); free(anz, 8); return p; }
+      poke64(r + MQ_R_PROPS_ANZ, peek64(anz));
+    }
+    // Leere Payload ist gueltig (F-01).
+    poke64(r + MQ_R_NUTZ_OFF, p);
+    poke64(r + MQ_R_NUTZ_LEN, rumpfLen - p);
+    free(h, 16); free(anz, 8);
+    return MQ_OK;
+  }
+
+  if (typ == MQ_PUBACK || typ == MQ_PUBREC || typ == MQ_PUBREL ||
+      typ == MQ_PUBCOMP) {
+    p := MqU16Lies(rumpf, rumpfLen, 0, h);
+    if (p < 0) { free(h, 16); free(anz, 8); return p; }
+    var pid2: int64 := peek64(h);
+    if (pid2 == 0) { free(h, 16); free(anz, 8); return MQ_E_PKTID_NULL; }
+    poke64(r + MQ_R_PKTID, pid2);
+    if (version == MQ_V311) {
+      free(h, 16); free(anz, 8);
+      if (rumpfLen != 2) { return MQ_E_REMLEN; }
+      return MQ_OK;
+    }
+    // MQTT 5.0 §3.4.2.1: Reason Code und Properties sind weglassbar.
+    if (rumpfLen == 2) { free(h, 16); free(anz, 8); return MQ_OK; }
+    p := MqU8Lies(rumpf, rumpfLen, p, h);
+    if (p < 0) { free(h, 16); free(anz, 8); return p; }
+    poke64(r + MQ_R_REASON, peek64(h));
+    if (rumpfLen == 3) { free(h, 16); free(anz, 8); return MQ_OK; }
+    poke64(r + MQ_R_PROPS_OFF, p);
+    p := MqPropsLies(rumpf, rumpfLen, p, typ, tab, tabMax, anz);
+    if (p < 0) { free(h, 16); free(anz, 8); return p; }
+    poke64(r + MQ_R_PROPS_ANZ, peek64(anz));
+    free(h, 16); free(anz, 8);
+    if (p != rumpfLen) { return MQ_E_REST; }
+    return MQ_OK;
+  }
+
+  if (typ == MQ_SUBSCRIBE || typ == MQ_UNSUBSCRIBE) {
+    p := MqU16Lies(rumpf, rumpfLen, 0, h);
+    if (p < 0) { free(h, 16); free(anz, 8); return p; }
+    var pid3: int64 := peek64(h);
+    if (pid3 == 0) { free(h, 16); free(anz, 8); return MQ_E_PKTID_NULL; }
+    poke64(r + MQ_R_PKTID, pid3);
+    if (version == MQ_V5) {
+      poke64(r + MQ_R_PROPS_OFF, p);
+      p := MqPropsLies(rumpf, rumpfLen, p, typ, tab, tabMax, anz);
+      if (p < 0) { free(h, 16); free(anz, 8); return p; }
+      poke64(r + MQ_R_PROPS_ANZ, peek64(anz));
+    }
+    if (p >= rumpfLen) { free(h, 16); free(anz, 8); return MQ_E_LEER; }
+    // Liste pruefen, ohne sie zu kopieren.
+    var q: int64 := p;
+    while (q < rumpfLen) {
+      var fq: int64 := MqStrLies(rumpf, rumpfLen, q, h);
+      if (fq < 0) { free(h, 16); free(anz, 8); return fq; }
+      var fOff: int64 := peek64(h + 0);
+      var fLen: int64 := peek64(h + 8);
+      var rcf2: int64 := MqSubscribeFilterPruefe(rumpf + fOff, fLen, false);
+      if (rcf2 != MQ_OK) { free(h, 16); free(anz, 8); return rcf2; }
+      if (typ == MQ_SUBSCRIBE) {
+        var oq: int64 := MqU8Lies(rumpf, rumpfLen, fq, h);
+        if (oq < 0) { free(h, 16); free(anz, 8); return oq; }
+        var shared: bool := MqIstSharedFilter(rumpf + fOff, fLen);
+        var rco: int64 := MqSubOptPruefe(peek64(h), version, shared);
+        if (rco != MQ_OK) { free(h, 16); free(anz, 8); return rco; }
+        fq := oq;
+      }
+      q := fq;
+    }
+    poke64(r + MQ_R_NUTZ_OFF, p);
+    poke64(r + MQ_R_NUTZ_LEN, rumpfLen - p);
+    free(h, 16); free(anz, 8);
+    return MQ_OK;
+  }
+
+  if (typ == MQ_SUBACK || typ == MQ_UNSUBACK) {
+    p := MqU16Lies(rumpf, rumpfLen, 0, h);
+    if (p < 0) { free(h, 16); free(anz, 8); return p; }
+    var pid4: int64 := peek64(h);
+    if (pid4 == 0) { free(h, 16); free(anz, 8); return MQ_E_PKTID_NULL; }
+    poke64(r + MQ_R_PKTID, pid4);
+    if (typ == MQ_UNSUBACK && version == MQ_V311) {
+      // MQTT 3.1.1 §3.11: UNSUBACK hat keine Reason Codes.
+      free(h, 16); free(anz, 8);
+      if (rumpfLen != 2) { return MQ_E_REMLEN; }
+      return MQ_OK;
+    }
+    if (version == MQ_V5) {
+      poke64(r + MQ_R_PROPS_OFF, p);
+      p := MqPropsLies(rumpf, rumpfLen, p, typ, tab, tabMax, anz);
+      if (p < 0) { free(h, 16); free(anz, 8); return p; }
+      poke64(r + MQ_R_PROPS_ANZ, peek64(anz));
+    }
+    if (p >= rumpfLen) { free(h, 16); free(anz, 8); return MQ_E_LEER; }
+    poke64(r + MQ_R_NUTZ_OFF, p);
+    poke64(r + MQ_R_NUTZ_LEN, rumpfLen - p);
+    free(h, 16); free(anz, 8);
+    return MQ_OK;
+  }
+
+  if (typ == MQ_DISCONNECT) {
+    if (version == MQ_V311) {
+      free(h, 16); free(anz, 8);
+      if (rumpfLen != 0) { return MQ_E_REMLEN; }
+      return MQ_OK;
+    }
+    if (rumpfLen == 0) { free(h, 16); free(anz, 8); return MQ_OK; }
+    p := MqU8Lies(rumpf, rumpfLen, 0, h);
+    if (p < 0) { free(h, 16); free(anz, 8); return p; }
+    poke64(r + MQ_R_REASON, peek64(h));
+    if (rumpfLen == 1) { free(h, 16); free(anz, 8); return MQ_OK; }
+    poke64(r + MQ_R_PROPS_OFF, p);
+    p := MqPropsLies(rumpf, rumpfLen, p, MQ_DISCONNECT, tab, tabMax, anz);
+    if (p < 0) { free(h, 16); free(anz, 8); return p; }
+    poke64(r + MQ_R_PROPS_ANZ, peek64(anz));
+    free(h, 16); free(anz, 8);
+    if (p != rumpfLen) { return MQ_E_REST; }
+    return MQ_OK;
+  }
+
+  if (typ == MQ_AUTH) {
+    // Nur MQTT 5.0; MqTypGueltig hat 3.1.1 schon abgewiesen.
+    if (rumpfLen == 0) { free(h, 16); free(anz, 8); return MQ_OK; }
+    p := MqU8Lies(rumpf, rumpfLen, 0, h);
+    if (p < 0) { free(h, 16); free(anz, 8); return p; }
+    poke64(r + MQ_R_REASON, peek64(h));
+    if (rumpfLen == 1) { free(h, 16); free(anz, 8); return MQ_OK; }
+    poke64(r + MQ_R_PROPS_OFF, p);
+    p := MqPropsLies(rumpf, rumpfLen, p, MQ_AUTH, tab, tabMax, anz);
+    if (p < 0) { free(h, 16); free(anz, 8); return p; }
+    poke64(r + MQ_R_PROPS_ANZ, peek64(anz));
+    free(h, 16); free(anz, 8);
+    if (p != rumpfLen) { return MQ_E_REST; }
+    return MQ_OK;
+  }
+
+  free(h, 16); free(anz, 8);
+  // Kein Catch-all: jeder in dieser Fassung gueltige Typ ist oben behandelt.
+  return MQ_E_VERSION;
+}
+
+// Iterator ueber die SUBSCRIBE-Liste. `pos` ist der Offset im Rumpf, beim
+// ersten Aufruf MQ_R_NUTZ_OFF. `aus` erhaelt (filterOff, filterLen, options).
+// Rueckgabe: naechste Position, oder MQ_E_LEER am Listenende.
+pub fn MqSubscribeNaechster(rumpf: int64, rumpfLen: int64, pos: int64,
+                            aus: int64): int64 {
+  if (pos >= rumpfLen) { return MQ_E_LEER; }
+  var h: int64 := alloc(16);
+  var q: int64 := MqStrLies(rumpf, rumpfLen, pos, h);
+  if (q < 0) { free(h, 16); return q; }
+  var fOff: int64 := peek64(h + 0);
+  var fLen: int64 := peek64(h + 8);
+  var oq: int64 := MqU8Lies(rumpf, rumpfLen, q, h);
+  if (oq < 0) { free(h, 16); return oq; }
+  if (aus != 0) {
+    poke64(aus + 0, fOff);
+    poke64(aus + 8, fLen);
+    poke64(aus + 16, peek64(h));
+  }
+  free(h, 16);
+  return oq;
+}
+
+// Iterator ueber die UNSUBSCRIBE-Liste. `aus` erhaelt (filterOff, filterLen).
+pub fn MqUnsubscribeNaechster(rumpf: int64, rumpfLen: int64, pos: int64,
+                              aus: int64): int64 {
+  if (pos >= rumpfLen) { return MQ_E_LEER; }
+  var h: int64 := alloc(16);
+  var q: int64 := MqStrLies(rumpf, rumpfLen, pos, h);
+  if (q < 0) { free(h, 16); return q; }
+  if (aus != 0) {
+    poke64(aus + 0, peek64(h + 0));
+    poke64(aus + 8, peek64(h + 8));
+  }
+  free(h, 16);
+  return q;
+}
+
+// Reason Code Nummer `i` aus SUBACK/UNSUBACK. -1 wenn es den Eintrag nicht gibt.
+pub fn MqAckReason(rumpf: int64, r: int64, i: int64): int64 {
+  var off: int64 := peek64(r + MQ_R_NUTZ_OFF);
+  var n: int64 := peek64(r + MQ_R_NUTZ_LEN);
+  if (i < 0 || i >= n) { return -1; }
+  return peek8(rumpf + off + i) & 0xFF;
+}
+
+pub fn MqAckReasonAnzahl(r: int64): int64 { return peek64(r + MQ_R_NUTZ_LEN); }
+
+// ===========================================================================
+// Kodieren
+// ===========================================================================
+// Alle Schreibfunktionen bauen das ganze Paket in `buf` und liefern die
+// Gesamtlaenge oder einen Fehlercode. Der Rumpf wird mit einer Reserve von
+// 4 Byte hinter dem Typbyte aufgebaut und danach so verschoben, dass die
+// Remaining Length exakt davor passt — damit braucht keine Funktion einen
+// zweiten Durchgang.
+fn _fertig(buf: int64, cap: int64, kopf: int64, rumpfEnde: int64): int64 {
+  var rumpfLen: int64 := rumpfEnde - 5;
+  var n: int64 := MqVarintLen(rumpfLen);
+  if (n < 0) { return MQ_E_VARINT_WERT; }
+  var ziel: int64 := 1 + n;
+  if (ziel != 5) {
+    var i: int64 := 0;
+    while (i < rumpfLen) {
+      poke8(buf + ziel + i, peek8(buf + 5 + i) & 0xFF);
+      i := i + 1;
+    }
+  }
+  poke8(buf + 0, kopf);
+  var p: int64 := MqVarintSchreib(buf, cap, 1, rumpfLen);
+  if (p < 0) { return p; }
+  return ziel + rumpfLen;
+}
+
+// CONNECT. `willTopic`/`willPayload` sind 0, wenn kein Will gesetzt ist;
+// `props`/`propsLen` bzw. `willProps`/`willPropsLen` sind vorgefertigte
+// Property-Bloecke OHNE Laengenpraefix (nur MQTT 5.0, sonst 0).
+pub fn MqConnectSchreib(buf: int64, cap: int64, version: int64,
+                        clientId: int64, clientIdLen: int64,
+                        keepAlive: int64, cleanStart: bool,
+                        username: int64, usernameLen: int64,
+                        password: int64, passwordLen: int64,
+                        willTopic: int64, willTopicLen: int64,
+                        willPayload: int64, willPayloadLen: int64,
+                        willQos: int64, willRetain: bool,
+                        props: int64, propsLen: int64,
+                        willProps: int64, willPropsLen: int64): int64 {
+  if (version != MQ_V311 && version != MQ_V5) { return MQ_E_PROTOLEVEL; }
+  if (version == MQ_V311 && propsLen > 0) { return MQ_E_SUBOPT_V5; }
+  if (willQos < 0 || willQos > 2) { return MQ_E_CONNFLAGS; }
+  if (willTopic == 0 && (willQos != 0 || willRetain)) { return MQ_E_CONNFLAGS; }
+  if (password != 0 && username == 0) {
+    // MQTT 3.1.1 §3.1.2.9: Password ohne Username ist unzulaessig.
+    if (version == MQ_V311) { return MQ_E_CONNFLAGS; }
+  }
+  var mqtt: pchar := "MQTT";
+  var p: int64 := MqStrSchreib(buf, cap, 5, mqtt as int64, 4);
+  if (p < 0) { return p; }
+  p := MqU8Schreib(buf, cap, p, version);
+  if (p < 0) { return p; }
+  var cf: int64 := 0;
+  if (cleanStart) { cf := cf | 0x02; }
+  if (willTopic != 0) {
+    cf := cf | 0x04;
+    cf := cf | (willQos * 8);
+    if (willRetain) { cf := cf | 0x20; }
+  }
+  if (password != 0) { cf := cf | 0x40; }
+  if (username != 0) { cf := cf | 0x80; }
+  p := MqU8Schreib(buf, cap, p, cf);
+  if (p < 0) { return p; }
+  p := MqU16Schreib(buf, cap, p, keepAlive);
+  if (p < 0) { return p; }
+  if (version == MQ_V5) {
+    p := MqVarintSchreib(buf, cap, p, propsLen);
+    if (p < 0) { return p; }
+    var i: int64 := 0;
+    while (i < propsLen) {
+      if (p + i >= cap) { return MQ_E_PUFFER_KLEIN; }
+      poke8(buf + p + i, peek8(props + i) & 0xFF);
+      i := i + 1;
+    }
+    p := p + propsLen;
+  }
+  p := MqStrSchreib(buf, cap, p, clientId, clientIdLen);
+  if (p < 0) { return p; }
+  if (willTopic != 0) {
+    if (version == MQ_V5) {
+      p := MqVarintSchreib(buf, cap, p, willPropsLen);
+      if (p < 0) { return p; }
+      var k: int64 := 0;
+      while (k < willPropsLen) {
+        if (p + k >= cap) { return MQ_E_PUFFER_KLEIN; }
+        poke8(buf + p + k, peek8(willProps + k) & 0xFF);
+        k := k + 1;
+      }
+      p := p + willPropsLen;
+    } else if (willPropsLen > 0) {
+      return MQ_E_SUBOPT_V5;
+    }
+    p := MqStrSchreib(buf, cap, p, willTopic, willTopicLen);
+    if (p < 0) { return p; }
+    p := MqBinSchreib(buf, cap, p, willPayload, willPayloadLen);
+    if (p < 0) { return p; }
+  }
+  if (username != 0) {
+    p := MqStrSchreib(buf, cap, p, username, usernameLen);
+    if (p < 0) { return p; }
+  }
+  if (password != 0) {
+    p := MqBinSchreib(buf, cap, p, password, passwordLen);
+    if (p < 0) { return p; }
+  }
+  return _fertig(buf, cap, 16 * MQ_CONNECT, p);
+}
+
+// PUBLISH. `pktId` muss bei QoS > 0 ungleich 0 sein und bei QoS 0 gleich 0.
+pub fn MqPublishSchreib(buf: int64, cap: int64, version: int64,
+                        topic: int64, topicLen: int64,
+                        payload: int64, payloadLen: int64,
+                        qos: int64, retain: bool, dup: bool, pktId: int64,
+                        props: int64, propsLen: int64): int64 {
+  if (qos < 0 || qos > 2) { return MQ_E_SUBOPT; }
+  if (qos == 0 && pktId != 0) { return MQ_E_PKTID_NULL; }
+  if (qos > 0 && pktId == 0) { return MQ_E_PKTID_FEHLT; }
+  if (qos == 0 && dup) { return MQ_E_FLAGS; }
+  if (version == MQ_V311 && propsLen > 0) { return MQ_E_SUBOPT_V5; }
+  if (topicLen > 0) {
+    var rct: int64 := MqTopicNamePruefe(topic, topicLen, true);
+    if (rct != MQ_OK) { return rct; }
+  } else if (version == MQ_V311) {
+    return MQ_E_TOPIC_EMPTY;      // leerer Topic Name nur mit Topic Alias
+  }
+  var p: int64 := MqStrSchreib(buf, cap, 5, topic, topicLen);
+  if (p < 0) { return p; }
+  if (qos > 0) {
+    p := MqU16Schreib(buf, cap, p, pktId);
+    if (p < 0) { return p; }
+  }
+  if (version == MQ_V5) {
+    p := MqVarintSchreib(buf, cap, p, propsLen);
+    if (p < 0) { return p; }
+    var i: int64 := 0;
+    while (i < propsLen) {
+      if (p + i >= cap) { return MQ_E_PUFFER_KLEIN; }
+      poke8(buf + p + i, peek8(props + i) & 0xFF);
+      i := i + 1;
+    }
+    p := p + propsLen;
+  }
+  var k: int64 := 0;
+  while (k < payloadLen) {
+    if (p + k >= cap) { return MQ_E_PUFFER_KLEIN; }
+    poke8(buf + p + k, peek8(payload + k) & 0xFF);
+    k := k + 1;
+  }
+  p := p + payloadLen;
+  var flags: int64 := qos * 2;
+  if (retain) { flags := flags | 0x01; }
+  if (dup) { flags := flags | 0x08; }
+  return _fertig(buf, cap, 16 * MQ_PUBLISH + flags, p);
+}
+
+// PUBACK/PUBREC/PUBREL/PUBCOMP. Unter MQTT 5.0 wird der Reason Code nur
+// geschrieben, wenn er ungleich 0 ist oder Properties anliegen (kuerzeste Form).
+pub fn MqAckSchreib(buf: int64, cap: int64, version: int64, typ: int64,
+                    pktId: int64, reason: int64,
+                    props: int64, propsLen: int64): int64 {
+  if (typ != MQ_PUBACK && typ != MQ_PUBREC && typ != MQ_PUBREL &&
+      typ != MQ_PUBCOMP) {
+    return MQ_E_TYP;
+  }
+  if (pktId == 0) { return MQ_E_PKTID_NULL; }
+  if (version == MQ_V311 && (reason != 0 || propsLen > 0)) {
+    return MQ_E_SUBOPT_V5;
+  }
+  var p: int64 := MqU16Schreib(buf, cap, 5, pktId);
+  if (p < 0) { return p; }
+  if (version == MQ_V5 && (reason != 0 || propsLen > 0)) {
+    p := MqU8Schreib(buf, cap, p, reason);
+    if (p < 0) { return p; }
+    if (propsLen > 0) {
+      p := MqVarintSchreib(buf, cap, p, propsLen);
+      if (p < 0) { return p; }
+      var i: int64 := 0;
+      while (i < propsLen) {
+        if (p + i >= cap) { return MQ_E_PUFFER_KLEIN; }
+        poke8(buf + p + i, peek8(props + i) & 0xFF);
+        i := i + 1;
+      }
+      p := p + propsLen;
+    }
+  }
+  var flags: int64 := 0;
+  if (typ == MQ_PUBREL) { flags := 0x02; }
+  return _fertig(buf, cap, 16 * typ + flags, p);
+}
+
+// SUBSCRIBE. `filter` ist eine Tabelle mit `n` Eintraegen a 24 Byte:
+// (Adresse, Laenge, Options).
+pub fn MqSubscribeSchreib(buf: int64, cap: int64, version: int64, pktId: int64,
+                          filter: int64, n: int64,
+                          props: int64, propsLen: int64): int64 {
+  if (pktId == 0) { return MQ_E_PKTID_NULL; }
+  if (n <= 0) { return MQ_E_LEER; }
+  if (version == MQ_V311 && propsLen > 0) { return MQ_E_SUBOPT_V5; }
+  var p: int64 := MqU16Schreib(buf, cap, 5, pktId);
+  if (p < 0) { return p; }
+  if (version == MQ_V5) {
+    p := MqVarintSchreib(buf, cap, p, propsLen);
+    if (p < 0) { return p; }
+    var i: int64 := 0;
+    while (i < propsLen) {
+      if (p + i >= cap) { return MQ_E_PUFFER_KLEIN; }
+      poke8(buf + p + i, peek8(props + i) & 0xFF);
+      i := i + 1;
+    }
+    p := p + propsLen;
+  }
+  var k: int64 := 0;
+  while (k < n) {
+    var e: int64 := filter + k * 24;
+    var fa: int64 := peek64(e + 0);
+    var fl: int64 := peek64(e + 8);
+    var fo: int64 := peek64(e + 16);
+    var rcf: int64 := MqSubscribeFilterPruefe(fa, fl, true);
+    if (rcf != MQ_OK) { return rcf; }
+    var rco: int64 := MqSubOptPruefe(fo, version, MqIstSharedFilter(fa, fl));
+    if (rco != MQ_OK) { return rco; }
+    p := MqStrSchreib(buf, cap, p, fa, fl);
+    if (p < 0) { return p; }
+    p := MqU8Schreib(buf, cap, p, fo);
+    if (p < 0) { return p; }
+    k := k + 1;
+  }
+  return _fertig(buf, cap, 16 * MQ_SUBSCRIBE + 0x02, p);
+}
+
+// UNSUBSCRIBE. `filter` ist eine Tabelle mit `n` Eintraegen a 16 Byte.
+pub fn MqUnsubscribeSchreib(buf: int64, cap: int64, version: int64, pktId: int64,
+                            filter: int64, n: int64,
+                            props: int64, propsLen: int64): int64 {
+  if (pktId == 0) { return MQ_E_PKTID_NULL; }
+  if (n <= 0) { return MQ_E_LEER; }
+  if (version == MQ_V311 && propsLen > 0) { return MQ_E_SUBOPT_V5; }
+  var p: int64 := MqU16Schreib(buf, cap, 5, pktId);
+  if (p < 0) { return p; }
+  if (version == MQ_V5) {
+    p := MqVarintSchreib(buf, cap, p, propsLen);
+    if (p < 0) { return p; }
+    var i: int64 := 0;
+    while (i < propsLen) {
+      if (p + i >= cap) { return MQ_E_PUFFER_KLEIN; }
+      poke8(buf + p + i, peek8(props + i) & 0xFF);
+      i := i + 1;
+    }
+    p := p + propsLen;
+  }
+  var k: int64 := 0;
+  while (k < n) {
+    var e: int64 := filter + k * 16;
+    var fa: int64 := peek64(e + 0);
+    var fl: int64 := peek64(e + 8);
+    var rcf: int64 := MqSubscribeFilterPruefe(fa, fl, true);
+    if (rcf != MQ_OK) { return rcf; }
+    p := MqStrSchreib(buf, cap, p, fa, fl);
+    if (p < 0) { return p; }
+    k := k + 1;
+  }
+  return _fertig(buf, cap, 16 * MQ_UNSUBSCRIBE + 0x02, p);
+}
+
+// PINGREQ / PINGRESP / leeres DISCONNECT (3.1.1).
+pub fn MqLeerSchreib(buf: int64, cap: int64, typ: int64): int64 {
+  if (typ != MQ_PINGREQ && typ != MQ_PINGRESP && typ != MQ_DISCONNECT) {
+    return MQ_E_TYP;
+  }
+  if (cap < 2) { return MQ_E_PUFFER_KLEIN; }
+  poke8(buf + 0, 16 * typ);
+  poke8(buf + 1, 0);
+  return 2;
+}
+
+// DISCONNECT mit Reason Code und Properties (MQTT 5.0 §3.14).
+pub fn MqDisconnectSchreib(buf: int64, cap: int64, version: int64,
+                           reason: int64, props: int64, propsLen: int64): int64 {
+  if (version == MQ_V311) {
+    if (reason != 0 || propsLen > 0) { return MQ_E_SUBOPT_V5; }
+    return MqLeerSchreib(buf, cap, MQ_DISCONNECT);
+  }
+  if (reason == 0 && propsLen == 0) {
+    return MqLeerSchreib(buf, cap, MQ_DISCONNECT);
+  }
+  var p: int64 := MqU8Schreib(buf, cap, 5, reason);
+  if (p < 0) { return p; }
+  if (propsLen > 0) {
+    p := MqVarintSchreib(buf, cap, p, propsLen);
+    if (p < 0) { return p; }
+    var i: int64 := 0;
+    while (i < propsLen) {
+      if (p + i >= cap) { return MQ_E_PUFFER_KLEIN; }
+      poke8(buf + p + i, peek8(props + i) & 0xFF);
+      i := i + 1;
+    }
+    p := p + propsLen;
+  }
+  return _fertig(buf, cap, 16 * MQ_DISCONNECT, p);
+}
+
+// AUTH (MQTT 5.0 §3.15). Nur mit Authentication Method sinnvoll; die Properties
+// baut der AUTH-Provider.
+pub fn MqAuthSchreib(buf: int64, cap: int64, version: int64, reason: int64,
+                     props: int64, propsLen: int64): int64 {
+  if (version != MQ_V5) { return MQ_E_VERSION; }
+  var p: int64 := MqU8Schreib(buf, cap, 5, reason);
+  if (p < 0) { return p; }
+  p := MqVarintSchreib(buf, cap, p, propsLen);
+  if (p < 0) { return p; }
+  var i: int64 := 0;
+  while (i < propsLen) {
+    if (p + i >= cap) { return MQ_E_PUFFER_KLEIN; }
+    poke8(buf + p + i, peek8(props + i) & 0xFF);
+    i := i + 1;
+  }
+  p := p + propsLen;
+  return _fertig(buf, cap, 16 * MQ_AUTH, p);
+}

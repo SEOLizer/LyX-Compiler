@@ -1,0 +1,196 @@
+// std/mqtt/topic.lyx — MQTT-UTF-8, Topic Names und Topic Filter.
+//
+// Netzfrei und allokationsfrei: alle Funktionen arbeiten auf (Adresse, Länge)
+// und geben einen Fehlercode zurück. Kein Catch-all: jede Abweisung nennt
+// einen eigenen Grund (aurum/CLAUDE.md, "Stiller Default").
+//
+// Normbezug: OASIS MQTT 3.1.1 §1.5.3, §4.7; MQTT 5.0 §1.5.4, §4.7, §4.8.2.
+unit std.mqtt.topic;
+
+// --- Fehlercodes -----------------------------------------------------------
+// Sentinel ausserhalb jedes gueltigen Ergebnisses (CLAUDE.md,
+// "Fehlerwert in Ganzzahl-APIs"). 0 == gueltig.
+pub con MQ_OK: int64                  := 0;
+pub con MQ_E_UTF8_FORM: int64         := -201;   // nicht wohlgeformtes UTF-8
+pub con MQ_E_UTF8_NULL: int64         := -202;   // U+0000 enthalten
+pub con MQ_E_UTF8_SURROGATE: int64    := -203;   // D800..DFFF
+pub con MQ_E_UTF8_OVERLONG: int64     := -204;   // zu lange Kodierung
+pub con MQ_E_UTF8_RANGE: int64        := -205;   // > U+10FFFF
+pub con MQ_E_UTF8_CONTROL: int64      := -206;   // Steuerzeichen (nur streng)
+pub con MQ_E_UTF8_NONCHAR: int64      := -207;   // Nichtzeichen (nur streng)
+pub con MQ_E_UTF8_TOO_LONG: int64     := -208;   // > 65535 Byte
+pub con MQ_E_TOPIC_EMPTY: int64       := -210;   // Laenge 0
+pub con MQ_E_TOPIC_WILDCARD: int64    := -211;   // + oder # im Topic Name
+pub con MQ_E_FILTER_PLUS_LEVEL: int64 := -212;   // + belegt Ebene nicht allein
+pub con MQ_E_FILTER_HASH_LEVEL: int64 := -213;   // # belegt Ebene nicht allein
+pub con MQ_E_FILTER_HASH_LAST: int64  := -214;   // # ist nicht letzte Ebene
+pub con MQ_E_SHARE_NAME: int64        := -215;   // ShareName leer/ungueltig
+pub con MQ_E_SHARE_FILTER: int64      := -216;   // $share ohne Restfilter
+
+pub con MQ_UTF8_MAX: int64 := 65535;             // 16-Bit-Laengenpraefix
+
+// --- MQTT-UTF-8 ------------------------------------------------------------
+// Prueft wohlgeformtes UTF-8 nach den MQTT-Zusatzregeln.
+// streng == true weist zusaetzlich die SHOULD-NOT-Faelle ab
+// (U+0001..U+001F, U+007F..U+009F, Nichtzeichen) — fuer gesendete Werte.
+// Rueckgabe: MQ_OK oder einer der MQ_E_UTF8_*.
+pub fn MqUtf8Pruefe(ptr: int64, len: int64, streng: bool): int64 {
+  if (len < 0) { return MQ_E_UTF8_FORM; }
+  if (len > MQ_UTF8_MAX) { return MQ_E_UTF8_TOO_LONG; }
+  var i: int64 := 0;
+  while (i < len) {
+    // peek8 liefert 0..255; trotzdem maskieren, damit die Pruefungen
+    // unabhaengig von der Vorzeichenerweiterung anderer peek-Breiten gelten.
+    var b0: int64 := peek8(ptr + i) & 0xFF;
+    var cp: int64 := 0;
+    var n: int64 := 0;                   // Anzahl Folgebytes
+    if (b0 < 0x80) {
+      cp := b0; n := 0;
+    } else if (b0 >= 0xC2 && b0 <= 0xDF) {
+      cp := b0 - 0xC0; n := 1;
+    } else if (b0 >= 0xE0 && b0 <= 0xEF) {
+      cp := b0 - 0xE0; n := 2;
+    } else if (b0 >= 0xF0 && b0 <= 0xF4) {
+      cp := b0 - 0xF0; n := 3;
+    } else if (b0 == 0xC0 || b0 == 0xC1) {
+      return MQ_E_UTF8_OVERLONG;         // 2-Byte-Form fuer < U+0080
+    } else if (b0 >= 0xF5) {
+      return MQ_E_UTF8_RANGE;            // oberhalb U+10FFFF
+    } else {
+      return MQ_E_UTF8_FORM;             // 0x80..0xBF als Startbyte
+    }
+    if (n > 0 && i + n >= len) {
+      return MQ_E_UTF8_FORM;             // abgeschnittene Folge
+    }
+    var k: int64 := 1;
+    while (k <= n) {
+      var bk: int64 := peek8(ptr + i + k) & 0xFF;
+      if (bk < 0x80 || bk > 0xBF) { return MQ_E_UTF8_FORM; }
+      cp := cp * 64 + (bk - 0x80);
+      k := k + 1;
+    }
+    if (n == 2 && cp < 0x800) { return MQ_E_UTF8_OVERLONG; }
+    if (n == 3 && cp < 0x10000) { return MQ_E_UTF8_OVERLONG; }
+    if (cp >= 0xD800 && cp <= 0xDFFF) { return MQ_E_UTF8_SURROGATE; }
+    if (cp > 0x10FFFF) { return MQ_E_UTF8_RANGE; }
+    if (cp == 0) { return MQ_E_UTF8_NULL; }
+    if (streng) {
+      if (cp >= 0x01 && cp <= 0x1F) { return MQ_E_UTF8_CONTROL; }
+      if (cp >= 0x7F && cp <= 0x9F) { return MQ_E_UTF8_CONTROL; }
+      if (cp >= 0xFDD0 && cp <= 0xFDEF) { return MQ_E_UTF8_NONCHAR; }
+      if ((cp & 0xFFFF) == 0xFFFE || (cp & 0xFFFF) == 0xFFFF) {
+        return MQ_E_UTF8_NONCHAR;
+      }
+    }
+    i := i + n + 1;
+  }
+  return MQ_OK;
+}
+
+// --- Topic Name ------------------------------------------------------------
+// Gueltig: wohlgeformtes MQTT-UTF-8, mindestens 1 Byte, keine Wildcards.
+// Leere Topic Names sind NUR mit Topic Alias zulaessig; das entscheidet der
+// Protokollteil, nicht diese Pruefung (MQTT 5.0 §3.3.2.1).
+pub fn MqTopicNamePruefe(ptr: int64, len: int64, streng: bool): int64 {
+  if (len <= 0) { return MQ_E_TOPIC_EMPTY; }
+  var rc: int64 := MqUtf8Pruefe(ptr, len, streng);
+  if (rc != MQ_OK) { return rc; }
+  var i: int64 := 0;
+  while (i < len) {
+    var b: int64 := peek8(ptr + i) & 0xFF;
+    if (b == 43 || b == 35) { return MQ_E_TOPIC_WILDCARD; }  // '+' '#'
+    i := i + 1;
+  }
+  return MQ_OK;
+}
+
+// --- Topic Filter ----------------------------------------------------------
+// Gueltig: wohlgeformtes MQTT-UTF-8, mindestens 1 Byte; '+' belegt eine ganze
+// Ebene; '#' belegt eine ganze Ebene und ist die letzte. Leere Ebenen ("a//b",
+// fuehrender und abschliessender '/') sind ausdruecklich zulaessig.
+pub fn MqTopicFilterPruefe(ptr: int64, len: int64, streng: bool): int64 {
+  if (len <= 0) { return MQ_E_TOPIC_EMPTY; }
+  var rc: int64 := MqUtf8Pruefe(ptr, len, streng);
+  if (rc != MQ_OK) { return rc; }
+  var ebeneStart: int64 := 0;
+  var i: int64 := 0;
+  while (i <= len) {
+    var grenze: bool := i == len;
+    if (!grenze) { grenze := (peek8(ptr + i) & 0xFF) == 47; }   // '/'
+    if (grenze) {
+      var eLen: int64 := i - ebeneStart;
+      var j: int64 := ebeneStart;
+      while (j < i) {
+        var b: int64 := peek8(ptr + j) & 0xFF;
+        if (b == 43) {                       // '+'
+          if (eLen != 1) { return MQ_E_FILTER_PLUS_LEVEL; }
+        } else if (b == 35) {                // '#'
+          if (eLen != 1) { return MQ_E_FILTER_HASH_LEVEL; }
+          if (i != len) { return MQ_E_FILTER_HASH_LAST; }
+        }
+        j := j + 1;
+      }
+      ebeneStart := i + 1;
+    }
+    i := i + 1;
+  }
+  return MQ_OK;
+}
+
+// Praefix "$share/" — exakter Name, keine Praefixpruefung auf Teilstuecke
+// (CLAUDE.md, "Eine Praefixpruefung vergibt Rechte zu weit": hier entscheidet
+// sie ueber die Filterform, darum Zeichen fuer Zeichen gegen den ganzen Namen).
+fn _istShare(ptr: int64, len: int64): bool {
+  if (len < 7) { return false; }
+  if ((peek8(ptr + 0) & 0xFF) != 36)  { return false; }   // '$'
+  if ((peek8(ptr + 1) & 0xFF) != 115) { return false; }   // 's'
+  if ((peek8(ptr + 2) & 0xFF) != 104) { return false; }   // 'h'
+  if ((peek8(ptr + 3) & 0xFF) != 97)  { return false; }   // 'a'
+  if ((peek8(ptr + 4) & 0xFF) != 114) { return false; }   // 'r'
+  if ((peek8(ptr + 5) & 0xFF) != 101) { return false; }   // 'e'
+  if ((peek8(ptr + 6) & 0xFF) != 47)  { return false; }   // '/'
+  return true;
+}
+
+// Erkennt eine Shared Subscription (MQTT 5.0 §4.8.2). Nur die Form, nicht die
+// Verfuegbarkeit beim Broker.
+pub fn MqIstSharedFilter(ptr: int64, len: int64): bool {
+  return _istShare(ptr, len);
+}
+
+// Prueft einen Shared-Subscription-Filter. `aus` ist entweder 0 oder die
+// Adresse von zwei int64-Plaetzen; dort landen bei Erfolg Offset und Laenge
+// des Restfilters hinter "$share/{ShareName}/". `ref` traegt in Lyx nur bei
+// Struct-Parametern (sema error 1.2.31H), darum die Ausgabeadresse.
+// Rueckgabe: MQ_OK oder Fehlercode; bei Fehler bleibt `aus` unberuehrt.
+pub fn MqSharedFilterPruefe(ptr: int64, len: int64, streng: bool,
+                            aus: int64): int64 {
+  if (!_istShare(ptr, len)) { return MQ_E_SHARE_NAME; }
+  var i: int64 := 7;
+  while (i < len) {
+    var b: int64 := peek8(ptr + i) & 0xFF;
+    if (b == 47) { break; }                                 // '/'
+    if (b == 43 || b == 35) { return MQ_E_SHARE_NAME; }      // '+' '#'
+    i := i + 1;
+  }
+  if (i == 7) { return MQ_E_SHARE_NAME; }        // ShareName leer
+  if (i >= len) { return MQ_E_SHARE_FILTER; }    // kein '/' nach ShareName
+  var rOff: int64 := i + 1;
+  var rLen: int64 := len - rOff;
+  if (rLen <= 0) { return MQ_E_SHARE_FILTER; }
+  var rc: int64 := MqTopicFilterPruefe(ptr + rOff, rLen, streng);
+  if (rc != MQ_OK) { return rc; }
+  if (aus != 0) {
+    poke64(aus + 0, rOff);
+    poke64(aus + 8, rLen);
+  }
+  return MQ_OK;
+}
+
+// Einstieg fuer SUBSCRIBE: unterscheidet Shared und gewoehnlichen Filter.
+pub fn MqSubscribeFilterPruefe(ptr: int64, len: int64, streng: bool): int64 {
+  if (_istShare(ptr, len)) {
+    return MqSharedFilterPruefe(ptr, len, streng, 0);
+  }
+  return MqTopicFilterPruefe(ptr, len, streng);
+}
