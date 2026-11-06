@@ -39,7 +39,18 @@ REF_MOD="$(LC_ALL=C lscpu | sed -n 's/^Model: *//p' | head -1)"
 REF_TPC="$(LC_ALL=C lscpu | sed -n 's/^Thread(s) per core: *//p' | head -1)"
 [ -n "$REF_FAM" ] && { [ "$(feld family)" = "$REF_FAM" ] && ok "info: family = $REF_FAM" || no "family" "'$(feld family)'"; }
 [ -n "$REF_MOD" ] && { [ "$(feld model)" = "$REF_MOD" ] && ok "info: model = $REF_MOD" || no "model" "'$(feld model)'"; }
-[ -n "$REF_TPC" ] && { [ "$(feld threads_per_core)" = "$REF_TPC" ] && ok "info: threads_per_core = $REF_TPC" || no "threads_per_core" "'$(feld threads_per_core)'"; }
+# threads_per_core kommt aus CPUID.0xB. Fehlt das Blatt (EPYC in der VM, CI),
+# steht dort ein Status und keine Zahl — richtig so, siehe #2413. Dieselbe
+# Prueffrage wie in tests/cpu_describe_2397_test.sh; die beiden muessen
+# uebereinstimmen.
+TPC_FELD="$(feld threads_per_core)"
+case "$TPC_FELD" in
+  unsupported|permission_denied|not_implemented)
+    echo "HINWEIS: threads_per_core = $TPC_FELD (CPUID.0xB fehlt, lscpu sagt ${REF_TPC:-?}) — #2413"
+    ok "info: threads_per_core meldet einen Status statt einer erfundenen Zahl" ;;
+  *)
+    [ -n "$REF_TPC" ] && { [ "$TPC_FELD" = "$REF_TPC" ] && ok "info: threads_per_core = $REF_TPC" || no "threads_per_core" "'$TPC_FELD'"; } ;;
+esac
 REF_LINE="$(cat /sys/devices/system/cpu/cpu0/cache/index0/coherency_line_size 2>/dev/null)"
 [ -n "$REF_LINE" ] && { [ "$(feld cache0_line_bytes)" = "$REF_LINE" ] && ok "info: cache0_line_bytes = $REF_LINE" || no "cache0_line_bytes" "'$(feld cache0_line_bytes)'"; }
 # Jedes Feld traegt eine Quelle.

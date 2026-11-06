@@ -135,8 +135,19 @@ fi
 
 if [ "$(hol rdseed_bit)" = "1" ]; then
   S="$(hol rdseed_erfolge)"
-  if [ "${S:-0}" -ge 90 ]; then ok "RDSEED: $S von 100 Aufrufen erfolgreich"
-  else no "RDSEED-Erfolgsrate" "$S von 100"; fi
+  # RDSEED DARF fehlschlagen: CF=0 heisst "gerade kein Zufall verfuegbar"
+  # (Intel SDM Vol. 2B, RDSEED — der Entropiequelle wird nicht nachgeholfen).
+  # Die Rate haengt an der Maschine und an der Konkurrenz um die Quelle: auf
+  # dem Entwicklungsrechner 100 von 100, auf einem CI-Laeufer 78 von 100. Eine
+  # Schwelle von 90 % war damit eine Aussage ueber die MASCHINE und nicht
+  # ueber den Code — sie machte den Lauf fremdbestimmt rot.
+  #
+  # Geprueft wird deshalb, was am Code liegt: die Instruktion laeuft
+  # ueberhaupt (mindestens ein Erfolg, kein #UD), und kein Erfolg gibt den
+  # Fehlschlagwert heraus. Die Rate wird berichtet, nicht bewertet.
+  if [ "${S:-0}" -ge 1 ]; then ok "RDSEED laeuft: $S von 100 Aufrufen erfolgreich"
+  else no "RDSEED" "kein einziger Erfolg in 100 Aufrufen — die Instruktion laeuft nicht"; fi
+  echo "HINWEIS: RDSEED-Erfolgsrate $S/100 — maschinenabhaengig, kein Pruefkriterium."
 else
   echo "HINWEIS: kein RDSEED auf dieser CPU (RDRAND ohne RDSEED gibt es, z. B. Ivy Bridge)."
 fi

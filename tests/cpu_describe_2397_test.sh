@@ -117,7 +117,23 @@ done
 # ── Topologie gegen lscpu ───────────────────────────────────────────────────
 REF_TPC="$(LC_ALL=C lscpu | sed -n 's/^Thread(s) per core: *//p' | head -1)"
 REF_CPS="$(LC_ALL=C lscpu | sed -n 's/^Core(s) per socket: *//p' | head -1)"
-[ -n "$REF_TPC" ] && { [ "$(hol threads_je_kern)" = "$REF_TPC" ] && ok "threads_je_kern = $REF_TPC" || no "threads_je_kern" "'$(hol threads_je_kern)' statt $REF_TPC"; }
+# Threads je Kern kommt aus der x2APIC-Topologie (CPUID.0xB). Fehlt das Blatt
+# — auf dem CI-Laeufer EPYC 7763 in der VM ist es so —, meldet die Bibliothek
+# STATUS:unsupported, und das ist die richtige Antwort und keine erfundene
+# Zahl. Geprueft wird deshalb: entweder die Zahl stimmt mit lscpu, oder es
+# steht ein STATUS da. Eine 0 oder ein leerer Wert faellt weiterhin durch.
+TPC_IST="$(hol threads_je_kern)"
+case "$TPC_IST" in
+  STATUS:*)
+    echo "HINWEIS: threads_je_kern = $TPC_IST — CPUID.0xB fehlt (VM);"
+    echo "         lscpu sagt ${REF_TPC:-?}. Siehe #2413 (AMD-Herkunft 0x8000001E fehlt)."
+    ok "threads_je_kern meldet einen Status statt einer erfundenen Zahl" ;;
+  *)
+    if [ -n "$REF_TPC" ]; then
+      [ "$TPC_IST" = "$REF_TPC" ] && ok "threads_je_kern = $REF_TPC" \
+        || no "threads_je_kern" "'$TPC_IST' statt $REF_TPC"
+    fi ;;
+esac
 # Kerne je Paket: die Zahl kommt aus der x2APIC-Topologie (CPUID.0xB) und ist
 # die HARDWARE-Sicht. In einer VM beschreibt CPUID die Topologie des WIRTS,
 # waehrend lscpu zaehlt, was der Gast sieht — gemessen auf dem CI-Laeufer
@@ -128,7 +144,10 @@ REF_CPS="$(LC_ALL=C lscpu | sed -n 's/^Core(s) per socket: *//p' | head -1)"
 # Threads je Kern) — die gilt immer — und der Abgleich mit lscpu nur dort, wo
 # der Gast die ganze Maschine sieht.
 TJP="$(hol threads_je_paket)"; TJK="$(hol threads_je_kern)"; KER="$(hol kerne)"
-if [ -n "$TJP" ] && [ -n "$TJK" ] && [ -n "$KER" ] && [ "$TJK" -gt 0 ]; then
+# Jede der drei Zahlen kann ein STATUS sein; dann ist die Rechnung nicht
+# anwendbar (und `[ "$TJK" -gt 0 ]` wuerde mit einem Syntaxfehler abbrechen).
+ist_zahl() { case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+if ist_zahl "$TJP" && ist_zahl "$TJK" && ist_zahl "$KER" && [ "$TJK" -gt 0 ]; then
   if [ $(( KER * TJK )) = "$TJP" ]; then
     ok "innere Stimmigkeit: $KER Kerne x $TJK Threads = $TJP Threads je Paket"
   else
@@ -137,7 +156,7 @@ if [ -n "$TJP" ] && [ -n "$TJK" ] && [ -n "$KER" ] && [ "$TJK" -gt 0 ]; then
 fi
 REF_SOCK="$(LC_ALL=C lscpu | sed -n 's/^Socket(s): *//p' | head -1)"
 REF_LOG="$(LC_ALL=C lscpu | sed -n 's/^CPU(s): *//p' | head -1)"
-if [ -n "$REF_CPS" ] && [ -n "$REF_SOCK" ] && [ -n "$REF_LOG" ] && [ -n "$TJP" ]; then
+if [ -n "$REF_CPS" ] && [ -n "$REF_SOCK" ] && [ -n "$REF_LOG" ] && ist_zahl "$TJP"; then
   if [ $(( REF_SOCK * TJP )) = "$REF_LOG" ]; then
     [ "$KER" = "$REF_CPS" ] && ok "kerne_je_paket = $REF_CPS (gegen lscpu)" \
       || no "kerne" "'$KER' statt $REF_CPS"
