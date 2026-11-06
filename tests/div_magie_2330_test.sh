@@ -32,9 +32,13 @@
 #   2. AM ERZEUGNIS, beide Seiten: mit Literal darf KEINE eigene Division
 #      uebrig sein, mit Variable MUSS eine drin sein. Ohne die zweite
 #      Haelfte wuerde der Test auch bestehen, wenn gar nicht umgeformt wird.
-#   3. GEGENSEITE DER ERKENNUNG: ein vorzeichenLOSER Dividend bleibt bewusst
-#      bei `div` (anderer Faktor, Zusatzstufe mit Uebertrag — nicht in
-#      diesem Schritt). Belegt, dass die Bedingung nicht zu weit greift.
+#   3. GEGENSEITE DER ERKENNUNG: ein vorzeichenLOSER Dividend nimmt einen
+#      ANDEREN Weg — anderer Faktor (`magicu`), `mul` statt `imul`, bei der
+#      Haelfte der Divisoren eine Zusatzstufe. Bis 1.2.31K fiel er auf `div`
+#      zurueck; seit #2333 hat er seinen eigenen Weg, geprueft in
+#      tests/div_magie_unsig_2333_test.sh. Hier wird belegt, dass er NICHT
+#      ueber den vorzeichenbehafteten Faktor laeuft: `imul rcx` (48 F7 E9)
+#      darf im vorzeichenlosen Erzeugnis nicht vorkommen.
 #   4. GRENZE DER ZULASSUNG: ein Divisor ueber 2^62 wird abgelehnt und muss
 #      weiter ueber die Division laufen UND richtig rechnen.
 
@@ -205,7 +209,7 @@ else
 fi
 
 # ---------------------------------------------------------------- 3
-# Vorzeichenloser Dividend bleibt bei `div` — und rechnet richtig.
+# Vorzeichenloser Dividend: eigener Weg (#2333), nicht der Faktor von hier.
 cat > "$TMP/unsig.lyx" <<'EOF'
 unit main;
 fn r(x: uint64): uint64 { return x / 1000; }
@@ -216,9 +220,22 @@ fn main(): int64 {
 }
 EOF
 if baue unsig; then
-  N="$(divzahl "$TMP/unsig")"
-  if [ "$N" -gt "$GRUND" ]; then ok "vorzeichenlos bleibt bei div ($N) — Bedingung nicht zu weit"
-  else no "vorzeichenlos" "Division verschwunden, der Faktor gilt dort nicht"; fi
+  # #2333: Der vorzeichenlose Weg braucht `mul rcx` (48 F7 E1). Der Faktor
+  # dieses Schrittes (`imul rcx`, 48 F7 E9) darf dort NICHT auftauchen — er
+  # ist ein anderer und wuerde still falsch rechnen.
+  HATMUL="$(python3 -I -c "
+import sys
+d=open(sys.argv[1],'rb').read()
+print(1 if d.find(bytes.fromhex('48f7e1')) >= 0 else 0)" "$TMP/unsig")"
+  HATIMUL="$(python3 -I -c "
+import sys
+d=open(sys.argv[1],'rb').read()
+print(1 if d.find(bytes.fromhex('48f7e9')) >= 0 else 0)" "$TMP/unsig")"
+  if [ "$HATMUL" = "1" ] && [ "$HATIMUL" = "0" ]; then
+    ok "vorzeichenlos nimmt den eigenen Weg (mul rcx, kein imul rcx) — #2333"
+  else
+    no "vorzeichenlos" "mul=$HATMUL imul=$HATIMUL — erwartet mul=1, imul=0"
+  fi
   "$TMP/unsig"; RC=$?
   if [ $RC -eq 0 ]; then ok "vorzeichenlose Fassung rechnet richtig"
   else no "vorzeichenlose Fassung" "rc=$RC"; fi
