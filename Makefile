@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.32B
+VERSION   := 1.2.32C
 VERSION_DATE := 2026-11-06
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -365,6 +365,8 @@ test: lyxc
 	@bash tests/aes_ni_test.sh
 	@echo "--- GHASH mit PCLMULQDQ, AES-NI in AES-GCM, beide Wege gleich (#2390) ---"
 	@bash tests/ghash_pclmul_2390_test.sh
+	@echo "--- fma mit einer Rundung, Hardware und exakter Rueckfall gegen libm (#2403) ---"
+	@bash tests/fma_2403_test.sh
 	@echo "--- RDRAND/RDSEED als Zusatz-Entropie, Erfolg statt Wert (#2392) ---"
 	@bash tests/rand_hw_2392_test.sh
 	@echo "--- Vektorarena: kein Wachstum, kein Syscall je Operation (#2206) ---"

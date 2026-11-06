@@ -132,7 +132,8 @@ is_exempt() {
 # aufgerufen werden — beides wird unten geprueft.
 DIR_RUNNERS="lyx|tests/run_lyx_tests.sh
 snapshot|tests/run_snapshot_tests.sh
-lyx-units-fuzz|tests/lyx_units_fuzz_test.sh"
+lyx-units-fuzz|tests/lyx_units_fuzz_test.sh
+fma_2403|tests/fma_2403_test.sh"
 
 covered_dirs=""
 runner_problems=""
