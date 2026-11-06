@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.32D
+VERSION   := 1.2.32E
 VERSION_DATE := 2026-11-06
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -572,6 +572,8 @@ test: lyxc
 	@bash tests/rumpfausrichtung_2339_test.sh
 	@echo "--- Suchschleifen vorspulen: Wert, Erzeugnis, Gegenrichtung (#2360) ---"
 	@bash tests/vektor_suche_2360_test.sh
+	@echo "--- SemaRTI: Ablauf, Capability-Durchsetzung, Uebersetzerseite ---"
+	@bash tests/semarti_mvp_test.sh
 	@bash tests/code_offset_2339_test.sh
 	@bash tests/str_primitiven_simd_test.sh
 	@bash tests/div_konstante_2330_test.sh
