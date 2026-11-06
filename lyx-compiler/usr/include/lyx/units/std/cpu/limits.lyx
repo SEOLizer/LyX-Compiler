@@ -1,0 +1,220 @@
+// std/cpu/limits.lyx — Prozessgrenzen (#2399, Teil von #2396)
+//
+// Die Rechenleistung, die einem Prozess zusteht, ist etwas anderes als die
+// Kernzahl des Rechners. `GetLogicalCores()` liefert 8, auch wenn der Prozess
+// per `taskset -c 2` auf einem Thread festgenagelt ist oder in einem Container
+// mit `cpu.max 200000 100000` laeuft. Fuer Messungen und fuer die
+// Thread-Verteilung ist das die falsche Zahl — und eine vergessene oder
+// geerbte Affinitaetsmaske faellt ohne Abfrage nicht auf.
+//
+// Der abgeleitete Wert `CpuVerfuegbareParallelitaet` ist die Zahl, die
+// Runtime und Benchmark-Werkzeuge benutzen sollen. Er nennt zusaetzlich,
+// WELCHE Grenze gebunden hat — ohne diese Angabe sieht eine Quota-Grenze
+// genauso aus wie eine kleine Maschine.
+//
+// Fehlt die cgroup-Datei (kein Container), ist das CPU_ST_UNSUPPORTED fuer das
+// Quota-Feld und NICHT "Quota = Kernzahl": ein erfundenes Quota wuerde die
+// bindende Grenze falsch benennen.
+
+@description("Prozessgrenzen: Affinitaet, cgroup-Quota, effektive Parallelitaet")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+unit std.cpu.limits;
+
+import std.alloc;
+import std.cpu.status;
+import std.cpu.sysfs;
+import std.sched;
+import std.systeminfo;
+
+pub con CPU_GRENZE_UNBEKANNT:  int64 := 0;
+pub con CPU_GRENZE_HARDWARE:   int64 := 1;   // nichts schraenkt ein
+pub con CPU_GRENZE_AFFINITAET: int64 := 2;
+pub con CPU_GRENZE_QUOTA:      int64 := 3;
+
+// Zahl der CPUs, auf denen dieser Prozess laufen DARF.
+pub fn CpuErlaubteCpus(t: int64): void {
+  var maske: int64 := alloc(CPU_SET_SIZE);
+  if (maske == 0) {
+    CpuWertFehlt(t, CPU_ST_NOT_IMPLEMENTED, "sched_getaffinity"c);
+    return;
+  }
+  var rc: int64 := SchedGetAffinity(0, maske);
+  if (rc < 0) {
+    CpuWertFehlt(t, CpuStatusAusErrno(rc), "sched_getaffinity"c);
+    free(maske, CPU_SET_SIZE);
+    return;
+  }
+  var n: int64 := CpuSetCount(maske);
+  if (n <= 0) {
+    CpuWertFehlt(t, CPU_ST_NOT_EXPOSED_BY_VM, "sched_getaffinity (leere Maske)"c);
+    free(maske, CPU_SET_SIZE);
+    return;
+  }
+  CpuWertSetzen(t, n, "sched_getaffinity"c);
+  free(maske, CPU_SET_SIZE);
+}
+
+// Kern, auf dem dieser Thread GERADE laeuft. Ohne Pinning ist das eine
+// Momentaufnahme und keine Eigenschaft — der Zeitpunkt im Traeger sagt das.
+pub fn CpuAktuellerKern(t: int64): void {
+  var c: int64 := GetCurrentCPU();
+  if (c < 0) {
+    CpuWertFehlt(t, CpuStatusAusErrno(c), "getcpu"c);
+    return;
+  }
+  CpuWertSetzen(t, c, "getcpu"c);
+}
+
+// Pfad des eigenen cgroups aus /proc/self/cgroup. cgroup v2 hat genau eine
+// Zeile der Form "0::/pfad"; v1 mehrere mit Controllernamen. Rueckgabe leer,
+// wenn nichts lesbar ist.
+fn liPfadV2(): pchar {
+  var txt: pchar := CpuSysfsText("/proc/self/cgroup"c);
+  var b: int64 := txt as int64;
+  var i: int64 := 0;
+  // "0::" am Anfang einer Zeile suchen.
+  while (peek8(b + i) != 0) {
+    if (peek8(b + i) == 48 && peek8(b + i + 1) == 58 && peek8(b + i + 2) == 58) {
+      var p: int64 := alloc(512);
+      var j: int64 := i + 3;
+      var pos: int64 := 0;
+      while (peek8(b + j) != 0 && peek8(b + j) != 10) {
+        poke8(p + pos, peek8(b + j)); pos := pos + 1; j := j + 1;
+      }
+      poke8(p + pos, 0);
+      return p as pchar;
+    }
+    i := i + 1;
+  }
+  return ""c;
+}
+
+fn liStrLen(s: pchar): int64 {
+  var i: int64 := 0;
+  while (peek8((s as int64) + i) != 0) { i := i + 1; }
+  return i;
+}
+
+// "/sys/fs/cgroup" + cgroup-Pfad + "/" + datei
+fn liCgroupDatei(datei: pchar): pchar {
+  var cg: pchar := liPfadV2();
+  var p: int64 := alloc(1024);
+  var pos: int64 := 0;
+  var vor: pchar := "/sys/fs/cgroup"c;
+  var i: int64 := 0;
+  while (i < liStrLen(vor)) { poke8(p + pos, peek8((vor as int64) + i)); pos := pos + 1; i := i + 1; }
+  i := 0;
+  while (i < liStrLen(cg)) { poke8(p + pos, peek8((cg as int64) + i)); pos := pos + 1; i := i + 1; }
+  if (pos > 0 && peek8(p + pos - 1) != 47) { poke8(p + pos, 47); pos := pos + 1; }
+  i := 0;
+  while (i < liStrLen(datei)) { poke8(p + pos, peek8((datei as int64) + i)); pos := pos + 1; i := i + 1; }
+  poke8(p + pos, 0);
+  return p as pchar;
+}
+
+// cgroup-Quota als Kernaequivalent in HUNDERTSTEL Kernen (150 = 1,5 Kerne).
+// So bleibt die Angabe ganzzahlig, ohne die Genauigkeit wegzurunden — die
+// Aufrundung auf ganze Threads passiert erst in der Parallelitaet.
+//
+// cgroup v2: `cpu.max` enthaelt "<quota> <period>" oder "max <period>".
+// "max" heisst unbegrenzt — das ist KEIN Zahlenwert und wird als
+// CPU_ST_UNSUPPORTED gemeldet, mit der Quelle als Beleg.
+// cgroup v1: `cpu.cfs_quota_us` (-1 = unbegrenzt) und `cpu.cfs_period_us`.
+pub fn CpuCgroupQuotaHundertstel(t: int64): void {
+  var pfad: pchar := liCgroupDatei("cpu.max"c);
+  var puf: int64 := alloc(CPU_SYSFS_PUF);
+  var n: int64 := CpuSysfsLies(pfad, puf, CPU_SYSFS_PUF);
+  if (n > 0) {
+    // "max ..." -> unbegrenzt
+    if (peek8(puf) == 109) {                       // 'm'
+      CpuWertFehlt(t, CPU_ST_UNSUPPORTED, "cgroup v2 cpu.max == max (unbegrenzt)"c);
+      return;
+    }
+    var i: int64 := 0;
+    var quota: int64 := 0;
+    while (i < n && peek8(puf + i) >= 48 && peek8(puf + i) <= 57) {
+      quota := quota * 10 + (peek8(puf + i) - 48); i := i + 1;
+    }
+    while (i < n && (peek8(puf + i) == 32 || peek8(puf + i) == 9)) { i := i + 1; }
+    var period: int64 := 0;
+    while (i < n && peek8(puf + i) >= 48 && peek8(puf + i) <= 57) {
+      period := period * 10 + (peek8(puf + i) - 48); i := i + 1;
+    }
+    if (period <= 0) {
+      CpuWertFehlt(t, CPU_ST_UNSUPPORTED, "cgroup v2 cpu.max ohne Periode"c);
+      return;
+    }
+    CpuWertSetzen(t, (quota * 100) / period, "cgroup v2 cpu.max"c);
+    return;
+  }
+  // Rueckfall cgroup v1.
+  var q: int64 := CpuWertNeu();
+  var p2: int64 := CpuWertNeu();
+  CpuSysfsZahl(liCgroupDatei("cpu.cfs_quota_us"c), "cgroup v1 cpu.cfs_quota_us"c, q);
+  CpuSysfsZahl(liCgroupDatei("cpu.cfs_period_us"c), "cgroup v1 cpu.cfs_period_us"c, p2);
+  if (CpuWertDa(q) == 0 || CpuWertDa(p2) == 0) {
+    // Keine der beiden Welten lesbar: kein Quota bekannt. NICHT "Quota =
+    // Kernzahl" — das waere die erfundene Zahl, vor der #2399 warnt.
+    CpuWertFehlt(t, CpuStatusAusErrno(n), "cgroup v2 cpu.max / cgroup v1 cpu.cfs_quota_us"c);
+    return;
+  }
+  if (CpuWert(p2) <= 0) {
+    CpuWertFehlt(t, CPU_ST_UNSUPPORTED, "cgroup v1 cpu.cfs_period_us == 0"c);
+    return;
+  }
+  CpuWertSetzen(t, (CpuWert(q) * 100) / CpuWert(p2), "cgroup v1 cpu.cfs_quota_us / cpu.cfs_period_us"c);
+}
+
+// cpuset.cpus.effective des eigenen cgroups als Text ("" wenn nicht lesbar).
+pub fn CpuCgroupCpuset(): pchar {
+  return CpuSysfsText(liCgroupDatei("cpuset.cpus.effective"c));
+}
+
+// Welche Grenze bindet? Ergebnis ist eine der CPU_GRENZE_*-Konstanten.
+pub fn CpuBindendeGrenze(): int64 {
+  var aff: int64 := CpuWertNeu();
+  var quo: int64 := CpuWertNeu();
+  CpuErlaubteCpus(aff);
+  CpuCgroupQuotaHundertstel(quo);
+  var hw: int64 := GetLogicalCores();
+  if (CpuWertDa(aff) == 0) { return CPU_GRENZE_UNBEKANNT; }
+  var a: int64 := CpuWert(aff);
+  if (CpuWertDa(quo) != 0) {
+    // Quota in ganzen Threads, aufgerundet.
+    var qt: int64 := (CpuWert(quo) + 99) / 100;
+    if (qt < a) { return CPU_GRENZE_QUOTA; }
+  }
+  if (a < hw) { return CPU_GRENZE_AFFINITAET; }
+  return CPU_GRENZE_HARDWARE;
+}
+
+pub fn CpuGrenzeName(g: int64): pchar {
+  if (g == CPU_GRENZE_HARDWARE)   { return "hardware"c; }
+  if (g == CPU_GRENZE_AFFINITAET) { return "affinitaet"c; }
+  if (g == CPU_GRENZE_QUOTA)      { return "cgroup-quota"c; }
+  return "unbekannt"c;
+}
+
+// Die Zahl, mit der gerechnet werden soll: Minimum aus erlaubten CPUs und
+// aufgerundetem Quota.
+pub fn CpuVerfuegbareParallelitaet(t: int64): void {
+  var aff: int64 := CpuWertNeu();
+  CpuErlaubteCpus(aff);
+  if (CpuWertDa(aff) == 0) {
+    CpuWertFehlt(t, CpuStatus(aff), "sched_getaffinity"c);
+    return;
+  }
+  var n: int64 := CpuWert(aff);
+  var quo: int64 := CpuWertNeu();
+  CpuCgroupQuotaHundertstel(quo);
+  if (CpuWertDa(quo) != 0) {
+    var qt: int64 := (CpuWert(quo) + 99) / 100;
+    if (qt < 1) { qt := 1; }
+    if (qt < n) {
+      CpuWertSetzen(t, qt, "min(sched_getaffinity, cgroup-quota aufgerundet)"c);
+      return;
+    }
+  }
+  CpuWertSetzen(t, n, "sched_getaffinity"c);
+}

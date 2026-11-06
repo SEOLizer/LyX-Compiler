@@ -199,6 +199,163 @@ pub fn CpuHasSHA512(): int64    { return (CpuFeatureDetect() & CPU_FEAT_SHA512) 
 pub fn CpuHasSM3(): int64       { return (CpuFeatureDetect() & CPU_FEAT_SM3)       != 0; }
 pub fn CpuHasSM4(): int64       { return (CpuFeatureDetect() & CPU_FEAT_SM4)       != 0; }
 
+// ── #2398: WARUM fehlt ein Bit? ─────────────────────────────────────────────
+//
+// CpuHas*() sagt "vorhanden UND nutzbar": die zustandsbehafteten Bits (AVX,
+// AVX2, FMA, AVX512F, VAES, VPCLMULQDQ) sind oben schon gegen OSXSAVE und die
+// zustaendigen XCR0-Bits gefiltert. Was fehlte, ist die BEGRUENDUNG: von
+// aussen war nicht unterscheidbar, ob die CPU das Bit nicht hat, ob das
+// Betriebssystem den Registerzustand nicht sichert oder ob ein Kernelparameter
+// es abgeschaltet hat. Genau diese Kette braucht `lyx-cpu explain` (#2402).
+//
+// Die Zuordnung Bit -> benoetigte XCR0-Bits steht als EINE Tabelle
+// (cpuXcr0Bedarf), nicht als zweite Kette von `if`. Ein Bit, das dort fehlt,
+// laesst die Abfrage LAUT scheitern — nicht als "nutzbar" durchgehen. Das ist
+// die Regel "unvollstaendige Aufzaehlung": eine neue Faehigkeit muss in beide
+// Aufzaehlungen, und das Scheitern erinnert daran.
+
+pub con CPU_NUTZBAR:              int64 := 0;   // vorhanden und nutzbar
+pub con CPU_FEHLT_IN_HARDWARE:    int64 := 1;   // CPUID-Bit nicht gesetzt
+pub con CPU_FEHLT_OSXSAVE:        int64 := 2;   // CPU kann es, OS sichert keinen XSAVE-Zustand
+pub con CPU_FEHLT_XCR0:           int64 := 3;   // OSXSAVE da, aber der Zustand ist nicht freigegeben
+pub con CPU_FEHLT_KEIN_X86:       int64 := 4;   // kein CPUID (arm64, riscv, Mikrocontroller)
+
+// Welche XCR0-Bits braucht dieses Faehigkeitsbit? 0 = keine (zustandslos).
+// Rueckgabe -1 = Bit nicht in der Tabelle.
+fn cpuXcr0Bedarf(feat: int64): int64 {
+  // Zustandslos: laufen ohne gesicherten erweiterten Registerzustand.
+  if (feat == CPU_FEAT_SSE2 || feat == CPU_FEAT_SSE41 || feat == CPU_FEAT_SSE42) { return 0; }
+  if (feat == CPU_FEAT_POPCNT || feat == CPU_FEAT_LZCNT) { return 0; }
+  if (feat == CPU_FEAT_AESNI || feat == CPU_FEAT_PCLMUL) { return 0; }
+  if (feat == CPU_FEAT_BMI1 || feat == CPU_FEAT_BMI2) { return 0; }
+  if (feat == CPU_FEAT_SHANI || feat == CPU_FEAT_RDRAND || feat == CPU_FEAT_RDSEED) { return 0; }
+  if (feat == CPU_FEAT_KEYLOCKER || feat == CPU_FEAT_SHA512) { return 0; }
+  if (feat == CPU_FEAT_SM3 || feat == CPU_FEAT_SM4) { return 0; }
+  // XMM- und YMM-Zustand (Bit 1 und 2).
+  if (feat == CPU_FEAT_AVX || feat == CPU_FEAT_AVX2 || feat == CPU_FEAT_FMA) { return 6; }
+  if (feat == CPU_FEAT_VAES || feat == CPU_FEAT_VPCLMUL) { return 6; }
+  // Zusaetzlich Maskenregister und beide ZMM-Haelften (Bit 5, 6, 7).
+  if (feat == CPU_FEAT_AVX512F) { return 230; }
+  return 0 - 1;
+}
+
+// Rohes CPUID-Bit OHNE die Zustandsfilter — fuer die Begruendung gebraucht:
+// nur so ist "Hardware kann es, OS gibt es nicht frei" von "Hardware kann es
+// nicht" unterscheidbar.
+fn cpuRohBit(feat: int64): int64 {
+  if (cpu_leafVorhanden(1) == 0) { return 0; }
+  var ecx1: int64 := cpu_id(1, 0, 2);
+  var edx1: int64 := cpu_id(1, 0, 3);
+  if (feat == CPU_FEAT_SSE2)   { return (edx1 >> 26) & 1; }
+  if (feat == CPU_FEAT_SSE41)  { return (ecx1 >> 19) & 1; }
+  if (feat == CPU_FEAT_SSE42)  { return (ecx1 >> 20) & 1; }
+  if (feat == CPU_FEAT_POPCNT) { return (ecx1 >> 23) & 1; }
+  if (feat == CPU_FEAT_AESNI)  { return (ecx1 >> 25) & 1; }
+  if (feat == CPU_FEAT_PCLMUL) { return (ecx1 >> 1)  & 1; }
+  if (feat == CPU_FEAT_RDRAND) { return (ecx1 >> 30) & 1; }
+  if (feat == CPU_FEAT_AVX)    { return (ecx1 >> 28) & 1; }
+  if (feat == CPU_FEAT_FMA)    { return (ecx1 >> 12) & 1; }
+  if (feat == CPU_FEAT_LZCNT) {
+    var maxExt: int64 := cpu_id(2147483648, 0, 0);
+    if (maxExt < 2147483649) { return 0; }
+    return (cpu_id(2147483649, 0, 2) >> 5) & 1;
+  }
+  if (cpu_leafVorhanden(7) == 0) { return 0; }
+  var ebx7: int64 := cpu_id(7, 0, 1);
+  var ecx7: int64 := cpu_id(7, 0, 2);
+  if (feat == CPU_FEAT_BMI1)    { return (ebx7 >> 3)  & 1; }
+  if (feat == CPU_FEAT_BMI2)    { return (ebx7 >> 8)  & 1; }
+  if (feat == CPU_FEAT_SHANI)   { return (ebx7 >> 29) & 1; }
+  if (feat == CPU_FEAT_RDSEED)  { return (ebx7 >> 18) & 1; }
+  if (feat == CPU_FEAT_AVX2)    { return (ebx7 >> 5)  & 1; }
+  if (feat == CPU_FEAT_AVX512F) { return (ebx7 >> 16) & 1; }
+  if (feat == CPU_FEAT_VAES)    { return (ecx7 >> 9)  & 1; }
+  if (feat == CPU_FEAT_VPCLMUL) { return (ecx7 >> 10) & 1; }
+  if (feat == CPU_FEAT_KEYLOCKER) { return (ecx7 >> 23) & 1; }
+  var maxSub: int64 := cpu_id(7, 0, 0);
+  if (maxSub < 1) { return 0; }
+  var eax71: int64 := cpu_id(7, 1, 0);
+  if (feat == CPU_FEAT_SHA512) { return (eax71 >> 0) & 1; }
+  if (feat == CPU_FEAT_SM3)    { return (eax71 >> 1) & 1; }
+  if (feat == CPU_FEAT_SM4)    { return (eax71 >> 2) & 1; }
+  return 0;
+}
+
+// Begruendung, warum ein Faehigkeitsbit nicht nutzbar ist — oder
+// CPU_NUTZBAR. `feat` ist eine der CPU_FEAT_*-Konstanten.
+//
+// Scheitert LAUT, wenn `feat` keine bekannte Konstante ist: ein Tippfehler
+// oder eine neu dazugekommene Faehigkeit soll auffallen und nicht als
+// "nutzbar" oder "fehlt in Hardware" durchgehen.
+pub fn CpuFeatureUnusableReason(feat: int64): int64 {
+  if (CpuHasCpuid() == 0) { return CPU_FEHLT_KEIN_X86; }
+  var bedarf: int64 := cpuXcr0Bedarf(feat);
+  if (bedarf < 0) {
+    panic("std.cpu.features: unbekanntes Faehigkeitsbit in CpuFeatureUnusableReason — Tabelle cpuXcr0Bedarf nachziehen (#2398)");
+  }
+  if (cpuRohBit(feat) == 0) { return CPU_FEHLT_IN_HARDWARE; }
+  if (bedarf == 0) { return CPU_NUTZBAR; }
+  var ecx1: int64 := cpu_id(1, 0, 2);
+  if (((ecx1 >> 27) & 1) == 0) { return CPU_FEHLT_OSXSAVE; }
+  var xcr0: int64 := cpu_xgetbv(0);
+  if ((xcr0 & bedarf) != bedarf) { return CPU_FEHLT_XCR0; }
+  return CPU_NUTZBAR;
+}
+
+// Name der Begruendung fuer Berichte.
+pub fn CpuUnusableReasonName(grund: int64): pchar {
+  if (grund == CPU_NUTZBAR)           { return "nutzbar"c; }
+  if (grund == CPU_FEHLT_IN_HARDWARE) { return "nicht in Hardware"c; }
+  if (grund == CPU_FEHLT_OSXSAVE)     { return "kein OSXSAVE (OS sichert keinen XSAVE-Zustand)"c; }
+  if (grund == CPU_FEHLT_XCR0)        { return "XCR0-Bit fehlt (Zustand nicht freigegeben, z. B. noxsave)"c; }
+  if (grund == CPU_FEHLT_KEIN_X86)    { return "kein CPUID (nicht x86)"c; }
+  return "unbekannte Begruendung"c;
+}
+
+// Faehigkeitsbit zu einem Namen — die Liste, die `lyx-cpu explain` zulaesst.
+// Rueckgabe 0 = Name unbekannt (der Aufrufer meldet das laut, siehe #2402).
+pub fn CpuFeatureBitAusName(nm: pchar, nl: int64): int64 {
+  if (cpuNameGleich(nm, nl, "sse2"c, 4))       { return CPU_FEAT_SSE2; }
+  if (cpuNameGleich(nm, nl, "sse4_1"c, 6))     { return CPU_FEAT_SSE41; }
+  if (cpuNameGleich(nm, nl, "sse4_2"c, 6))     { return CPU_FEAT_SSE42; }
+  if (cpuNameGleich(nm, nl, "popcnt"c, 6))     { return CPU_FEAT_POPCNT; }
+  if (cpuNameGleich(nm, nl, "abm"c, 3))        { return CPU_FEAT_LZCNT; }
+  if (cpuNameGleich(nm, nl, "aes"c, 3))        { return CPU_FEAT_AESNI; }
+  if (cpuNameGleich(nm, nl, "pclmulqdq"c, 9))  { return CPU_FEAT_PCLMUL; }
+  if (cpuNameGleich(nm, nl, "avx"c, 3))        { return CPU_FEAT_AVX; }
+  if (cpuNameGleich(nm, nl, "avx2"c, 4))       { return CPU_FEAT_AVX2; }
+  if (cpuNameGleich(nm, nl, "avx512f"c, 7))    { return CPU_FEAT_AVX512F; }
+  if (cpuNameGleich(nm, nl, "fma"c, 3))        { return CPU_FEAT_FMA; }
+  if (cpuNameGleich(nm, nl, "bmi1"c, 4))       { return CPU_FEAT_BMI1; }
+  if (cpuNameGleich(nm, nl, "bmi2"c, 4))       { return CPU_FEAT_BMI2; }
+  if (cpuNameGleich(nm, nl, "sha_ni"c, 6))     { return CPU_FEAT_SHANI; }
+  if (cpuNameGleich(nm, nl, "vaes"c, 4))       { return CPU_FEAT_VAES; }
+  if (cpuNameGleich(nm, nl, "vpclmulqdq"c, 10)) { return CPU_FEAT_VPCLMUL; }
+  if (cpuNameGleich(nm, nl, "rdrand"c, 6))     { return CPU_FEAT_RDRAND; }
+  if (cpuNameGleich(nm, nl, "rdseed"c, 6))     { return CPU_FEAT_RDSEED; }
+  if (cpuNameGleich(nm, nl, "keylocker"c, 9))  { return CPU_FEAT_KEYLOCKER; }
+  if (cpuNameGleich(nm, nl, "sha512"c, 6))     { return CPU_FEAT_SHA512; }
+  if (cpuNameGleich(nm, nl, "sm3"c, 3))        { return CPU_FEAT_SM3; }
+  if (cpuNameGleich(nm, nl, "sm4"c, 3))        { return CPU_FEAT_SM4; }
+  return 0;
+}
+
+// Die zulaessigen Namen als eine Zeile — fuer die Fehlermeldung bei einem
+// unbekannten Namen (#2402: "nennt die zulaessigen Werte").
+pub fn CpuFeatureNamenListe(): pchar {
+  return "sse2 sse4_1 sse4_2 popcnt abm aes pclmulqdq avx avx2 avx512f fma bmi1 bmi2 sha_ni vaes vpclmulqdq rdrand rdseed keylocker sha512 sm3 sm4"c;
+}
+
+fn cpuNameGleich(a: pchar, al: int64, b: pchar, bl: int64): int64 {
+  if (al != bl) { return 0; }
+  var i: int64 := 0;
+  while (i < al) {
+    if (peek8((a as int64) + i) != peek8((b as int64) + i)) { return 0; }
+    i := i + 1;
+  }
+  return 1;
+}
+
 // Ist diese Architektur ueberhaupt x86? CPUID gibt es nur dort; auf arm64,
 // riscv und den Mikrocontroller-Zielen liefert das Builtin 0, und Blatt 0
 // meldet dann eine Hoechstnummer von 0. Wer die Unterscheidung braucht, soll
