@@ -133,7 +133,8 @@ is_exempt() {
 DIR_RUNNERS="lyx|tests/run_lyx_tests.sh
 snapshot|tests/run_snapshot_tests.sh
 lyx-units-fuzz|tests/lyx_units_fuzz_test.sh
-fma_2403|tests/fma_2403_test.sh"
+fma_2403|tests/fma_2403_test.sh
+vektor_suche_2360|tests/vektor_suche_2360_test.sh"
 
 covered_dirs=""
 runner_problems=""
