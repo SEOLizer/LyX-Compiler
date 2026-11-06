@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.32A
+VERSION   := 1.2.32B
 VERSION_DATE := 2026-11-06
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -341,6 +341,18 @@ test: lyxc
 	@bash tests/std_path_autoritativ_test.sh
 	@echo "--- std.cpu.features gegen die echte CPU, beide Richtungen (#2187) ---"
 	@bash tests/cpu_features_test.sh
+	@echo "--- std.cpu: Statusmodell, Identitaet, Topologie, Caches (#2397) ---"
+	@bash tests/cpu_describe_2397_test.sh
+	@echo "--- std.cpu: Begruendung der Nutzbarkeit, beide Richtungen (#2398) ---"
+	@bash tests/cpu_reason_2398_test.sh
+	@echo "--- std.cpu: Prozessgrenzen in drei Laeufen (#2399) ---"
+	@bash tests/cpu_limits_2399_test.sh
+	@echo "--- std.cpu: Governor, Boost, vier getrennte Taktfelder (#2400) ---"
+	@bash tests/cpu_power_2400_test.sh
+	@echo "--- std.cpu: gemessener Takt gegen perf stat (#2401) ---"
+	@bash tests/cpu_clock_2401_test.sh
+	@echo "--- lyx-cpu: CLI gegen lscpu/sysfs/perf, JSON gegen Parser (#2402) ---"
+	@bash tests/lyx_cpu_cli_2402_test.sh
 	@echo "--- vorzeichenlose Division durch konstanten Divisor ohne div (#2333) ---"
 	@bash tests/div_magie_unsig_2333_test.sh
 	@echo "--- Merktabelle fuer die Methodendeklaration, Schluessel (#2321) ---"

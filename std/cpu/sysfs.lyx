@@ -1,0 +1,115 @@
+// std/cpu/sysfs.lyx — eine Stelle fuer das Lesen von sysfs/procfs (#2396)
+//
+// Die Diagnose liest Dutzende kleine Textdateien
+// (/sys/devices/system/cpu/.../scaling_governor, /proc/self/cgroup, ...). Der
+// Grund fuer diese Unit ist nicht Bequemlichkeit, sondern das Statusmodell:
+// `ReadFile` aus std/fs.lyx gibt bei JEDEM Fehlschlag -1 zurueck und macht
+// damit `EACCES` (Rechte, Lockdown) von `ENOENT` (Datei gibt es hier nicht)
+// ununterscheidbar. Fuer den Bericht sind das zwei verschiedene Aussagen:
+// "permission_denied" heisst "auf dieser Maschine nicht lesbar",
+// "unsupported" heisst "diesen Regler gibt es nicht".
+//
+// Darum steht das Lesen hier EINMAL, mit durchgereichtem errno, und jede
+// Abfrage der Bibliothek geht darueber.
+
+@description("sysfs/procfs lesen mit durchgereichtem errno fuer das Statusmodell der CPU-Diagnose")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+unit std.cpu.sysfs;
+
+import std.alloc;
+import std.cpu.status;
+
+pub con CPU_SYSFS_PUF: int64 := 4096;
+
+// Datei lesen. Rueckgabe: Zahl der gelesenen Byte, oder der NEGATIVE
+// Fehlercode von open/read. Der Puffer wird nullterminiert.
+pub fn CpuSysfsLies(pfad: pchar, puf: int64, max: int64): int64 {
+  var f: int64 := open(pfad, 0, 0);                 // O_RDONLY
+  if (f < 0) { return f; }
+  var gelesen: int64 := 0;
+  while (gelesen < max - 1) {
+    var n: int64 := read(f, (puf + gelesen) as pchar, max - 1 - gelesen);
+    if (n < 0) { close(f); return n; }
+    if (n == 0) { break; }
+    gelesen := gelesen + n;
+  }
+  close(f);
+  poke8(puf + gelesen, 0);
+  return gelesen;
+}
+
+// Erste Ganzzahl aus einer Datei in einen Traeger. Fehlt die Datei oder ist
+// sie nicht lesbar, traegt der Wert den passenden Status und den PFAD als
+// Quelle — nie eine 0.
+//
+// `quelle` wird ausdruecklich uebergeben und nicht aus `pfad` abgeleitet: bei
+// Pfaden mit eingesetzter CPU-Nummer soll im Bericht der konkrete Pfad stehen.
+pub fn CpuSysfsZahl(pfad: pchar, quelle: pchar, t: int64): void {
+  var puf: int64 := alloc(CPU_SYSFS_PUF);
+  if (puf == 0) {
+    CpuWertFehlt(t, CPU_ST_NOT_IMPLEMENTED, quelle);
+    return;
+  }
+  var n: int64 := CpuSysfsLies(pfad, puf, CPU_SYSFS_PUF);
+  if (n < 0) {
+    CpuWertFehlt(t, CpuStatusAusErrno(n), quelle);
+    free(puf, CPU_SYSFS_PUF);
+    return;
+  }
+  if (n == 0) {
+    // Datei da, aber leer: das ist der Fall, den ein Hypervisor hinterlaesst.
+    CpuWertFehlt(t, CPU_ST_NOT_EXPOSED_BY_VM, quelle);
+    free(puf, CPU_SYSFS_PUF);
+    return;
+  }
+  // Erste Zahl lesen. Ein Text ohne Ziffer ist KEINE 0, sondern unsupported —
+  // "max" in cpu.max und "powersave" in scaling_governor sind genau solche.
+  var i: int64 := 0;
+  while (i < n && (peek8(puf + i) < 48 || peek8(puf + i) > 57)) { i := i + 1; }
+  if (i >= n) {
+    CpuWertFehlt(t, CPU_ST_UNSUPPORTED, quelle);
+    free(puf, CPU_SYSFS_PUF);
+    return;
+  }
+  var v: int64 := 0;
+  while (i < n && peek8(puf + i) >= 48 && peek8(puf + i) <= 57) {
+    v := v * 10 + (peek8(puf + i) - 48);
+    i := i + 1;
+  }
+  CpuWertSetzen(t, v, quelle);
+  free(puf, CPU_SYSFS_PUF);
+}
+
+// Textinhalt einer Datei ohne Zeilenende, neu angelegt. Leere Zeichenkette,
+// wenn die Datei nicht lesbar ist — der Aufrufer prueft das ueber
+// CpuSysfsLies, wenn er den Grund braucht.
+pub fn CpuSysfsText(pfad: pchar): pchar {
+  var puf: int64 := alloc(CPU_SYSFS_PUF);
+  if (puf == 0) { return ""c; }
+  var n: int64 := CpuSysfsLies(pfad, puf, CPU_SYSFS_PUF);
+  if (n <= 0) { poke8(puf, 0); return puf as pchar; }
+  var e: int64 := n;
+  while (e > 0 && (peek8(puf + e - 1) == 10 || peek8(puf + e - 1) == 32)) { e := e - 1; }
+  poke8(puf + e, 0);
+  return puf as pchar;
+}
+
+// Pfad "/sys/devices/system/cpu/cpuN/<rest>" zusammensetzen.
+pub fn CpuSysfsPfad(cpu: int64, rest: pchar): pchar {
+  var p: int64 := alloc(256);
+  var pos: int64 := 0;
+  var vor: pchar := "/sys/devices/system/cpu/cpu"c;
+  var i: int64 := 0;
+  while (peek8((vor as int64) + i) != 0) { poke8(p + pos, peek8((vor as int64) + i)); pos := pos + 1; i := i + 1; }
+  // Nummer (hoechstens vierstellig, mehr Threads hat kein Ziel dieser Unit).
+  if (cpu >= 1000) { poke8(p + pos, 48 + (cpu / 1000) % 10); pos := pos + 1; }
+  if (cpu >= 100)  { poke8(p + pos, 48 + (cpu / 100) % 10);  pos := pos + 1; }
+  if (cpu >= 10)   { poke8(p + pos, 48 + (cpu / 10) % 10);   pos := pos + 1; }
+  poke8(p + pos, 48 + cpu % 10); pos := pos + 1;
+  poke8(p + pos, 47); pos := pos + 1;                       // '/'
+  i := 0;
+  while (peek8((rest as int64) + i) != 0) { poke8(p + pos, peek8((rest as int64) + i)); pos := pos + 1; i := i + 1; }
+  poke8(p + pos, 0);
+  return p as pchar;
+}
