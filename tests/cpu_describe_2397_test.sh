@@ -104,7 +104,12 @@ REF_NAME="$(grep -m1 'model name' /proc/cpuinfo | sed 's/^model name[^:]*: *//')
 for p in "vendor:$REF_VENDOR" "familie:$REF_FAM" "modell:$REF_MOD" "stepping:$REF_STEP" "brand:$REF_NAME"; do
   n="${p%%:*}"; w="${p#*:}"
   if [ -z "$w" ]; then echo "HINWEIS: keine Referenz fuer $n"; continue; fi
-  if [ "$(hol "$n")" = "$w" ]; then ok "$n = '$w' (gegen lscpu/proc)"; else no "$n" "'$(hol "$n")' statt '$w'"; fi
+  # Beide Seiten ohne Rand-Leerzeichen vergleichen: der Markenname aus CPUID
+  # ist herstellerabhaengig links oder rechts aufgefuellt (Intel vorn, AMD
+  # hinten), /proc/cpuinfo liefert ihn schon beschnitten.
+  ist="$(printf '%s' "$(hol "$n")" | sed 's/^ *//; s/ *$//')"
+  soll="$(printf '%s' "$w" | sed 's/^ *//; s/ *$//')"
+  if [ "$ist" = "$soll" ]; then ok "$n = '$soll' (gegen lscpu/proc)"; else no "$n" "'$ist' statt '$soll'"; fi
 done
 [ "$(hol uarch_status)" = "ok" ] && ok "Mikroarchitektur erkannt: $(hol uarch)" \
   || echo "HINWEIS: Mikroarchitektur nicht in der Tabelle ($(hol uarch_status)) — der Default-Zweig scheitert damit richtig laut"
@@ -113,7 +118,35 @@ done
 REF_TPC="$(LC_ALL=C lscpu | sed -n 's/^Thread(s) per core: *//p' | head -1)"
 REF_CPS="$(LC_ALL=C lscpu | sed -n 's/^Core(s) per socket: *//p' | head -1)"
 [ -n "$REF_TPC" ] && { [ "$(hol threads_je_kern)" = "$REF_TPC" ] && ok "threads_je_kern = $REF_TPC" || no "threads_je_kern" "'$(hol threads_je_kern)' statt $REF_TPC"; }
-[ -n "$REF_CPS" ] && { [ "$(hol kerne)" = "$REF_CPS" ] && ok "kerne_je_paket = $REF_CPS" || no "kerne" "'$(hol kerne)' statt $REF_CPS"; }
+# Kerne je Paket: die Zahl kommt aus der x2APIC-Topologie (CPUID.0xB) und ist
+# die HARDWARE-Sicht. In einer VM beschreibt CPUID die Topologie des WIRTS,
+# waehrend lscpu zaehlt, was der Gast sieht — gemessen auf dem CI-Laeufer
+# (EPYC 9V45, 4 vCPUs): CPUID 16 Threads je Paket, also 8 Kerne; lscpu sagt
+# 2 Kerne je Sockel. Beides ist richtig, es sind verschiedene Fragen.
+#
+# Geprueft wird deshalb die INNERE Stimmigkeit (Threads je Paket = Kerne *
+# Threads je Kern) — die gilt immer — und der Abgleich mit lscpu nur dort, wo
+# der Gast die ganze Maschine sieht.
+TJP="$(hol threads_je_paket)"; TJK="$(hol threads_je_kern)"; KER="$(hol kerne)"
+if [ -n "$TJP" ] && [ -n "$TJK" ] && [ -n "$KER" ] && [ "$TJK" -gt 0 ]; then
+  if [ $(( KER * TJK )) = "$TJP" ]; then
+    ok "innere Stimmigkeit: $KER Kerne x $TJK Threads = $TJP Threads je Paket"
+  else
+    no "Topologie" "$KER x $TJK != $TJP — die drei Zahlen passen nicht zueinander"
+  fi
+fi
+REF_SOCK="$(LC_ALL=C lscpu | sed -n 's/^Socket(s): *//p' | head -1)"
+REF_LOG="$(LC_ALL=C lscpu | sed -n 's/^CPU(s): *//p' | head -1)"
+if [ -n "$REF_CPS" ] && [ -n "$REF_SOCK" ] && [ -n "$REF_LOG" ] && [ -n "$TJP" ]; then
+  if [ $(( REF_SOCK * TJP )) = "$REF_LOG" ]; then
+    [ "$KER" = "$REF_CPS" ] && ok "kerne_je_paket = $REF_CPS (gegen lscpu)" \
+      || no "kerne" "'$KER' statt $REF_CPS"
+  else
+    echo "HINWEIS: CPUID beschreibt $TJP Threads je Paket, der Gast sieht $REF_LOG"
+    echo "         bei $REF_SOCK Sockel — eine VM mit beschnittener Topologie."
+    echo "         Der Abgleich mit lscpu entfaellt, die innere Stimmigkeit gilt."
+  fi
+fi
 
 # ── Caches gegen sysfs ──────────────────────────────────────────────────────
 sysfsgr() { # Ebene Typ -> Groesse in Byte
