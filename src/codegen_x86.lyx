@@ -19570,6 +19570,141 @@ pub type Codegen = class {
       self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x7F); self.cg_e8(0x07);    // movdqu [rdi], xmm0
       self.cg_zeroRax();
 
+    } else if (self.cg_seq(fname, fnlen, "ghash_blocks", 12)) {
+      // #2390: GHASH mit PCLMULQDQ. rdi = Z (16 Byte, GCM-Ordnung),
+      // rsi = H (16 Byte, GCM-Ordnung), rdx = Datenbloecke (roh),
+      // rcx = Anzahl der Bloecke.
+      //
+      // Je Block: Z ^= Block, dann Z := Z * H im GF(2^128). Die
+      // Multiplikation steht als Karatsuba-freie Vierfachform (vier
+      // PCLMULQDQ, danach Mittelteil zusammenlegen) mit der Reduktion aus
+      // Intels Weissbuch "Carry-Less Multiplication and Its Usage for
+      // Computing the GCM Mode" (Shift um 1, dann zwei Stufen aus
+      // pslld/psrld/pslldq/psrldq) [VENDOR].
+      //
+      // Der Schnitt ist derselbe wie bei AES-NI (#2383): EIN Aufruf fuer
+      // viele Bloecke, Z und H bleiben in xmm0/xmm1. Ein Builtin je
+      // Multiplikation haette Z und die acht Zwischenwerte der Reduktion je
+      // Block durch den Speicher geschickt.
+      //
+      // Z und H liegen byteweise UMGEDREHT (GCM-Ordnung); die Datenbloecke
+      // sind roh und werden hier mit pshufb gedreht. Die Maske liegt dafuer
+      // auf dem Stack — sie wird einmal je Aufruf gebaut, nicht je Block.
+      //
+      // Verzweigungsfrei im Datenpfad: die einzige Verzweigung zaehlt die
+      // Bloecke. Keine Tabelle, also kein datenabhaengiger Cachezugriff —
+      // genau der Grund, warum der bitweise Weg daneben stehen bleibt und
+      // nicht ersetzt wird (er ist der Rueckfall ohne PCLMULQDQ).
+      //
+      // Dieselben Bytes stehen in emit_lyxos (ID 564) — die beiden muessen
+      // uebereinstimmen; beide sind aus derselben Beschreibung erzeugt.
+      self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0x07);   // movdqu xmm0, [rdi]  (Z)
+      self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0x0E);   // movdqu xmm1, [rsi]  (H)
+      // pshufb-Maske 0f..00 auf den Stack: der zweite push liegt an der
+      // NIEDRIGEREN Adresse, dort muessen die Bytes 0f 0e 0d 0c 0b 0a 09 08
+      // stehen.
+      self.cg_e8(0x48); self.cg_e8(0xB8); self.cg_e64(283686952306183);       // movabs rax, 0x0001020304050607
+      self.cg_e8(0x50);                                                         // push rax
+      self.cg_e8(0x48); self.cg_e8(0xB8); self.cg_e64(579005069656919567);      // movabs rax, 0x08090a0b0c0d0e0f
+      self.cg_e8(0x50);                                                         // push rax
+      self.cg_e8(0xF3); self.cg_e8(0x44); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0x04); self.cg_e8(0x24);  // movdqu xmm8, [rsp]
+      self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC9);                     // test rcx, rcx
+      self.cg_e8(0x0F); self.cg_e8(0x84); var ghEnde: int64 := self.codeLen; self.cg_e32(0);   // jz ende
+      var ghTop: int64 := self.codeLen;
+      self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0x12);   // movdqu xmm2, [rdx]
+      self.cg_e8(0x66); self.cg_e8(0x41); self.cg_e8(0x0F); self.cg_e8(0x38); self.cg_e8(0x00); self.cg_e8(0xD0);  // pshufb xmm2, xmm8
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0xEF); self.cg_e8(0xC2);   // pxor xmm0, xmm2
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0xD8);   // movdqa xmm3, xmm0
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x3A); self.cg_e8(0x44); self.cg_e8(0xD9); self.cg_e8(0x00);   // pclmulqdq xmm3, xmm1, 0x00   ; a0*b0
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0xE0);   // movdqa xmm4, xmm0
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x3A); self.cg_e8(0x44); self.cg_e8(0xE1); self.cg_e8(0x11);   // pclmulqdq xmm4, xmm1, 0x11   ; a1*b1
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0xE8);   // movdqa xmm5, xmm0
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x3A); self.cg_e8(0x44); self.cg_e8(0xE9); self.cg_e8(0x10);   // pclmulqdq xmm5, xmm1, 0x10
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0xF0);   // movdqa xmm6, xmm0
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x3A); self.cg_e8(0x44); self.cg_e8(0xF1); self.cg_e8(0x01);   // pclmulqdq xmm6, xmm1, 0x01
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0xEF); self.cg_e8(0xEE);   // pxor xmm5, xmm6              ; Mittelteil
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0xF5);   // movdqa xmm6, xmm5
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x73); self.cg_e8(0xFE); self.cg_e8(0x08);   // pslldq xmm6, 8
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x73); self.cg_e8(0xDD); self.cg_e8(0x08);   // psrldq xmm5, 8
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0xEF); self.cg_e8(0xDE);   // pxor xmm3, xmm6              ; xmm3 = untere 128 Bit
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0xEF); self.cg_e8(0xE5);   // pxor xmm4, xmm5              ; xmm4 = obere 128 Bit
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0xF3);   // movdqa xmm6, xmm3            ; 256 Bit um 1 nach links
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0xFC);   // movdqa xmm7, xmm4
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x72); self.cg_e8(0xF3); self.cg_e8(0x01);   // pslld xmm3, 1
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x72); self.cg_e8(0xF4); self.cg_e8(0x01);   // pslld xmm4, 1
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x72); self.cg_e8(0xD6); self.cg_e8(0x1F);   // psrld xmm6, 31
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x72); self.cg_e8(0xD7); self.cg_e8(0x1F);   // psrld xmm7, 31
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0xEE);   // movdqa xmm5, xmm6
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x73); self.cg_e8(0xFF); self.cg_e8(0x04);   // pslldq xmm7, 4
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x73); self.cg_e8(0xFE); self.cg_e8(0x04);   // pslldq xmm6, 4
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x73); self.cg_e8(0xDD); self.cg_e8(0x0C);   // psrldq xmm5, 12
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0xEB); self.cg_e8(0xDE);   // por xmm3, xmm6
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0xEB); self.cg_e8(0xE7);   // por xmm4, xmm7
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0xEB); self.cg_e8(0xE5);   // por xmm4, xmm5
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0xF3);   // movdqa xmm6, xmm3            ; Reduktion, erste Stufe
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0xFB);   // movdqa xmm7, xmm3
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0xEB);   // movdqa xmm5, xmm3
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x72); self.cg_e8(0xF6); self.cg_e8(0x1F);   // pslld xmm6, 31
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x72); self.cg_e8(0xF7); self.cg_e8(0x1E);   // pslld xmm7, 30
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x72); self.cg_e8(0xF5); self.cg_e8(0x19);   // pslld xmm5, 25
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0xEF); self.cg_e8(0xF7);   // pxor xmm6, xmm7
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0xEF); self.cg_e8(0xF5);   // pxor xmm6, xmm5
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0xFE);   // movdqa xmm7, xmm6
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x73); self.cg_e8(0xFE); self.cg_e8(0x0C);   // pslldq xmm6, 12
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x73); self.cg_e8(0xDF); self.cg_e8(0x04);   // psrldq xmm7, 4
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0xEF); self.cg_e8(0xDE);   // pxor xmm3, xmm6
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0xD3);   // movdqa xmm2, xmm3            ; Reduktion, zweite Stufe
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0xEB);   // movdqa xmm5, xmm3
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0xF3);   // movdqa xmm6, xmm3
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x72); self.cg_e8(0xD2); self.cg_e8(0x01);   // psrld xmm2, 1
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x72); self.cg_e8(0xD5); self.cg_e8(0x02);   // psrld xmm5, 2
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x72); self.cg_e8(0xD6); self.cg_e8(0x07);   // psrld xmm6, 7
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0xEF); self.cg_e8(0xD5);   // pxor xmm2, xmm5
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0xEF); self.cg_e8(0xD6);   // pxor xmm2, xmm6
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0xEF); self.cg_e8(0xD7);   // pxor xmm2, xmm7
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0xEF); self.cg_e8(0xDA);   // pxor xmm3, xmm2
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0xEF); self.cg_e8(0xE3);   // pxor xmm4, xmm3
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0xC4);   // movdqa xmm0, xmm4            ; Ergebnis
+      self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC2); self.cg_e8(0x10);   // add rdx, 16
+      self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC9);                     // dec rcx
+      self.cg_e8(0x0F); self.cg_e8(0x85); self.cg_e32(ghTop - (self.codeLen + 4));  // jnz oben (rel32: der Rumpf ist weit ueber 127 Byte, #1915)
+      self.cg_bumpZiel(ghEnde);                                                 // jz-Ziel nachtragen (#2244-Muster)
+      self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x7F); self.cg_e8(0x07);   // movdqu [rdi], xmm0
+      self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC4); self.cg_e8(0x10);   // add rsp, 16 (Maske)
+      self.cg_zeroRax();
+
+    } else if (self.cg_seq(fname, fnlen, "rdrand64", 8) ||
+               self.cg_seq(fname, fnlen, "rdseed64", 8)) {
+      // #2392: RDRAND/RDSEED. rdi = Zieladresse (8 Byte).
+      //
+      // Rueckgabe ist der ERFOLG (1/0), nicht der Wert: der Befehl setzt CF,
+      // und ohne diese Auskunft waere ein Fehlschlag nicht von einem
+      // gezogenen Wert zu unterscheiden — die Zahl 0 ist ein gueltiges
+      // Ergebnis. Genau das ist der stille Default, den die Projektregeln
+      // verbieten; bei einer Zufallsquelle heisst er "vorhersagbare Bytes".
+      //
+      // Der Wert wird IMMER geschrieben; bei Fehlschlag steht dort nach
+      // Intels Vorgabe 0, und der Aufrufer darf ihn dann nicht benutzen.
+      // Die Wiederholung (RDRAND bis zu 10 Versuche) gehoert in die Unit,
+      // nicht hierher — hier ist kein Platz fuer eine Pause.
+      //
+      // Dieselben Bytes stehen in emit_lyxos (IDs 565/566).
+      var rdOp: int64 := 0xF0;                                                  // rdrand rax (/6)
+      if (self.cg_seq(fname, fnlen, "rdseed64", 8)) { rdOp := 0xF8; }           // rdseed rax (/7)
+      self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xC7); self.cg_e8(rdOp);
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x07);                     // mov [rdi], rax
+      self.cg_e8(0x0F); self.cg_e8(0x92); self.cg_e8(0xC0);                     // setc al
+      self.cg_e8(0x0F); self.cg_e8(0xB6); self.cg_e8(0xC0);                     // movzx eax, al
+
+    } else if (self.cg_seq(fname, fnlen, "cpu_pause", 9)) {
+      // #2392 (Nebenbefund): `cpu_pause` war nur im lyxos-Emitter umgesetzt
+      // (emit_lyxos, ID 240) — auf Linux-x86-64 scheiterte die Uebersetzung
+      // mit "undefined function 'cpu_pause' — no codegen implementation
+      // found". Dieselbe Sache, zwei Aufzaehlungen, eine davon unvollstaendig.
+      // Gebraucht wird es fuer die Pause zwischen zwei RDSEED-Versuchen.
+      self.cg_e8(0xF3); self.cg_e8(0x90);                                       // pause
+      self.cg_zeroRax();
+
     } else if (self.cg_seq(fname, fnlen, "fence_sfence", 12)) {
       self.cg_e8(0x0F); self.cg_e8(0xAE); self.cg_e8(0xF8);  // sfence
       self.cg_zeroRax();

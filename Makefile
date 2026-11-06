@@ -21,8 +21,8 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.31L
-VERSION_DATE := 2026-11-05
+VERSION   := 1.2.32A
+VERSION_DATE := 2026-11-06
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
 UNITS_DST := $(PKG_DIR)/usr/include/lyx/units/std
@@ -351,6 +351,10 @@ test: lyxc
 	@bash tests/tcp_timeout_2294_test.sh
 	@echo "--- AES-NI: FIPS-197-Vektoren, beide Wege gleich, Bytemuster (#2383) ---"
 	@bash tests/aes_ni_test.sh
+	@echo "--- GHASH mit PCLMULQDQ, AES-NI in AES-GCM, beide Wege gleich (#2390) ---"
+	@bash tests/ghash_pclmul_2390_test.sh
+	@echo "--- RDRAND/RDSEED als Zusatz-Entropie, Erfolg statt Wert (#2392) ---"
+	@bash tests/rand_hw_2392_test.sh
 	@echo "--- Vektorarena: kein Wachstum, kein Syscall je Operation (#2206) ---"
 	@bash tests/vektorarena_test.sh
 	@echo "--- VEX-Encoder: Kodierungen zurueckgelesen (#2192, Schnitt 1) ---"
