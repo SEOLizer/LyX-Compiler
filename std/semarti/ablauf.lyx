@@ -38,6 +38,7 @@ import std.string;
 import std.semarti.wert;
 import std.semarti.schema;
 import std.semarti.registry;
+import std.semarti.objekte;
 
 // ── Ergebniscodes (die Namen der Spezifikation) ─────────────────────────────
 pub con SRA_OK:                    int64 := 0;
@@ -52,6 +53,19 @@ pub con SRA_DEADLINE_EXCEEDED:     int64 := 0 - 8;
 pub con SRA_HANDLER_FAILED:        int64 := 0 - 9;
 pub con SRA_INVALID_OUTPUT:        int64 := 0 - 10;
 pub con SRA_NOT_READY:             int64 := 0 - 11;
+// #2416: Ein Fehlschlag NACH dem Handler ist etwas anderes als einer davor.
+// Die Wirkung ist dann schon eingetreten, und ein blindes Wiederholen würde
+// sie ein zweites Mal auslösen. Der Code sagt das, statt es dem Aufrufer zu
+// überlassen, es zu erraten.
+pub con SRA_AUDIT_FAILED:          int64 := 0 - 12;
+// #2416: Die Instanzbindung hat eigene Befunde. „Kein Objekt angegeben",
+// „Handle ungültig" und „Handle VERALTET" sind drei verschiedene Lagen, und
+// die dritte ist die wichtigste: dort hat der Aufrufer ein Objekt im Blick,
+// das es nicht mehr gibt. Ein gemeinsamer Code hätte das verwischt.
+pub con SRA_OBJECT_REQUIRED:       int64 := 0 - 13;
+pub con SRA_OBJECT_NOT_ALLOWED:    int64 := 0 - 14;
+pub con SRA_OBJECT_INVALID:        int64 := 0 - 15;
+pub con SRA_OBJECT_STALE:          int64 := 0 - 16;
 
 // Policy-Entscheidungen.
 pub con SRA_POLICY_ERLAUBT:      int64 := 0;
@@ -62,16 +76,24 @@ pub con SRA_POLICY_BESTAETIGUNG: int64 := 2;
 // Authorizer: darf dieser Principal diese Operation? Bekommt den
 // Operationsindex und den Principal, NICHT die Eingabe — ein Recht hängt
 // nicht am Argument.
-pub type SemaAuthorizer = fn(int64, pchar): int64;
+// #2416: Der Authorizer bekommt das ZIEL-OBJEKT. Die drei
+// Capability-Stufen begrenzen, was die ANWENDUNG grundsätzlich darf;
+// `fs.read` unterscheidet keine Dokumente und keine Benutzer. Wer welche
+// Operation auf WELCHEM Objekt ausführen darf, entscheidet allein diese
+// Funktion — und sie braucht dafür das Objekt.
+pub type SemaAuthorizer = fn(int64, int64, pchar): int64;
 // Policy: urteilt über Wirkung, Risiko und Kontext. Bekommt zusätzlich die
 // Eingabe, weil eine Policy sehr wohl am Argument hängen darf
 // („löschen unter /tmp ja, sonst nein").
-pub type SemaPolicy = fn(int64, int64, pchar): int64;
+pub type SemaPolicy = fn(int64, int64, int64, pchar): int64;
 // Audit: Metadaten eines abgeschlossenen Versuchs. Bekommt KEINE Eingabe und
 // keine Ausgabe — was protokolliert wird, entscheidet der Host in seiner
 // eigenen Funktion, und eine Bibliothek soll ihm nicht ungefragt Nutzdaten
 // in das Log schieben.
-pub type SemaAudit = fn(int64, int64, pchar): void;
+// Gibt 0 zurück, wenn das Protokoll geschrieben wurde. Ein Protokoll, das
+// nicht geschrieben werden konnte, ist ein eigener Befund: die Wirkung ist
+// eingetreten, aber sie ist nicht festgehalten.
+pub type SemaAudit = fn(int64, int64, pchar): int64;
 
 var _auth: SemaAuthorizer := 0 as SemaAuthorizer;
 var _policy: SemaPolicy := 0 as SemaPolicy;
@@ -92,6 +114,20 @@ pub fn AblaufZuruecksetzenFuerTest(): void {
 var _letzteAusgabe: int64 := 0 - 1;
 pub fn AblaufLetzteAusgabe(): int64 { return _letzteAusgabe; }
 
+// #2416: WURDE DER HANDLER GERUFEN? Sobald er gerufen ist, kann eine Wirkung
+// eingetreten sein — auch bei einer Operation, die sich als `nur_lesen`
+// bezeichnet, denn das ist eine Angabe des Anbieters und keine Zusicherung
+// (ein Lesezugriff kann einen Zähler erhöhen, einen Cache füllen oder selbst
+// protokollieren).
+//
+// Dieses Flag ist deshalb an den AUFRUF gebunden und nicht an das Risiko:
+// nach `SRA_OK`, `SRA_HANDLER_FAILED`, `SRA_INVALID_OUTPUT` und
+// `SRA_AUDIT_FAILED` steht es auf 1, bei jeder Ablehnung VOR dem Handler auf
+// 0. Ein Aufrufer, der einen Fehlschlag wiederholen will, muss es lesen:
+// bei 1 ist das Wiederholen nicht folgenlos.
+var _wirkung: int64 := 0;
+pub fn AblaufWirkungEingetreten(): int64 { return _wirkung; }
+
 // Der Grund im Klartext gehört ins Betreiberlog, nicht zum Aufrufer: nach
 // außen geht ein einziges `invalid_input`, damit niemand aus der Meldung
 // ablesen kann, welches Feld welche Grenze hat.
@@ -100,6 +136,11 @@ pub fn AblaufLetzterGrund(): pchar { return _letzterGrund; }
 
 fn aNein(code: int64, oi: int64, principal: pchar, grund: pchar): int64 {
   _letzterGrund := grund;
+  // Scheitert das Protokoll AUF DEM ABLEHNUNGSWEG, bleibt der Ablehnungscode
+  // stehen: er ist die wichtigere Auskunft, und es gibt keine Wirkung, die
+  // ein Aufrufer wegen des Protokolls anders behandeln müsste. Auf dem
+  // Erfolgsweg ist es umgekehrt — dort wird aus einem Protokollfehler
+  // SRA_AUDIT_FAILED.
   if (_audit as int64 != 0) { _audit(oi, code, principal); }
   return code;
 }
@@ -111,23 +152,26 @@ fn aNein(code: int64, oi: int64, principal: pchar, grund: pchar): int64 {
 // Aufruf gleich darauf scheitert, und ein Modell würde es trotzdem versuchen.
 //
 // Ohne Authorizer ist die Liste LEER. Siehe Kopf dieser Datei.
-pub fn AblaufSichtbar(oi: int64, principal: pchar): int64 {
+// Sichtbarkeit wird je OBJEKT beantwortet: dasselbe `document.export` kann
+// auf einem Dokument erlaubt und auf einem anderen verboten sein. Für eine
+// Operation ohne Instanz steht SRO_WURZEL.
+pub fn AblaufSichtbar(oi: int64, objekt: int64, principal: pchar): int64 {
   if (RegistryIstAbgeschlossen() == 0) { return 0; }
   if (_auth as int64 == 0) { return 0; }
   if (oi < 0 || oi >= RegistryAnzahl()) { return 0; }
-  if (_auth(oi, principal) == 0) { return 0; }
+  if (_auth(oi, objekt, principal) == 0) { return 0; }
   if (_policy as int64 != 0) {
-    var d: int64 := _policy(oi, 0 - 1, principal);
+    var d: int64 := _policy(oi, objekt, 0 - 1, principal);
     if (d == SRA_POLICY_ABGELEHNT) { return 0; }
   }
   return 1;
 }
 
-pub fn AblaufSichtbareZahl(principal: pchar): int64 {
+pub fn AblaufSichtbareZahl(objekt: int64, principal: pchar): int64 {
   var n: int64 := 0;
   var i: int64 := 0;
   while (i < RegistryAnzahl()) {
-    if (AblaufSichtbar(i, principal) != 0) { n := n + 1; }
+    if (AblaufSichtbar(i, objekt, principal) != 0) { n := n + 1; }
     i := i + 1;
   }
   return n;
@@ -137,10 +181,11 @@ pub fn AblaufSichtbareZahl(principal: pchar): int64 {
 // `bestaetigt` ist die Zusage des HOSTS, dass ein Mensch diese konkrete
 // Operation freigegeben hat. Sie ist kein Eingabefeld: ein Vorschlag darf
 // sich nicht selbst bestätigen.
-pub fn AblaufAufrufen(id: pchar, major: int64, minor: int64,
+pub fn AblaufAufrufen(id: pchar, major: int64, minor: int64, objekt: int64,
                       eingabe: int64, principal: pchar, bestaetigt: int64): int64 {
   _letzteAusgabe := 0 - 1;
   _letzterGrund := ""c;
+  _wirkung := 0;
 
   // Eine nicht abgeschlossene Registry ist ein Einrichtungsfehler des Hosts
   // und kein Aufruffehler. Sie wird laut gemeldet, statt die Prüfungen mit
@@ -154,6 +199,26 @@ pub fn AblaufAufrufen(id: pchar, major: int64, minor: int64,
   // 2. Version
   if (OpVersionPasst(oi, major, minor) == 0) { return aNein(SRA_UNSUPPORTED_VERSION, oi, principal, "Version nicht unterstuetzt"c); }
 
+  // 2b. Instanz. VOR der Eingabeprüfung, weil ein Aufruf ohne gültiges Ziel
+  //     keinen Sinn hat, und VOR der Autorisierung, weil der Authorizer das
+  //     Objekt bekommt und es dafür gültig sein muss.
+  //
+  //     Ein veraltetes Handle wird als EIGENER Fall gemeldet: der Aufrufer
+  //     hat ein Objekt im Blick, das es nicht mehr gibt. Würde das als
+  //     „ungültig" durchgehen, könnte er es für einen Tippfehler halten und
+  //     weitersuchen, statt seinen Stand neu zu holen.
+  if (OpObjektbindung(oi) == SRR_OBJEKT_NOETIG) {
+    if (objekt == SRO_WURZEL) { return aNein(SRA_OBJECT_REQUIRED, oi, principal, "Operation braucht eine Instanz"c); }
+    var pz: int64 := ObjektPlatz(objekt);
+    if (pz == SRO_E_HANDLE_VERALTET) { return aNein(SRA_OBJECT_STALE, oi, principal, "Handle veraltet"c); }
+    if (pz < 0) { return aNein(SRA_OBJECT_INVALID, oi, principal, "Handle ungueltig"c); }
+  } else {
+    // Eine Operation ohne Instanzbindung mit einem Objekt aufzurufen ist kein
+    // harmloser Zusatz: niemand prüft dieses Ziel, und der Handler bekäme es
+    // trotzdem zu sehen.
+    if (objekt != SRO_WURZEL) { return aNein(SRA_OBJECT_NOT_ALLOWED, oi, principal, "Operation nimmt keine Instanz"c); }
+  }
+
   // 3. Eingabe. Vor jeder Rechteprüfung, damit eine missgebildete Eingabe
   //    nicht erst den Authorizer beschäftigt — und nach der Identität, weil
   //    ohne Operation kein Schema bekannt ist.
@@ -163,14 +228,14 @@ pub fn AblaufAufrufen(id: pchar, major: int64, minor: int64,
 
   // 4. Autorisierung. Ohne Authorizer: abgelehnt.
   if (_auth as int64 == 0) { return aNein(SRA_UNAUTHORIZED, oi, principal, "kein Authorizer gesetzt"c); }
-  if (_auth(oi, principal) == 0) { return aNein(SRA_UNAUTHORIZED, oi, principal, "Authorizer verweigert"c); }
+  if (_auth(oi, objekt, principal) == 0) { return aNein(SRA_UNAUTHORIZED, oi, principal, "Authorizer verweigert"c); }
 
   // 5. Policy. Ohne Policy gilt die Angabe der Operation; eine fehlende
   //    Policy ist kein Freibrief, sondern lässt die Bestätigungspflicht aus
   //    dem Deskriptor stehen.
   var noetig: int64 := OpBestaetigung(oi);
   if (_policy as int64 != 0) {
-    var d: int64 := _policy(oi, eingabe, principal);
+    var d: int64 := _policy(oi, objekt, eingabe, principal);
     if (d == SRA_POLICY_ABGELEHNT) { return aNein(SRA_POLICY_DENIED, oi, principal, "Policy verweigert"c); }
     if (d == SRA_POLICY_BESTAETIGUNG) { noetig := SRR_BESTAETIGUNG_NOETIG; }
     else if (d != SRA_POLICY_ERLAUBT) {
@@ -190,17 +255,39 @@ pub fn AblaufAufrufen(id: pchar, major: int64, minor: int64,
   if (ausgabe < 0) { return aNein(SRA_HANDLER_FAILED, oi, principal, "Arena erschoepft"c); }
   var h: SemaHandler := OpHandler(oi);
   if (h as int64 == 0) { return aNein(SRA_HANDLER_FAILED, oi, principal, "kein Handler"c); }
-  var hr: int64 := h(eingabe, ausgabe, principal as int64);
-  if (hr != 0) { return aNein(SRA_HANDLER_FAILED, oi, principal, "Handler meldete einen Fehler"c); }
+  // #2416: LEBENSDAUER WÄHREND DES ZUGRIFFS. Für die Dauer des Handlers
+  // liegt ein Leihschein auf dem Objekt; es kann in dieser Zeit nicht
+  // freigegeben werden. Der Schein wird in JEDEM Fall zurückgegeben, auch
+  // wenn der Handler scheitert — ein liegengebliebener Schein würde das
+  // Objekt für immer unfreigebbar machen.
+  if (objekt != SRO_WURZEL) { ObjektLeihen(objekt); }
+  // Das Flag wird VOR dem Aufruf gesetzt, nicht danach: ein Handler, der
+  // mitten drin abbricht, hat seine Wirkung vielleicht schon getan, und die
+  // Rückkehr ist kein Beweis für das Gegenteil.
+  _wirkung := 1;
+  var hr: int64 := h(eingabe, ausgabe, objekt, principal as int64);
+  if (objekt != SRO_WURZEL) { ObjektZurueckgeben(objekt); }
+  if (hr != 0) { return aNein(SRA_HANDLER_FAILED, oi, principal, "Handler meldete einen Fehler — Wirkung kann eingetreten sein"c); }
 
   // 8. Ausgabe. Auch die eigene Ausgabe wird geprüft: ein Handler, der etwas
   //    anderes liefert als zugesagt, bricht den Vertrag nach außen genauso
   //    wie eine falsche Eingabe ihn nach innen bräche.
   if (SchemaPruefe(ausgabe, OpAusgabeschema(oi)) != SRS_OK) {
+    // Die Wirkung ist eingetreten; nur die Ausgabe hält den Vertrag nicht.
+    // `AblaufWirkungEingetreten()` steht hier auf 1 — wiederholen ist nicht
+    // folgenlos.
     return aNein(SRA_INVALID_OUTPUT, oi, principal, SchemaLetztesGrundFeld());
   }
 
   _letzteAusgabe := ausgabe;
-  if (_audit as int64 != 0) { _audit(oi, SRA_OK, principal); }
+  if (_audit as int64 != 0) {
+    if (_audit(oi, SRA_OK, principal) != 0) {
+      // Der Aufruf war gültig und ist ausgeführt, aber das Protokoll fehlt.
+      // Das ist kein Erfolg: ein Vorgang ohne Protokoll ist für einen
+      // Betreiber nicht nachvollziehbar. Die Ausgabe bleibt abrufbar, damit
+      // der Host den Vorgang abschliessen kann, ohne ihn zu wiederholen.
+      return SRA_AUDIT_FAILED;
+    }
+  }
   return SRA_OK;
 }

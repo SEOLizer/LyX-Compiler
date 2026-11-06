@@ -53,6 +53,27 @@ else
   bad "slice_uebersetzt"; tail -5 "$TMP/b1.log"
 fi
 
+# ── 1b. Objektmodell ────────────────────────────────────────────────────────
+# Drei Fehlerklassen, jede mit eigenem Nachweis: ein veraltetes Handle trifft
+# nicht den Nachmieter seines Platzes, ein Objekt verschwindet nicht während
+# eines Zugriffs, und dieselbe Operation mit demselben Recht ist auf einem
+# Objekt erlaubt und auf einem anderen verboten.
+if "$LYXC" --std-path=. tests/semarti/objekte.lyx -o "$TMP/objekte" >"$TMP/b1b.log" 2>&1; then
+  ok "objekte_uebersetzt"
+  out=$("$TMP/objekte" 2>&1); rc=$?
+  n=$(echo "$out" | grep -c '^PASS ')
+  if [ "$rc" = "0" ] && echo "$out" | grep -q '^ALL PASS$'; then
+    ok "objekte_alle_${n}_pruefungen"
+  else
+    bad "objekte (rc=$rc, PASS=$n)"; echo "$out" | grep '^FAIL' | head -8
+  fi
+  for z in altes_handle_trifft_nachmieter_nicht verleiht_nicht_freigebbar fremdes_dokument_verboten veraltetes_handle_eigener_befund; do
+    if echo "$out" | grep -q "^PASS $z\$"; then ok "objekte_kern_$z"; else bad "objekte_kern_$z"; fi
+  done
+else
+  bad "objekte_uebersetzt"; tail -5 "$TMP/b1b.log"
+fi
+
 # ── 2. Durchsetzung am Kernel ───────────────────────────────────────────────
 ZIEL=/tmp/semarti_darf_nicht_$$.txt
 rm -f "$ZIEL"
