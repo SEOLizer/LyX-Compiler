@@ -74,6 +74,27 @@ else
   bad "objekte_uebersetzt"; tail -5 "$TMP/b1b.log"
 fi
 
+# ── 1c. Abbruch, Frist, Adapter, Nebenläufigkeit, Textraum (#2419) ─────────
+if "$LYXC" --std-path=. tests/semarti/reste.lyx -o "$TMP/reste" >"$TMP/b1c.log" 2>&1; then
+  ok "reste_uebersetzt"
+  out=$("$TMP/reste" 2>&1); rc=$?
+  n=$(echo "$out" | grep -c '^PASS ')
+  if [ "$rc" = "0" ] && echo "$out" | grep -q '^ALL PASS$'; then
+    ok "reste_alle_${n}_pruefungen"
+  else
+    bad "reste (rc=$rc, PASS=$n)"; echo "$out" | grep '^FAIL' | head -8
+  fi
+  # Die Zeilen, die je eine ganze Fehlerklasse abdecken, einzeln bestätigen.
+  for z in frist_ohne_uhr_abgewiesen abbruch_ohne_wirkung frist_meldet_eingetretene_wirkung \
+           rekursiver_aufruf_innerer_abgewiesen json_gleitkomma_abgewiesen json_zu_tief \
+           puffer_zu_klein_ist_fehler werkzeuge_nennen_keine_capabilities \
+           textraum_nicht_gewachsen laengerer_text_belegt_neu; do
+    if echo "$out" | grep -q "^PASS $z\$"; then ok "reste_kern_$z"; else bad "reste_kern_$z"; fi
+  done
+else
+  bad "reste_uebersetzt"; tail -5 "$TMP/b1c.log"
+fi
+
 # ── 2. Durchsetzung am Kernel ───────────────────────────────────────────────
 ZIEL=/tmp/semarti_darf_nicht_$$.txt
 rm -f "$ZIEL"

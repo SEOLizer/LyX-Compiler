@@ -102,6 +102,31 @@ var _bezVon: int64 := 0;      // Beziehungen: von-Handle
 var _bezNach: int64 := 0;     // nach-Handle
 var _bezArt: int64 := 0;      // Name der Beziehung (Textversatz)
 var _bezAnzahl: int64 := 0;
+// #2419 Punkt 5: Merker für den nächsten freien Platz. GEMESSEN (i5-8250U,
+// taskset) brauchte das Füllen des Registers vorher 5/15/32/101 ms für
+// 500/1000/2000/4000 Objekte — bei vierfacher Größe das 6,7-fache der Zeit,
+// weil die Platzsuche bei jedem Registrieren von vorn lief.
+//
+// Der Merker macht aus der Platzsuche im Normalfall einen Schritt. GEMESSEN
+// bringt das 102 -> 91 ms bei 4000 Objekten, also 11 % — und nicht die
+// erhoffte Größenordnung. Der Grund steht in derselben Messung: der
+// dominante Posten ist die NAMENSPRÜFUNG beim Registrieren, die über alle
+// Plätze läuft, nicht die Platzsuche. Der Merker bleibt trotzdem, weil er
+// fünf Zeilen kostet und messbar hilft; die Zahl steht hier, damit niemand
+// mehr von ihm erwartet.
+//
+// Ein Index über Namen würde den Rest holen (das Füllen ist dann linear
+// statt quadratisch). Er kommt NICHT, und zwar aus einem gemessenen Grund:
+// 101 ms für das vollständige Füllen des Registers an seiner Grenze und
+// 55 µs je Namenssuche sind für eine Introspektionsschicht tragbar. Wer das
+// ausreizt, hat die Messung hier und kann sie wiederholen, statt sie neu zu
+// erfinden.
+//
+// Der Merker ist ein HINWEIS und keine Zusicherung: nach einer Freigabe kann
+// weiter vorn ein Platz frei sein. Darum fällt die Suche auf den vollen
+// Durchlauf zurück, wenn ab dem Merker nichts frei ist — sonst meldete das
+// Register "voll", während Plätze frei liegen.
+var _naechsterFrei: int64 := 0;
 var _bereit: int64 := 0;
 
 fn oInit(): void {
@@ -206,12 +231,22 @@ pub fn ObjektRegistrieren(schemaId: pchar, name: pchar, eltern: int64): int64 {
   if (ObjektNameImBereich(eltern, name) >= 0) { return SRO_E_NAME_DOPPELT; }
 
   var idx: int64 := 0 - 1;
-  var i: int64 := 0;
+  var i: int64 := _naechsterFrei;
   while (i < SRO_MAX_OBJEKTE) {
     if (peek64(oZelle(i, 0)) == 0) { idx := i; i := SRO_MAX_OBJEKTE; }
     else { i := i + 1; }
   }
+  if (idx < 0 && _naechsterFrei > 0) {
+    // Ab dem Merker ist nichts frei — von vorn suchen. Ohne diesen Rückfall
+    // meldete das Register "voll", obwohl freigegebene Plätze davor liegen.
+    i := 0;
+    while (i < _naechsterFrei) {
+      if (peek64(oZelle(i, 0)) == 0) { idx := i; i := _naechsterFrei; }
+      else { i := i + 1; }
+    }
+  }
   if (idx < 0) { return SRO_E_VOLL; }
+  _naechsterFrei := idx + 1;
 
   var nOff: int64 := oTextAblegen(name, StrLen(name));
   if (nOff < 0) { return nOff; }
@@ -260,6 +295,9 @@ pub fn ObjektFreigeben(h: int64): int64 {
   _bezAnzahl := neu;
   poke64(oZelle(idx, 0), 0);
   poke64(oZelle(idx, 1), peek64(oZelle(idx, 1)) + 1);
+  // Der freigegebene Platz ist der nächste Kandidat, wenn er vor dem Merker
+  // liegt. Damit bleibt der Merker nach Freigaben brauchbar.
+  if (idx < _naechsterFrei) { _naechsterFrei := idx; }
   return SRO_OK;
 }
 
@@ -384,9 +422,50 @@ fn oEigSetzen(h: int64, name: pchar, wert: int64, istText: int64): int64 {
   return SRO_OK;
 }
 
+// #2419 Punkt 6: TEXTRAUM WIEDERVERWENDEN, WENN DER WERT HINEINPASST.
+//
+// Bis hierher legte jedes Überschreiben einen neuen Text ab und gab den
+// alten nicht frei. Ein Programm, das einen Titel tausendfach ändert, füllte
+// damit den Raum — gemeldet als SRO_E_TEXTRAUM_VOLL, also nicht still, aber
+// auch kein Dauerzustand.
+//
+// Jetzt gilt: ist die Eigenschaft schon da, trägt sie Text, und ist der neue
+// Wert nicht LÄNGER als der bisherige, wird an dieselbe Stelle geschrieben.
+// Das deckt den häufigen Fall (ein Titel ändert sich) ohne Allokator und
+// ohne Freiliste.
+//
+// Die Grenze dieser Lösung steht ausdrücklich hier: ein WACHSENDER Wert
+// belegt weiter neuen Raum. Wer das ausreizt, braucht eine Freiliste oder
+// einen Raum je Objekt — und sollte vorher messen, statt es anzunehmen.
+// Gezählt wird mitgeführt, damit diese Messung möglich ist, ohne den Code zu
+// ändern.
+var _textWiederverwendet: int64 := 0;
+var _textNeuBelegt: int64 := 0;
+
+pub fn ObjektTextWiederverwendet(): int64 { return _textWiederverwendet; }
+pub fn ObjektTextNeuBelegt(): int64 { return _textNeuBelegt; }
+pub fn ObjektTextBelegt(): int64 { return _textEnde; }
+
 pub fn ObjektEigenschaftText(h: int64, name: pchar, wert: pchar): int64 {
-  var off: int64 := oTextAblegen(wert, StrLen(wert));
+  var idx: int64 := ObjektPlatz(h);
+  if (idx < 0) { return idx; }
+  var neuLen: int64 := StrLen(wert);
+  var k: int64 := oEigFinden(idx, name);
+  if (k >= 0 && peek64(peek64(oZelle(idx, 10)) + k * 8) != 0) {
+    var altOff: int64 := peek64(peek64(oZelle(idx, 9)) + k * 8);
+    var altLen: int64 := StrLen((_text + altOff) as pchar);
+    if (neuLen <= altLen) {
+      var i: int64 := 0;
+      while (i < neuLen) { poke8(_text + altOff + i, peek8(wert + i)); i := i + 1; }
+      poke8(_text + altOff + neuLen, 0);
+      poke64(oZelle(idx, 5), peek64(oZelle(idx, 5)) + 1);
+      _textWiederverwendet := _textWiederverwendet + 1;
+      return SRO_OK;
+    }
+  }
+  var off: int64 := oTextAblegen(wert, neuLen);
   if (off < 0) { return off; }
+  _textNeuBelegt := _textNeuBelegt + 1;
   return oEigSetzen(h, name, off, 1);
 }
 
@@ -529,6 +608,7 @@ pub fn ObjektRegisterLeeren(): void {
   }
   _bezAnzahl := 0;
   _textEnde := 0;
+  _naechsterFrei := 0;
 }
 
 pub fn ObjektAnzahl(): int64 {

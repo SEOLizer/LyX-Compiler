@@ -23,7 +23,7 @@ Laufzeit-Typinformation** gibt. Zwei Folgen:
 Dazu kommt ein Vorteil, den es in C++ nicht gibt: `@capabilities` ist in
 dieser Sprache nicht Dokumentation, sondern wird vom Kernel durchgesetzt.
 
-## Die fünf Units
+## Die sechs Units
 
 | Unit | Aufgabe |
 |---|---|
@@ -32,6 +32,7 @@ dieser Sprache nicht Dokumentation, sondern wird vom Kernel durchgesetzt.
 | `std.semarti.registry` | Deskriptoren, Aufbauphase, danach unveränderlich |
 | `std.semarti.objekte` | dynamisches Objektregister: Handles mit Generation, Hierarchie, Beziehungen, Revisionen, Leihscheine |
 | `std.semarti.ablauf` | Discovery, Autorisierung, Policy, Bestätigung, Ausführung, Protokoll |
+| `std.semarti.adapter` | die Grenze nach außen: Serialisierung hinaus, geprüftes Lesen herein |
 
 `std.json` bleibt unberührt. Es ist durchgehend textbasiert (`pchar` hinein,
 `pchar` heraus) und hat keinen Werttyp, keine Navigation und keine Grenzen —
@@ -116,6 +117,42 @@ Ein Protokollfehler nach erfolgreicher Ausführung ist ebenfalls ein eigener
 Befund (`SRA_AUDIT_FAILED`): der Vorgang ist gültig und ausgeführt, aber
 nicht festgehalten. Die Ausgabe bleibt abrufbar, damit der Host abschliessen
 kann, ohne zu wiederholen.
+
+## Deskriptoren am Code: `@operation`
+
+Die Metadaten, die mit dem Code auseinanderlaufen können, stehen am Code:
+
+```lyx
+@operation(id: "com.example.doc.export", version: "2.1.3",
+           risk: external, confirm: true, instance: true)
+pub fn exportieren(eingabe: int64, ausgabe: int64, objekt: int64, principal: int64): int64 { … }
+```
+
+`lyxc --emit-semarti=DATEI` schreibt daraus eine **Lyx-Unit**, die
+`RegistryHinzufuegen` für jede Operation aufruft und die Trägerunit
+importiert. Sie wird mitübersetzt; damit gibt es keinen Laufzeitleser und
+kein Format zu parsen.
+
+**Warum eine Unit und keine Sektion im Erzeugnis.** `.meta_safe` geht den
+Sektionsweg, aber nur für ELF. LBF (`--target=lyxos`) hat ein eigenes
+TLV-Format, arm64, riscv, PE und Mach-O je ihr eigenes. Eine erzeugte Unit
+ist formatneutral und läuft auf jedem Ziel.
+
+**Was ins Attribut gehört und was nicht.** Das **Schema** bleibt eine
+Funktion — es ist verschachtelt, und in einem Attribut wäre es eine
+Mini-Sprache, die man später bereut. Die Verbindung läuft über eine
+Namenskonvention: `<fn>_eingabeschema()` und `<fn>_ausgabeschema()`. Fehlt
+eine davon, meldet es der Übersetzer beim Bauen der erzeugten Unit — nicht
+die Laufzeit.
+
+**Die Form wird streng geprüft**, weil ein Deskriptor ein Vertrag ist: die ID
+muss namensräumig und kleingeschrieben sein (eine ID, die sich nur in der
+Schreibweise unterscheidet, ist eine Falle für jeden, der sie abschreibt),
+die Version genau `MAJOR.MINOR.PATCH`. Eine Version, die sich nicht zerlegen
+lässt, würde im Generator stillschweigend zu `0.0.0` — der Aufrufer verlangte
+dann eine Version, die niemand angeboten hat. Ein unbekannter Schlüssel wird
+**gemeldet**, nicht übersprungen: `@operation(confrm: true)` wäre sonst eine
+Operation, die der Autor für bestätigungspflichtig hält und die es nicht ist.
 
 ## Der Ablauf, und warum die Reihenfolge der Kern ist
 
@@ -204,19 +241,95 @@ keiner die anderen ersetzt:
 3. **Übersetzerseite** — ein Tippfehler in `@capabilities` wird gemeldet, der
    richtige Name übersetzt.
 
+## Abbruch und Frist
+
+Beide Codes sind jetzt erreichbar, und sie beantworten die Frage, die der
+Wirkungsbefund aufgeworfen hat: ein Abbruch **nach** dem Handlerstart ist kein
+folgenloses Nein.
+
+* Abgefragt wird **vor** dem Handler (dann ist `cancelled` folgenlos,
+  `AblaufWirkungEingetreten()` bleibt 0) und **nach** ihm (dann ist die
+  Wirkung eingetreten und das Flag steht auf 1).
+* **Während** des Handlers kann die Bibliothek nicht fragen — sie ruft fremden
+  Code auf. Ein langlaufender Handler fragt deshalb selbst:
+  `AblaufSollAbbrechen()` ist dafür öffentlich.
+
+### Die Uhr kommt vom Host, nicht aus einem Import
+
+Der erste Entwurf holte sie über `import std.time`. Das war ein Fehler mit
+sofortiger Folge: beide Bestandstests starben an SIGSYS (rc 159), weil
+`clock_gettime` nicht in ihrem `@capabilities([fs.read])` stand. **Ein Import
+in einer Bibliothek verschiebt die Rechteanforderung jedes Nutzers** — SemaRTI
+hätte ab dann `system.time` verlangt, auch von einem Host, der nie eine Frist
+setzt.
+
+Die Uhr ist deshalb ein Haken wie Authorizer und Policy. Ohne gesetzte Uhr
+wird eine Frist **abgewiesen** (`SRA_FRIST_OHNE_UHR`) und nicht stillschweigend
+ignoriert: der Host würde sonst an eine Grenze glauben, die es nicht gibt.
+
+## Nebenläufigkeit wird gemeldet, nicht zugesagt
+
+Registry, Objektregister und Wert-Arena sind Modulzustand. Zwei gleichzeitige
+Aufrufe würden sich die Werte überschreiben — still, und das ist das
+Schlimmere.
+
+Diese Bibliothek baut deshalb **keine wartende Sperre** ein. Eine solche wäre
+eine Zusage über Blockieren und Fairness, die sie nicht halten kann, und sie
+verdeckte den Entwurfsfehler im Host. Statt dessen gibt es eine
+Eintrittsmarke: wer eintritt und sie belegt findet, bekommt `SRA_REENTRANT`.
+
+Derselbe Befund trifft **Rekursion** — ein Handler, der wieder aufruft, würde
+die Arena unter sich wegziehen. Das ist der Fall, der im Test nachgewiesen
+ist, weil er sich ohne Fäden herstellen lässt. Die Marke wird auf jedem
+Rückweg freigegeben, auch auf jedem Ablehnungsweg; eine liegengebliebene
+Marke wäre schlimmer als das Problem, das sie löst.
+
+## Die Grenze nach außen
+
+Zwei Richtungen, und sie sind nicht gleich vertrauenswürdig:
+
+* **Hinaus** — Deskriptoren werden zur Werkzeugbeschreibung, Werte zu JSON.
+  Das ist geprüfte eigene Datenlage; die Aufgabe ist Maskierung. Sie läuft
+  über `JSONEscape` aus `std.json` und ist nicht nachgebaut. Die verlangten
+  **Capabilities stehen nicht** in der Beschreibung: sie sind eine Innensicht,
+  und ein Empfänger könnte daraus ableiten, welche Rechte zu erraten lohnen.
+* **Herein** — ein Vorschlag wird zum Wert. Das ist Angreifereingabe, auch
+  wenn sie wohlgeformt ist. Jede Grenze greift beim **Lesen**: ein zu tiefes
+  Dokument steht nie vollständig im Speicher.
+
+Ausdrücklich abgewiesen statt halb unterstützt: Gleitkommazahlen, `\uXXXX`,
+Zahlen jenseits von int64 (geprüft **vor** der Multiplikation), ein zweites
+Dokument im selben Text, ein zu kleiner Ausgabepuffer. Jedes davon wäre als
+stiller Default ein anderer Wert als der gesendete.
+
+## Was gemessen wurde, statt es anzunehmen
+
+Objekt- und Namenssuche laufen linear über die Plätze. GEMESSEN (i5-8250U,
+`taskset`): das Füllen des Registers braucht 5 / 15 / 32 / 101 ms für
+500 / 1000 / 2000 / 4000 Objekte, eine Namenssuche an der Grenze 55 µs.
+
+Daraus folgt: **kein Index.** Ein Merker für den nächsten freien Platz bringt
+102 → 91 ms (11 %) und bleibt, weil er fünf Zeilen kostet; mehr ist von ihm
+nicht zu erwarten, denn der dominante Posten ist die Namensprüfung beim
+Registrieren, nicht die Platzsuche. Wer die Grenzen ausreizt, hat die Messung
+und kann sie wiederholen.
+
+Eigenschaftstexte werden beim Überschreiben **wiederverwendet**, solange der
+neue Wert nicht länger ist — der häufige Fall (ein Titel ändert sich) ohne
+Allokator. Ein wachsender Wert belegt weiter neuen Raum; die Zähler
+`ObjektTextWiederverwendet()` und `ObjektTextNeuBelegt()` machen das messbar,
+ohne den Code zu ändern.
+
 ## Nicht enthalten
 
 * Keine Modell- oder Netzanbindung. Der Kern läuft ohne beides.
 * Keine automatische Deskriptor-Erzeugung. Registriert wird von Hand; es gibt
   keinen Scan, der Funktionen nach Namensähnlichkeit freigibt.
-* Kein Serialisierer für ein Tool-Calling-Format. Der Wert kann gelesen und
-  gebaut werden; ein Adapter nach außen gehört in die Anwendung.
-* Kein Abbruch und keine Zeitgrenze im Aufruf. Die Codes `cancelled` und
-  `deadline_exceeded` sind vergeben, aber noch von keinem Pfad erreichbar —
-  und das steht hier, statt als erfüllt zu gelten.
 * Keine Nebenläufigkeit zugesagt. Registry und Arena sind Modulzustand ohne
   Sperre; ein Host mit Fäden muss die Aufrufe selbst ordnen.
-* Kein attributgetriebener Deskriptor. Das käme **nach** dem Objektmodell,
+* Keine Capability-Liste je Operation aus dem Attribut. Sie steht schon im
+  `@capabilities` der Unit; eine zweite Nennung wäre dieselbe Aufzählung an
+  zwei Stellen. Wer Rechte je Operation führen will, registriert von Hand. Das käme **nach** dem Objektmodell,
   nicht davor: sonst automatisiert man einen Vertrag, dessen Instanzbindung
   noch fehlt. Der Weg wäre ein Attribut wie `@operation(...)`, aus dem der
   Übersetzer eine Tabelle im Erzeugnis erzeugt — dafür gibt es mit

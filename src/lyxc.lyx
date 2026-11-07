@@ -132,6 +132,20 @@ con ANDROID_API_DEFAULT: int64 := 26;   // Android 8.0 — current target baseli
 // Command Line Options
 // ============================================================================
 
+
+// #2419: Schreibhelfer für die erzeugte SemaRTI-Unit. Freie Funktionen und
+// keine Methoden: sie brauchen keinen Zustand, und als Methoden war `self`
+// in den Ausdrücken eine Herkunft, die der Codegen hier nicht auflöst.
+fn semSchreib(puf: int64, pos: int64, quelle: int64, off: int64, len: int64): int64 {
+  var i: int64 := 0;
+  while (i < len) { poke8(puf + pos + i, peek8(quelle + off + i)); i := i + 1; }
+  return pos + len;
+}
+
+fn semStr(puf: int64, pos: int64, t: pchar): int64 {
+  return semSchreib(puf, pos, t as int64, 0, StrLen(t));
+}
+
 pub type CLIOptions = struct {
   // Input/Output (using int64 for pointer storage)
   inputFile: int64;
@@ -556,6 +570,7 @@ pub type CompilerConfig = class {
 
   // WP-3.2: --meta-safe: append .meta_safe section with CRC32 page hashes
   metaSafe: bool;
+  semartiOut: pchar;   // #2419: Ziel für --emit-semarti=DATEI, 0 = aus
 
   // WP-T14: Migration Tool + Compat-Modus
   migrateCaps: bool;  // --migrate-capabilities: Manifest generieren und ausgeben
@@ -763,6 +778,7 @@ pub type CompilerConfig = class {
     self.verifyTmr      := false;   // #1141
     self.debugSymbols   := false;
     self.metaSafe              := false;
+    self.semartiOut            := 0 as pchar;
     self.noLibcInit            := false;
     self.arm64LibcStartMainUsed := false;
     self.migrateCaps    := false;
@@ -1489,6 +1505,23 @@ pub type CompilerConfig = class {
       self.emitASM := true;   // #1370
       return;
     }
+    // #2419: Deskriptoren aus @operation als Lyx-Unit ausgeben.
+    //
+    // KEINE eigene Sektion im Erzeugnis, und das ist eine bewusste
+    // Entscheidung: `.meta_safe` geht diesen Weg, aber nur für ELF — LBF
+    // (`--target=lyxos`) hat ein eigenes TLV-Format, und arm64, riscv, PE und
+    // Mach-O hätten je ihren eigenen. Eine erzeugte Lyx-UNIT ist dagegen
+    // formatneutral: sie wird mitübersetzt und läuft auf jedem Ziel.
+    //
+    // Was ins Attribut gehört und was nicht: die Metadaten, die mit dem Code
+    // auseinanderlaufen können (ID, Version, Risiko, Bestätigung,
+    // Instanzbindung), stehen am Code. Das SCHEMA bleibt eine Funktion —
+    // es ist verschachtelt, und in einem Attribut wäre es eine Mini-Sprache,
+    // die man später bereut.
+    if StrStartsWith(arg, "--emit-semarti="c) {
+      self.semartiOut := arg + 15;
+      return;
+    }
     if StrCmp(arg, "--emit=obj"c) == 0 || StrCmp(arg, "-c"c) == 0 {
       self.emitObj := true;   // WSP-07: relocatable ELF-Objekt (ET_REL) für extern "asm"
       return;
@@ -1815,7 +1848,7 @@ pub type CompilerConfig = class {
     if StrCmp(arg, "--version"c) == 0 {
       PrintStr("lyxc"c);
       PrintStr(" "c);
-      PrintStrLn("1.2.32E"c);
+      PrintStrLn("1.2.33B"c);
       PrintStr("Build: "c);
       PrintStrLn("bootstrap"c);
       self.exitCode := 0;
@@ -1837,7 +1870,7 @@ pub type CompilerConfig = class {
       PrintStr("  Name: "c);
       PrintStrLn("lyxc"c);
       PrintStr("  Version: "c);
-      PrintStrLn("1.2.32E"c);
+      PrintStrLn("1.2.33B"c);
       PrintStr("  Build: "c);
       PrintStrLn("bootstrap"c);
       PrintStr("  Target: "c);
@@ -2093,7 +2126,7 @@ pub type CompilerConfig = class {
   }
 
   fn printHelp(): void {
-    PrintStrLn("lyxc 1.2.32E (bootstrap)");
+    PrintStrLn("lyxc 1.2.33B (bootstrap)");
     PrintStrLn("Copyright (c) 2026 Andreas Roene. All rights reserved.");
     PrintStrLn("");
     PrintStrLn("Verwendung: lyxc <datei.lyx> [-o <ausgabe>] [--target=TARGET] [--arch=ARCH]");
@@ -2270,6 +2303,13 @@ pub type CompilerConfig = class {
     if parser.hadError != 0 {
       self.exitCode := 1;
       return self.exitCode;
+    }
+
+    // #2419: Deskriptoren ausgeben, wenn verlangt. Vor allem Weiteren, damit
+    // ein Fehler hier nicht erst nach einem vollen Übersetzungslauf auffällt.
+    if self.semartiOut as int64 != 0 {
+      var rcS: int64 := self._emitSemarti(parser);
+      if rcS != 0 { self.exitCode := rcS; return self.exitCode; }
     }
 
     // LX-36: capture lifecycle kind from @lifecycle annotation (-1 = not set → ONE_SHOT)
@@ -6616,7 +6656,7 @@ pub type CompilerConfig = class {
     j := StrConcat(j, ",\"compiler\":{"c);
     // tools/next_version.sh ersetzt jedes Literal "x.y.zS"c in dieser Datei
     // global; diese Stelle wird also mitgezogen und driftet nicht weg.
-    j := StrConcat(j, self._cpTxt("version"c, "1.2.32E"c));
+    j := StrConcat(j, self._cpTxt("version"c, "1.2.33B"c));
     j := StrConcat(j, ","c);
     j := StrConcat(j, self._cpFehlt("commit"c, "NO_COMMIT_IN_BINARY"c));
     j := StrConcat(j, ","c);
@@ -6984,6 +7024,125 @@ pub type CompilerConfig = class {
       map_free(self.unitCache);
     }
     dispose self;
+  }
+  // #2419: Schreibt die Deskriptoren aus @operation als Lyx-Unit.
+  //
+  // Die erzeugte Unit ruft `RegistryHinzufuegen` für jede Operation auf und
+  // verweist auf zwei Funktionen, die der Autor bereitstellt:
+  //   <fn>_eingabeschema()  und  <fn>_ausgabeschema()
+  // Die Namenskonvention ist Absicht: ein Schema ist verschachtelt und
+  // gehört in Code, die Metadaten gehören ans Attribut. Fehlt eine der
+  // Funktionen, meldet es der Übersetzer beim Bauen der erzeugten Unit — und
+  // nicht die Laufzeit.
+  //
+  // Die Capability-Liste kommt NICHT aus dem Attribut. Sie steht schon im
+  // `@capabilities` der Unit, und eine zweite Nennung wäre eine Aufzählung
+  // derselben Sache an zwei Stellen. Die erzeugte Unit übergibt deshalb eine
+  // leere Liste; wer Rechte je Operation führen will, registriert von Hand.
+  // #2419: Schreibt die Deskriptoren aus @operation als Lyx-Unit.
+  //
+  // Die erzeugte Unit ruft `RegistryHinzufuegen` für jede Operation auf und
+  // verweist auf zwei Funktionen, die der Autor bereitstellt:
+  //   <fn>_eingabeschema()  und  <fn>_ausgabeschema()
+  // Die Namenskonvention ist Absicht: ein Schema ist verschachtelt und
+  // gehört in Code, die Metadaten gehören ans Attribut. Fehlt eine der
+  // Funktionen, meldet es der Übersetzer beim Bauen der erzeugten Unit — und
+  // nicht die Laufzeit.
+  //
+  // Die Capability-Liste kommt NICHT aus dem Attribut. Sie steht schon im
+  // `@capabilities` der Unit, und eine zweite Nennung wäre dieselbe
+  // Aufzählung an zwei Stellen. Die erzeugte Unit übergibt deshalb eine leere
+  // Liste; wer Rechte je Operation führen will, registriert von Hand.
+  fn _emitSemarti(parser: Parser): int64 {
+    var n: int64 := parser.OperationCount();
+    var src: int64 := parser.QuellText();
+    // Deckel: je Operation reichlich, dazu der Kopf. Ein zu kleiner Puffer
+    // wäre hier ein stiller Abschnitt in einer erzeugten Quelldatei — der
+    // schlechteste Fall, weil er erst beim Übersetzen auffällt und dort
+    // unverständlich aussieht.
+    var max: int64 := 4096 + n * 1024;
+    var puf: int64 := alloc(max);
+    var p2: int64 := 0;
+    p2 := semStr(puf, p2, "// ERZEUGT von lyxc --emit-semarti — nicht von Hand aendern.\n"c);
+    p2 := semStr(puf, p2, "// Quelle der Angaben: die @operation-Attribute am Code.\n"c);
+    p2 := semStr(puf, p2, "unit semarti_erzeugt;\n\n"c);
+    p2 := semStr(puf, p2, "import std.semarti.registry;\n"c);
+    p2 := semStr(puf, p2, "import std.semarti.wert;\n"c);
+    // Die Unit mit den Operationen importieren. Ohne diesen Import verwiese
+    // die erzeugte Unit auf Funktionen, die sie nicht sieht.
+    if parser.UnitNameLen() > 0 {
+      p2 := semStr(puf, p2, "import "c);
+      p2 := semSchreib(puf, p2, src, parser.UnitNameOff(), parser.UnitNameLen());
+      p2 := semStr(puf, p2, ";\n"c);
+    }
+    p2 := semStr(puf, p2, "\n"c);
+    p2 := semStr(puf, p2, "pub fn SemartiRegistrieren(): int64 {\n"c);
+    var i: int64 := 0;
+    while i < n {
+      var rec: int64 := parser.OperationRec(i);
+      var idOff: int64 := peek64(rec + 8);
+      var idLen: int64 := peek64(rec + 16);
+      var vOff:  int64 := peek64(rec + 24);
+      var vLen:  int64 := peek64(rec + 32);
+      var risk:  int64 := peek64(rec + 40);
+      var conf:  int64 := peek64(rec + 48);
+      var inst:  int64 := peek64(rec + 56);
+      var fOff:  int64 := peek64(rec + 64);
+      var fLen:  int64 := peek64(rec + 72);
+      // Version zerlegen: MAJOR.MINOR.PATCH, in sema auf Form geprüft.
+      var maj: int64 := 0;
+      var mi:  int64 := 0;
+      var pat: int64 := 0;
+      var teil: int64 := 0;
+      var k: int64 := 0;
+      while k < vLen {
+        var c: int64 := peek8(src + vOff + k);
+        if c == 46 { teil := teil + 1; }
+        else if c >= 48 && c <= 57 {
+          if teil == 0 { maj := maj * 10 + (c - 48); }
+          else if teil == 1 { mi := mi * 10 + (c - 48); }
+          else { pat := pat * 10 + (c - 48); }
+        }
+        k := k + 1;
+      }
+      p2 := semStr(puf, p2, "  RegistryHinzufuegen(\""c);
+      p2 := semSchreib(puf, p2, src, idOff, idLen);
+      p2 := semStr(puf, p2, "\"c, "c);
+      p2 := semStr(puf, p2, IntToStr(maj));
+      p2 := semStr(puf, p2, ", "c);
+      p2 := semStr(puf, p2, IntToStr(mi));
+      p2 := semStr(puf, p2, ", "c);
+      p2 := semStr(puf, p2, IntToStr(pat));
+      p2 := semStr(puf, p2, ",\n      \""c);
+      p2 := semSchreib(puf, p2, src, fOff, fLen);
+      p2 := semStr(puf, p2, "\"c, \"erzeugt aus @operation\"c,\n      "c);
+      p2 := semSchreib(puf, p2, src, fOff, fLen);
+      p2 := semStr(puf, p2, "_eingabeschema(), "c);
+      p2 := semSchreib(puf, p2, src, fOff, fLen);
+      p2 := semStr(puf, p2, "_ausgabeschema(), "c);
+      p2 := semSchreib(puf, p2, src, fOff, fLen);
+      p2 := semStr(puf, p2, ",\n      "c);
+      if risk == 0 { p2 := semStr(puf, p2, "SRR_RISIKO_NUR_LESEN"c); }
+      else if risk == 1 { p2 := semStr(puf, p2, "SRR_RISIKO_AENDERND"c); }
+      else { p2 := semStr(puf, p2, "SRR_RISIKO_AUSSENWIRKUNG"c); }
+      p2 := semStr(puf, p2, ", "c);
+      if conf != 0 { p2 := semStr(puf, p2, "SRR_BESTAETIGUNG_NOETIG"c); }
+      else { p2 := semStr(puf, p2, "SRR_BESTAETIGUNG_NICHT_NOETIG"c); }
+      p2 := semStr(puf, p2, ", 0, 0, "c);
+      if inst != 0 { p2 := semStr(puf, p2, "SRR_OBJEKT_NOETIG"c); }
+      else { p2 := semStr(puf, p2, "SRR_OBJEKT_KEINES"c); }
+      p2 := semStr(puf, p2, ");\n"c);
+      i := i + 1;
+    }
+    p2 := semStr(puf, p2, "  return "c);
+    p2 := semStr(puf, p2, IntToStr(n));
+    p2 := semStr(puf, p2, ";\n}\n"c);
+    poke8(puf + p2, 0);
+    // EmitWriteFile ist der Schreiber des Übersetzers; er meldet ETXTBSY
+    // eigens, weil das der häufigste Anlass ist. Eine zweite Schreibroutine
+    // hier wäre dieselbe Rechnung an zwei Stellen.
+    EmitWriteFile(self.semartiOut, puf, p2);
+    return 0;
   }
 };
 
@@ -7537,7 +7696,7 @@ pub fn main(argc: int64, argv: pchar): int64 {
 
   // Print version banner unless suppressed with --quiet
   if not cfg.quiet {
-    PrintStr("lyxc 1.2.32E — Copyright (c) 2026 Andreas Röne. All rights reserved.\n"c);
+    PrintStr("lyxc 1.2.33B — Copyright (c) 2026 Andreas Röne. All rights reserved.\n"c);
   }
 
   // WP-BC-50: --unit-info <file> — read .lyu file, print metadata, exit

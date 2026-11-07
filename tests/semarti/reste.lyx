@@ -1,0 +1,231 @@
+// #2419 Punkte 2 bis 6: Abbruch und Frist, Adapter nach außen, Nebenläufigkeit,
+// Textraum-Wiederverwendung.
+//
+// Die Uhr kommt vom HOST — deshalb steht `system.time` in DIESEM Attribut und
+// nicht in der Bibliothek. Der erste Entwurf holte sie über `import std.time`
+// in `std.semarti.ablauf`, und beide Bestandstests starben sofort an SIGSYS:
+// ein Import in einer Bibliothek verschiebt die Rechteanforderung jedes
+// Nutzers.
+@capabilities([fs.read, system.time])
+unit main;
+
+import std.io;
+import std.string;
+import std.time;
+import std.semarti.wert;
+import std.semarti.schema;
+import std.semarti.registry;
+import std.semarti.objekte;
+import std.semarti.ablauf;
+import std.semarti.adapter;
+
+var _fehler: int64 := 0;
+var _handlerLaeufe: int64 := 0;
+var _handlerBummelt: int64 := 0;
+var _rekursionErgebnis: int64 := 999;
+
+fn pruefe(name: pchar, b: int64): void {
+  if (b != 0) { PrintStr("PASS "c); PrintStrLn(name); }
+  else { PrintStr("FAIL "c); PrintStrLn(name); _fehler := _fehler + 1; }
+}
+
+fn schemaMit(feld: pchar): int64 {
+  var s: int64 := WertObjekt();
+  WertFeldSetzen(s, "type"c, WertText("object"c));
+  var p: int64 := WertObjekt();
+  var f: int64 := WertObjekt();
+  WertFeldSetzen(f, "type"c, WertText("string"c));
+  WertFeldSetzen(p, feld, f);
+  WertFeldSetzen(s, "properties"c, p);
+  var r: int64 := WertListe();
+  WertGliedAnhaengen(r, WertText(feld));
+  WertFeldSetzen(s, "required"c, r);
+  return s;
+}
+
+fn eingabe(): int64 {
+  var e: int64 := WertObjekt();
+  WertFeldSetzen(e, "key"c, WertText("k"c));
+  return e;
+}
+
+fn handler(ein: int64, aus: int64, objekt: int64, principal: int64): int64 {
+  _handlerLaeufe := _handlerLaeufe + 1;
+  if (_handlerBummelt != 0) {
+    // Lange genug, dass eine Frist von 1 ms sicher abläuft.
+    var t0: int64 := GetTimeMs();
+    while (GetTimeMs() - t0 < 30) { }
+  }
+  WertFeldSetzen(aus, "content"c, WertText("fertig"c));
+  return 0;
+}
+
+// Ein Handler, der wieder aufruft: das würde die Arena unter dem laufenden
+// Aufruf wegziehen. Ohne Fäden ist das der herstellbare Fall.
+fn rekursiv(ein: int64, aus: int64, objekt: int64, principal: int64): int64 {
+  _handlerLaeufe := _handlerLaeufe + 1;
+  _rekursionErgebnis := AblaufAufrufen("com.example.op"c, 1, 0, SRO_WURZEL, eingabe(), "nutzer"c, 0);
+  WertFeldSetzen(aus, "content"c, WertText("fertig"c));
+  return 0;
+}
+
+fn auth(oi: int64, objekt: int64, principal: pchar): int64 { return 1; }
+fn pol(oi: int64, objekt: int64, ein: int64, principal: pchar): int64 { return SRA_POLICY_ERLAUBT; }
+fn aud(oi: int64, code: int64, principal: pchar): int64 { return 0; }
+fn uhr(): int64 { return GetTimeMs(); }
+
+var _abbruchAn: int64 := 0;
+fn abbruch(): int64 { return _abbruchAn; }
+
+fn main(): int64 {
+  RegistryProgrammCapability("fs.read"c);
+  var caps: int64 := alloc(8);
+  poke64(caps, "fs.read"c as int64);
+  RegistryHinzufuegen("com.example.op"c, 1, 0, 0, "Op"c, "Eine Operation."c,
+      schemaMit("key"c), schemaMit("content"c), handler,
+      SRR_RISIKO_NUR_LESEN, SRR_BESTAETIGUNG_NICHT_NOETIG, caps, 1, SRR_OBJEKT_KEINES);
+  RegistryHinzufuegen("com.example.rek"c, 1, 0, 0, "Rekursiv"c, "Ruft wieder auf."c,
+      schemaMit("key"c), schemaMit("content"c), rekursiv,
+      SRR_RISIKO_NUR_LESEN, SRR_BESTAETIGUNG_NICHT_NOETIG, caps, 1, SRR_OBJEKT_KEINES);
+  RegistryAbschliessen();
+  AblaufAuthorizerSetzen(auth);
+  AblaufPolicySetzen(pol);
+  AblaufAuditSetzen(aud);
+
+  // ── Punkt 2: Frist braucht eine Uhr ──────────────────────────────────────
+  // Ohne Uhr wird die Frist ABGEWIESEN. Sie stillschweigend zu ignorieren
+  // wäre die schlimmere Antwort: der Host glaubte an eine Grenze, die es
+  // nicht gibt.
+  pruefe("frist_ohne_uhr_abgewiesen"c, AblaufFristSetzen(100) == SRA_FRIST_OHNE_UHR);
+  AblaufUhrSetzen(uhr);
+  pruefe("frist_mit_uhr_angenommen"c, AblaufFristSetzen(0) == SRA_OK);
+
+  // Normaler Aufruf ohne Frist.
+  WertArenaZuruecksetzen();
+  var v0: int64 := _handlerLaeufe;
+  pruefe("ohne_frist_ok"c, AblaufAufrufen("com.example.op"c, 1, 0, SRO_WURZEL, eingabe(), "nutzer"c, 0) == SRA_OK);
+  pruefe("ohne_frist_handler_lief"c, _handlerLaeufe == v0 + 1);
+  pruefe("ohne_frist_wirkung_gemeldet"c, AblaufWirkungEingetreten() == 1);
+
+  // ── Punkt 2: Abbruch VOR dem Handler ist folgenlos ───────────────────────
+  WertArenaZuruecksetzen();
+  AblaufAbbruchSetzen(abbruch);
+  _abbruchAn := 1;
+  var v1: int64 := _handlerLaeufe;
+  pruefe("abbruch_vor_handler"c, AblaufAufrufen("com.example.op"c, 1, 0, SRO_WURZEL, eingabe(), "nutzer"c, 0) == SRA_CANCELLED);
+  pruefe("abbruch_handler_nicht_gelaufen"c, _handlerLaeufe == v1);
+  pruefe("abbruch_ohne_wirkung"c, AblaufWirkungEingetreten() == 0);
+  _abbruchAn := 0;
+
+  // ── Punkt 2: Frist im Handler — Wirkung IST eingetreten ──────────────────
+  WertArenaZuruecksetzen();
+  AblaufFristSetzen(1);
+  _handlerBummelt := 1;
+  var v2: int64 := _handlerLaeufe;
+  pruefe("frist_im_handler"c, AblaufAufrufen("com.example.op"c, 1, 0, SRO_WURZEL, eingabe(), "nutzer"c, 0) == SRA_DEADLINE_EXCEEDED);
+  pruefe("frist_handler_lief_trotzdem"c, _handlerLaeufe == v2 + 1);
+  pruefe("frist_meldet_eingetretene_wirkung"c, AblaufWirkungEingetreten() == 1);
+  _handlerBummelt := 0;
+  AblaufFristSetzen(0);
+
+  // Nach dem Abbruch läuft alles wieder: die Eintrittsmarke ist freigegeben.
+  WertArenaZuruecksetzen();
+  pruefe("nach_abbruch_wieder_aufrufbar"c, AblaufAufrufen("com.example.op"c, 1, 0, SRO_WURZEL, eingabe(), "nutzer"c, 0) == SRA_OK);
+
+  // ── Punkt 4: Rekursion wird gemeldet, nicht stillschweigend zugelassen ───
+  WertArenaZuruecksetzen();
+  _rekursionErgebnis := 999;
+  pruefe("rekursiver_aufruf_aeusserer_ok"c, AblaufAufrufen("com.example.rek"c, 1, 0, SRO_WURZEL, eingabe(), "nutzer"c, 0) == SRA_OK);
+  pruefe("rekursiver_aufruf_innerer_abgewiesen"c, _rekursionErgebnis == SRA_REENTRANT);
+  // Und danach ist wieder alles normal.
+  WertArenaZuruecksetzen();
+  pruefe("nach_rekursion_wieder_aufrufbar"c, AblaufAufrufen("com.example.op"c, 1, 0, SRO_WURZEL, eingabe(), "nutzer"c, 0) == SRA_OK);
+
+  // ── Punkt 3: Adapter, beide Richtungen ───────────────────────────────────
+  WertArenaZuruecksetzen();
+  var w: int64 := AdapterJsonNachWert("{\"key\":\"abc\",\"n\":-42,\"l\":[1,2,3],\"b\":true,\"nichts\":null}"c);
+  pruefe("json_gelesen"c, w >= 0);
+  pruefe("json_text"c, StrEq(WertTextwert(WertFeld(w, "key"c)), "abc"c) != 0);
+  pruefe("json_negative_zahl"c, WertZahlwert(WertFeld(w, "n"c)) == 0 - 42);
+  pruefe("json_liste"c, WertGliederZahl(WertFeld(w, "l"c)) == 3);
+  pruefe("json_bool"c, WertZahlwert(WertFeld(w, "b"c)) == 1);
+  pruefe("json_null"c, WertArt(WertFeld(w, "nichts"c)) == SRW_NULL);
+
+  var puf: int64 := alloc(8192);
+  var n1: int64 := AdapterWertNachJson(w, puf as pchar, 8192);
+  pruefe("json_geschrieben"c, n1 > 0);
+  // Rundreise: einmal gelesen, geschrieben, wieder gelesen — gleicher Wert.
+  var w2: int64 := AdapterJsonNachWert(puf as pchar);
+  pruefe("rundreise_lesbar"c, w2 >= 0);
+  pruefe("rundreise_text_gleich"c, StrEq(WertTextwert(WertFeld(w2, "key"c)), "abc"c) != 0);
+  pruefe("rundreise_zahl_gleich"c, WertZahlwert(WertFeld(w2, "n"c)) == 0 - 42);
+
+  // Maskierung: Anführungszeichen im Text brechen das Format nicht.
+  WertArenaZuruecksetzen();
+  var m: int64 := WertObjekt();
+  WertFeldSetzen(m, "t"c, WertText("er sagte \"hallo\""c));
+  var n2: int64 := AdapterWertNachJson(m, puf as pchar, 8192);
+  pruefe("maskierung_geschrieben"c, n2 > 0);
+  var m2: int64 := AdapterJsonNachWert(puf as pchar);
+  pruefe("maskierung_rundreise"c, m2 >= 0 && StrEq(WertTextwert(WertFeld(m2, "t"c)), "er sagte \"hallo\""c) != 0);
+
+  // ── Punkt 3: was von außen ABGEWIESEN werden muss ────────────────────────
+  WertArenaZuruecksetzen();
+  pruefe("json_muell"c, AdapterJsonNachWert("{nicht json"c) < 0);
+  pruefe("json_abgeschnitten"c, AdapterJsonNachWert("{\"a\":"c) < 0);
+  pruefe("json_zweites_dokument"c, AdapterJsonNachWert("{} {}"c) < 0);
+  pruefe("json_gleitkomma_abgewiesen"c, AdapterJsonNachWert("{\"a\":1.5}"c) < 0);
+  pruefe("json_gleitkomma_grund"c, AdapterLetzterFehler() == SRA_A_E_NICHT_UNTERSTUETZT);
+  pruefe("json_unicode_escape_abgewiesen"c, AdapterJsonNachWert("{\"a\":\"\\u0041\"}"c) < 0);
+  pruefe("json_zahl_zu_gross"c, AdapterJsonNachWert("{\"a\":99999999999999999999}"c) < 0);
+  pruefe("json_zahl_zu_gross_grund"c, AdapterLetzterFehler() == SRA_A_E_ZAHL_ZU_GROSS);
+
+  // Zu tief: die Grenze greift beim LESEN, das Dokument steht nie ganz da.
+  var tief: pchar := "[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]"c;
+  pruefe("json_zu_tief"c, AdapterJsonNachWert(tief) < 0);
+  pruefe("json_zu_tief_grund"c, AdapterLetzterFehler() == SRA_A_E_ZU_TIEF);
+
+  // Puffer zu klein ist ein FEHLER, keine abgeschnittene Ausgabe.
+  WertArenaZuruecksetzen();
+  var gross: int64 := WertObjekt();
+  WertFeldSetzen(gross, "x"c, WertText("0123456789012345678901234567890123456789"c));
+  pruefe("puffer_zu_klein_ist_fehler"c, AdapterWertNachJson(gross, puf as pchar, 16) == SRA_A_E_PUFFER_VOLL);
+
+  // ── Punkt 3: Werkzeugbeschreibung ────────────────────────────────────────
+  var idx: int64 := alloc(16);
+  poke64(idx, 0);
+  poke64(idx + 8, 1);
+  var n3: int64 := AdapterWerkzeugeNachJson(idx, 2, puf as pchar, 8192);
+  pruefe("werkzeuge_geschrieben"c, n3 > 0);
+  pruefe("werkzeuge_sind_gueltiges_json"c, AdapterJsonNachWert(puf as pchar) >= 0);
+  pruefe("werkzeuge_nennen_die_id"c, StrFind(puf as pchar, "com.example.op"c) >= 0);
+  pruefe("werkzeuge_nennen_das_risiko"c, StrFind(puf as pchar, "read_only"c) >= 0);
+  // Die verlangten Capabilities sind eine Innensicht und stehen NICHT drin.
+  pruefe("werkzeuge_nennen_keine_capabilities"c, StrFind(puf as pchar, "fs.read"c) < 0);
+
+  // ── Punkt 6: Textraum wird wiederverwendet ───────────────────────────────
+  ObjektRegisterLeeren();
+  var o: int64 := ObjektRegistrieren("Doc"c, "d"c, SRO_WURZEL);
+  ObjektEigenschaftText(o, "title"c, "Angebot"c);
+  var belegt0: int64 := ObjektTextBelegt();
+  var wv0: int64 := ObjektTextWiederverwendet();
+  var i: int64 := 0;
+  while (i < 500) { ObjektEigenschaftText(o, "title"c, "Angebot"c); i := i + 1; }
+  pruefe("gleich_lange_texte_wiederverwendet"c, ObjektTextWiederverwendet() == wv0 + 500);
+  pruefe("textraum_nicht_gewachsen"c, ObjektTextBelegt() == belegt0);
+  pruefe("wert_stimmt_noch"c, StrEq(ObjektLeseText(o, "title"c), "Angebot"c) != 0);
+  // Kürzer passt auch hinein.
+  ObjektEigenschaftText(o, "title"c, "Ang"c);
+  pruefe("kuerzerer_text_wiederverwendet"c, ObjektTextBelegt() == belegt0);
+  pruefe("kuerzerer_wert_stimmt"c, StrEq(ObjektLeseText(o, "title"c), "Ang"c) != 0);
+  // Ein LÄNGERER Wert belegt neu — die Grenze der Lösung, ausdrücklich geprüft.
+  var nb0: int64 := ObjektTextNeuBelegt();
+  ObjektEigenschaftText(o, "title"c, "Ein viel laengerer Titel als vorher"c);
+  pruefe("laengerer_text_belegt_neu"c, ObjektTextNeuBelegt() == nb0 + 1);
+  pruefe("laengerer_wert_stimmt"c, StrEq(ObjektLeseText(o, "title"c), "Ein viel laengerer Titel als vorher"c) != 0);
+  pruefe("revision_zaehlte_jede_aenderung"c, ObjektRevision(o) > 500);
+
+  if (_fehler != 0) { PrintStr("FEHLER="c); PrintLn(_fehler); return 1; }
+  PrintStrLn("ALL PASS"c);
+  return 0;
+}
