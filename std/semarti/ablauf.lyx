@@ -66,6 +66,24 @@ pub con SRA_OBJECT_REQUIRED:       int64 := 0 - 13;
 pub con SRA_OBJECT_NOT_ALLOWED:    int64 := 0 - 14;
 pub con SRA_OBJECT_INVALID:        int64 := 0 - 15;
 pub con SRA_OBJECT_STALE:          int64 := 0 - 16;
+// #2419 Punkt 4: NEBENLÄUFIGKEIT WIRD GEMELDET, NICHT ZUGESAGT.
+//
+// Registry, Objektregister und Wert-Arena sind Modulzustand. Zwei
+// gleichzeitige Aufrufe würden sich die Werte überschreiben — und zwar
+// still, was das Schlimmere ist.
+//
+// Diese Bibliothek baut deshalb KEINE wartende Sperre ein. Eine solche wäre
+// eine Zusage über Blockieren und Fairness, die sie nicht halten kann, und
+// sie verdeckte den Entwurfsfehler im Host, statt ihn zu zeigen. Statt
+// dessen gibt es eine Eintrittsmarke: wer eintritt und sie belegt findet,
+// bekommt diesen Befund. Der Host sieht damit sofort, dass sein Modell nicht
+// passt.
+//
+// Derselbe Befund trifft REKURSION: ein Handler, der wieder aufruft, würde
+// die Arena unter sich wegziehen. Das ist der Fall, der im Test nachgewiesen
+// ist, weil er sich ohne Fäden herstellen lässt.
+pub con SRA_REENTRANT:             int64 := 0 - 17;
+pub con SRA_FRIST_OHNE_UHR:        int64 := 0 - 18;
 
 // Policy-Entscheidungen.
 pub con SRA_POLICY_ERLAUBT:      int64 := 0;
@@ -95,6 +113,95 @@ pub type SemaPolicy = fn(int64, int64, int64, pchar): int64;
 // eingetreten, aber sie ist nicht festgehalten.
 pub type SemaAudit = fn(int64, int64, pchar): int64;
 
+// #2419 Punkt 2: ABBRUCH UND FRIST.
+//
+// Beide Codes waren vergeben, aber von keinem Pfad erreichbar — das stand so
+// in der Doku, statt als erfüllt zu gelten. Jetzt gibt es sie wirklich, und
+// zwar mit der Antwort auf die Frage, die der Wirkungsbefund aufgeworfen hat:
+// ein Abbruch NACH dem Handlerstart ist kein folgenloses Nein.
+//
+// Der Abbruchhaken wird an zwei Stellen gefragt: VOR dem Handler (dann ist
+// `cancelled` folgenlos) und NACH ihm (dann ist die Wirkung eingetreten, und
+// `AblaufWirkungEingetreten()` sagt das). Während des Handlers kann diese
+// Bibliothek nicht fragen — sie ruft fremden Code auf und kehrt erst danach
+// zurück. Ein Handler, der lange läuft, muss den Haken deshalb selbst
+// abfragen; dafür ist er öffentlich.
+pub type SemaAbbruch = fn(): int64;
+
+// DIE UHR KOMMT VOM HOST, NICHT AUS EINEM IMPORT.
+//
+// Der erste Entwurf holte sie über `import std.time` und `GetTimeMs()`. Das
+// war ein Fehler mit Folgen, die der Test sofort gezeigt hat: beide
+// Testprogramme starben an SIGSYS (rc 159), weil `clock_gettime` nicht in
+// ihrem `@capabilities([fs.read])` stand. Ein Import in einer Bibliothek
+// VERSCHIEBT die Rechteanforderung jedes Nutzers — SemaRTI hätte ab dann
+// `system.time` verlangt, auch von einem Host, der nie eine Frist setzt.
+//
+// Die Uhr ist deshalb ein Haken wie Authorizer und Policy: der Host liefert
+// die Fähigkeit, die Bibliothek schreibt nur den Ablauf vor. Ohne Uhr gibt es
+// keine Frist — und das ist kein stiller Verzicht, sondern eine Bedingung,
+// die `AblaufFristSetzen` ausdrücklich prüft.
+pub type SemaUhr = fn(): int64;
+
+var _uhr: SemaUhr := 0 as SemaUhr;
+var _abbruch: SemaAbbruch := 0 as SemaAbbruch;
+var _fristMs: int64 := 0;      // 0 = keine Frist
+
+pub fn AblaufAbbruchSetzen(f: SemaAbbruch): void { _abbruch := f; }
+
+// Setzt die Uhr. Sie soll eine MONOTONE Millisekundenzahl liefern — eine
+// Uhr, die springen kann, wäre als Frist unbrauchbar. Welche das ist,
+// entscheidet der Host; auf Linux ist `GetTimeMs()` aus `std.time` die
+// passende, und das Recht dafür steht dann in SEINEM Attribut.
+pub fn AblaufUhrSetzen(f: SemaUhr): void { _uhr := f; }
+
+// Setzt die Frist je Aufruf in Millisekunden. 0 schaltet sie ab.
+//
+// Ohne gesetzte Uhr wird die Frist ABGEWIESEN (Rückgabe
+// SRA_FRIST_OHNE_UHR). Sie stillschweigend zu ignorieren wäre die
+// schlimmere Antwort: der Host glaubte an eine Grenze, die es nicht gibt.
+//
+// Die Frist deckt den GANZEN Ablauf ab, nicht nur den Handler: Schema,
+// Autorisierung und Policy sind Code des Hosts und können selbst lange
+// brauchen. Gemessen wird gegen CLOCK_MONOTONIC — eine Uhr, die springen
+// kann, wäre als Frist unbrauchbar.
+pub fn AblaufFristSetzen(ms: int64): int64 {
+  if (ms > 0 && _uhr as int64 == 0) { return SRA_FRIST_OHNE_UHR; }
+  _fristMs := ms;
+  return SRA_OK;
+}
+
+// Frage, die ein langlaufender Handler selbst stellen kann. Gibt 1, wenn
+// abgebrochen wurde ODER die Frist abgelaufen ist.
+var _startMs: int64 := 0;
+
+// Eintrittsmarke. Ein eigener 8-Byte-Bereich, weil `atomic_cas` eine Adresse
+// braucht; eine Modulvariable hat in dieser Sprache keine nehmbare Adresse.
+var _marke: int64 := 0;
+
+fn aMarke(): int64 {
+  if (_marke == 0) { _marke := alloc(8); poke64(_marke, 0); }
+  return _marke;
+}
+
+pub fn AblaufSollAbbrechen(): int64 {
+  if (_abbruch as int64 != 0) {
+    if (_abbruch() != 0) { return 1; }
+  }
+  if (_fristMs > 0 && _startMs > 0 && _uhr as int64 != 0) {
+    if (_uhr() - _startMs > _fristMs) { return 1; }
+  }
+  return 0;
+}
+
+fn aFristAbgelaufen(): int64 {
+  if (_fristMs <= 0) { return 0; }
+  if (_startMs <= 0) { return 0; }
+  if (_uhr as int64 == 0) { return 0; }
+  if (_uhr() - _startMs > _fristMs) { return 1; }
+  return 0;
+}
+
 var _auth: SemaAuthorizer := 0 as SemaAuthorizer;
 var _policy: SemaPolicy := 0 as SemaPolicy;
 var _audit: SemaAudit := 0 as SemaAudit;
@@ -107,6 +214,10 @@ pub fn AblaufZuruecksetzenFuerTest(): void {
   _auth := 0 as SemaAuthorizer;
   _policy := 0 as SemaPolicy;
   _audit := 0 as SemaAudit;
+  _abbruch := 0 as SemaAbbruch;
+  _uhr := 0 as SemaUhr;
+  _fristMs := 0;
+  _startMs := 0;
 }
 
 // Letzter Ausgabeknoten eines erfolgreichen Aufrufs. Gilt bis zum nächsten
@@ -136,6 +247,11 @@ pub fn AblaufLetzterGrund(): pchar { return _letzterGrund; }
 
 fn aNein(code: int64, oi: int64, principal: pchar, grund: pchar): int64 {
   _letzterGrund := grund;
+  // #2419 Punkt 4: Die Eintrittsmarke wird hier freigegeben, weil JEDE
+  // Ablehnung nach dem Belegen über diese Funktion läuft. Die zwei
+  // Ablehnungen davor (nicht bereit, Marke belegt) gehen absichtlich nicht
+  // durch sie.
+  if (_marke != 0) { poke64(_marke, 0); }
   // Scheitert das Protokoll AUF DEM ABLEHNUNGSWEG, bleibt der Ablehnungscode
   // stehen: er ist die wichtigere Auskunft, und es gibt keine Wirkung, die
   // ein Aufrufer wegen des Protokolls anders behandeln müsste. Auf dem
@@ -186,11 +302,24 @@ pub fn AblaufAufrufen(id: pchar, major: int64, minor: int64, objekt: int64,
   _letzteAusgabe := 0 - 1;
   _letzterGrund := ""c;
   _wirkung := 0;
+  if (_uhr as int64 != 0) { _startMs := _uhr(); } else { _startMs := 0; }
 
   // Eine nicht abgeschlossene Registry ist ein Einrichtungsfehler des Hosts
   // und kein Aufruffehler. Sie wird laut gemeldet, statt die Prüfungen mit
   // halb aufgebauten Deskriptoren zu fahren.
   if (RegistryIstAbgeschlossen() == 0) { return aNein(SRA_NOT_READY, 0 - 1, principal, "Registry nicht abgeschlossen"c); }
+
+  // #2419 Punkt 4: Eintritt belegen. Scheitert das, läuft schon ein Aufruf —
+  // aus einem anderen Faden oder aus einem Handler heraus. Beides würde die
+  // Arena unter dem laufenden Aufruf wegziehen.
+  //
+  // Die Marke wird auf JEDEM Rückweg freigegeben, auch auf jedem
+  // Ablehnungsweg. Eine liegengebliebene Marke machte jeden weiteren Aufruf
+  // unmöglich — das wäre schlimmer als das Problem, das sie löst.
+  if (atomic_cas(aMarke(), 0, 1) != 0) {
+    _letzterGrund := "ein Aufruf laeuft bereits (Faden oder Rekursion)"c;
+    return SRA_REENTRANT;
+  }
 
   // 1. Identität
   var oi: int64 := RegistryFinde(id);
@@ -250,6 +379,17 @@ pub fn AblaufAufrufen(id: pchar, major: int64, minor: int64, objekt: int64,
     return aNein(SRA_CONFIRMATION_REQUIRED, oi, principal, "Bestaetigung fehlt"c);
   }
 
+  // 6b. Abbruch und Frist, VOR dem Handler. Hier ist ein Nein folgenlos:
+  //     es ist noch nichts geschehen, und `AblaufWirkungEingetreten()` bleibt
+  //     auf 0. Geprüft wird nach der Bestätigung, damit ein Abbruch während
+  //     einer Rückfrage noch greift.
+  if (AblaufSollAbbrechen() != 0) {
+    if (aFristAbgelaufen() != 0) {
+      return aNein(SRA_DEADLINE_EXCEEDED, oi, principal, "Frist vor dem Handler abgelaufen"c);
+    }
+    return aNein(SRA_CANCELLED, oi, principal, "vor dem Handler abgebrochen"c);
+  }
+
   // 7. Handler
   var ausgabe: int64 := WertObjekt();
   if (ausgabe < 0) { return aNein(SRA_HANDLER_FAILED, oi, principal, "Arena erschoepft"c); }
@@ -267,6 +407,17 @@ pub fn AblaufAufrufen(id: pchar, major: int64, minor: int64, objekt: int64,
   _wirkung := 1;
   var hr: int64 := h(eingabe, ausgabe, objekt, principal as int64);
   if (objekt != SRO_WURZEL) { ObjektZurueckgeben(objekt); }
+  // 7b. Frist NACH dem Handler. Die Wirkung ist eingetreten — der Code sagt
+  //     nur, dass sie zu lange gebraucht hat. Ein Aufrufer, der daraus ein
+  //     Wiederholen ableitet, löst sie ein zweites Mal aus; dafür steht
+  //     `AblaufWirkungEingetreten()` auf 1.
+  //
+  //     Gemeldet wird die Frist VOR dem Handlerfehler: eine abgelaufene Frist
+  //     erklärt einen Abbruch im Handler, und die umgekehrte Reihenfolge
+  //     verdeckte sie.
+  if (aFristAbgelaufen() != 0) {
+    return aNein(SRA_DEADLINE_EXCEEDED, oi, principal, "Frist im Handler abgelaufen — Wirkung eingetreten"c);
+  }
   if (hr != 0) { return aNein(SRA_HANDLER_FAILED, oi, principal, "Handler meldete einen Fehler — Wirkung kann eingetreten sein"c); }
 
   // 8. Ausgabe. Auch die eigene Ausgabe wird geprüft: ein Handler, der etwas
@@ -280,6 +431,7 @@ pub fn AblaufAufrufen(id: pchar, major: int64, minor: int64, objekt: int64,
   }
 
   _letzteAusgabe := ausgabe;
+  if (_marke != 0) { poke64(_marke, 0); }
   if (_audit as int64 != 0) {
     if (_audit(oi, SRA_OK, principal) != 0) {
       // Der Aufruf war gültig und ist ausgeführt, aber das Protokoll fehlt.
