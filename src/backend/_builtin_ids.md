@@ -537,6 +537,8 @@ arbeiten auf 16-Byte-Bloecken im Speicher, weil Lyx keinen 128-Bit-Werttyp hat.
 | 562 | `AESIMC` auf einem Block | `aes_imc(dst, src)` | wie 560 | #2383 |
 | 563 | `AESENCLAST` gegen einen Nullschluessel = tabellenfreies SubBytes | `aes_subword(dst, src)` | wie 560 | #2383 |
 
+| 568 | ganze SHA-256-Kompression (`SHA256RNDS2`/`MSG1`/`MSG2`) | `sha256_compress(state, data, blocks)` | **nur ELF-x86** (0/1/5/6/13), NICHT lyxos (14) — dort PANIC, weil `emit_lyxos` keine SHA-NI-Fassung hat und unbehandelte IDs stumm verwirft | #2391 |
+
 **Warum PANIC und nicht 0.** Bei `cpu_id` (253) ist 0 die *richtige* Antwort
 auf "hat diese CPU AES-NI". Bei einer Verschluesselung gibt es keinen
 plausiblen Ersatzwert — ein stiller Default waere hier eine stille

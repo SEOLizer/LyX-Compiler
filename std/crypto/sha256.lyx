@@ -8,6 +8,7 @@
 unit std.crypto.sha256;
 
 import std.alloc;
+import std.cpu.features;   // #2391: CpuHasSHANI
 
 // ============================================================================
 // Internal helpers
@@ -81,8 +82,61 @@ fn sha256Scratch(): int64 {
     return k;
 }
 
+// ============================================================================
+// #2391: SHA-NI
+// ============================================================================
+//
+// `sha256_compress(state, data, blocks)` rechnet die Kompressionsfunktion in
+// Hardware (SHA256RNDS2/MSG1/MSG2). Der Zustand hat dort DASSELBE Format wie
+// hier — 8 uint32 in ABCDEFGH —, die Umordnung auf das ABEF/CDGH-Paar, das
+// die Befehle brauchen, macht der erzeugte Code selbst.
+//
+// Ergebnis von CpuHasSHANI, einmal gemessen. Das Flag ist noetig, weil 0 ein
+// gueltiges Ergebnis ist (dieselbe Begruendung wie bei AES-NI in aes.lyx und
+// in std/cpu/features.lyx).
+var shaniCache: int64 := 0;
+var shaniProbed: int64 := 0;
+
+// Umschalter auf den Rechenweg, auch wenn die CPU SHA-NI hat.
+//
+// Wie `AESForceSoftware` (#2383) nicht fuer Anwender, sondern damit der
+// SOFTWAREweg messbar bleibt: auf einer CPU mit SHA-NI fuehrt sonst kein
+// Aufruf mehr durch die Rundenschleife unten, und eine Regression dort waere
+// auf genau den Maschinen unsichtbar, auf denen sie auffallen muesste.
+// tests/sha_ni_2391_test.sh prueft beide Wege gegeneinander.
+var shaniForceSoft: int64 := 0;
+
+// 1 = ab jetzt rechnen statt SHA256RNDS2. 0 = wieder die CPU fragen.
+pub fn SHA256ForceSoftware(on: int64): int64 {
+    shaniForceSoft := on;
+    return shaniForceSoft;
+}
+
+// Hat diese CPU SHA-NI (und ist der Rechenweg nicht erzwungen)? 1 oder 0.
+// Auf Nicht-x86 immer 0.
+pub fn SHA256NIAvailable(): int64 {
+    if (shaniForceSoft != 0) { return 0; }
+    if (shaniProbed != 0) { return shaniCache; }
+    var v: int64 := 0;
+    if (CpuHasSHANI() != 0) { v := 1; }
+    shaniCache := v;
+    shaniProbed := 1;
+    return v;
+}
+
 // Process one 64-byte (512-bit) block into the 8-word state buffer
 fn sha256Block(state: int64, block: int64): void {
+    // #2391: Schnellweg. Die Abfrage steht VOR jeder Vorarbeit — der
+    // Softwareweg unten legt sich einen Kratzbereich an und baut die
+    // K-Tabelle, und beides waere hier verloren.
+    //
+    // Ohne SHA-NI wird `sha256_compress` NICHT aufgerufen: der Befehl loest
+    // dort SIGILL aus. Das ist kein stiller Default, sondern ein lauter
+    // Abbruch — die Weiche hier ist die einzige Stelle, die ihn verhindert.
+    if (SHA256NIAvailable() != 0) {
+        sha256_compress(state, block, 1);
+        return;
+    }
     if (sha256Scratch() == 0) { panic("SHA-256: kein Speicher fuer die Rundentabelle (#1318)"); }
     var W: int64 := _sha256W;
     var K: int64 := _sha256K;

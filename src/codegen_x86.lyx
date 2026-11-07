@@ -1408,6 +1408,7 @@ pub type Codegen = class {
   // dieselbe Kodierung wie bei der Marke aus #2206, wo `slot < 0` als
   // "nicht gesetzt" die Stelle immer abgewuergt hat.
   simdZielOff:       int64;
+  shaKOff:           int64;   // #2391: Datenoffset der SHA-256-K-Tabelle, -1 = noch nicht angelegt
   // #2247: `peek32(adr) & 0xFFFFFFFF` ist der vorzeichenLOSE 32-Bit-Zugriff.
   // peek32 erweitert mit Vorzeichen, die Maske schneidet danach die oberen
   // 32 Bit ab — zwei Befehle fuer etwas, das x86 in EINEM kann: ein
@@ -8629,6 +8630,103 @@ pub type Codegen = class {
     var done: int64 := self.codeLen;
     cg_patchRel8Wert(self.code, jge, done - skBody);
     self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xD0);                    // mov rax, rdx
+  }
+
+  // #2391: SHA-NI — die beiden Bausteine der SHA-256-Kompression.
+  //
+  // REGISTERPLAN (verifiziert gegen eine Assembler-Fassung, die beide
+  // NIST-Vektoren fuer SHA-256 bitgleich liefert):
+  //   xmm0       Nachricht — ZWINGEND, `sha256rnds2` liest sie implizit
+  //   xmm1/xmm2  abef / cdgh (der Zustand in der Form, die die Befehle
+  //              brauchen; NICHT ABCDEFGH)
+  //   xmm3       Arbeitsregister
+  //   xmm4..xmm7 die vier Nachrichtenviertel m0..m3
+  //   xmm8/xmm9  Sicherung des Zustands fuer die Schlussaddition
+  //   xmm10      die Byteumkehrmaske
+  //   r8         K-Tabelle, r9 Maske, rdi Zustand, rsi Daten, rdx Bloecke
+  //
+  // Ein Rundenpaar. `koff` ist der Byteabstand in der K-Tabelle.
+  //
+  // Geladen wird mit `movdqu`, NICHT ueber einen Speicheroperanden von
+  // `paddd`: ein Legacy-SSE-Befehl mit m128-Operand verlangt 16-Byte-
+  // Ausrichtung, und die ist im Datensegment nicht zugesagt. Dieselbe
+  // Entscheidung wie im Vektorkern seit 1.2.31A (#2372). Kostet einen
+  // Befehl je Runde und erspart eine Ausrichtungszusage, die sonst
+  // irgendwann still verletzt wird.
+  fn cg_shaRnds(mm: int64, koff: int64) {
+    self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0xC0 + mm);   // movdqa xmm0, xmm<mm>
+    // movdqu xmm3, [r8 + koff] — ModRM reg=3, rm=0 (r8 ueber REX.B)
+    self.cg_e8(0xF3); self.cg_e8(0x41); self.cg_e8(0x0F); self.cg_e8(0x6F);
+    if (koff == 0) {
+      self.cg_e8(0x18);
+    } else if (koff < 128) {
+      self.cg_e8(0x58); self.cg_e8(koff);
+    } else {
+      self.cg_e8(0x98); self.cg_e32(koff);
+    }
+    self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0xFE); self.cg_e8(0xC3);        // paddd xmm0, xmm3
+    self.cg_e8(0x0F); self.cg_e8(0x38); self.cg_e8(0xCB); self.cg_e8(0xD1);        // sha256rnds2 xmm2, xmm1 (, xmm0)
+    self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x70); self.cg_e8(0xC0); self.cg_e8(0x0E);  // pshufd xmm0, xmm0, 0x0E
+    self.cg_e8(0x0F); self.cg_e8(0x38); self.cg_e8(0xCB); self.cg_e8(0xCA);        // sha256rnds2 xmm1, xmm2 (, xmm0)
+  }
+
+  // Ein Viertel des Nachrichtenplans: x := msg2(msg1(x, y) + (w:z >> 4), w).
+  // Die vier Viertel rotieren durch, siehe Aufrufreihenfolge unten.
+  fn cg_shaSched(x: int64, y: int64, z: int64, w: int64) {
+    self.cg_e8(0x0F); self.cg_e8(0x38); self.cg_e8(0xCC); self.cg_e8(0xC0 + x * 8 + y);   // sha256msg1 x, y
+    self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0xD8 + w);           // movdqa xmm3, w
+    self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x3A); self.cg_e8(0x0F); self.cg_e8(0xD8 + z); self.cg_e8(0x04);  // palignr xmm3, z, 4
+    self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0xFE); self.cg_e8(0xC3 + x * 8);       // paddd x, xmm3
+    self.cg_e8(0x0F); self.cg_e8(0x38); self.cg_e8(0xCD); self.cg_e8(0xC0 + x * 8 + w);   // sha256msg2 x, w
+  }
+
+  // Die 64 Rundenkonstanten aus FIPS 180-4, als Bytes ins Datensegment.
+  // Zurueck kommt der Datenoffset der Tabelle; direkt dahinter liegt die
+  // Byteumkehrmaske, deren Offset der Aufrufer selbst errechnet.
+  // Ein 32-Bit-Wort little-endian ins Datensegment.
+  fn cg_edataW(w: int64) {
+    self.cg_edata(w & 255);
+    self.cg_edata((w >> 8) & 255);
+    self.cg_edata((w >> 16) & 255);
+    self.cg_edata((w >> 24) & 255);
+  }
+
+  // EINMAL je Erzeugnis, nicht je Aufrufstelle. Ohne diese Frage lag die
+  // Tabelle (256 Byte, plus 16 fuer die Maske) so oft im Datensegment, wie
+  // `sha256_compress` aufgerufen wird — bei drei Aufrufen 816 statt 272
+  // Byte, und linear wachsend. Aufgefallen beim Abzaehlen der Konstanten im
+  // Erzeugnis, nicht beim Lesen des Codes.
+  fn cg_shaKTabelle(): int64 {
+    if (self.shaKOff >= 0) { return self.shaKOff; }
+    var off: int64 := self.dataLen;
+    self.shaKOff := off;
+    // FIPS 180-4, Tabelle der 64 Rundenkonstanten. WOERTLICH uebernommen
+    // aus der Spezifikation und gegen die verifizierte Assembler-Fassung
+    // gegengerechnet; nicht aus den Kubikwurzeln neu gerechnet.
+    self.cg_edataW(0x428a2f98); self.cg_edataW(0x71374491); self.cg_edataW(0xb5c0fbcf); self.cg_edataW(0xe9b5dba5);
+    self.cg_edataW(0x3956c25b); self.cg_edataW(0x59f111f1); self.cg_edataW(0x923f82a4); self.cg_edataW(0xab1c5ed5);
+    self.cg_edataW(0xd807aa98); self.cg_edataW(0x12835b01); self.cg_edataW(0x243185be); self.cg_edataW(0x550c7dc3);
+    self.cg_edataW(0x72be5d74); self.cg_edataW(0x80deb1fe); self.cg_edataW(0x9bdc06a7); self.cg_edataW(0xc19bf174);
+    self.cg_edataW(0xe49b69c1); self.cg_edataW(0xefbe4786); self.cg_edataW(0xfc19dc6); self.cg_edataW(0x240ca1cc);
+    self.cg_edataW(0x2de92c6f); self.cg_edataW(0x4a7484aa); self.cg_edataW(0x5cb0a9dc); self.cg_edataW(0x76f988da);
+    self.cg_edataW(0x983e5152); self.cg_edataW(0xa831c66d); self.cg_edataW(0xb00327c8); self.cg_edataW(0xbf597fc7);
+    self.cg_edataW(0xc6e00bf3); self.cg_edataW(0xd5a79147); self.cg_edataW(0x6ca6351); self.cg_edataW(0x14292967);
+    self.cg_edataW(0x27b70a85); self.cg_edataW(0x2e1b2138); self.cg_edataW(0x4d2c6dfc); self.cg_edataW(0x53380d13);
+    self.cg_edataW(0x650a7354); self.cg_edataW(0x766a0abb); self.cg_edataW(0x81c2c92e); self.cg_edataW(0x92722c85);
+    self.cg_edataW(0xa2bfe8a1); self.cg_edataW(0xa81a664b); self.cg_edataW(0xc24b8b70); self.cg_edataW(0xc76c51a3);
+    self.cg_edataW(0xd192e819); self.cg_edataW(0xd6990624); self.cg_edataW(0xf40e3585); self.cg_edataW(0x106aa070);
+    self.cg_edataW(0x19a4c116); self.cg_edataW(0x1e376c08); self.cg_edataW(0x2748774c); self.cg_edataW(0x34b0bcb5);
+    self.cg_edataW(0x391c0cb3); self.cg_edataW(0x4ed8aa4a); self.cg_edataW(0x5b9cca4f); self.cg_edataW(0x682e6ff3);
+    self.cg_edataW(0x748f82ee); self.cg_edataW(0x78a5636f); self.cg_edataW(0x84c87814); self.cg_edataW(0x8cc70208);
+    self.cg_edataW(0x90befffa); self.cg_edataW(0xa4506ceb); self.cg_edataW(0xbef9a3f7); self.cg_edataW(0xc67178f2);
+    // Byteumkehrmaske: 03 02 01 00 07 06 05 04 0B 0A 09 08 0F 0E 0D 0C
+    var j: int64 := 0;
+    while (j < 4) {
+      var k: int64 := 3;
+      while (k >= 0) { self.cg_edata(j * 4 + k); k := k - 1; }
+      j := j + 1;
+    }
+    return off;
   }
 
   // #2213: Ergebnisablage einer Vektoroperation. Erwartet rcx = Elementzahl,
@@ -19709,6 +19807,84 @@ pub type Codegen = class {
       self.cg_bumpZiel(ghEnde);                                                 // jz-Ziel nachtragen (#2244-Muster)
       self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x7F); self.cg_e8(0x07);   // movdqu [rdi], xmm0
       self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC4); self.cg_e8(0x10);   // add rsp, 16 (Maske)
+      self.cg_zeroRax();
+
+    } else if (self.cg_seq(fname, fnlen, "sha256_compress", 15)) {
+      // #2391: sha256_compress(state, data, blocks) — rdi, rsi, rdx.
+      //
+      // Die Befehlsfolge ist NICHT hier entworfen, sondern aus einer
+      // Assembler-Fassung uebernommen, die beide NIST-Vektoren fuer
+      // SHA-256 bitgleich liefert („abc" und die leere Nachricht), unter
+      // `qemu-x86_64 -cpu max` ausgefuehrt. Die Entwicklungsmaschine
+      // (i5-8250U) hat kein SHA-NI; qemu emuliert es, VAES dagegen nicht.
+      // Register und Reihenfolge stehen bei cg_shaRnds.
+      //
+      // Der Zustand kommt und geht in ABCDEFGH (FIPS 180-4). Die Befehle
+      // brauchen ihn als ABEF/CDGH, jeweils lane-verdreht — diese
+      // Umordnung steht vor und hinter der Schleife, nicht beim Aufrufer.
+      var shaK: int64 := self.cg_shaKTabelle();
+      var shaM: int64 := shaK + 256;   // Byteumkehrmaske direkt hinter der Tabelle
+      // Null Bloecke: nichts tun. Ohne diese Frage liefe die Schleife
+      // 2^64 mal durch, denn geprueft wird unten mit `dec`/`jnz`.
+      self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xD2);                       // test rdx, rdx
+      self.cg_e8(0x0F); self.cg_e8(0x84); var shaEnde: int64 := self.codeLen; self.cg_e32(0);  // jz ende
+      self.cg_emitLeaRaxData(shaK);
+      self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xC0);                       // mov r8, rax
+      self.cg_emitLeaRaxData(shaM);
+      self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xC1);                       // mov r9, rax
+      self.cg_e8(0xF3); self.cg_e8(0x45); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0x11);  // movdqu xmm10, [r9]
+      // Zustand laden und nach ABEF / CDGH umordnen
+      self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0x0F);     // movdqu xmm1, [rdi]
+      self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0x57); self.cg_e8(0x10);  // movdqu xmm2, [rdi+16]
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x70); self.cg_e8(0xC9); self.cg_e8(0xB1);  // pshufd xmm1, xmm1, 0xB1
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x70); self.cg_e8(0xD2); self.cg_e8(0x1B);  // pshufd xmm2, xmm2, 0x1B
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0xD9);     // movdqa xmm3, xmm1
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x3A); self.cg_e8(0x0F); self.cg_e8(0xCA); self.cg_e8(0x08);  // palignr xmm1, xmm2, 8
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x3A); self.cg_e8(0x0E); self.cg_e8(0xD3); self.cg_e8(0xF0);  // pblendw xmm2, xmm3, 0xF0
+      var shaTop: int64 := self.codeLen;
+      self.cg_e8(0x66); self.cg_e8(0x44); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0xC1);  // movdqa xmm8, xmm1
+      self.cg_e8(0x66); self.cg_e8(0x44); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0xCA);  // movdqa xmm9, xmm2
+      // Die vier Nachrichtenviertel laden und byteweise drehen (big-endian
+      // im Standard, little-endian im Register).
+      self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0x26);     // movdqu xmm4, [rsi]
+      self.cg_e8(0x66); self.cg_e8(0x41); self.cg_e8(0x0F); self.cg_e8(0x38); self.cg_e8(0x00); self.cg_e8(0xE2);  // pshufb xmm4, xmm10
+      self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0x6E); self.cg_e8(0x10);  // movdqu xmm5, [rsi+16]
+      self.cg_e8(0x66); self.cg_e8(0x41); self.cg_e8(0x0F); self.cg_e8(0x38); self.cg_e8(0x00); self.cg_e8(0xEA);  // pshufb xmm5, xmm10
+      self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0x76); self.cg_e8(0x20);  // movdqu xmm6, [rsi+32]
+      self.cg_e8(0x66); self.cg_e8(0x41); self.cg_e8(0x0F); self.cg_e8(0x38); self.cg_e8(0x00); self.cg_e8(0xF2);  // pshufb xmm6, xmm10
+      self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0x7E); self.cg_e8(0x30);  // movdqu xmm7, [rsi+48]
+      self.cg_e8(0x66); self.cg_e8(0x41); self.cg_e8(0x0F); self.cg_e8(0x38); self.cg_e8(0x00); self.cg_e8(0xFA);  // pshufb xmm7, xmm10
+      // Runden 0..15: noch ohne Plan, die Nachricht steht schon da.
+      self.cg_shaRnds(4, 0);
+      self.cg_shaRnds(5, 16);
+      self.cg_shaRnds(6, 32);
+      self.cg_shaRnds(7, 48);
+      // Runden 16..63: je vier Viertel fortschreiben und verrechnen. Die
+      // Viertel rotieren (4,5,6,7 → 5,6,7,4 → …), darum die vier Zeilen je
+      // Gruppe und nicht eine Schleife — der Emitter rollt sie aus, der
+      // erzeugte Code hat sie dann ohne Zaehler.
+      var shaR: int64 := 64;
+      while (shaR < 256) {
+        self.cg_shaSched(4, 5, 6, 7); self.cg_shaRnds(4, shaR);
+        self.cg_shaSched(5, 6, 7, 4); self.cg_shaRnds(5, shaR + 16);
+        self.cg_shaSched(6, 7, 4, 5); self.cg_shaRnds(6, shaR + 32);
+        self.cg_shaSched(7, 4, 5, 6); self.cg_shaRnds(7, shaR + 48);
+        shaR := shaR + 64;
+      }
+      self.cg_e8(0x66); self.cg_e8(0x41); self.cg_e8(0x0F); self.cg_e8(0xFE); self.cg_e8(0xC8);  // paddd xmm1, xmm8
+      self.cg_e8(0x66); self.cg_e8(0x41); self.cg_e8(0x0F); self.cg_e8(0xFE); self.cg_e8(0xD1);  // paddd xmm2, xmm9
+      self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC6); self.cg_e8(0x40);     // add rsi, 64
+      self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xCA);                       // dec rdx
+      self.cg_e8(0x0F); self.cg_e8(0x85); self.cg_e32(shaTop - self.codeLen - 4); // jnz top
+      // zurueck nach ABCDEFGH
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x70); self.cg_e8(0xC9); self.cg_e8(0x1B);  // pshufd xmm1, xmm1, 0x1B
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x70); self.cg_e8(0xD2); self.cg_e8(0xB1);  // pshufd xmm2, xmm2, 0xB1
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0xD9);     // movdqa xmm3, xmm1
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x3A); self.cg_e8(0x0E); self.cg_e8(0xCA); self.cg_e8(0xF0);  // pblendw xmm1, xmm2, 0xF0
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x3A); self.cg_e8(0x0F); self.cg_e8(0xD3); self.cg_e8(0x08);  // palignr xmm2, xmm3, 8
+      self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x7F); self.cg_e8(0x0F);     // movdqu [rdi], xmm1
+      self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x7F); self.cg_e8(0x57); self.cg_e8(0x10);  // movdqu [rdi+16], xmm2
+      poke32(self.code + shaEnde, self.codeLen - shaEnde - 4);
       self.cg_zeroRax();
 
     } else if (self.cg_seq(fname, fnlen, "rdrand64", 8) ||
@@ -32981,6 +33157,7 @@ pub type Codegen = class {
     self.inlArgCount  := 0;
 
     self.simdZielOff := 1;   // #2213: keine Zielablage
+    self.shaKOff := 0 - 1;   // #2391: K-Tabelle noch nicht im Datensegment
     self.p32Wunsch := 0;     // #2247
     self.mmapOomSprung := 0; // #2296
     self.p32Erfuellt := 0;
