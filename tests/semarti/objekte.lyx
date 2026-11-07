@@ -1,0 +1,237 @@
+// Das dynamische Objektmodell: Handles mit Generation, Namensbereiche,
+// Besitzhierarchie, Beziehungen, Revisionen, Leihscheine — und die
+// objektbezogene Autorisierung.
+//
+// Der Kern dieses Tests sind drei Nachweise, die jeder für sich eine ganze
+// Fehlerklasse abdecken:
+//   * Ein VERALTETES Handle trifft nicht den Nachmieter seines Platzes.
+//   * Ein Objekt kann nicht verschwinden, während darauf zugegriffen wird.
+//   * Dieselbe Operation kann auf einem Objekt erlaubt und auf einem anderen
+//     verboten sein — `fs.read` unterscheidet keine Dokumente.
+@capabilities([fs.read])
+unit main;
+
+import std.io;
+import std.string;
+import std.semarti.wert;
+import std.semarti.schema;
+import std.semarti.registry;
+import std.semarti.objekte;
+import std.semarti.ablauf;
+
+var _fehler: int64 := 0;
+var _handlerLaeufe: int64 := 0;
+var _handlerSahObjekt: int64 := 0;
+
+fn pruefe(name: pchar, b: int64): void {
+  if (b != 0) { PrintStr("PASS "c); PrintStrLn(name); }
+  else { PrintStr("FAIL "c); PrintStrLn(name); _fehler := _fehler + 1; }
+}
+
+// ── Handler, der mit einer Instanz arbeitet ─────────────────────────────────
+fn titelLesen(eingabe: int64, ausgabe: int64, objekt: int64, principal: int64): int64 {
+  _handlerLaeufe := _handlerLaeufe + 1;
+  _handlerSahObjekt := objekt;
+  // Während des Handlers liegt ein Leihschein: das Objekt kann nicht
+  // freigegeben werden.
+  if (ObjektFreigeben(objekt) != SRO_E_VERLEIHT) { return 1; }
+  WertFeldSetzen(ausgabe, "content"c, WertText(ObjektLeseText(objekt, "title"c)));
+  return 0;
+}
+
+fn listeHandler(eingabe: int64, ausgabe: int64, objekt: int64, principal: int64): int64 {
+  _handlerLaeufe := _handlerLaeufe + 1;
+  WertFeldSetzen(ausgabe, "content"c, WertText("liste"c));
+  return 0;
+}
+
+// ── Haken: objektbezogen ────────────────────────────────────────────────────
+// Der Nutzer "leser" darf nur das Dokument, dessen Eigenschaft
+// `besitzer` auf ihn zeigt. Das ist die Unterscheidung, die eine
+// Capability allein nicht leisten kann.
+fn authorizer(oi: int64, objekt: int64, principal: pchar): int64 {
+  if (StrLen(principal) == 0) { return 0; }
+  if (objekt == SRO_WURZEL) { return 1; }
+  var b: pchar := ObjektLeseText(objekt, "besitzer"c);
+  if (StrLen(b) == 0) { return 0; }
+  if (StrEq(b, principal) != 0 && StrLen(b) == StrLen(principal)) { return 1; }
+  return 0;
+}
+
+fn policy(oi: int64, objekt: int64, eingabe: int64, principal: pchar): int64 {
+  return SRA_POLICY_ERLAUBT;
+}
+
+fn audit(oi: int64, code: int64, principal: pchar): int64 { return 0; }
+
+fn schemaMit(feld: pchar): int64 {
+  var s: int64 := WertObjekt();
+  WertFeldSetzen(s, "type"c, WertText("object"c));
+  var p: int64 := WertObjekt();
+  var f: int64 := WertObjekt();
+  WertFeldSetzen(f, "type"c, WertText("string"c));
+  WertFeldSetzen(p, feld, f);
+  WertFeldSetzen(s, "properties"c, p);
+  var r: int64 := WertListe();
+  WertGliedAnhaengen(r, WertText(feld));
+  WertFeldSetzen(s, "required"c, r);
+  return s;
+}
+
+fn leereEingabe(): int64 {
+  var e: int64 := WertObjekt();
+  WertFeldSetzen(e, "key"c, WertText("x"c));
+  return e;
+}
+
+fn main(): int64 {
+  // ── Handles mit Generation ────────────────────────────────────────────────
+  var projekt: int64 := ObjektRegistrieren("Project"c, "Angebote"c, SRO_WURZEL);
+  pruefe("wurzelobjekt_registriert"c, projekt > 0);
+  var d1: int64 := ObjektRegistrieren("Document"c, "angebot-4711"c, projekt);
+  var d2: int64 := ObjektRegistrieren("Document"c, "angebot-4712"c, projekt);
+  pruefe("zwei_kinder_registriert"c, d1 > 0 && d2 > 0 && d1 != d2);
+  pruefe("eltern_stimmt"c, ObjektEltern(d1) == projekt);
+  pruefe("kinderzahl"c, ObjektKinderZahl(projekt) == 2);
+
+  // Namen sind im Bereich eindeutig — und nur dort.
+  pruefe("name_doppelt_im_bereich"c,
+      ObjektRegistrieren("Document"c, "angebot-4711"c, projekt) == SRO_E_NAME_DOPPELT);
+  var anderes: int64 := ObjektRegistrieren("Project"c, "Rechnungen"c, SRO_WURZEL);
+  pruefe("gleicher_name_in_anderem_bereich_erlaubt"c,
+      ObjektRegistrieren("Document"c, "angebot-4711"c, anderes) > 0);
+
+  // Auflösen über Namen.
+  pruefe("find_name_trifft"c, ObjektNameImBereich(projekt, "angebot-4712"c) == d2);
+  pruefe("find_name_praefix_trifft_nicht"c, ObjektNameImBereich(projekt, "angebot-471"c) == SRO_E_NICHT_GEFUNDEN);
+
+  // DER Nachweis gegen veraltete Referenzen: ein freigegebenes Handle darf
+  // nicht den nächsten Bewohner seines Platzes treffen.
+  var weg: int64 := ObjektRegistrieren("Document"c, "wird-geschlossen"c, projekt);
+  pruefe("drittes_dokument"c, weg > 0);
+  pruefe("freigeben_ok"c, ObjektFreigeben(weg) == SRO_OK);
+  pruefe("altes_handle_ist_veraltet"c, ObjektPlatz(weg) == SRO_E_HANDLE_VERALTET);
+  var nachmieter: int64 := ObjektRegistrieren("Document"c, "neues-dokument"c, projekt);
+  pruefe("nachmieter_bekam_denselben_platz"c, (nachmieter & 1048575) == (weg & 1048575));
+  pruefe("nachmieter_hat_andere_generation"c, nachmieter != weg);
+  pruefe("altes_handle_trifft_nachmieter_nicht"c, ObjektPlatz(weg) == SRO_E_HANDLE_VERALTET);
+  pruefe("altes_handle_liest_keinen_namen"c, StrLen(ObjektName(weg)) == 0);
+
+  // Eltern mit Kindern können nicht verschwinden.
+  pruefe("eltern_mit_kindern_nicht_freigebbar"c, ObjektFreigeben(projekt) == SRO_E_HAT_KINDER);
+
+  // ── Eigenschaften und Revision ───────────────────────────────────────────
+  var rev0: int64 := ObjektRevision(d1);
+  ObjektEigenschaftText(d1, "title"c, "Angebot"c);
+  var rev1: int64 := ObjektRevision(d1);
+  pruefe("revision_waechst_bei_aenderung"c, rev1 > rev0);
+  pruefe("titel_lesbar"c, StrEq(ObjektLeseText(d1, "title"c), "Angebot"c) != 0);
+  ObjektEigenschaftText(d1, "title"c, "Angebot v2"c);
+  pruefe("revision_waechst_erneut"c, ObjektRevision(d1) > rev1);
+  pruefe("titel_aktualisiert"c, StrEq(ObjektLeseText(d1, "title"c), "Angebot v2"c) != 0);
+  ObjektEigenschaftZahl(d1, "seiten"c, 12);
+  pruefe("zahl_lesbar"c, ObjektLeseZahl(d1, "seiten"c) == 12);
+  pruefe("zahl_ist_keine_textfrage"c, StrLen(ObjektLeseText(d1, "seiten"c)) == 0);
+  pruefe("fehlende_eigenschaft_meldet"c, ObjektLeseZahl(d1, "gibtsnicht"c) == SRO_E_EIGENSCHAFT_FEHLT);
+
+  // ── Beziehungen, getrennt von der Besitzhierarchie ───────────────────────
+  var fenster: int64 := ObjektRegistrieren("Window"c, "fenster-1"c, SRO_WURZEL);
+  ObjektBeziehungSetzen(fenster, "zeigt"c, d1);
+  ObjektBeziehungSetzen(fenster, "zeigt"c, d2);
+  pruefe("beziehung_gezaehlt"c, ObjektBeziehungZahl(fenster, "zeigt"c) == 2);
+  pruefe("beziehung_aufloesbar"c, ObjektBeziehung(fenster, "zeigt"c, 0) == d1);
+  pruefe("unbekannte_beziehung_leer"c, ObjektBeziehungZahl(fenster, "besitzt"c) == 0);
+  // Das Fenster BESITZT die Dokumente nicht: die Hierarchie bleibt getrennt.
+  pruefe("beziehung_ist_kein_besitz"c, ObjektEltern(d1) == projekt);
+
+  // ── Leihschein ───────────────────────────────────────────────────────────
+  pruefe("leihen_ok"c, ObjektLeihen(d2) == SRO_OK);
+  pruefe("verleiht_nicht_freigebbar"c, ObjektFreigeben(d2) == SRO_E_VERLEIHT);
+  pruefe("zurueckgeben_ok"c, ObjektZurueckgeben(d2) == SRO_OK);
+  pruefe("zuviel_zurueckgeben_meldet"c, ObjektZurueckgeben(d2) == SRO_E_HANDLE_UNGUELTIG);
+
+  // ── Beschreibung ist eine Momentaufnahme ─────────────────────────────────
+  var b: int64 := ObjektBeschreiben(d1);
+  pruefe("beschreibung_hat_schema"c, StrEq(WertTextwert(WertFeld(b, "schema"c)), "Document"c) != 0);
+  pruefe("beschreibung_hat_revision"c, WertZahlwert(WertFeld(b, "revision"c)) == ObjektRevision(d1));
+  var eig: int64 := WertFeld(b, "eigenschaften"c);
+  pruefe("beschreibung_hat_titel"c, StrEq(WertTextwert(WertFeld(eig, "title"c)), "Angebot v2"c) != 0);
+  // Keine Handles in der Beschreibung: ein Handle ist eine Fähigkeit.
+  pruefe("beschreibung_nennt_nur_kinderzahl"c, WertZahlwert(WertFeld(b, "kinder"c)) >= 0);
+
+  // ── Aufruf mit Instanzbindung ────────────────────────────────────────────
+  ObjektEigenschaftText(d1, "besitzer"c, "leser"c);
+  ObjektEigenschaftText(d2, "besitzer"c, "jemand-anders"c);
+
+  RegistryProgrammCapability("fs.read"c);
+  var caps: int64 := alloc(8);
+  poke64(caps, "fs.read"c as int64);
+
+  var oiTitel: int64 := RegistryHinzufuegen("com.example.document.read_title"c, 1, 0, 0,
+      "Titel lesen"c, "Liest den Titel eines Dokuments."c,
+      schemaMit("key"c), schemaMit("content"c), titelLesen,
+      SRR_RISIKO_NUR_LESEN, SRR_BESTAETIGUNG_NICHT_NOETIG, caps, 1, SRR_OBJEKT_NOETIG);
+  var oiListe: int64 := RegistryHinzufuegen("com.example.storage.list"c, 1, 0, 0,
+      "Auflisten"c, "Listet ohne Instanz."c,
+      schemaMit("key"c), schemaMit("content"c), listeHandler,
+      SRR_RISIKO_NUR_LESEN, SRR_BESTAETIGUNG_NICHT_NOETIG, caps, 1, SRR_OBJEKT_KEINES);
+  pruefe("beide_operationen_registriert"c, oiTitel >= 0 && oiListe >= 0);
+  pruefe("unbekannte_objektbindung_abgewiesen"c,
+      RegistryHinzufuegen("com.example.x"c, 1, 0, 0, "x"c, "y"c,
+        schemaMit("key"c), schemaMit("content"c), listeHandler,
+        SRR_RISIKO_NUR_LESEN, SRR_BESTAETIGUNG_NICHT_NOETIG, caps, 1, 7) == SRR_E_OBJEKTBINDUNG_UNBEKANNT);
+
+  RegistryAbschliessen();
+  AblaufAuthorizerSetzen(authorizer);
+  AblaufPolicySetzen(policy);
+  AblaufAuditSetzen(audit);
+
+  // Der gute Fall: eigenes Dokument.
+  var v0: int64 := _handlerLaeufe;
+  pruefe("eigenes_dokument_erlaubt"c,
+      AblaufAufrufen("com.example.document.read_title"c, 1, 0, d1, leereEingabe(), "leser"c, 0) == SRA_OK);
+  pruefe("handler_sah_das_objekt"c, _handlerSahObjekt == d1);
+  pruefe("handler_lief_einmal"c, _handlerLaeufe == v0 + 1);
+  pruefe("ausgabe_traegt_den_titel"c,
+      StrEq(WertTextwert(WertFeld(AblaufLetzteAusgabe(), "content"c)), "Angebot v2"c) != 0);
+
+  // DER Nachweis für Punkt 2: dieselbe Operation, dasselbe Recht, anderes
+  // Objekt — und sie ist verboten.
+  var v1: int64 := _handlerLaeufe;
+  pruefe("fremdes_dokument_verboten"c,
+      AblaufAufrufen("com.example.document.read_title"c, 1, 0, d2, leereEingabe(), "leser"c, 0) == SRA_UNAUTHORIZED);
+  pruefe("fremdes_dokument_handler_nicht_gelaufen"c, _handlerLaeufe == v1);
+  pruefe("fremdes_dokument_keine_wirkung"c, AblaufWirkungEingetreten() == 0);
+
+  // Instanzbindung wird in beide Richtungen erzwungen.
+  pruefe("ohne_instanz_abgewiesen"c,
+      AblaufAufrufen("com.example.document.read_title"c, 1, 0, SRO_WURZEL, leereEingabe(), "leser"c, 0) == SRA_OBJECT_REQUIRED);
+  pruefe("instanz_wo_keine_erlaubt_ist"c,
+      AblaufAufrufen("com.example.storage.list"c, 1, 0, d1, leereEingabe(), "leser"c, 0) == SRA_OBJECT_NOT_ALLOWED);
+  pruefe("ohne_instanz_richtig"c,
+      AblaufAufrufen("com.example.storage.list"c, 1, 0, SRO_WURZEL, leereEingabe(), "leser"c, 0) == SRA_OK);
+
+  // Veraltetes Handle: eigener Befund, nicht „ungültig".
+  var temp: int64 := ObjektRegistrieren("Document"c, "temporaer"c, projekt);
+  ObjektEigenschaftText(temp, "besitzer"c, "leser"c);
+  ObjektFreigeben(temp);
+  var v2: int64 := _handlerLaeufe;
+  pruefe("veraltetes_handle_eigener_befund"c,
+      AblaufAufrufen("com.example.document.read_title"c, 1, 0, temp, leereEingabe(), "leser"c, 0) == SRA_OBJECT_STALE);
+  pruefe("veraltetes_handle_handler_nicht_gelaufen"c, _handlerLaeufe == v2);
+  pruefe("handle_null_ist_nicht_gueltig"c,
+      AblaufAufrufen("com.example.document.read_title"c, 1, 0, 999999, leereEingabe(), "leser"c, 0) == SRA_OBJECT_STALE
+      || AblaufAufrufen("com.example.document.read_title"c, 1, 0, 999999, leereEingabe(), "leser"c, 0) == SRA_OBJECT_INVALID);
+
+  // Der Leihschein wurde nach dem Aufruf zurückgegeben — sonst wäre das
+  // Objekt für immer unfreigebbar.
+  pruefe("leihschein_nach_aufruf_zurueck"c, ObjektLeihscheine(d1) == 0);
+
+  // Discovery je Objekt: dasselbe Werkzeug, zwei Antworten.
+  pruefe("discovery_auf_eigenem_dokument"c, AblaufSichtbar(oiTitel, d1, "leser"c) == 1);
+  pruefe("discovery_auf_fremdem_dokument"c, AblaufSichtbar(oiTitel, d2, "leser"c) == 0);
+
+  if (_fehler != 0) { PrintStr("FEHLER="c); PrintLn(_fehler); return 1; }
+  PrintStrLn("ALL PASS"c);
+  return 0;
+}

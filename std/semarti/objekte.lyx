@@ -1,0 +1,543 @@
+// std/semarti/objekte.lyx — dynamisches Objektregister für SemaRTI.
+//
+// WARUM DAS NICHT IN DIE REGISTRY GEHÖRT. Deskriptoren sind unveränderlich,
+// sobald die Aufbauphase vorbei ist — darauf ruhen alle Prüfungen des
+// Ablaufs. Instanzen sind das Gegenteil: ein Fenster öffnet sich, ein
+// Dokument wird geschlossen, ein Titel ändert sich. Beides in einen Speicher
+// zu legen hiesse, die Unveränderlichkeit aufzugeben, von der die
+// Aufrufprüfung lebt.
+//
+// Die Trennung in Zahlen:
+//
+//   statische Beschreibung          dynamische Instanz
+//   ------------------------------  ------------------------------
+//   Schema `Document`               geöffnetes Dokument, Handle 4711
+//   Operation `document.export`     Aufruf auf Dokument 4711
+//   Eigenschaft `title: string`     aktueller Titel „Angebot"
+//   unterstützte Beziehungen        konkrete Zuordnung zum Fenster
+//
+// WARUM AUCH NICHT IN DIE WERT-ARENA. Die hat zwei Phasen: vor der Marke die
+// Deskriptoren, danach die Werte eines einzelnen Aufrufs, die beim nächsten
+// Zurücksetzen verschwinden. Ein Objektregister passt in keine davon — es
+// ist langlebig UND veränderlich. Es bekommt deshalb seinen eigenen
+// Speicher, und das ist die DRITTE Lebensdauer im System. Ein Bereich, eine
+// Rolle: dieselbe Regel, die der Marke zugrunde liegt.
+//
+// VIER DINGE, DIE EIN OBJEKTREGISTER OHNE AUSNAHME BRAUCHT:
+//
+//  1. HANDLES MIT GENERATION. Ein Index allein zeigt nach dem Freigeben auf
+//     das nächste Objekt, das den Platz bekommt — ein veraltetes Handle
+//     träfe dann stillschweigend ein fremdes Dokument. Jedes Handle trägt
+//     deshalb die Generation seines Platzes; stimmt sie nicht, ist das
+//     Handle veraltet und wird abgewiesen. Das ist dieselbe Fehlerart wie
+//     ein wiederverwendeter Kratzbereich, und sie ist in diesem Baum fünfmal
+//     aufgetreten.
+//  2. EINDEUTIGE NAMEN IM BEREICH. Zwei Geschwister mit demselben Namen
+//     machen jede Auflösung über Namen zufällig. Der Bereich ist das
+//     Elternobjekt; auf oberster Ebene die Wurzel.
+//  3. LEBENSDAUER WÄHREND DES ZUGRIFFS. Solange ein Zugriff offen ist, darf
+//     das Objekt nicht verschwinden. `ObjektFreigeben` scheitert, solange
+//     ein Leihschein offen ist — statt die Entfernung zu erlauben und den
+//     Leser auf einen toten Platz zeigen zu lassen.
+//  4. REVISION. Jede Änderung einer Eigenschaft erhöht sie. Ein Aufrufer,
+//     der eine Eigenschaft gelesen und dann gehandelt hat, kann prüfen, ob
+//     sein Wissen noch gilt — ohne Sperre und ohne Rückfrage.
+
+@description("SemaRTI: dynamisches Objektregister mit Handles, Hierarchie und Beziehungen")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+unit std.semarti.objekte;
+
+import std.alloc;
+import std.string;
+import std.semarti.wert;
+
+// ── Grenzen ─────────────────────────────────────────────────────────────────
+pub con SRO_MAX_OBJEKTE:    int64 := 4096;
+pub con SRO_MAX_NAME:       int64 := 128;
+pub con SRO_MAX_EIGENSCHAFTEN: int64 := 16;    // je Objekt
+pub con SRO_MAX_BEZIEHUNGEN:   int64 := 8192;  // im ganzen Register
+pub con SRO_MAX_TEXTRAUM:   int64 := 1048576;
+pub con SRO_MAX_TIEFE:      int64 := 32;       // Besitzhierarchie
+
+// Handle: untere 20 Bit Platzindex, darüber die Generation. Die Generation
+// beginnt bei 1, damit das Handle 0 niemals gültig ist — ein nicht gesetztes
+// Feld ist dann kein Treffer.
+pub con SRO_IDX_BITS: int64 := 20;
+pub con SRO_IDX_MASKE: int64 := 1048575;
+
+pub con SRO_WURZEL: int64 := 0;   // Bereich „oberste Ebene"
+
+// ── Befunde ─────────────────────────────────────────────────────────────────
+pub con SRO_OK:                int64 := 0;
+pub con SRO_E_VOLL:            int64 := 0 - 1;
+pub con SRO_E_HANDLE_UNGUELTIG: int64 := 0 - 2;
+pub con SRO_E_HANDLE_VERALTET: int64 := 0 - 3;
+pub con SRO_E_NAME_LEER:       int64 := 0 - 4;
+pub con SRO_E_NAME_ZU_LANG:    int64 := 0 - 5;
+pub con SRO_E_NAME_DOPPELT:    int64 := 0 - 6;
+pub con SRO_E_ELTERN_UNGUELTIG: int64 := 0 - 7;
+pub con SRO_E_ZU_TIEF:         int64 := 0 - 8;
+pub con SRO_E_TEXTRAUM_VOLL:   int64 := 0 - 9;
+pub con SRO_E_ZU_VIELE_EIGENSCHAFTEN: int64 := 0 - 10;
+pub con SRO_E_EIGENSCHAFT_FEHLT: int64 := 0 - 11;
+pub con SRO_E_VERLEIHT:        int64 := 0 - 12;
+pub con SRO_E_HAT_KINDER:      int64 := 0 - 13;
+pub con SRO_E_BEZIEHUNGEN_VOLL: int64 := 0 - 14;
+pub con SRO_E_NICHT_GEFUNDEN:  int64 := 0 - 15;
+pub con SRO_E_KREIS:           int64 := 0 - 16;
+
+// ── Speicher ────────────────────────────────────────────────────────────────
+// Je Platz ein Satz:
+//  [0] belegt (0/1)        [8] generation       [16] schemaId (pchar)
+// [24] nameOff            [32] eltern (Handle)  [40] revision
+// [48] leihscheine        [56] eigAnzahl        [64] eigNamen (Puffer)
+// [72] eigWerte (Puffer)  [80] eigIstText (Puffer)
+con SRO_PLATZ_BYTES: int64 := 96;
+
+var _plaetze: int64 := 0;
+var _text: int64 := 0;
+var _textEnde: int64 := 0;
+var _bezVon: int64 := 0;      // Beziehungen: von-Handle
+var _bezNach: int64 := 0;     // nach-Handle
+var _bezArt: int64 := 0;      // Name der Beziehung (Textversatz)
+var _bezAnzahl: int64 := 0;
+var _bereit: int64 := 0;
+
+fn oInit(): void {
+  if (_bereit != 0) { return; }
+  _plaetze := alloc(SRO_MAX_OBJEKTE * SRO_PLATZ_BYTES);
+  _text := alloc(SRO_MAX_TEXTRAUM);
+  _bezVon := alloc(SRO_MAX_BEZIEHUNGEN * 8);
+  _bezNach := alloc(SRO_MAX_BEZIEHUNGEN * 8);
+  _bezArt := alloc(SRO_MAX_BEZIEHUNGEN * 8);
+  // Alle Plätze unbelegt, Generation 1: ein Handle mit Generation 0 kann so
+  // nie gültig werden.
+  var i: int64 := 0;
+  while (i < SRO_MAX_OBJEKTE) {
+    poke64(_plaetze + i * SRO_PLATZ_BYTES, 0);
+    poke64(_plaetze + i * SRO_PLATZ_BYTES + 8, 1);
+    i := i + 1;
+  }
+  _bereit := 1;
+}
+
+fn oZelle(idx: int64, nr: int64): int64 { return _plaetze + idx * SRO_PLATZ_BYTES + nr * 8; }
+
+fn oHandleBauen(idx: int64, gen: int64): int64 { return (gen << SRO_IDX_BITS) | idx; }
+fn oIdx(h: int64): int64 { return h & SRO_IDX_MASKE; }
+fn oGen(h: int64): int64 { return (h >> SRO_IDX_BITS) & 4398046511103; }
+
+// Löst ein Handle auf: Platzindex oder ein Befund. Die Generationsprüfung ist
+// der Kern — ein Handle auf einen inzwischen freigegebenen Platz wird als
+// VERALTET gemeldet und nicht als Treffer auf den Nachmieter.
+pub fn ObjektPlatz(h: int64): int64 {
+  oInit();
+  if (h <= 0) { return SRO_E_HANDLE_UNGUELTIG; }
+  var idx: int64 := oIdx(h);
+  if (idx >= SRO_MAX_OBJEKTE) { return SRO_E_HANDLE_UNGUELTIG; }
+  if (peek64(oZelle(idx, 0)) == 0) { return SRO_E_HANDLE_VERALTET; }
+  if (peek64(oZelle(idx, 1)) != oGen(h)) { return SRO_E_HANDLE_VERALTET; }
+  return idx;
+}
+
+pub fn ObjektGueltig(h: int64): int64 {
+  if (ObjektPlatz(h) >= 0) { return 1; }
+  return 0;
+}
+
+fn oTextAblegen(s: pchar, n: int64): int64 {
+  if (_textEnde + n + 1 > SRO_MAX_TEXTRAUM) { return SRO_E_TEXTRAUM_VOLL; }
+  var ziel: int64 := _textEnde;
+  var i: int64 := 0;
+  while (i < n) { poke8(_text + ziel + i, peek8(s + i)); i := i + 1; }
+  poke8(_text + ziel + n, 0);
+  _textEnde := _textEnde + n + 1;
+  return ziel;
+}
+
+fn oName(idx: int64): pchar { return (_text + peek64(oZelle(idx, 3))) as pchar; }
+
+// Tiefe der Besitzkette. Dient zwei Zwecken: der Grenze und der
+// Kreisprüfung — eine Kette, die länger wird als es Objekte gibt, ist ein
+// Kreis.
+fn oTiefe(h: int64): int64 {
+  var t: int64 := 0;
+  var cur: int64 := h;
+  while (cur != SRO_WURZEL) {
+    var p: int64 := ObjektPlatz(cur);
+    if (p < 0) { return 0 - 1; }
+    cur := peek64(oZelle(p, 4));
+    t := t + 1;
+    if (t > SRO_MAX_TIEFE) { return 0 - 1; }
+  }
+  return t;
+}
+
+// ── Registrieren ────────────────────────────────────────────────────────────
+// Namen sind innerhalb ihres Bereichs eindeutig. Verglichen wird auf
+// Gleichheit, nie auf Präfix.
+pub fn ObjektNameImBereich(eltern: int64, name: pchar): int64 {
+  oInit();
+  var nl: int64 := StrLen(name);
+  var i: int64 := 0;
+  while (i < SRO_MAX_OBJEKTE) {
+    if (peek64(oZelle(i, 0)) != 0 && peek64(oZelle(i, 4)) == eltern) {
+      var n: pchar := oName(i);
+      if (StrLen(n) == nl && StrEq(n, name) != 0) {
+        return oHandleBauen(i, peek64(oZelle(i, 1)));
+      }
+    }
+    i := i + 1;
+  }
+  return SRO_E_NICHT_GEFUNDEN;
+}
+
+pub fn ObjektRegistrieren(schemaId: pchar, name: pchar, eltern: int64): int64 {
+  oInit();
+  if (StrLen(name) == 0) { return SRO_E_NAME_LEER; }
+  if (StrLen(name) > SRO_MAX_NAME) { return SRO_E_NAME_ZU_LANG; }
+  if (eltern != SRO_WURZEL) {
+    if (ObjektPlatz(eltern) < 0) { return SRO_E_ELTERN_UNGUELTIG; }
+    var te: int64 := oTiefe(eltern);
+    if (te < 0) { return SRO_E_KREIS; }
+    if (te + 1 > SRO_MAX_TIEFE) { return SRO_E_ZU_TIEF; }
+  }
+  if (ObjektNameImBereich(eltern, name) >= 0) { return SRO_E_NAME_DOPPELT; }
+
+  var idx: int64 := 0 - 1;
+  var i: int64 := 0;
+  while (i < SRO_MAX_OBJEKTE) {
+    if (peek64(oZelle(i, 0)) == 0) { idx := i; i := SRO_MAX_OBJEKTE; }
+    else { i := i + 1; }
+  }
+  if (idx < 0) { return SRO_E_VOLL; }
+
+  var nOff: int64 := oTextAblegen(name, StrLen(name));
+  if (nOff < 0) { return nOff; }
+
+  poke64(oZelle(idx, 0), 1);
+  poke64(oZelle(idx, 2), schemaId as int64);
+  poke64(oZelle(idx, 3), nOff);
+  poke64(oZelle(idx, 4), eltern);
+  poke64(oZelle(idx, 5), 1);        // Revision beginnt bei 1
+  poke64(oZelle(idx, 6), 0);        // keine Leihscheine
+  poke64(oZelle(idx, 7), 0);        // keine Eigenschaften
+  poke64(oZelle(idx, 8), alloc(SRO_MAX_EIGENSCHAFTEN * 8));
+  poke64(oZelle(idx, 9), alloc(SRO_MAX_EIGENSCHAFTEN * 8));
+  poke64(oZelle(idx, 10), alloc(SRO_MAX_EIGENSCHAFTEN * 8));
+  return oHandleBauen(idx, peek64(oZelle(idx, 1)));
+}
+
+// Gibt ein Objekt frei. Scheitert, solange ein Leihschein offen ist oder das
+// Objekt Kinder hat: eine Hierarchie mit verwaisten Kindern wäre nicht mehr
+// ablaufbar, und ein offener Zugriff zeigte auf einen toten Platz.
+//
+// Beim Freigeben wird die GENERATION erhöht. Jedes vorher ausgegebene Handle
+// ist damit veraltet und wird als solches gemeldet — nicht als Treffer auf
+// den Nachmieter des Platzes.
+pub fn ObjektFreigeben(h: int64): int64 {
+  var idx: int64 := ObjektPlatz(h);
+  if (idx < 0) { return idx; }
+  if (peek64(oZelle(idx, 6)) > 0) { return SRO_E_VERLEIHT; }
+  if (ObjektKinderZahl(h) > 0) { return SRO_E_HAT_KINDER; }
+  // Beziehungen, die dieses Objekt nennen, verschwinden mit ihm: eine Kante
+  // auf ein freigegebenes Objekt wäre ein veraltetes Handle in einer Tabelle,
+  // und das ist genau der Zustand, den die Generationsprüfung verhindern soll.
+  var i: int64 := 0;
+  var neu: int64 := 0;
+  while (i < _bezAnzahl) {
+    var v: int64 := peek64(_bezVon + i * 8);
+    var n: int64 := peek64(_bezNach + i * 8);
+    if (v != h && n != h) {
+      poke64(_bezVon + neu * 8, v);
+      poke64(_bezNach + neu * 8, n);
+      poke64(_bezArt + neu * 8, peek64(_bezArt + i * 8));
+      neu := neu + 1;
+    }
+    i := i + 1;
+  }
+  _bezAnzahl := neu;
+  poke64(oZelle(idx, 0), 0);
+  poke64(oZelle(idx, 1), peek64(oZelle(idx, 1)) + 1);
+  return SRO_OK;
+}
+
+// ── Leihscheine: Lebensdauer während des Zugriffs ───────────────────────────
+// Wer ein Objekt über mehrere Schritte benutzt, nimmt einen Leihschein. Für
+// die Dauer kann es nicht freigegeben werden. Der Leihschein ist KEINE Sperre
+// gegen Änderungen — nur gegen das Verschwinden; Änderungen werden über die
+// Revision erkannt.
+pub fn ObjektLeihen(h: int64): int64 {
+  var idx: int64 := ObjektPlatz(h);
+  if (idx < 0) { return idx; }
+  poke64(oZelle(idx, 6), peek64(oZelle(idx, 6)) + 1);
+  return SRO_OK;
+}
+
+pub fn ObjektZurueckgeben(h: int64): int64 {
+  var idx: int64 := ObjektPlatz(h);
+  if (idx < 0) { return idx; }
+  var c: int64 := peek64(oZelle(idx, 6));
+  if (c <= 0) {
+    // Mehr zurückgegeben als geliehen: ein Fehler im Aufrufer. Laut melden,
+    // statt den Zähler ins Negative laufen zu lassen — sonst erlaubte ein
+    // doppeltes Zurückgeben später die Freigabe eines geliehenen Objekts.
+    return SRO_E_HANDLE_UNGUELTIG;
+  }
+  poke64(oZelle(idx, 6), c - 1);
+  return SRO_OK;
+}
+
+pub fn ObjektLeihscheine(h: int64): int64 {
+  var idx: int64 := ObjektPlatz(h);
+  if (idx < 0) { return idx; }
+  return peek64(oZelle(idx, 6));
+}
+
+// ── Lesen ───────────────────────────────────────────────────────────────────
+pub fn ObjektSchemaId(h: int64): pchar {
+  var idx: int64 := ObjektPlatz(h);
+  if (idx < 0) { return ""c; }
+  return peek64(oZelle(idx, 2)) as pchar;
+}
+
+pub fn ObjektName(h: int64): pchar {
+  var idx: int64 := ObjektPlatz(h);
+  if (idx < 0) { return ""c; }
+  return oName(idx);
+}
+
+pub fn ObjektEltern(h: int64): int64 {
+  var idx: int64 := ObjektPlatz(h);
+  if (idx < 0) { return idx; }
+  return peek64(oZelle(idx, 4));
+}
+
+pub fn ObjektRevision(h: int64): int64 {
+  var idx: int64 := ObjektPlatz(h);
+  if (idx < 0) { return idx; }
+  return peek64(oZelle(idx, 5));
+}
+
+pub fn ObjektKinderZahl(h: int64): int64 {
+  oInit();
+  var n: int64 := 0;
+  var i: int64 := 0;
+  while (i < SRO_MAX_OBJEKTE) {
+    if (peek64(oZelle(i, 0)) != 0 && peek64(oZelle(i, 4)) == h) { n := n + 1; }
+    i := i + 1;
+  }
+  return n;
+}
+
+// Kind Nummer k (0-basiert) oder ein Befund. Die Reihenfolge ist die der
+// Plätze und damit stabil, solange nichts freigegeben wird.
+pub fn ObjektKind(h: int64, k: int64): int64 {
+  oInit();
+  var n: int64 := 0;
+  var i: int64 := 0;
+  while (i < SRO_MAX_OBJEKTE) {
+    if (peek64(oZelle(i, 0)) != 0 && peek64(oZelle(i, 4)) == h) {
+      if (n == k) { return oHandleBauen(i, peek64(oZelle(i, 1))); }
+      n := n + 1;
+    }
+    i := i + 1;
+  }
+  return SRO_E_NICHT_GEFUNDEN;
+}
+
+// ── Eigenschaften ───────────────────────────────────────────────────────────
+// Eine Eigenschaft ist Name -> Text oder Zahl. Jede Änderung erhöht die
+// Revision; so kann ein Aufrufer prüfen, ob sein gelesener Stand noch gilt.
+fn oEigFinden(idx: int64, name: pchar): int64 {
+  var nl: int64 := StrLen(name);
+  var anz: int64 := peek64(oZelle(idx, 7));
+  var namen: int64 := peek64(oZelle(idx, 8));
+  var i: int64 := 0;
+  while (i < anz) {
+    var n: pchar := (_text + peek64(namen + i * 8)) as pchar;
+    if (StrLen(n) == nl && StrEq(n, name) != 0) { return i; }
+    i := i + 1;
+  }
+  return 0 - 1;
+}
+
+fn oEigSetzen(h: int64, name: pchar, wert: int64, istText: int64): int64 {
+  var idx: int64 := ObjektPlatz(h);
+  if (idx < 0) { return idx; }
+  if (StrLen(name) == 0) { return SRO_E_NAME_LEER; }
+  if (StrLen(name) > SRO_MAX_NAME) { return SRO_E_NAME_ZU_LANG; }
+  var k: int64 := oEigFinden(idx, name);
+  if (k < 0) {
+    var anz: int64 := peek64(oZelle(idx, 7));
+    if (anz >= SRO_MAX_EIGENSCHAFTEN) { return SRO_E_ZU_VIELE_EIGENSCHAFTEN; }
+    var nOff: int64 := oTextAblegen(name, StrLen(name));
+    if (nOff < 0) { return nOff; }
+    poke64(peek64(oZelle(idx, 8)) + anz * 8, nOff);
+    k := anz;
+    poke64(oZelle(idx, 7), anz + 1);
+  }
+  poke64(peek64(oZelle(idx, 9)) + k * 8, wert);
+  poke64(peek64(oZelle(idx, 10)) + k * 8, istText);
+  poke64(oZelle(idx, 5), peek64(oZelle(idx, 5)) + 1);
+  return SRO_OK;
+}
+
+pub fn ObjektEigenschaftText(h: int64, name: pchar, wert: pchar): int64 {
+  var off: int64 := oTextAblegen(wert, StrLen(wert));
+  if (off < 0) { return off; }
+  return oEigSetzen(h, name, off, 1);
+}
+
+pub fn ObjektEigenschaftZahl(h: int64, name: pchar, wert: int64): int64 {
+  return oEigSetzen(h, name, wert, 0);
+}
+
+pub fn ObjektEigenschaftAnzahl(h: int64): int64 {
+  var idx: int64 := ObjektPlatz(h);
+  if (idx < 0) { return idx; }
+  return peek64(oZelle(idx, 7));
+}
+
+pub fn ObjektEigenschaftName(h: int64, k: int64): pchar {
+  var idx: int64 := ObjektPlatz(h);
+  if (idx < 0) { return ""c; }
+  if (k < 0 || k >= peek64(oZelle(idx, 7))) { return ""c; }
+  return (_text + peek64(peek64(oZelle(idx, 8)) + k * 8)) as pchar;
+}
+
+pub fn ObjektIstText(h: int64, name: pchar): int64 {
+  var idx: int64 := ObjektPlatz(h);
+  if (idx < 0) { return idx; }
+  var k: int64 := oEigFinden(idx, name);
+  if (k < 0) { return SRO_E_EIGENSCHAFT_FEHLT; }
+  return peek64(peek64(oZelle(idx, 10)) + k * 8);
+}
+
+pub fn ObjektLeseText(h: int64, name: pchar): pchar {
+  var idx: int64 := ObjektPlatz(h);
+  if (idx < 0) { return ""c; }
+  var k: int64 := oEigFinden(idx, name);
+  if (k < 0) { return ""c; }
+  if (peek64(peek64(oZelle(idx, 10)) + k * 8) == 0) { return ""c; }
+  return (_text + peek64(peek64(oZelle(idx, 9)) + k * 8)) as pchar;
+}
+
+pub fn ObjektLeseZahl(h: int64, name: pchar): int64 {
+  var idx: int64 := ObjektPlatz(h);
+  if (idx < 0) { return idx; }
+  var k: int64 := oEigFinden(idx, name);
+  if (k < 0) { return SRO_E_EIGENSCHAFT_FEHLT; }
+  if (peek64(peek64(oZelle(idx, 10)) + k * 8) != 0) { return SRO_E_EIGENSCHAFT_FEHLT; }
+  return peek64(peek64(oZelle(idx, 9)) + k * 8);
+}
+
+// ── Beziehungen ─────────────────────────────────────────────────────────────
+// Getrennt von der Besitzhierarchie: ein Dokument GEHÖRT einem Projekt, ist
+// aber auf einem Fenster ANGEZEIGT. Das erste ist die Kette, die die
+// Lebensdauer bestimmt, das zweite eine benannte Kante ohne Besitz.
+pub fn ObjektBeziehungSetzen(von: int64, art: pchar, nach: int64): int64 {
+  oInit();
+  if (ObjektPlatz(von) < 0) { return ObjektPlatz(von); }
+  if (ObjektPlatz(nach) < 0) { return ObjektPlatz(nach); }
+  if (StrLen(art) == 0) { return SRO_E_NAME_LEER; }
+  if (_bezAnzahl >= SRO_MAX_BEZIEHUNGEN) { return SRO_E_BEZIEHUNGEN_VOLL; }
+  var off: int64 := oTextAblegen(art, StrLen(art));
+  if (off < 0) { return off; }
+  poke64(_bezVon + _bezAnzahl * 8, von);
+  poke64(_bezNach + _bezAnzahl * 8, nach);
+  poke64(_bezArt + _bezAnzahl * 8, off);
+  _bezAnzahl := _bezAnzahl + 1;
+  return SRO_OK;
+}
+
+pub fn ObjektBeziehungZahl(von: int64, art: pchar): int64 {
+  oInit();
+  var nl: int64 := StrLen(art);
+  var n: int64 := 0;
+  var i: int64 := 0;
+  while (i < _bezAnzahl) {
+    if (peek64(_bezVon + i * 8) == von) {
+      var a: pchar := (_text + peek64(_bezArt + i * 8)) as pchar;
+      if (StrLen(a) == nl && StrEq(a, art) != 0) { n := n + 1; }
+    }
+    i := i + 1;
+  }
+  return n;
+}
+
+pub fn ObjektBeziehung(von: int64, art: pchar, k: int64): int64 {
+  oInit();
+  var nl: int64 := StrLen(art);
+  var n: int64 := 0;
+  var i: int64 := 0;
+  while (i < _bezAnzahl) {
+    if (peek64(_bezVon + i * 8) == von) {
+      var a: pchar := (_text + peek64(_bezArt + i * 8)) as pchar;
+      if (StrLen(a) == nl && StrEq(a, art) != 0) {
+        if (n == k) { return peek64(_bezNach + i * 8); }
+        n := n + 1;
+      }
+    }
+    i := i + 1;
+  }
+  return SRO_E_NICHT_GEFUNDEN;
+}
+
+// ── Beschreiben ─────────────────────────────────────────────────────────────
+// Baut eine MOMENTAUFNAHME als SemaRTI-Wert. Sie liegt in der Aufruf-Arena
+// und ist damit kurzlebig — richtig so: eine Beschreibung gilt für die
+// Revision, die sie nennt, und nicht darüber hinaus.
+//
+// Die Beschreibung enthält KEINE Handles von Kindern oder Beziehungen,
+// sondern nur deren Zahl. Ein Handle ist eine Fähigkeit; wer es bekommt,
+// entscheidet die Autorisierung, nicht eine Beschreibung.
+pub fn ObjektBeschreiben(h: int64): int64 {
+  var idx: int64 := ObjektPlatz(h);
+  if (idx < 0) { return idx; }
+  var o: int64 := WertObjekt();
+  if (o < 0) { return o; }
+  WertFeldSetzen(o, "schema"c, WertText(ObjektSchemaId(h)));
+  WertFeldSetzen(o, "name"c, WertText(ObjektName(h)));
+  WertFeldSetzen(o, "revision"c, WertZahl(ObjektRevision(h)));
+  WertFeldSetzen(o, "kinder"c, WertZahl(ObjektKinderZahl(h)));
+  var eig: int64 := WertObjekt();
+  var anz: int64 := peek64(oZelle(idx, 7));
+  var i: int64 := 0;
+  while (i < anz) {
+    var nm: pchar := ObjektEigenschaftName(h, i);
+    if (peek64(peek64(oZelle(idx, 10)) + i * 8) != 0) {
+      WertFeldSetzen(eig, nm, WertText(ObjektLeseText(h, nm)));
+    } else {
+      WertFeldSetzen(eig, nm, WertZahl(ObjektLeseZahl(h, nm)));
+    }
+    i := i + 1;
+  }
+  WertFeldSetzen(o, "eigenschaften"c, eig);
+  return o;
+}
+
+// Nur für Tests.
+pub fn ObjektRegisterLeeren(): void {
+  oInit();
+  var i: int64 := 0;
+  while (i < SRO_MAX_OBJEKTE) {
+    poke64(oZelle(i, 0), 0);
+    poke64(oZelle(i, 1), peek64(oZelle(i, 1)) + 1);
+    i := i + 1;
+  }
+  _bezAnzahl := 0;
+  _textEnde := 0;
+}
+
+pub fn ObjektAnzahl(): int64 {
+  oInit();
+  var n: int64 := 0;
+  var i: int64 := 0;
+  while (i < SRO_MAX_OBJEKTE) {
+    if (peek64(oZelle(i, 0)) != 0) { n := n + 1; }
+    i := i + 1;
+  }
+  return n;
+}
