@@ -80,6 +80,13 @@ AUS="$( cd "$TMP" && timeout 60 ./r 2>&1 )" || { no "laeuft" "rc=$?"; echo "=== 
 
 # Jede Zeile: hat=1 muss "nutzbar" heissen, hat=0 muss eine BEGRUENDUNG haben.
 WIDER=0; GEPRUEFT=0; NUTZBAR=0; FEHLEND=0
+# Die NAMEN mitführen, nicht nur zählen. Bis hierher stand im Protokoll „17
+# nutzbar, 5 nicht nutzbar" — welche fünf, war nicht zu sehen. Auf einem
+# fremden Läufer ist das aber genau die Auskunft, die man braucht: ob ein
+# Schnellweg dort überhaupt nachweisbar wäre (#2391 SHA-NI, #2393
+# VAES/VPCLMUL) oder ob er auf Hardware wartet, die niemand hat (#2394).
+# Eine Zahl beantwortet das nicht, eine Liste schon.
+NAMEN_JA=""; NAMEN_NEIN=""
 while read -r nm rest; do
   case "$rest" in bit=*) ;; *) continue ;; esac
   hat="$(printf '%s' "$rest" | sed -n 's/.* hat=\([0-9-]*\) .*/\1/p')"
@@ -87,10 +94,10 @@ while read -r nm rest; do
   [ -z "$hat" ] && continue
   GEPRUEFT=$((GEPRUEFT+1))
   if [ "$hat" = "1" ]; then
-    NUTZBAR=$((NUTZBAR+1))
+    NUTZBAR=$((NUTZBAR+1)); NAMEN_JA="$NAMEN_JA $nm"
     [ "$grund" = "nutzbar" ] || { echo "  WIDERSPRUCH $nm: CpuHas=1, Begruendung '$grund'"; WIDER=$((WIDER+1)); }
   else
-    FEHLEND=$((FEHLEND+1))
+    FEHLEND=$((FEHLEND+1)); NAMEN_NEIN="$NAMEN_NEIN $nm"
     [ "$grund" = "nutzbar" ] && { echo "  WIDERSPRUCH $nm: CpuHas=0, Begruendung 'nutzbar'"; WIDER=$((WIDER+1)); }
   fi
 done <<< "$AUS"
@@ -104,6 +111,10 @@ if [ "$NUTZBAR" -gt 0 ] && [ "$FEHLEND" -gt 0 ]; then
 else
   echo "HINWEIS: diese CPU belegt nur eine Richtung ($NUTZBAR nutzbar, $FEHLEND fehlend)."
 fi
+# Immer ausgeben, auch im grünen Lauf: diese Zeilen sind die Messung, auf die
+# sich andere Issues berufen, und sie kostet nichts.
+echo "  nutzbar     ($NUTZBAR):$NAMEN_JA"
+echo "  nicht nutzbar ($FEHLEND):$NAMEN_NEIN"
 
 hol() { printf '%s\n' "$AUS" | sed -n "s/^$1=//p" | head -1; }
 [ "$(hol unbekannt_bit)" = "0" ] && ok "unbekannter Name liefert 0 (der Aufrufer meldet es laut)" \
