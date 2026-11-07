@@ -184,13 +184,21 @@ pruefe_meldet_text() {   # Name, Aufruf, erwarteter Textbaustein
     fi
 }
 
-pruefe_meldet_text "sys_gettid"       "sys_gettid()"            "sys_getpid (136)"
 pruefe_meldet_text "sys_thread_spawn" "sys_thread_spawn(0,0,0,0)" "sys_spawn_child"
 pruefe_meldet_text "sys_thread_exit"  "sys_thread_exit(0)"      "kein Thread-Ende"
 pruefe_meldet_text "sys_wait"         "sys_wait(0,0,0)"         "nicht vorgesehen"
 pruefe_meldet_text "sys_priority"     "sys_priority(0,0)"       "314/315"
-pruefe_meldet_text "sys_getrandom"    "sys_getrandom(0,0,0)"    "keine Zufallsquelle"
 pruefe_meldet_text "sys_signal_mask"  "sys_signal_mask(0,0)"    "kein Signalmodell"
+
+# #2011: sys_gettid und sys_getrandom hat der Kernel seit lyx-os 6187de3 —
+# 257 bzw. 258. Hier stand bis dahin die Gegenprobe, dass sie ABGELEHNT
+# werden; jetzt wird geprueft, dass die richtige Nummer herauskommt und die
+# alte Entwurfsnummer weg ist (8 = sys_lseek war der schaerfste Fall oben).
+pruefe_bytes "sys_gettid emittiert 257, nicht 8" \
+    'fn main(): int64 { return sys_gettid(); }' "257" "8"
+
+pruefe_bytes "sys_getrandom emittiert 258, nicht 13" \
+    'fn main(): int64 { return sys_getrandom(0 as pchar, 0, 0); }' "258" "13"
 
 # Schlafen gibt es — aber in Ticks (Nr. 25), nicht in Nanosekunden. Geprueft
 # wird die BEFEHLSFOLGE `mov rax, nr; syscall`, nicht nur die Zahl irgendwo:
