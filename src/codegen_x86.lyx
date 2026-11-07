@@ -11643,6 +11643,43 @@ pub type Codegen = class {
     self.cg_e8(0xF3); self.cg_e8(0x48); self.cg_e8(0xA5);   // rep movsq
   }
 
+  // #2421: Dasselbe fuer eine GLOBALE. Zwei Aufzaehlungen derselben Sache —
+  // wer hier eine Bedingung aendert, muss cg_localWertStructBytes mitaendern;
+  // genau dieses Auseinanderlaufen ist der Fehler, den #2421 gemeldet hat.
+  //
+  // Geprueft wird zusaetzlich die Markierung `globalIsArray == 3`: nur dann
+  // hat die Globale einen EIGENEN Block im Datenbereich (#1256/#1299), in den
+  // kopiert werden kann. Ohne Block gibt es nichts zu kopieren, und der
+  // alte Weg (Zeiger uebernehmen) bleibt — bei `@redundant` ist das heute so,
+  // weil dort kein Block angelegt wird.
+  fn cg_globalWertStructBytes(name: pchar, nlen: int64): int64 {
+    var gi: int64 := self.cg_findGlobalIdx(name, nlen);
+    if (gi < 0) { return 0; }
+    if (peek8(self.globalIsArray + gi) != 3) { return 0; }
+    var tb: int64 := self.globalTypeNames + gi * 16;
+    var tp: pchar := peek64(tb) as pchar;
+    var tl: int64 := peek64(tb + 8);
+    if (tp == 0 as pchar || tl <= 0) { return 0; }
+    var ci: int64 := self.cg_findClass(tp, tl);
+    if (ci < 0) { return 0; }
+    if (self.cg_istWertStruct(ci) == 0) { return 0; }
+    return self.cg_classStructSize(ci);
+  }
+
+  // #2421: Kopiert den Struct-INHALT in den Block einer globalen Variablen.
+  // rax traegt die Quelladresse. Aufbau wie cg_emitStructKopieNach, nur dass
+  // die Zieladresse aus dem Datenslot kommt statt aus dem Rahmen.
+  fn cg_emitStructKopieNachGlobal(doff: int64, bytes: int64) {
+    if (bytes <= 0) { return; }
+    var worte: int64 := (bytes + 7) / 8;
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC6);   // mov rsi, rax
+    self.cg_loadRaxGlobal(doff);                             // Zeiger auf den Block
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC7);   // mov rdi, rax
+    self.cg_movRaxImm(worte);
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC1);   // mov rcx, rax
+    self.cg_e8(0xF3); self.cg_e8(0x48); self.cg_e8(0xA5);   // rep movsq
+  }
+
   // Traegt das Local einen Struct-Typ? Liefert die Groesse in Byte, sonst 0.
   fn cg_localWertStructBytes(name: pchar, nlen: int64): int64 {
     var li: int64 := self.cg_findLocalIdx(name, nlen);
@@ -23139,7 +23176,28 @@ pub type Codegen = class {
           }
         } else {
           var goff: int64 := self.cg_findGlobal(name, nlen);
-          if (goff >= 0) { self.cg_emitGlobalWrite(name, nlen, goff); }   // #1141
+          if (goff >= 0) {
+            // #2421: `g := r` bei einer globalen WERT-Struct kopiert den
+            // INHALT in ihren Block. Bis hierher wurde der ZEIGER
+            // ueberschrieben — die Globale zeigte danach in den Rahmen des
+            // Aufrufers, und sobald der weiterbenutzt wurde, standen
+            // Stapeladressen in den Feldern. Gemeldet wurde es fuer einen
+            // Parameter als Quelle; es traf aber JEDE Quelle, auch ein Local:
+            // dort fiel es nur nicht auf, weil der Rahmen von `main`
+            // weiterlebt (nach `lokal.a := 777` wanderte die Globale mit).
+            //
+            // Dieselbe Rechnung wie fuer Locals in #1351; die beiden
+            // Stellen muessen uebereinstimmen.
+            var gStructBytes: int64 := 0;
+            if (self.cg_nkind(rhs) != CGN_CAST && self.cg_nkind(rhs) != CGN_NEW) {
+              gStructBytes := self.cg_globalWertStructBytes(name, nlen);
+            }
+            if (gStructBytes > 0) {
+              self.cg_emitStructKopieNachGlobal(goff, gStructBytes);
+            } else {
+              self.cg_emitGlobalWrite(name, nlen, goff);   // #1141
+            }
+          }
         }
       } else if (self.cg_nkind(lhs) == CGN_FIELD) {
         // obj.field := rhs

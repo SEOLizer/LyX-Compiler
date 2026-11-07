@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.33B
+VERSION   := 1.2.33C
 VERSION_DATE := 2026-11-07
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -576,6 +576,8 @@ test: lyxc
 	@bash tests/semarti_mvp_test.sh
 	@echo "--- SemaRTI: @operation am Code, erzeugte Unit, Formpruefung (#2419) ---"
 	@bash tests/semarti_attribut_test.sh
+	@echo "--- Struct-Zuweisung an eine Modulvariable kopiert den Inhalt (#2421) ---"
+	@bash tests/record_2421_test.sh
 	@bash tests/code_offset_2339_test.sh
 	@bash tests/str_primitiven_simd_test.sh
 	@bash tests/div_konstante_2330_test.sh
