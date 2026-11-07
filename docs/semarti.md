@@ -118,6 +118,42 @@ Befund (`SRA_AUDIT_FAILED`): der Vorgang ist gültig und ausgeführt, aber
 nicht festgehalten. Die Ausgabe bleibt abrufbar, damit der Host abschliessen
 kann, ohne zu wiederholen.
 
+## Deskriptoren am Code: `@operation`
+
+Die Metadaten, die mit dem Code auseinanderlaufen können, stehen am Code:
+
+```lyx
+@operation(id: "com.example.doc.export", version: "2.1.3",
+           risk: external, confirm: true, instance: true)
+pub fn exportieren(eingabe: int64, ausgabe: int64, objekt: int64, principal: int64): int64 { … }
+```
+
+`lyxc --emit-semarti=DATEI` schreibt daraus eine **Lyx-Unit**, die
+`RegistryHinzufuegen` für jede Operation aufruft und die Trägerunit
+importiert. Sie wird mitübersetzt; damit gibt es keinen Laufzeitleser und
+kein Format zu parsen.
+
+**Warum eine Unit und keine Sektion im Erzeugnis.** `.meta_safe` geht den
+Sektionsweg, aber nur für ELF. LBF (`--target=lyxos`) hat ein eigenes
+TLV-Format, arm64, riscv, PE und Mach-O je ihr eigenes. Eine erzeugte Unit
+ist formatneutral und läuft auf jedem Ziel.
+
+**Was ins Attribut gehört und was nicht.** Das **Schema** bleibt eine
+Funktion — es ist verschachtelt, und in einem Attribut wäre es eine
+Mini-Sprache, die man später bereut. Die Verbindung läuft über eine
+Namenskonvention: `<fn>_eingabeschema()` und `<fn>_ausgabeschema()`. Fehlt
+eine davon, meldet es der Übersetzer beim Bauen der erzeugten Unit — nicht
+die Laufzeit.
+
+**Die Form wird streng geprüft**, weil ein Deskriptor ein Vertrag ist: die ID
+muss namensräumig und kleingeschrieben sein (eine ID, die sich nur in der
+Schreibweise unterscheidet, ist eine Falle für jeden, der sie abschreibt),
+die Version genau `MAJOR.MINOR.PATCH`. Eine Version, die sich nicht zerlegen
+lässt, würde im Generator stillschweigend zu `0.0.0` — der Aufrufer verlangte
+dann eine Version, die niemand angeboten hat. Ein unbekannter Schlüssel wird
+**gemeldet**, nicht übersprungen: `@operation(confrm: true)` wäre sonst eine
+Operation, die der Autor für bestätigungspflichtig hält und die es nicht ist.
+
 ## Der Ablauf, und warum die Reihenfolge der Kern ist
 
 ```
@@ -291,9 +327,9 @@ ohne den Code zu ändern.
   keinen Scan, der Funktionen nach Namensähnlichkeit freigibt.
 * Keine Nebenläufigkeit zugesagt. Registry und Arena sind Modulzustand ohne
   Sperre; ein Host mit Fäden muss die Aufrufe selbst ordnen.
-* **Kein attributgetriebener Deskriptor** — der einzige offene Punkt aus
-  #2419. Er berührt Parser, sema und das Hauptprogramm und ist deshalb ein
-  eigener Schritt. Das käme **nach** dem Objektmodell,
+* Keine Capability-Liste je Operation aus dem Attribut. Sie steht schon im
+  `@capabilities` der Unit; eine zweite Nennung wäre dieselbe Aufzählung an
+  zwei Stellen. Wer Rechte je Operation führen will, registriert von Hand. Das käme **nach** dem Objektmodell,
   nicht davor: sonst automatisiert man einen Vertrag, dessen Instanzbindung
   noch fehlt. Der Weg wäre ein Attribut wie `@operation(...)`, aus dem der
   Übersetzer eine Tabelle im Erzeugnis erzeugt — dafür gibt es mit

@@ -352,6 +352,7 @@ pub con ANNO_FLIGHTCRIT:     int64 := 2048; // @flight_crit
 // buildExportList las statt dessen das extern-Bit: jedes `extern fn` stand
 // als Export in der .so. Die Parser-Stellen setzen fuer @export dieses Bit.
 pub con ANNO_EXPORT_FN:      int64 := 16384;
+pub con ANNO_OPERATION:      int64 := 32768; // #2419: @operation(...)
 // #2191: @cpu(stufe) ist KEIN Bit in iVal. Dort ist kein Platz mehr: 0-7 sind
 // die Markierungen, 8-10 @energy, 11 @flight_crit, 12-13 @integrity, 14
 // @export an einer Funktion, 16-39 @stack_limit, 40-63 @wcet — frei ist allein
@@ -416,6 +417,26 @@ pub type Parser = class {
   jniBuf:   int64;
   jniCap:   int64;
   jniCount: int64;
+  // #2419: @operation(...) — Deskriptor einer SemaRTI-Operation am Code.
+  //
+  // Die Werte stehen zwischen dem Lesen des Attributs und der nächsten
+  // Funktionsdeklaration hier; gebunden wird wie bei @jni über eine Tabelle,
+  // die den Knoten der Funktion nennt. Der Grund für diesen Weg steht in
+  // #2419: eine Beschreibung, die NEBEN dem Code liegt, läuft mit ihm
+  // auseinander. Am Code kann sie das nicht.
+  _pendingOpIdOff:   int64;
+  _pendingOpIdLen:   int64;
+  _pendingOpVerOff:  int64;
+  _pendingOpVerLen:  int64;
+  _pendingOpRisk:    int64;   // 0 read_only, 1 mutating, 2 external, -1 nicht gesetzt
+  _pendingOpConfirm: int64;   // 0 nein, 1 ja, -1 nicht gesetzt
+  _pendingOpInst:    int64;   // 0 keine, 1 nötig, -1 nicht gesetzt
+  _unitNameOff: int64;
+  _unitNameLen: int64;
+  opBuf:   int64;
+  opCount: int64;
+  opCap:   int64;
+
   // Scratch values held between @jni parsing and attach to the next FUNC_DECL.
   _pendingJniClassOff:  int64;
   _pendingJniClassLen:  int64;
@@ -550,6 +571,10 @@ pub type Parser = class {
 
   // WP-AND-02 Phase B: query annotation flags on a node (iVal slot).
   pub fn NAnnoFlags(i: int64): int64 { return peek64(self._noff(i) + NODE_OFF_IVAL); }
+  // #2419: Quelltext, damit die Ausgabe die abgelegten Versätze auflösen kann.
+  pub fn QuellText(): int64 { return self.src; }
+  pub fn UnitNameOff(): int64 { return self._unitNameOff; }
+  pub fn UnitNameLen(): int64 { return self._unitNameLen; }
   pub fn NHasAnno(i: int64, flag: int64): int64 {
     if (peek64(self._noff(i) + NODE_OFF_IVAL) & flag) != 0 { return 1; }
     return 0;
@@ -845,6 +870,10 @@ pub type Parser = class {
     if self._tokTextEq(tokIdx, "stack_limit"c)     != 0 { return 2; }
     if self._tokTextEq(tokIdx, "dal"c)             != 0 { return 4; }
     if self._tokTextEq(tokIdx, "integrity"c)       != 0 { return 4; }
+    // #2419: @operation(id: "...", version: "1.0.0", risk: ..., confirm: ...,
+    // instance: ...) — eigene Form, die Werte werden in _parseOperationArgs
+    // geprüft. Form 4 und nicht 3: die Argumente sind Schlüssel-Wert-Paare.
+    if self._tokTextEq(tokIdx, "operation"c)       != 0 { return 4; }
     return 0;
   }
 
@@ -894,7 +923,7 @@ pub type Parser = class {
       PrintStrLn("  Bekannt sind: @export @packed @redundant @volatile @align @energy @cpu @fastpath"c);
       PrintStrLn("    @big_endian @little_endian @capabilities @uses_caller_cap @cap @jni @lifecycle"c);
       PrintStrLn("    @critical @dal @wcet @stack_limit @integrity @flight_crit"c);
-      PrintStrLn("    @description @author @copyright @version"c);
+      PrintStrLn("    @description @author @copyright @version @operation"c);
       PrintStrLn("    @io_check @overflow_check @bounds_check @debug_info @optimization_level"c);
       return;
     }
@@ -967,7 +996,96 @@ pub type Parser = class {
     if self._tokTextEq(tokIdx, "cap"c)             != 0 { return ANNO_CAP_EXTERN; }    // WP-L1
     if self._tokTextEq(tokIdx, "lifecycle"c)       != 0 { return ANNO_LIFECYCLE; }    // LX-36
     if self._tokTextEq(tokIdx, "flight_crit"c)     != 0 { return ANNO_FLIGHTCRIT; }   // #1140
+    if self._tokTextEq(tokIdx, "operation"c)       != 0 { return ANNO_OPERATION; }    // #2419
     return 0;
+  }
+
+  // #2419: @operation(id: "...", version: "1.0.0", risk: mutating,
+  //                    confirm: true, instance: true)
+  //
+  // Geschrieben wie `_parseJniArgs`, mit einem Unterschied, der Absicht ist:
+  // ein UNBEKANNTER Schlüssel wird GEMELDET und nicht übersprungen. Bei @jni
+  // ist Nachsicht harmlos, hier nicht — `@operation(confrm: true)` wäre eine
+  // Operation, die der Autor für bestätigungspflichtig hält und die es nicht
+  // ist. Genau diese Art stiller Nachsicht hat in diesem Baum einen
+  // Tippfehler in `@stack_limt(512)` fehlerfrei übersetzen lassen (#1099).
+  fn _parseOperationArgs() {
+    if (self.Match(TK_LPAREN) == 0) { return; }
+    while (self.Check(TK_RPAREN) == 0 && self.Peek() != TK_EOF) {
+      var keyTok: int64 := self.cur;
+      if (self.TokKind(keyTok) != TK_IDENT) {
+        self._err("@operation: Schluessel erwartet"c);
+        self.Advance();
+        self.Match(TK_COMMA);
+        continue;
+      }
+      var isId:      int64 := self._tokTextEq(keyTok, "id"c);
+      var isVer:     int64 := self._tokTextEq(keyTok, "version"c);
+      var isRisk:    int64 := self._tokTextEq(keyTok, "risk"c);
+      var isConfirm: int64 := self._tokTextEq(keyTok, "confirm"c);
+      var isInst:    int64 := self._tokTextEq(keyTok, "instance"c);
+      if (isId == 0 && isVer == 0 && isRisk == 0 && isConfirm == 0 && isInst == 0) {
+        self._err("@operation kennt nur id, version, risk, confirm, instance"c);
+        self.Advance();
+        self.Match(TK_COMMA);
+        continue;
+      }
+      self.Advance();
+      if (self.Match(TK_COLON) == 0) {
+        self._err("@operation: Doppelpunkt nach dem Schluessel erwartet"c);
+        self.Match(TK_COMMA);
+        continue;
+      }
+      if (isId != 0 || isVer != 0) {
+        if (self.Check(TK_STRING) == 0) {
+          self._err("@operation: id und version sind Zeichenketten"c);
+          self.Advance();
+          self.Match(TK_COMMA);
+          continue;
+        }
+        var strTok: int64 := self.cur;
+        self.Advance();
+        // Anfuehrungszeichen abziehen, dazu ein moegliches `c`-Suffix.
+        var rawOff: int64 := self._tokOff(strTok);
+        var rawLen: int64 := self._tokLen(strTok);
+        var trim: int64 := 2;
+        if peek8(self.src + rawOff + rawLen - 1) == 99 { trim := 3; }
+        if (isId != 0) {
+          self._pendingOpIdOff := rawOff + 1;
+          self._pendingOpIdLen := rawLen - trim;
+        } else {
+          self._pendingOpVerOff := rawOff + 1;
+          self._pendingOpVerLen := rawLen - trim;
+        }
+      } else {
+        // risk, confirm, instance sind NAMEN. Verglichen wird nach TEXT und
+        // nicht nach Tokenart: `true` und `false` sind in dieser Sprache
+        // Schlüsselwörter (TK_TRUE/TK_FALSE) und keine Bezeichner. Der
+        // @jni-Parser macht es aus demselben Grund so — `class` und `method`
+        // sind dort ebenfalls reserviert.
+        //
+        // Ein unbekannter Name wird gemeldet; eine Vorgabe zu raten wäre hier
+        // besonders teuer, weil sie die Rechtelage beschreibt.
+        var vTok: int64 := self.cur;
+        self.Advance();
+        if (isRisk != 0) {
+          if      (self._tokTextEq(vTok, "read_only"c) != 0) { self._pendingOpRisk := 0; }
+          else if (self._tokTextEq(vTok, "mutating"c)  != 0) { self._pendingOpRisk := 1; }
+          else if (self._tokTextEq(vTok, "external"c)  != 0) { self._pendingOpRisk := 2; }
+          else { self._err("@operation risk kennt nur read_only, mutating, external"c); }
+        } else if (isConfirm != 0) {
+          if      (self._tokTextEq(vTok, "true"c)  != 0) { self._pendingOpConfirm := 1; }
+          else if (self._tokTextEq(vTok, "false"c) != 0) { self._pendingOpConfirm := 0; }
+          else { self._err("@operation confirm kennt nur true und false"c); }
+        } else {
+          if      (self._tokTextEq(vTok, "true"c)  != 0) { self._pendingOpInst := 1; }
+          else if (self._tokTextEq(vTok, "false"c) != 0) { self._pendingOpInst := 0; }
+          else { self._err("@operation instance kennt nur true und false"c); }
+        }
+      }
+      self.Match(TK_COMMA);
+    }
+    self.Expect(TK_RPAREN);
   }
 
   // WP-AND-02 Phase B2: parse @jni(class="...", method="...") arguments.
@@ -1053,6 +1171,18 @@ pub type Parser = class {
     self.jniCap   := 16;
     self.jniBuf   := alloc(self.jniCap * 40);
     self.jniCount := 0;
+    self._unitNameOff := 0;
+    self._unitNameLen := 0;
+    self.opCount := 0;
+    self.opBuf := 0;
+    self.opCap := 0;
+    self._pendingOpIdOff := 0;
+    self._pendingOpIdLen := 0;
+    self._pendingOpVerOff := 0;
+    self._pendingOpVerLen := 0;
+    self._pendingOpRisk := 0 - 1;
+    self._pendingOpConfirm := 0 - 1;
+    self._pendingOpInst := 0 - 1;
     self._pendingJniClassOff  := 0;
     self._pendingJniClassLen  := 0;
     self._pendingJniMethodOff := 0;
@@ -1099,6 +1229,107 @@ pub type Parser = class {
     poke64(off + JNI_REC_OFF_METHODOFF,  methodOff);
     poke64(off + JNI_REC_OFF_METHODLEN,  methodLen);
     self.jniCount += 1;
+  }
+
+  // #2419: Ein Satz je Operation, 72 Byte:
+  //   +0 funcNodeId  +8 idOff  +16 idLen  +24 verOff  +32 verLen
+  //  +40 risk       +48 confirm  +56 instance
+  //  +64 fnNameOff  +72 fnNameLen
+  //
+  // Der FUNKTIONSNAME wird hier mitgelegt und nicht später aus dem Knoten
+  // gelesen: dann braucht die Ausgabe keine neue Knoten-API, und der Satz ist
+  // vollständig ohne den AST.
+  fn _pushOpEntry(funcNodeId: int64, idOff: int64, idLen: int64,
+                  verOff: int64, verLen: int64,
+                  risk: int64, confirm: int64, inst: int64) {
+    if (self.opBuf == 0) {
+      self.opCap := 64;
+      self.opBuf := alloc(self.opCap * 88);
+      self.opCount := 0;
+    }
+    if (self.opCount >= self.opCap) {
+      var newCap: int64 := self.opCap * 2;
+      var nb: int64 := alloc(newCap * 88);
+      memcpy(nb, self.opBuf, self.opCount * 88);
+      self.opBuf := nb;
+      self.opCap := newCap;
+    }
+    var off: int64 := self.opBuf + self.opCount * 88;
+    poke64(off +  0, funcNodeId);
+    poke64(off +  8, idOff);
+    poke64(off + 16, idLen);
+    poke64(off + 24, verOff);
+    poke64(off + 32, verLen);
+    poke64(off + 40, risk);
+    poke64(off + 48, confirm);
+    poke64(off + 56, inst);
+    poke64(off + 64, peek64(self._noff(funcNodeId) + NODE_OFF_SVAL));
+    poke64(off + 72, peek64(self._noff(funcNodeId) + NODE_OFF_SLEN));
+    self.opCount += 1;
+  }
+
+  // #2419: Form der Attributwerte. Beide Prüfungen sind streng, weil ein
+  // Deskriptor ein VERTRAG ist: eine ID ohne Namensraum kollidiert mit der
+  // nächsten Anwendung, und eine Version, die sich nicht in drei Zahlen
+  // zerlegen lässt, würde im Generator stillschweigend zu 0.0.0 — der
+  // Aufrufer verlangte dann eine Version, die niemand angeboten hat.
+  fn _opIdGueltig(off: int64, len: int64): int64 {
+    if (len <= 0) { return 0; }
+    var punkte: int64 := 0;
+    var i: int64 := 0;
+    while (i < len) {
+      var c: int64 := peek8(self.src + off + i);
+      if (c == 46) {
+        punkte := punkte + 1;
+        // Zwei Punkte hintereinander und ein Punkt am Rand ergeben einen
+        // leeren Namensteil.
+        if (i == 0 || i == len - 1) { return 0; }
+        if (peek8(self.src + off + i - 1) == 46) { return 0; }
+      } else if ((c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 95) {
+        // erlaubt
+      } else if (c >= 65 && c <= 90) {
+        // Großbuchstaben sind erlaubt, aber eine ID unterscheidet sich dann
+        // nur in der Schreibweise von einer anderen — das ist eine Falle für
+        // jeden, der sie von Hand abschreibt.
+        return 0;
+      } else {
+        return 0;
+      }
+      i := i + 1;
+    }
+    if (punkte < 1) { return 0; }
+    return 1;
+  }
+
+  fn _opVersionGueltig(off: int64, len: int64): int64 {
+    if (len <= 0) { return 0; }
+    var punkte: int64 := 0;
+    var ziffernImTeil: int64 := 0;
+    var i: int64 := 0;
+    while (i < len) {
+      var c: int64 := peek8(self.src + off + i);
+      if (c == 46) {
+        if (ziffernImTeil == 0) { return 0; }
+        punkte := punkte + 1;
+        ziffernImTeil := 0;
+      } else if (c >= 48 && c <= 57) {
+        ziffernImTeil := ziffernImTeil + 1;
+        // Mehr als 18 Ziffern je Teil liefen im Generator über.
+        if (ziffernImTeil > 18) { return 0; }
+      } else {
+        return 0;
+      }
+      i := i + 1;
+    }
+    if (punkte != 2) { return 0; }
+    if (ziffernImTeil == 0) { return 0; }
+    return 1;
+  }
+
+  pub fn OperationCount(): int64 { return self.opCount; }
+  pub fn OperationRec(i: int64): int64 {
+    if (i < 0 || i >= self.opCount) { return 0; }
+    return self.opBuf + i * 88;
   }
 
   // WP-AND-02 Phase B2: linear lookup. Returns record pointer, or 0 if absent.
@@ -6102,7 +6333,9 @@ pub type Parser = class {
           self.Advance();
         }
         if (self.Check(TK_LPAREN) != 0) {
-          if (flag == ANNO_JNI) {
+          if (flag == ANNO_OPERATION) {
+            self._parseOperationArgs();                                  // #2419
+          } else if (flag == ANNO_JNI) {
             self._parseJniArgs();
           } else if (isEnergy != 0) {
             // WP-EN-02: @energy(N) as function annotation
@@ -6190,7 +6423,9 @@ pub type Parser = class {
           self.Advance();
         }
         if (self.Check(TK_LPAREN) != 0) {
-          if (flag2 == ANNO_JNI) {
+          if (flag2 == ANNO_OPERATION) {
+            self._parseOperationArgs();                                  // #2419
+          } else if (flag2 == ANNO_JNI) {
             self._parseJniArgs();
           } else if (isEnergy2 != 0) {
             self.Advance();  // consume (
@@ -6250,6 +6485,36 @@ pub type Parser = class {
           // ParseFuncDecl schon gesetzt hat.
           // #2117: @export (Bit 0) als ANNO_EXPORT_FN (Bit 14) weitergeben.
           self._siv(decl, self.NIVal(decl) | (annoFlags & 0xFFFFFFFFFFFFFFFE) | ((annoFlags & ANNO_EXPORT) * ANNO_EXPORT_FN));
+          // #2419: @operation an diese Funktion binden. Fehlt die ID, ist das
+          // ein Fehler und keine leere Eintragung: eine Operation ohne
+          // stabilen Namen ist nicht aufrufbar.
+          if (annoFlags & ANNO_OPERATION) != 0 {
+            if self._pendingOpIdLen <= 0 {
+              self._err("@operation verlangt id: \"...\""c);
+            } else if self._pendingOpVerLen <= 0 {
+              self._err("@operation verlangt version: \"MAJOR.MINOR.PATCH\""c);
+            } else if self._opIdGueltig(self._pendingOpIdOff, self._pendingOpIdLen) == 0 {
+              self._err("@operation id: stabiler, namespaced Bezeichner erwartet (a-z, 0-9, Punkt, Unterstrich; mindestens ein Punkt)"c);
+            } else if self._opVersionGueltig(self._pendingOpVerOff, self._pendingOpVerLen) == 0 {
+              self._err("@operation version: MAJOR.MINOR.PATCH erwartet, nur Ziffern und zwei Punkte"c);
+            } else {
+              var rk: int64 := self._pendingOpRisk;
+              if (rk < 0) { rk := 0; }
+              var cf: int64 := self._pendingOpConfirm;
+              if (cf < 0) { cf := 0; }
+              var it: int64 := self._pendingOpInst;
+              if (it < 0) { it := 0; }
+              self._pushOpEntry(decl,
+                                self._pendingOpIdOff, self._pendingOpIdLen,
+                                self._pendingOpVerOff, self._pendingOpVerLen,
+                                rk, cf, it);
+            }
+            self._pendingOpIdLen := 0;
+            self._pendingOpVerLen := 0;
+            self._pendingOpRisk := 0 - 1;
+            self._pendingOpConfirm := 0 - 1;
+            self._pendingOpInst := 0 - 1;
+          }
           // Attach pending @jni args (if any) to this FUNC_DECL.
           if (annoFlags & ANNO_JNI) != 0 {
             if self._pendingJniClassLen > 0 && self._pendingJniMethodLen > 0 {
@@ -6313,7 +6578,23 @@ pub type Parser = class {
           self._err("  `mode: scrubbed` dagegen gilt programmweit und ist an der Unit richtig."c);
         }
         self.Advance();  // consume 'unit'
-        while (self.Peek() != TK_SEMI && self.Peek() != TK_EOF) { self.Advance(); }
+        // #2419: Den Unitnamen merken. Er wird gebraucht, damit die erzeugte
+        // SemaRTI-Unit die Unit IMPORTIEREN kann, in der die Operationen
+        // stehen — ohne den Import verwiese sie auf Funktionen, die sie nicht
+        // sieht, und wäre allein nicht übersetzbar.
+        if (self._unitNameLen == 0 && self.TokKind(self.cur) == TK_IDENT) {
+          self._unitNameOff := self._tokOff(self.cur);
+          var letzterTok: int64 := self.cur;
+          while (self.Peek() != TK_SEMI && self.Peek() != TK_EOF) {
+            letzterTok := self.cur;
+            self.Advance();
+          }
+          // Der Name kann punktiert sein (`std.semarti.wert`): die Länge
+          // reicht vom ersten Bezeichner bis zum Ende des letzten.
+          self._unitNameLen := (self._tokOff(letzterTok) + self._tokLen(letzterTok)) - self._unitNameOff;
+        } else {
+          while (self.Peek() != TK_SEMI && self.Peek() != TK_EOF) { self.Advance(); }
+        }
         self.Match(TK_SEMI);
       }
       else {
