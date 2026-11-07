@@ -152,5 +152,53 @@ else
   bad "profil_lauf"
 fi
 
+# ── #2415: EINE Lesung gegen einen invarianten WERT ─────────────────────────
+# Die Suche nach einem Byte (`peek8(a+i) == 32`) oder nach dem Inhalt einer
+# Variablen. Der Wert wird vor der Schleife in alle Bahnen gebrochen; geprüft
+# wird in allen vier Breiten gegen die skalare Fassung derselben Quelle.
+W=tests/vektor_suche_2360/wertsuche.lyx
+if "$LYXC" --std-path=. "$W" -o "$TMP/wv" >"$TMP/w1.log" 2>&1    && "$LYXC" --std-path=. --debug "$W" -o "$TMP/ws" >"$TMP/w2.log" 2>&1; then
+  ok "wertsuche_uebersetzt_beide_fassungen"
+  "$TMP/wv" > "$TMP/wv.txt" 2>&1; "$TMP/ws" > "$TMP/ws.txt" 2>&1
+  if diff -q "$TMP/ws.txt" "$TMP/wv.txt" >/dev/null; then
+    ok "wertsuche_wertgleich_zur_skalaren_fassung"
+  else
+    bad "wertsuche_wertgleich"; diff "$TMP/ws.txt" "$TMP/wv.txt" | head -8
+  fi
+  # Der Broadcast muss wirklich drinstehen — sonst wäre die Wertgleichheit
+  # auch von einer Fassung erfüllt, die gar nicht vorspult.
+  bb=$(zaehl "$TMP/wv" 660f6fca)   # movdqa xmm1, xmm2
+  pu=$(zaehl "$TMP/wv" 660f60d2)   # punpcklbw xmm2, xmm2 (nur Breite 1)
+  if [ "$bb" -ge 2 ] && [ "$pu" -ge 1 ]; then
+    ok "erzeugnis_traegt_den_broadcast (movdqa=$bb punpcklbw=$pu)"
+  else
+    bad "erzeugnis_traegt_den_broadcast (movdqa=$bb punpcklbw=$pu)"
+  fi
+  if [ "$(zaehl "$TMP/ws" 660f6fca)" = "0" ]; then
+    ok "skalare_fassung_ohne_broadcast (Gegenrichtung)"
+  else
+    bad "skalare_fassung_ohne_broadcast"
+  fi
+else
+  bad "wertsuche_uebersetzt_beide_fassungen"; tail -4 "$TMP/w1.log" "$TMP/w2.log"
+fi
+
+# Was trotz EINER Lesung skalar bleiben muss: ein Aufruf als Wert (Nebenwirkung)
+# und eine Rechnung (Invarianz nicht belegbar).
+A2=tests/vektor_suche_2360/wertsuche_ablehnung.lyx
+if "$LYXC" --std-path=. "$A2" -o "$TMP/a2" >"$TMP/a2.log" 2>&1; then
+  if [ "$(zaehl "$TMP/a2" 660f74c1)" = "0" ] && [ "$(zaehl "$TMP/a2" 660f6fca)" = "0" ]; then
+    ok "wert_mit_nebenwirkung_bleibt_skalar"
+  else
+    bad "wert_mit_nebenwirkung_bleibt_skalar — eine dieser Formen wurde vorgespult"
+  fi
+  o2=$("$TMP/a2" 2>&1)
+  # Die Wirkung: der Aufruf muss für JEDES Element laufen (81 bis zum Treffer
+  # bei 80). Würde vorgespult, wären es weniger.
+  if echo "$o2" | grep -q "^aufrufe=81$"; then ok "aufruf_als_wert_laeuft_je_element"; else bad "aufruf_als_wert_laeuft_je_element"; echo "$o2"|head -4; fi
+else
+  bad "wertsuche_ablehnung_uebersetzt"; tail -3 "$TMP/a2.log"
+fi
+
 echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
