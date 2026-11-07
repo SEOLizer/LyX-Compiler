@@ -209,5 +209,41 @@ else
   no "Nebenwirkung laeuft einmal, zur defer-Zeit" "compile fehlgeschlagen"
 fi
 
+# #2380: `defer` auf einer Variablen, die im INNEREN Block deklariert ist.
+#
+# Die Meldung beschrieb einen Uebersetzungsabbruch ("Bezeichner 'b' als Wert
+# hat keine bekannte Herkunft"); nachgemessen auf 1.2.33B tritt er nicht mehr
+# auf, und die Werte stimmen auch. Die Form war hier aber NICHT abgedeckt:
+# die vorhandenen Faelle oben benutzen Literale als Argument, und dann ist es
+# gleichgueltig, ob der Codegen die Variable des inneren Blocks findet.
+#
+# Geprueft wird deshalb beides zusammen — dass es uebersetzt UND dass jeder
+# Durchlauf seinen EIGENEN Wert mitnimmt. Ein Test, der nur die
+# Uebersetzbarkeit prueft, waere auch von einer Fassung erfuellt, die alle
+# Durchlaeufe mit demselben (letzten) Wert abarbeitet.
+run "Variable aus dem Schleifenrumpf" '
+  var i: int64 := 1;
+  while (i <= 3) {
+    var b: int64 := i * 10;
+    defer PrintLn(b);
+    i := i + 1;
+  }
+  PrintLn(99);' '10|20|30|99|'
+
+# Dieselbe Form mit Deklarationen VOR und IN der Schleife. Die Meldung nannte
+# genau diese Mischung (ein `defer` im Funktionskopf, eines im Rumpf), und
+# beide Wege geben an verschiedenen Stellen aus: der innere am Blockende, der
+# aeussere am Funktionsende.
+run "Variablen aussen und innen gemischt" '
+  var a: int64 := 100;
+  defer PrintLn(a);
+  var i: int64 := 1;
+  while (i <= 2) {
+    var b: int64 := i;
+    defer PrintLn(b);
+    i := i + 1;
+  }
+  PrintLn(0);' '1|2|0|100|'
+
 echo "Ergebnis: $PASS PASS, $FAIL FAIL"
 [ "$FAIL" -eq 0 ]
