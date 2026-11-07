@@ -26023,7 +26023,42 @@ pub type Codegen = class {
     var lN: int64 := self.cg_nc0(kb);
     var rN: int64 := self.cg_nc1(kb);
     if (lN < 0 || rN < 0) { return self._vsNein("VS_IF_SIDE_MISSING"c); }
-    if (self.cg_nkind(lN) != CGN_CALL || self.cg_nkind(rN) != CGN_CALL) { return self._vsNein("VS_IF_SIDE_NOT_CALL"c); }
+    // #2415: EINE Lesung gegen einen invarianten WERT — die Suche nach einem
+    // Byte (`peek8(a+i) == 32`) oder nach dem Inhalt einer Variablen
+    // (`peek8(a+i) == w`). GEMESSEN am Selbstbau von src/lyxc.lyx: 128 der
+    // 353 Ablehnungen dieses Tores haben genau diese Form (92 gegen ein
+    // Local, 36 gegen ein Literal), und sie scheitern an NICHTS sonst —
+    // Bedingung, Rumpf, Basis und Breite passen alle.
+    //
+    // Der Wert wird vor der Schleife in alle Bahnen gebrochen; danach läuft
+    // derselbe Vergleich wie bei zwei Lesungen. `wertKn` traegt den Knoten
+    // bis in den Emitter.
+    //
+    // Was NICHT zugelassen wird: ein Aufruf, ein Feld oder eine Rechnung als
+    // Wert. Ein Aufruf hätte eine Nebenwirkung, und bei den anderen ist die
+    // Invarianz nicht ohne weiteres zu belegen — ein Vorspulen wäre dann
+    // beobachtbar. Die Zahlen dafür sind klein (1 von 128).
+    var wertKn: int64 := 0 - 1;
+    if (self.cg_nkind(lN) != CGN_CALL || self.cg_nkind(rN) != CGN_CALL) {
+      var lLese: int64 := 0;
+      if (self.cg_nkind(lN) == CGN_CALL
+          && self.cg_vsLesebreite(self.cg_nsval(lN), self.cg_nslen(lN)) != 0) { lLese := 1; }
+      var rLese: int64 := 0;
+      if (self.cg_nkind(rN) == CGN_CALL
+          && self.cg_vsLesebreite(self.cg_nsval(rN), self.cg_nslen(rN)) != 0) { rLese := 1; }
+      if (lLese == rLese) { return self._vsNein("VS_IF_SIDE_NOT_CALL"c); }
+      var andereS: int64 := rN;
+      if (rLese != 0) { andereS := lN; }
+      var akS: int64 := self.cg_nkind(andereS);
+      var invar: int64 := 0;
+      if (akS == CGN_LIT_INT) { invar := 1; }
+      else if (akS == CGN_IDENT && self.cg_vmIdentOff(andereS) != 0) { invar := 1; }
+      if (invar == 0) { return self._vsNein("VS_IF_VALUE_NOT_INVARIANT"c); }
+      wertKn := andereS;
+      // Beide Leseseiten auf DIESELBE setzen: die Zeigerprüfungen gelten dann
+      // zweimal für denselben Zeiger — richtig, nur redundant.
+      if (rLese != 0) { lN := rN; } else { rN := lN; }
+    }
     var breite: int64 := self.cg_vsLesebreite(self.cg_nsval(lN), self.cg_nslen(lN));
     if (breite == 0) { return self._vsNein("VS_LEFT_NOT_PEEK"c); }
     if (self.cg_vsLesebreite(self.cg_nsval(rN), self.cg_nslen(rN)) != breite) { return self._vsNein("VS_WIDTH_MISMATCH"c); }
@@ -26074,6 +26109,7 @@ pub type Codegen = class {
     poke64(kasten + 88, bKn);
     poke64(kasten + 96,  peek64(aFz));   poke64(kasten + 104, peek64(aFz + 8));
     poke64(kasten + 112, peek64(bFz));   poke64(kasten + 120, peek64(bFz + 8));
+    poke64(kasten + 128, wertKn);        // #2415: -1 = zwei Lesungen
     return 1;
   }
 
@@ -26114,6 +26150,7 @@ pub type Codegen = class {
     var kop: int64 := peek64(kasten + 40);
     var aKn: int64 := peek64(kasten + 80);
     var bKn: int64 := peek64(kasten + 88);
+    var wertKn: int64 := peek64(kasten + 128);   // #2415
     var schub: int64 := 0;
     if (breite == 2) { schub := 1; }
     if (breite == 4) { schub := 2; }
@@ -26147,6 +26184,33 @@ pub type Codegen = class {
       self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC1);                        // mov rcx, rax
     }
 
+    // #2415: Den invarianten Wert in ALLE Bahnen von xmm2 brechen. Einmal vor
+    // der Schleife — `cpuid`-frei und ohne Speicherzugriff je Durchlauf.
+    //
+    // Der Weg hängt an der Breite, weil `pshufd` auf 32-Bit-Bahnen arbeitet:
+    //   8 Byte: movq + punpcklqdq      (zwei Bahnen)
+    //   4 Byte: movd + pshufd 0        (vier Bahnen)
+    //   2 Byte: movd + pshuflw/pshufd  (acht Bahnen)
+    //   1 Byte: movd + punpcklbw + pshuflw + pshufd (sechzehn Bahnen)
+    // Die schmalen Breiten brauchen die Verdopplung ZUERST, sonst stehen in
+    // den oberen Bytes jeder Bahn Nullen und der Vergleich trifft nie.
+    if (wertKn >= 0) {
+      self.cg_genExpr(wertKn);                                                     // Wert nach rax
+      if (breite == 8) {
+        self.cg_e8(0x66); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0x6E); self.cg_e8(0xD0);  // movq xmm2, rax
+        self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x6C); self.cg_e8(0xD2);                    // punpcklqdq xmm2, xmm2
+      } else {
+        self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x6E); self.cg_e8(0xD0);                    // movd xmm2, eax
+        if (breite == 1) {
+          self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x60); self.cg_e8(0xD2);                  // punpcklbw xmm2, xmm2
+        }
+        if (breite == 1 || breite == 2) {
+          self.cg_e8(0xF2); self.cg_e8(0x0F); self.cg_e8(0x70); self.cg_e8(0xD2); self.cg_e8(0x00); // pshuflw xmm2, xmm2, 0
+        }
+        self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x70); self.cg_e8(0xD2); self.cg_e8(0x00);   // pshufd xmm2, xmm2, 0
+      }
+    }
+
     // r8 = i (der Zaehler kann beim Eintritt schon ungleich 0 sein)
     self.cg_loadRax(iOff);
     self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xC0);                          // mov r8, rax
@@ -26173,7 +26237,12 @@ pub type Codegen = class {
 
     // #2372: unausgerichtet laden — die Basis ist beliebig ausgerichtet.
     self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0x02);                    // movdqu xmm0, [rdx]
-    self.cg_e8(0xF3); self.cg_e8(0x41); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0x0A);  // movdqu xmm1, [r10]
+    if (wertKn >= 0) {
+      // #2415: die zweite Seite ist der gebrochene Wert, kein zweiter Zeiger.
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0xCA);                  // movdqa xmm1, xmm2
+    } else {
+      self.cg_e8(0xF3); self.cg_e8(0x41); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0x0A);  // movdqu xmm1, [r10]
+    }
     if (breite == 1) {
       self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x74); self.cg_e8(0xC1);      // pcmpeqb xmm0, xmm1
     } else if (breite == 2) {
@@ -26228,7 +26297,7 @@ pub type Codegen = class {
     // Ueberlappung und ist der Vergleichsweg der Tests.
     var vmUeber: int64 := 0 - 1;
     var vmKasten: int64 := alloc(168);
-    var vsKasten: int64 := alloc(128);  // #2360 Scheibe C: Suchschleife  // #2350: Art/Wert/Objekt-/Feldversatz der Schranke; #2363: [88..104] Basisknoten der drei Zeiger; #2375: [112] Kopiermarke; #2378: [120..160] Objekt-/Feldversatz je Zeiger
+    var vsKasten: int64 := alloc(144);  // #2360 Scheibe C; #2415: +wertKn  // #2350: Art/Wert/Objekt-/Feldversatz der Schranke; #2363: [88..104] Basisknoten der drei Zeiger; #2375: [112] Kopiermarke; #2378: [120..160] Objekt-/Feldversatz je Zeiger
     if (self.cg_vmErkennen(ni, vmKasten) != 0) { vmUeber := self.cg_vmEmit(vmKasten); }
     // #2335: sonst vielleicht eine Reduktion. Die beiden Formen schliessen
     // sich aus — die eine schreibt in ein Feld, die andere in ein Local —,
