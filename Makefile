@@ -367,6 +367,8 @@ test: lyxc
 	@bash tests/ghash_pclmul_2390_test.sh
 	@echo "--- fma mit einer Rundung, Hardware und exakter Rueckfall gegen libm (#2403) ---"
 	@bash tests/fma_2403_test.sh
+	@echo "--- memcpy: jedes Byte und Waechter, alle Wegegrenzen des Helfers (#2353) ---"
+	@bash tests/memcpy_2353_test.sh
 	@echo "--- RDRAND/RDSEED als Zusatz-Entropie, Erfolg statt Wert (#2392) ---"
 	@bash tests/rand_hw_2392_test.sh
 	@echo "--- Vektorarena: kein Wachstum, kein Syscall je Operation (#2206) ---"
