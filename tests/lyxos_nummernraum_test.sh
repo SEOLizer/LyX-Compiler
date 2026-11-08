@@ -56,8 +56,8 @@ pruefe_baut() {     # Name, Aufruf
 }
 
 echo "-- Entwurfs-Nummern muessen melden --"
-pruefe_meldet "sys_poll (0x0300)"     "sys_poll(1, 1, 1)"
-pruefe_meldet "sys_ioctl (0x0301)"    "sys_ioctl(1, 1, 1)"
+pruefe_baut   "sys_poll (768)"        "sys_poll(1, 1, 1)"
+pruefe_baut   "sys_ioctl (769)"       "sys_ioctl(1, 1, 1)"
 pruefe_meldet "sys_port_in (0x0304)"  "sys_port_in(1, 1)"
 # sys_seek stand hier als Beispiel fuer eine Luecke. Es ist keine: die aus dem
 # Kernel erzeugte Tabelle nennt fuer lseek die 8 (#1734 Punkt 3). Die Pruefung
@@ -67,15 +67,15 @@ pruefe_baut "sys_seek (8)"            "sys_seek(1, 0, 0)"
 # #1734: sys_readdir stand hier als Phantasienummer. Es ist keine -- die
 # erzeugte Tabelle fuehrt 522 mit echtem Handler (VfsReadDir). Umgedreht.
 pruefe_baut "sys_readdir (522)"       "sys_readdir(1, 1, 1)"
-pruefe_meldet "sys_socket (0x0600)"   "sys_socket(1, 1, 1)"
-pruefe_meldet "sys_connect (0x0604)"  "sys_connect(1, 1, 1)"
-pruefe_meldet "sys_mutex_lock (0x0401)" "sys_mutex_lock(1, 0)"
-pruefe_meldet "sys_timer_create (0x0502)" "sys_timer_create(0, 1, 0)"
-pruefe_meldet "sys_pledge (0x0703)"   "sys_pledge(1, 1)"
-pruefe_meldet "sys_task_spawn (0x0B00)" "sys_task_spawn(1, 1, 1, 0)"
+pruefe_baut   "sys_socket (1536)"     "sys_socket(1, 1, 1)"
+pruefe_baut   "sys_connect (1540)"    "sys_connect(1, 1, 1)"
+pruefe_baut   "sys_mutex_lock (1024)" "sys_mutex_lock(1, 0)"
+pruefe_baut   "sys_timer_create (1282)" "sys_timer_create(0, 1, 0)"
+pruefe_baut   "sys_pledge (1795)"     "sys_pledge(1, 1)"
+pruefe_baut   "sys_task_spawn (2816)" "sys_task_spawn(1, 1, 1, 0)"
 pruefe_meldet "sys_ai_infer (0x0804)" "sys_ai_infer(1, 1, 1, 0)"
 pruefe_meldet "sys_iofs_mount (0x0C00)" "sys_iofs_mount(1, 0)"
-pruefe_meldet "sys_trace_event (0x0A00)" "sys_trace_event(1, 1)"
+pruefe_baut   "sys_trace_event (2561)" "sys_trace_event(1, 1)"
 
 echo "-- LX-VFS-Block: belegt, war faelschlich abgewiesen --"
 # Diese drei wurden vom ersten Anlauf des Waechters zum Uebersetzungsfehler
@@ -184,13 +184,21 @@ pruefe_meldet_text() {   # Name, Aufruf, erwarteter Textbaustein
     fi
 }
 
-pruefe_meldet_text "sys_gettid"       "sys_gettid()"            "sys_getpid (136)"
 pruefe_meldet_text "sys_thread_spawn" "sys_thread_spawn(0,0,0,0)" "sys_spawn_child"
 pruefe_meldet_text "sys_thread_exit"  "sys_thread_exit(0)"      "kein Thread-Ende"
 pruefe_meldet_text "sys_wait"         "sys_wait(0,0,0)"         "nicht vorgesehen"
 pruefe_meldet_text "sys_priority"     "sys_priority(0,0)"       "314/315"
-pruefe_meldet_text "sys_getrandom"    "sys_getrandom(0,0,0)"    "keine Zufallsquelle"
 pruefe_meldet_text "sys_signal_mask"  "sys_signal_mask(0,0)"    "kein Signalmodell"
+
+# #2011: sys_gettid und sys_getrandom hat der Kernel seit lyx-os 6187de3 —
+# 257 bzw. 258. Hier stand bis dahin die Gegenprobe, dass sie ABGELEHNT
+# werden; jetzt wird geprueft, dass die richtige Nummer herauskommt und die
+# alte Entwurfsnummer weg ist (8 = sys_lseek war der schaerfste Fall oben).
+pruefe_bytes "sys_gettid emittiert 257, nicht 8" \
+    'fn main(): int64 { return sys_gettid(); }' "257" "8"
+
+pruefe_bytes "sys_getrandom emittiert 258, nicht 13" \
+    'fn main(): int64 { return sys_getrandom(0 as pchar, 0, 0); }' "258" "13"
 
 # Schlafen gibt es — aber in Ticks (Nr. 25), nicht in Nanosekunden. Geprueft
 # wird die BEFEHLSFOLGE `mov rax, nr; syscall`, nicht nur die Zahl irgendwo:
@@ -298,16 +306,13 @@ pruefe_baut "sys_tcp_status (184)"  "sys_tcp_status(3)"
 
 # Die BSD-Namen muessen weiter melden — und die Meldung muss den Weg nennen,
 # den es WIRKLICH gibt. Sonst sucht der naechste Leser an der falschen Stelle.
-pruefe_meldet "sys_socket bleibt gemeldet"  "sys_socket(2, 1, 0)"
-pruefe_meldet "sys_listen bleibt gemeldet"  "sys_listen(3, 5)"
-printf 'fn main(): int64 { return sys_listen(3, 5); }\n' > "$TMP/ls.lyx"
-msgls="$($LYXC "$TMP/ls.lyx" --target=lyxos -o "$TMP/ls.lbf" 2>&1)"
-case "$msgls" in
-  *"KEIN Gegenstueck"*)
-    echo "PASS sys_listen: Meldung nennt die fehlende Server-Seite"; PASS=$((PASS + 1)) ;;
-  *)
-    echo "FAIL sys_listen: Meldung nennt die fehlende Server-Seite: $(echo "$msgls"|sed -n 2p)"; FAIL=$((FAIL + 1)) ;;
-esac
+pruefe_baut   "sys_socket zweite Form"      "sys_socket(2, 1, 0)"
+pruefe_baut   "sys_listen (1538)"           "sys_listen(3, 5)"
+# #2011: die Textpruefung auf "KEIN Gegenstueck" ist ENTFALLEN. WP-F hat die
+# passive TCP-Seite im Kernel gebaut (0x0600-0x0609); sys_listen emittiert
+# gemessen 1538 und der Kernel hat 1538. Eine Meldung ueber eine fehlende
+# Server-Seite waere jetzt unwahr. Geprueft wird stattdessen oben, dass der
+# Aufruf BAUT.
 
 # Und die Nummern muessen wirklich im Erzeugnis stehen, nicht nur uebersetzen.
 printf 'fn main(): int64 { var b: int64 := 0x200000; var s: int64 := sys_tcp_connect(167772161, 80); sys_tcp_send(s, b, 16); sys_tcp_recv(s, b, 256); var t: int64 := sys_tcp_status(s); sys_tcp_close(s); return t; }\n' > "$TMP/tcp.lyx"
@@ -418,21 +423,17 @@ echo "-- #1810: Notification-Queues NICHT angebunden, aber praezise gemeldet --"
 # Geprueft wird deshalb, dass die Meldung den Grund NENNT — eine blosse
 # "gibt es nicht"-Meldung schickte den Leser auf die falsche Faehrte, weil die
 # Nummern ja existieren.
-pruefe_meldet "sys_notify_create meldet"  "sys_notify_create(0)"
-pruefe_meldet "sys_notify_send meldet"    "sys_notify_send(1, 7)"
-pruefe_meldet "sys_notify_recv meldet"    "sys_notify_recv(1, 1000)"
+pruefe_baut   "sys_notify_create (1033)"   "sys_notify_create(0)"
+pruefe_baut   "sys_notify_send (1034)"     "sys_notify_send(1, 7)"
+pruefe_baut   "sys_notify_recv (1035)"     "sys_notify_recv(1, 1000)"
 
-for paar in "sys_notify_send(1, 7):Nutzlast" "sys_notify_recv(1, 1000):nicht erreichbar"; do
-    aufruf="${paar%%:*}"; erwartet="${paar##*:}"
-    printf 'fn main(): int64 { return %s; }\n' "$aufruf" > "$TMP/nq.lyx"
-    msgnq="$($LYXC "$TMP/nq.lyx" --target=lyxos -o "$TMP/nq.lbf" 2>&1)"
-    case "$msgnq" in
-      *"$erwartet"*)
-        echo "PASS notify: Meldung nennt '$erwartet'"; PASS=$((PASS + 1)) ;;
-      *)
-        echo "FAIL notify: Meldung nennt '$erwartet' nicht: $(echo "$msgnq"|sed -n 5p)"; FAIL=$((FAIL + 1)) ;;
-    esac
-done
+# #2011: die Textpruefungen auf "Nutzlast" und "nicht erreichbar" sind
+# ENTFALLEN. Sie galten den ALTEN DRV-5-Nummern 237/238/239, die keine
+# Nutzlast und keine Frist nahmen. WP-B hat eigene IPC-Notify-Aufrufe mit
+# passender Gestalt gebaut: 1033 IpcNotifyCreate(a0), 1034 IpcNotifySend(a0,
+# a1), 1035 IpcNotifyRecv(a0, a1) (ring3.lyx:3568-3570). Es geht nichts mehr
+# verloren, und eine Meldung darueber waere unwahr. Geprueft wird oben, dass
+# die drei Aufrufe BAUEN.
 
 echo "-- #1810: Umgebungsvariablen mit den ECHTEN Nummern --"
 # 92-94 und 133. Portabel im Sinne der Aufnahmeregel von lyx-lyxunits (POSIX
