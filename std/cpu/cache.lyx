@@ -1,0 +1,148 @@
+// std/cpu/cache.lyx — Cachehierarchie (#2397, Teil von #2396)
+//
+// Je Ebene Groesse, Assoziativitaet, Zeilenlaenge, Typ und Zahl der teilenden
+// Threads. Gebraucht wird das nicht zur Zierde: ohne Cachezeilenlaenge und
+// L2-Groesse kann der Codegen keine Blockgroessen waehlen. Heute steht die 64
+// als Literal im Compiler (die Cachezeilen-Periode 64 wurde in #2339 GEMESSEN,
+// nicht abgefragt) — diese Unit macht die Abfrage moeglich.
+//
+// Quelle ist CPUID.4 (Intel) bzw. CPUID.0x8000001D (AMD); beide haben dasselbe
+// Feldformat. Gibt es keines der beiden Blaetter, fehlt der Wert mit
+// CPU_ST_UNSUPPORTED — es gibt keinen Rueckfall auf "wahrscheinlich 64", weil
+// genau das die falsche Blockgroesse erzeugen wuerde, und zwar still.
+
+@description("CPU-Caches: Groesse, Assoziativitaet, Zeilenlaenge, Typ, teilende Threads je Ebene")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+unit std.cpu.cache;
+
+import std.cpu.status;
+
+pub con CPU_CACHE_DATEN:        int64 := 1;
+pub con CPU_CACHE_BEFEHLE:      int64 := 2;
+pub con CPU_CACHE_VEREINHEIT:   int64 := 3;
+
+// Welches Blatt beschreibt die Caches? 4 bei Intel, 0x8000001D bei AMD.
+// 0 heisst: keines von beiden.
+fn caBlatt(): int64 {
+  // Intel: Blatt 4 muss vorhanden sein UND einen Cache melden.
+  if (cpu_id(0, 0, 0) >= 4) {
+    if ((cpu_id(4, 0, 0) & 31) != 0) { return 4; }
+  }
+  // AMD: erweitertes Blatt 0x8000001D.
+  if (cpu_id(2147483648, 0, 0) >= 2147483677) {
+    if ((cpu_id(2147483677, 0, 0) & 31) != 0) { return 2147483677; }
+  }
+  return 0;
+}
+
+// Zahl der beschriebenen Cache-Ebenen (Unterblaetter mit Typ != 0).
+pub fn CpuCacheAnzahl(): int64 {
+  var blatt: int64 := caBlatt();
+  if (blatt == 0) { return 0; }
+  var i: int64 := 0;
+  while (i < 16) {
+    if ((cpu_id(blatt, i, 0) & 31) == 0) { return i; }
+    i := i + 1;
+  }
+  return 16;
+}
+
+// Gueltiges Unterblatt? Sonst fehlt jeder Wert mit Begruendung.
+fn caPruef(i: int64, t: int64): int64 {
+  var blatt: int64 := caBlatt();
+  if (blatt == 0) {
+    CpuWertFehlt(t, CPU_ST_UNSUPPORTED, "cpuid.4 / cpuid.8000001d (kein Cacheblatt)"c);
+    return 0;
+  }
+  if (i < 0 || (cpu_id(blatt, i, 0) & 31) == 0) {
+    CpuWertFehlt(t, CPU_ST_UNSUPPORTED, "cpuid.4 (Unterblatt beschreibt keinen Cache)"c);
+    return 0;
+  }
+  return blatt;
+}
+
+pub fn CpuCacheTyp(i: int64, t: int64): void {
+  var blatt: int64 := caPruef(i, t);
+  if (blatt == 0) { return; }
+  CpuWertSetzen(t, cpu_id(blatt, i, 0) & 31, "cpuid.4 eax bit 0..4"c);
+}
+
+pub fn CpuCacheEbene(i: int64, t: int64): void {
+  var blatt: int64 := caPruef(i, t);
+  if (blatt == 0) { return; }
+  CpuWertSetzen(t, (cpu_id(blatt, i, 0) >> 5) & 7, "cpuid.4 eax bit 5..7"c);
+}
+
+pub fn CpuCacheZeilenlaenge(i: int64, t: int64): void {
+  var blatt: int64 := caPruef(i, t);
+  if (blatt == 0) { return; }
+  CpuWertSetzen(t, (cpu_id(blatt, i, 1) & 4095) + 1, "cpuid.4 ebx bit 0..11"c);
+}
+
+pub fn CpuCacheAssoziativitaet(i: int64, t: int64): void {
+  var blatt: int64 := caPruef(i, t);
+  if (blatt == 0) { return; }
+  CpuWertSetzen(t, ((cpu_id(blatt, i, 1) >> 22) & 1023) + 1, "cpuid.4 ebx bit 22..31"c);
+}
+
+pub fn CpuCacheTeilendeThreads(i: int64, t: int64): void {
+  var blatt: int64 := caPruef(i, t);
+  if (blatt == 0) { return; }
+  CpuWertSetzen(t, ((cpu_id(blatt, i, 0) >> 14) & 4095) + 1, "cpuid.4 eax bit 14..25"c);
+}
+
+// Groesse in Byte = Wege * Partitionen * Zeilenlaenge * Mengen. Jeder der vier
+// Faktoren steht im Blatt um eins verringert — wer das Minus-eins vergisst,
+// bekommt eine Groesse, die plausibel aussieht und falsch ist.
+pub fn CpuCacheGroesse(i: int64, t: int64): void {
+  var blatt: int64 := caPruef(i, t);
+  if (blatt == 0) { return; }
+  var ebx: int64 := cpu_id(blatt, i, 1);
+  var zeile: int64 := (ebx & 4095) + 1;
+  var teile: int64 := ((ebx >> 12) & 1023) + 1;
+  var wege:  int64 := ((ebx >> 22) & 1023) + 1;
+  var mengen: int64 := cpu_id(blatt, i, 2) + 1;
+  CpuWertSetzen(t, wege * teile * zeile * mengen, "cpuid.4 ebx/ecx"c);
+}
+
+// Zeilenlaenge des Datencaches der Ebene 1 — der Wert, den Codegen und
+// Allokator brauchen. Gibt es ihn nicht, fehlt er; 64 wird NICHT geraten.
+pub fn CpuZeilenlaenge(t: int64): void {
+  var n: int64 := CpuCacheAnzahl();
+  var i: int64 := 0;
+  while (i < n) {
+    var ty: int64 := CpuWertNeu();
+    var eb: int64 := CpuWertNeu();
+    CpuCacheTyp(i, ty);
+    CpuCacheEbene(i, eb);
+    if (CpuWertDa(ty) != 0 && CpuWertDa(eb) != 0) {
+      if (CpuWert(eb) == 1 && (CpuWert(ty) == CPU_CACHE_DATEN || CpuWert(ty) == CPU_CACHE_VEREINHEIT)) {
+        CpuCacheZeilenlaenge(i, t);
+        return;
+      }
+    }
+    i := i + 1;
+  }
+  CpuWertFehlt(t, CPU_ST_UNSUPPORTED, "cpuid.4 (kein L1-Datencache beschrieben)"c);
+}
+
+// Groesse einer Ebene (1, 2, 3 ...) fuer Daten- bzw. vereinheitlichte Caches.
+pub fn CpuCacheGroesseEbene(ebene: int64, t: int64): void {
+  var n: int64 := CpuCacheAnzahl();
+  var i: int64 := 0;
+  while (i < n) {
+    var ty: int64 := CpuWertNeu();
+    var eb: int64 := CpuWertNeu();
+    CpuCacheTyp(i, ty);
+    CpuCacheEbene(i, eb);
+    if (CpuWertDa(ty) != 0 && CpuWertDa(eb) != 0) {
+      if (CpuWert(eb) == ebene && (CpuWert(ty) == CPU_CACHE_DATEN || CpuWert(ty) == CPU_CACHE_VEREINHEIT)) {
+        CpuCacheGroesse(i, t);
+        return;
+      }
+    }
+    i := i + 1;
+  }
+  CpuWertFehlt(t, CPU_ST_UNSUPPORTED, "cpuid.4 (Ebene nicht beschrieben)"c);
+}

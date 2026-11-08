@@ -1,0 +1,137 @@
+// std/cpu/status.lyx — Statusmodell der CPU-Diagnose (#2397, Teil von #2396)
+//
+// Jede Abfrage im Bestand gab bisher eine nackte Ganzzahl zurueck
+// (`GetLogicalCores(): int64`), und "unbekannt" war davon nicht
+// unterscheidbar — es wurde 0 oder -1 und erschien im Bericht als echte Zahl.
+// Genau diese Form des stillen Defaults ist in CLAUDE.md als haeufigste
+// Ursache belegt: ein Catch-all, der etwas Plausibles liefert statt zu melden.
+//
+// Deshalb traegt hier JEDER Messwert vier Angaben:
+//
+//   wert    — die Zahl, nur gueltig bei status == CPU_ST_OK
+//   status  — warum der Wert fehlt, wenn er fehlt
+//   quelle  — WOHER er kommt ("cpuid.4", "/sys/.../scaling_governor")
+//   zeit    — monotone Nanosekunden der Messung
+//
+// Die Quelle ist nicht Zierde: dieselbe Groesse hat je Weg verschiedene
+// Bedeutungen (`scaling_cur_freq` ist der angeforderte Zustand, nicht der
+// Takt), und ohne Quellenangabe laesst sich eine Zahl spaeter nicht einordnen.
+//
+// Gelesen wird auf GENAU ZWEI Wegen: `CpuWert` scheitert laut, wenn der Wert
+// fehlt, und `CpuWertOder` verlangt einen ausdruecklichen Ersatz. Eine dritte
+// Lesefunktion, die still 0 liefert, gibt es nicht und darf es nicht geben.
+
+@description("Statusmodell der CPU-Diagnose: Wert, Status, Quelle, Zeitpunkt")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+unit std.cpu.status;
+
+import std.alloc;
+import std.time;
+
+// ── Statuswerte ─────────────────────────────────────────────────────────────
+pub con CPU_ST_OK:                int64 := 0;
+pub con CPU_ST_UNSUPPORTED:       int64 := 1;   // Quelle gibt es auf dieser Maschine nicht
+pub con CPU_ST_PERMISSION_DENIED: int64 := 2;   // EACCES/EPERM — Lockdown, paranoid, Rechte
+pub con CPU_ST_NOT_EXPOSED_BY_VM: int64 := 3;   // Quelle da, aber vom Hypervisor leer gelassen
+pub con CPU_ST_NOT_IMPLEMENTED:   int64 := 4;   // dieses Ziel kennt den Weg noch nicht
+
+// Groesse eines Traegers in Byte. Vier 64-Bit-Felder; Lyx hat keinen
+// Mehrfachrueckgabewert, der Traeger liegt deshalb im Speicher.
+pub con CPU_WERT_SZ: int64 := 32;
+
+pub con CPU_W_OFF_WERT:   int64 := 0;
+pub con CPU_W_OFF_STATUS: int64 := 8;
+pub con CPU_W_OFF_QUELLE: int64 := 16;
+pub con CPU_W_OFF_ZEIT:   int64 := 24;
+
+// Einen Traeger anlegen (32 Byte, Status NOT_IMPLEMENTED — wer ihn nicht
+// fuellt, hat damit kein "0", sondern eine Meldung).
+pub fn CpuWertNeu(): int64 {
+  var t: int64 := alloc(CPU_WERT_SZ);
+  if (t == 0) { return 0; }
+  poke64(t + CPU_W_OFF_WERT, 0);
+  poke64(t + CPU_W_OFF_STATUS, CPU_ST_NOT_IMPLEMENTED);
+  poke64(t + CPU_W_OFF_QUELLE, 0);
+  poke64(t + CPU_W_OFF_ZEIT, GetTimeNs(CLOCK_MONOTONIC));
+  return t;
+}
+
+// Einen gueltigen Wert eintragen.
+pub fn CpuWertSetzen(t: int64, wert: int64, quelle: pchar): void {
+  if (t == 0) { return; }
+  poke64(t + CPU_W_OFF_WERT, wert);
+  poke64(t + CPU_W_OFF_STATUS, CPU_ST_OK);
+  poke64(t + CPU_W_OFF_QUELLE, quelle as int64);
+  poke64(t + CPU_W_OFF_ZEIT, GetTimeNs(CLOCK_MONOTONIC));
+}
+
+// Einen fehlenden Wert eintragen. Der WERT bleibt 0, ist aber ueber den
+// Status als ungueltig gekennzeichnet — und `CpuWert` gibt ihn nicht heraus.
+pub fn CpuWertFehlt(t: int64, status: int64, quelle: pchar): void {
+  if (t == 0) { return; }
+  poke64(t + CPU_W_OFF_WERT, 0);
+  poke64(t + CPU_W_OFF_STATUS, status);
+  poke64(t + CPU_W_OFF_QUELLE, quelle as int64);
+  poke64(t + CPU_W_OFF_ZEIT, GetTimeNs(CLOCK_MONOTONIC));
+}
+
+pub fn CpuStatus(t: int64): int64 {
+  if (t == 0) { return CPU_ST_NOT_IMPLEMENTED; }
+  return peek64(t + CPU_W_OFF_STATUS);
+}
+
+pub fn CpuQuelle(t: int64): pchar {
+  if (t == 0) { return ""c; }
+  var q: int64 := peek64(t + CPU_W_OFF_QUELLE);
+  if (q == 0) { return ""c; }
+  return q as pchar;
+}
+
+pub fn CpuZeit(t: int64): int64 {
+  if (t == 0) { return 0; }
+  return peek64(t + CPU_W_OFF_ZEIT);
+}
+
+pub fn CpuWertDa(t: int64): int64 {
+  if (CpuStatus(t) == CPU_ST_OK) { return 1; }
+  return 0;
+}
+
+// Wert lesen — scheitert LAUT, wenn er fehlt. Das ist der Normalweg fuer
+// Code, der ohne den Wert nicht weiterrechnen kann.
+pub fn CpuWert(t: int64): int64 {
+  if (CpuStatus(t) != CPU_ST_OK) {
+    panic("std.cpu: Wert nicht verfuegbar — Status pruefen (CpuWertDa) oder CpuWertOder benutzen");
+  }
+  return peek64(t + CPU_W_OFF_WERT);
+}
+
+// Wert lesen mit AUSDRUECKLICHEM Ersatz. Wer 0 als Ersatz will, schreibt das
+// hin — dann steht es im Quelltext und ist kein stiller Default.
+pub fn CpuWertOder(t: int64, ersatz: int64): int64 {
+  if (CpuStatus(t) != CPU_ST_OK) { return ersatz; }
+  return peek64(t + CPU_W_OFF_WERT);
+}
+
+// Name des Status fuer Berichte. Der Default-Zweig nennt die Zahl, statt
+// einen Namen zu erfinden.
+pub fn CpuStatusName(status: int64): pchar {
+  if (status == CPU_ST_OK)                { return "ok"c; }
+  if (status == CPU_ST_UNSUPPORTED)       { return "unsupported"c; }
+  if (status == CPU_ST_PERMISSION_DENIED) { return "permission_denied"c; }
+  if (status == CPU_ST_NOT_EXPOSED_BY_VM) { return "not_exposed_by_vm"c; }
+  if (status == CPU_ST_NOT_IMPLEMENTED)   { return "not_implemented"c; }
+  return "unbekannter_status"c;
+}
+
+// Aus einem negativen errno den passenden Status ableiten. EACCES (-13) und
+// EPERM (-1) heissen "Rechte", ENOENT (-2) und ENODEV (-19) "gibt es hier
+// nicht". Alles andere ist NICHT "unsupported", sondern bleibt als
+// not_implemented stehen — ein unbekannter Fehler darf nicht als bekannter
+// Zustand erscheinen.
+pub fn CpuStatusAusErrno(rc: int64): int64 {
+  if (rc == 0 - 13 || rc == 0 - 1) { return CPU_ST_PERMISSION_DENIED; }
+  if (rc == 0 - 2 || rc == 0 - 19) { return CPU_ST_UNSUPPORTED; }
+  return CPU_ST_NOT_IMPLEMENTED;
+}

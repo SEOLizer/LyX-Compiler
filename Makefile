@@ -21,8 +21,8 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.31H
-VERSION_DATE := 2026-11-05
+VERSION   := 1.2.34B
+VERSION_DATE := 2026-11-08
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
 UNITS_DST := $(PKG_DIR)/usr/include/lyx/units/std
@@ -341,8 +341,38 @@ test: lyxc
 	@bash tests/std_path_autoritativ_test.sh
 	@echo "--- std.cpu.features gegen die echte CPU, beide Richtungen (#2187) ---"
 	@bash tests/cpu_features_test.sh
+	@echo "--- std.cpu: Statusmodell, Identitaet, Topologie, Caches (#2397) ---"
+	@bash tests/cpu_describe_2397_test.sh
+	@echo "--- std.cpu: Begruendung der Nutzbarkeit, beide Richtungen (#2398) ---"
+	@bash tests/cpu_reason_2398_test.sh
+	@echo "--- std.cpu: Prozessgrenzen in drei Laeufen (#2399) ---"
+	@bash tests/cpu_limits_2399_test.sh
+	@echo "--- std.cpu: Governor, Boost, vier getrennte Taktfelder (#2400) ---"
+	@bash tests/cpu_power_2400_test.sh
+	@echo "--- std.cpu: gemessener Takt gegen perf stat (#2401) ---"
+	@bash tests/cpu_clock_2401_test.sh
+	@echo "--- lyx-cpu: CLI gegen lscpu/sysfs/perf, JSON gegen Parser (#2402) ---"
+	@bash tests/lyx_cpu_cli_2402_test.sh
+	@echo "--- vorzeichenlose Division durch konstanten Divisor ohne div (#2333) ---"
+	@bash tests/div_magie_unsig_2333_test.sh
+	@echo "--- Merktabelle fuer die Methodendeklaration, Schluessel (#2321) ---"
+	@bash tests/methodmerker_2321_test.sh
+	@echo "--- std.url: Getter liefern Bestandteile, nicht den Rest (#2366) ---"
+	@bash tests/url_getter_2366_test.sh
+	@echo "--- TCP-Zeitlimits: Wirkung und Gegenrichtung (#2294) ---"
+	@bash tests/tcp_timeout_2294_test.sh
 	@echo "--- AES-NI: FIPS-197-Vektoren, beide Wege gleich, Bytemuster (#2383) ---"
 	@bash tests/aes_ni_test.sh
+	@echo "--- GHASH mit PCLMULQDQ, AES-NI in AES-GCM, beide Wege gleich (#2390) ---"
+	@bash tests/ghash_pclmul_2390_test.sh
+	@echo "--- SHA-NI-Schnellweg fuer SHA-256, beide Wege gleich (#2391) ---"
+	@bash tests/sha_ni_2391_test.sh
+	@echo "--- fma mit einer Rundung, Hardware und exakter Rueckfall gegen libm (#2403) ---"
+	@bash tests/fma_2403_test.sh
+	@echo "--- memcpy: jedes Byte und Waechter, alle Wegegrenzen des Helfers (#2353) ---"
+	@bash tests/memcpy_2353_test.sh
+	@echo "--- RDRAND/RDSEED als Zusatz-Entropie, Erfolg statt Wert (#2392) ---"
+	@bash tests/rand_hw_2392_test.sh
 	@echo "--- Vektorarena: kein Wachstum, kein Syscall je Operation (#2206) ---"
 	@bash tests/vektorarena_test.sh
 	@echo "--- VEX-Encoder: Kodierungen zurueckgelesen (#2192, Schnitt 1) ---"
@@ -544,6 +574,15 @@ test: lyxc
 	@bash tests/vektor_reduktion_2335_test.sh
 	@bash tests/vektor_int8mul_2336_test.sh
 	@bash tests/rumpfausrichtung_2339_test.sh
+	@echo "--- Suchschleifen vorspulen: Wert, Erzeugnis, Gegenrichtung (#2360) ---"
+	@bash tests/vektor_suche_2360_test.sh
+	@echo "--- SemaRTI: Ablauf, Capability-Durchsetzung, Uebersetzerseite ---"
+	@bash tests/semarti_mvp_test.sh
+	@echo "--- SemaRTI: @operation am Code, erzeugte Unit, Formpruefung (#2419) ---"
+	@bash tests/semarti_attribut_test.sh
+	@echo "--- Struct-Zuweisung an eine Modulvariable kopiert den Inhalt (#2421) ---"
+	@bash tests/record_2421_test.sh
+	@bash tests/code_offset_2339_test.sh
 	@bash tests/str_primitiven_simd_test.sh
 	@bash tests/div_konstante_2330_test.sh
 	@bash tests/div_magie_2330_test.sh
@@ -734,7 +773,7 @@ test: lyxc
 	@bash tests/crypto_kette_rsa_ed25519_test.sh
 	@bash tests/tls13_handschlag_test.sh
 	@bash tests/tls13_schluesselarten_test.sh
-	@bash tests/tls13_interop_openssl_test.sh
+	@echo "--- TLS-Interop gegen OpenSSL: in tests/known-red.txt (!flaky, #2418) ---"
 	@bash tests/ir_datei_builtins_test.sh
 	@bash tests/unit_private_globals_test.sh
 	@bash tests/ir_kein_stiller_ausdruck_test.sh
@@ -1312,21 +1351,42 @@ test-lyx-integration: lyxc
 # Die .sh-Eintraege aus tests/known-red.txt. Sie laufen, ihr Fehlschlag ist
 # erwartet und bricht nichts ab — aber wenn einer wieder gruen wird, wird
 # DIESES Ziel rot, damit der Eintrag verschwindet statt zu veralten.
+# #2418: `!flaky` wirkt jetzt AUCH hier. Die Markierung ist in
+# tests/known-red.txt seit #1153 beschrieben ("ohne die Markierung faerbt
+# jeder zufaellige Durchlauf das Ziel rot, weil ein bekannt roter Test gruen
+# wurde"), war aber nur in tests/run_lyx_tests.sh umgesetzt — fuer die
+# .lyx-Eintraege. Dieses Ziel schnitt `!flaky` bloss aus dem Pfad und
+# behandelte den Eintrag wie jeden anderen.
+#
+# Folge: ein .sh-Eintrag, der NUR UNTER LAST faellt, war hier nicht
+# unterbringbar. Gruen lief er oft, und jeder gruene Lauf machte das Ziel rot.
+#
+# Ein markierter Eintrag meldet seinen gruenen Lauf weiterhin — er bleibt
+# sichtbar —, faerbt das Ziel aber nicht. Unmarkierte Eintraege verhalten
+# sich unveraendert: wird einer gruen, wird das Ziel rot, damit die Liste
+# nicht stillschweigend veraltet. Beide Seiten sind geprueft.
 .PHONY: test-known-red
 test-known-red: lyxc
-	@fail=0; n=0; \
+	@fail=0; n=0; nf=0; \
 	while read -r line; do \
-	  line="$${line%%\#*}"; line="$$(printf '%s' "$$line" | sed -e 's/[[:space:]]*$$//' -e 's/[[:space:]]*!flaky$$//')"; \
+	  line="$${line%%\#*}"; line="$$(printf '%s' "$$line" | sed -e 's/[[:space:]]*$$//')"; \
+	  flaky=0; \
+	  case "$$line" in *!flaky) flaky=1; line="$$(printf '%s' "$$line" | sed -e 's/[[:space:]]*!flaky$$//')" ;; esac; \
 	  case "$$line" in ''|*.lyx) continue ;; esac; \
 	  n=$$((n+1)); \
 	  if bash "$$line" >/dev/null 2>&1; then \
-	    echo "WIEDER GRUEN $$line — Eintrag aus tests/known-red.txt streichen"; \
-	    fail=$$((fail+1)); \
+	    if [ "$$flaky" = 1 ]; then \
+	      echo "gruen (flaky) $$line — faellt nur unter Last, Eintrag bleibt"; \
+	      nf=$$((nf+1)); \
+	    else \
+	      echo "WIEDER GRUEN $$line — Eintrag aus tests/known-red.txt streichen"; \
+	      fail=$$((fail+1)); \
+	    fi; \
 	  else \
 	    echo "bekannt rot   $$line"; \
 	  fi; \
 	done < tests/known-red.txt; \
-	echo "known-red (.sh): $$n geprueft, $$fail unerwartet gruen"; \
+	echo "known-red (.sh): $$n geprueft, $$fail unerwartet gruen, $$nf flaky-gruen"; \
 	test $$fail -eq 0
 
 # LyxOS-Tests aus tests/ (nicht tests/lyxos/ -- dafuer gibt es `test-lyxos`).

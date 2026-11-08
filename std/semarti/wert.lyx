@@ -1,0 +1,348 @@
+// std/semarti/wert.lyx — strukturierter Wert für SemaRTI.
+//
+// WARUM NEBEN std/json.lyx UND NICHT DARIN. In diesem Baum ist dieselbe
+// Rechnung an zwei Stellen ein Korrektheitsproblem. Hier liegt keine zweite
+// Fassung derselben Rechnung: `std.json` ist durchgehend TEXTBASIERT
+// (`pchar` hinein, `pchar` heraus, Listen als pipe-getrennte Zeichenkette).
+// Es gibt dort keinen Werttyp, keine Navigation über Felder und keine
+// Grenzen für Tiefe oder Größe. Genau das braucht eine Eingabeprüfung, die
+// vor einem Aufruf entscheidet. Was sich wiederverwenden lässt, wird
+// wiederverwendet: das Maskieren von Text läuft über `JSONEscape` aus
+// `std.json` und ist hier NICHT nachgebaut.
+//
+// WARUM EINE ARENA UND KEINE ZEIGERGEFLECHTE. Ein Wert kommt von außen und
+// ist damit Angreifereingabe. Eine Arena mit festem Deckel macht die
+// Erschöpfung zu einem gemeldeten Fehler statt zu einer offenen
+// Speicherbelegung: jede Grenze ist eine Zahl, die im Kopf dieser Datei
+// steht, und keine Eigenschaft des Hostspeichers.
+//
+// WARUM DIE GRENZEN SO FRÜH GREIFEN. Geprüft wird beim BAUEN des Wertes,
+// nicht erst beim Lesen. Ein zu tiefes oder zu großes Dokument wird also
+// abgewiesen, bevor es im Speicher steht — nicht nachdem es dort steht.
+
+@description("SemaRTI: strukturierter Wert mit harten Grenzen")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+unit std.semarti.wert;
+
+import std.alloc;
+import std.string;
+import std.json;
+
+// ── Knotenarten ─────────────────────────────────────────────────────────────
+// Die Aufzählung ist vollständig und wird an EINER Stelle geführt. Eine neue
+// Art braucht einen Eintrag hier, einen in `wTypName` und einen in
+// `wSerialisiere`; wer eine davon vergisst, bekommt eine laute Meldung und
+// keinen stillen Durchfall.
+pub con SRW_NULL:   int64 := 0;
+pub con SRW_BOOL:   int64 := 1;
+pub con SRW_ZAHL:   int64 := 2;
+pub con SRW_TEXT:   int64 := 3;
+pub con SRW_LISTE:  int64 := 4;
+pub con SRW_OBJEKT: int64 := 5;
+
+// ── Grenzen ─────────────────────────────────────────────────────────────────
+// Alle Grenzen stehen hier und nirgends sonst. Sie sind bewusst klein: ein
+// Aufrufvorschlag ist eine Handvoll Felder, kein Dokument.
+pub con SRW_MAX_KNOTEN:    int64 := 4096;   // Knoten je Arena
+pub con SRW_MAX_TIEFE:     int64 := 16;     // Verschachtelung
+pub con SRW_MAX_TEXTLAENGE: int64 := 8192;  // Byte je Textknoten
+pub con SRW_MAX_FELDER:    int64 := 64;     // Felder je Objekt, Glieder je Liste
+pub con SRW_MAX_NAME:      int64 := 128;    // Byte je Feldname
+pub con SRW_MAX_TEXTRAUM:  int64 := 262144; // Byte für allen Text zusammen
+
+// ── Fehlercodes ─────────────────────────────────────────────────────────────
+// 0 ist Erfolg. Jeder Fehler ist ein EIGENER Wert: "Arena voll" und "zu tief"
+// sind verschiedene Befunde, und ein Aufrufer, der sie unterscheiden will,
+// muss das können.
+pub con SRW_OK:              int64 := 0;
+pub con SRW_E_ARENA_VOLL:    int64 := 0 - 1;
+pub con SRW_E_ZU_TIEF:       int64 := 0 - 2;
+pub con SRW_E_TEXT_ZU_LANG:  int64 := 0 - 3;
+pub con SRW_E_ZU_VIELE_FELDER: int64 := 0 - 4;
+pub con SRW_E_NAME_ZU_LANG:  int64 := 0 - 5;
+pub con SRW_E_TEXTRAUM_VOLL: int64 := 0 - 6;
+pub con SRW_E_KEIN_OBJEKT:   int64 := 0 - 7;
+pub con SRW_E_KEINE_LISTE:   int64 := 0 - 8;
+pub con SRW_E_UNBEKANNT:     int64 := 0 - 9;
+pub con SRW_E_NICHT_GEFUNDEN: int64 := 0 - 10;
+pub con SRW_E_SYNTAX:        int64 := 0 - 11;
+
+// ── Arena ───────────────────────────────────────────────────────────────────
+// Ein Knoten ist ein Satz aus sechs 8-Byte-Zellen:
+//   [0] art        SRW_*
+//   [8] zahl       Zahlwert, Bool (0/1), Textlänge oder Gliederzahl
+//  [16] text       Versatz im Textraum (bei SRW_TEXT)
+//  [24] erstesKind Knotenindex oder -1
+//  [32] naechster  Knotenindex des Geschwisters oder -1
+//  [40] name       Versatz des Feldnamens im Textraum, -1 wenn ohne Namen
+pub con SRW_KNOTEN_BYTES: int64 := 48;
+
+var _knoten: int64 := 0;      // Puffer der Knotensätze
+var _anzahl: int64 := 0;      // belegte Knoten
+var _text: int64 := 0;        // Textraum
+var _textEnde: int64 := 0;    // belegte Bytes im Textraum
+var _bereit: int64 := 0;
+
+fn wInit(): void {
+  if (_bereit != 0) { return; }
+  _knoten := alloc(SRW_MAX_KNOTEN * SRW_KNOTEN_BYTES);
+  _text := alloc(SRW_MAX_TEXTRAUM);
+  _anzahl := 0;
+  _textEnde := 0;
+  _bereit := 1;
+}
+
+// Setzt die Arena zurück. Der Host ruft das je Aufruf auf: ein Vorschlag ist
+// ein Vorgang, und sein Speicher gehört nicht dem nächsten.
+//
+// WICHTIG: alle vorher ausgegebenen Knotenindizes sind danach ungültig. Das
+// ist derselbe Fehler, der in diesem Baum fünfmal als wiederverwendeter
+// Kratzbereich aufgetreten ist — ein Bereich, eine Rolle. Wer einen Wert
+// über einen Rücksetzpunkt hinaus braucht, serialisiert ihn vorher.
+// MARKE: der Stand nach der Aufbauphase. Deskriptoren und ihre Schemas
+// werden EINMAL gebaut und müssen jedes Zurücksetzen überleben; die Werte
+// eines einzelnen Aufrufs dürfen es nicht. Dasselbe Muster trägt die
+// Vektorarena des Übersetzers (#2206): eine Marke, und zurückgesetzt wird
+// nur bis dorthin.
+//
+// Ohne diese Trennung wäre es derselbe Fehler, der in diesem Baum fünfmal
+// aufgetreten ist — ein wiederverwendeter Bereich mit zwei Rollen, bei dem
+// jeder zweite Zugriff auf fremde Daten zeigt.
+var _markeKnoten: int64 := 0;
+var _markeText: int64 := 0;
+var _markeGesetzt: int64 := 0;
+
+pub fn WertMarkeSetzen(): void {
+  wInit();
+  _markeKnoten := _anzahl;
+  _markeText := _textEnde;
+  _markeGesetzt := 1;
+}
+
+pub fn WertMarkeGesetzt(): int64 { return _markeGesetzt; }
+
+// Setzt die Arena auf die Marke zurück. Ohne gesetzte Marke wird alles
+// freigegeben — dann gibt es keine Deskriptoren, die zu schützen wären.
+//
+// WICHTIG: alle nach der Marke ausgegebenen Knotenindizes sind danach
+// ungültig. Wer einen Wert über einen Rücksetzpunkt hinaus braucht,
+// serialisiert ihn vorher oder baut ihn vor der Marke.
+pub fn WertArenaZuruecksetzen(): void {
+  wInit();
+  _anzahl := _markeKnoten;
+  _textEnde := _markeText;
+}
+
+// Gibt auch die Deskriptoren frei. Nur für Tests und für einen Host, der
+// seine Registry neu aufbaut.
+pub fn WertAllesFreigeben(): void {
+  wInit();
+  _anzahl := 0;
+  _textEnde := 0;
+  _markeKnoten := 0;
+  _markeText := 0;
+  _markeGesetzt := 0;
+}
+
+pub fn WertKnotenZahl(): int64 { wInit(); return _anzahl; }
+
+fn wZelle(ni: int64, nr: int64): int64 {
+  return _knoten + ni * SRW_KNOTEN_BYTES + nr * 8;
+}
+
+pub fn WertArt(ni: int64): int64 {
+  wInit();
+  if (ni < 0 || ni >= _anzahl) { return SRW_E_UNBEKANNT; }
+  return peek64(wZelle(ni, 0));
+}
+
+fn wNeu(art: int64): int64 {
+  wInit();
+  if (_anzahl >= SRW_MAX_KNOTEN) { return SRW_E_ARENA_VOLL; }
+  var ni: int64 := _anzahl;
+  _anzahl := _anzahl + 1;
+  poke64(wZelle(ni, 0), art);
+  poke64(wZelle(ni, 1), 0);
+  poke64(wZelle(ni, 2), 0);
+  poke64(wZelle(ni, 3), 0 - 1);
+  poke64(wZelle(ni, 4), 0 - 1);
+  poke64(wZelle(ni, 5), 0 - 1);
+  return ni;
+}
+
+// Legt Text im Textraum ab und gibt den Versatz zurück (oder einen Fehler).
+// Abgelegt wird mit abschließender Null, damit Leser `pchar` bekommen.
+fn wTextAblegen(s: pchar, n: int64): int64 {
+  wInit();
+  if (n < 0) { return SRW_E_UNBEKANNT; }
+  if (_textEnde + n + 1 > SRW_MAX_TEXTRAUM) { return SRW_E_TEXTRAUM_VOLL; }
+  var ziel: int64 := _textEnde;
+  var i: int64 := 0;
+  while (i < n) {
+    poke8(_text + ziel + i, peek8(s + i));
+    i := i + 1;
+  }
+  poke8(_text + ziel + n, 0);
+  _textEnde := _textEnde + n + 1;
+  return ziel;
+}
+
+// ── Werte bauen ─────────────────────────────────────────────────────────────
+pub fn WertNull(): int64 { return wNeu(SRW_NULL); }
+
+pub fn WertBool(b: int64): int64 {
+  var ni: int64 := wNeu(SRW_BOOL);
+  if (ni < 0) { return ni; }
+  if (b != 0) { poke64(wZelle(ni, 1), 1); }
+  return ni;
+}
+
+pub fn WertZahl(z: int64): int64 {
+  var ni: int64 := wNeu(SRW_ZAHL);
+  if (ni < 0) { return ni; }
+  poke64(wZelle(ni, 1), z);
+  return ni;
+}
+
+pub fn WertText(s: pchar): int64 {
+  var n: int64 := StrLen(s);
+  if (n > SRW_MAX_TEXTLAENGE) { return SRW_E_TEXT_ZU_LANG; }
+  var off: int64 := wTextAblegen(s, n);
+  if (off < 0) { return off; }
+  var ni: int64 := wNeu(SRW_TEXT);
+  if (ni < 0) { return ni; }
+  poke64(wZelle(ni, 1), n);
+  poke64(wZelle(ni, 2), off);
+  return ni;
+}
+
+pub fn WertListe(): int64 { return wNeu(SRW_LISTE); }
+pub fn WertObjekt(): int64 { return wNeu(SRW_OBJEKT); }
+
+// Hängt `kind` an `eltern` an. Bei einem Objekt trägt das Kind einen Namen.
+// Die Gliederzahl steht in Zelle 1 und wird hier mitgeführt, damit die
+// Feldgrenze ohne Ablaufen der Kette prüfbar ist.
+fn wAnhaengen(eltern: int64, kind: int64, nameOff: int64): int64 {
+  if (eltern < 0 || kind < 0) { return SRW_E_UNBEKANNT; }
+  var art: int64 := WertArt(eltern);
+  if (art != SRW_LISTE && art != SRW_OBJEKT) { return SRW_E_KEIN_OBJEKT; }
+  var anz: int64 := peek64(wZelle(eltern, 1));
+  if (anz >= SRW_MAX_FELDER) { return SRW_E_ZU_VIELE_FELDER; }
+  poke64(wZelle(kind, 5), nameOff);
+  var erstes: int64 := peek64(wZelle(eltern, 3));
+  if (erstes < 0) {
+    poke64(wZelle(eltern, 3), kind);
+  } else {
+    // Ans Ende der Kette. Die Reihenfolge der Felder bleibt damit die
+    // Reihenfolge des Einfügens, und eine Serialisierung ist wiederholbar.
+    var letztes: int64 := erstes;
+    while (peek64(wZelle(letztes, 4)) >= 0) { letztes := peek64(wZelle(letztes, 4)); }
+    poke64(wZelle(letztes, 4), kind);
+  }
+  poke64(wZelle(eltern, 1), anz + 1);
+  return SRW_OK;
+}
+
+pub fn WertFeldSetzen(obj: int64, name: pchar, kind: int64): int64 {
+  if (WertArt(obj) != SRW_OBJEKT) { return SRW_E_KEIN_OBJEKT; }
+  var nl: int64 := StrLen(name);
+  if (nl > SRW_MAX_NAME) { return SRW_E_NAME_ZU_LANG; }
+  var off: int64 := wTextAblegen(name, nl);
+  if (off < 0) { return off; }
+  return wAnhaengen(obj, kind, off);
+}
+
+pub fn WertGliedAnhaengen(liste: int64, kind: int64): int64 {
+  if (WertArt(liste) != SRW_LISTE) { return SRW_E_KEINE_LISTE; }
+  return wAnhaengen(liste, kind, 0 - 1);
+}
+
+// ── Werte lesen ─────────────────────────────────────────────────────────────
+pub fn WertZahlwert(ni: int64): int64 {
+  if (WertArt(ni) != SRW_ZAHL && WertArt(ni) != SRW_BOOL) { return SRW_E_UNBEKANNT; }
+  return peek64(wZelle(ni, 1));
+}
+
+pub fn WertTextwert(ni: int64): pchar {
+  if (WertArt(ni) != SRW_TEXT) { return ""c; }
+  return (_text + peek64(wZelle(ni, 2))) as pchar;
+}
+
+pub fn WertTextLaenge(ni: int64): int64 {
+  if (WertArt(ni) != SRW_TEXT) { return 0 - 1; }
+  return peek64(wZelle(ni, 1));
+}
+
+pub fn WertGliederZahl(ni: int64): int64 {
+  var art: int64 := WertArt(ni);
+  if (art != SRW_LISTE && art != SRW_OBJEKT) { return 0 - 1; }
+  return peek64(wZelle(ni, 1));
+}
+
+pub fn WertErstesKind(ni: int64): int64 {
+  var art: int64 := WertArt(ni);
+  if (art != SRW_LISTE && art != SRW_OBJEKT) { return 0 - 1; }
+  return peek64(wZelle(ni, 3));
+}
+
+pub fn WertNaechstes(ni: int64): int64 {
+  if (ni < 0 || ni >= _anzahl) { return 0 - 1; }
+  return peek64(wZelle(ni, 4));
+}
+
+pub fn WertFeldName(ni: int64): pchar {
+  if (ni < 0 || ni >= _anzahl) { return ""c; }
+  var off: int64 := peek64(wZelle(ni, 5));
+  if (off < 0) { return ""c; }
+  return (_text + off) as pchar;
+}
+
+// Sucht ein Feld. Gibt den Knotenindex oder SRW_E_NICHT_GEFUNDEN.
+//
+// Gesucht wird über GLEICHHEIT des ganzen Namens, nicht über ein Präfix: ein
+// Präfixtreffer würde auch jeden Namen treffen, den es noch nicht gibt, und
+// genau das hat in diesem Baum dreimal Rechte zu weit vergeben.
+pub fn WertFeld(obj: int64, name: pchar): int64 {
+  if (WertArt(obj) != SRW_OBJEKT) { return SRW_E_KEIN_OBJEKT; }
+  var nl: int64 := StrLen(name);
+  var k: int64 := WertErstesKind(obj);
+  while (k >= 0) {
+    var fn2: pchar := WertFeldName(k);
+    if (StrLen(fn2) == nl && StrEq(fn2, name) != 0) { return k; }
+    k := WertNaechstes(k);
+  }
+  return SRW_E_NICHT_GEFUNDEN;
+}
+
+pub fn WertHatFeld(obj: int64, name: pchar): int64 {
+  if (WertFeld(obj, name) >= 0) { return 1; }
+  return 0;
+}
+
+// Tiefe eines Wertes. Ein Blatt hat Tiefe 1.
+pub fn WertTiefe(ni: int64): int64 {
+  var art: int64 := WertArt(ni);
+  if (art < 0) { return 0 - 1; }
+  if (art != SRW_LISTE && art != SRW_OBJEKT) { return 1; }
+  var tiefste: int64 := 0;
+  var k: int64 := WertErstesKind(ni);
+  while (k >= 0) {
+    var t: int64 := WertTiefe(k);
+    if (t > tiefste) { tiefste := t; }
+    k := WertNaechstes(k);
+  }
+  return tiefste + 1;
+}
+
+pub fn WertTypName(art: int64): pchar {
+  if (art == SRW_NULL)   { return "null"c; }
+  if (art == SRW_BOOL)   { return "boolean"c; }
+  if (art == SRW_ZAHL)   { return "integer"c; }
+  if (art == SRW_TEXT)   { return "string"c; }
+  if (art == SRW_LISTE)  { return "array"c; }
+  if (art == SRW_OBJEKT) { return "object"c; }
+  // Kein stiller Default: eine unbekannte Art ist ein Fehler im Aufrufer und
+  // wird als solcher benannt, nicht als plausibler Name beantwortet.
+  return "<unbekannt>"c;
+}

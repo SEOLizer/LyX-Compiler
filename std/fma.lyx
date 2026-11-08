@@ -1,0 +1,579 @@
+// std/fma.lyx — fma(a, b, c) mit EINER Rundung (#2403, Teil von #2193)
+//
+// `a * b + c` in zwei Schritten rundet zweimal. Die verschmolzene Form rundet
+// einmal, und das ist der Grund, sie zu haben — nicht die Geschwindigkeit:
+// jedes Verfahren, das auf dem exakten Produkt beruht (Horner mit
+// Fehlerterm, Dekkers TwoProduct, Skalarprodukte mit Kompensation,
+// Newton-Iterationen fuer Division und Wurzel), braucht sie als Zusage.
+//
+// Deshalb steht hier NICHT einfach der Hardwarebefehl. `MathFma` nimmt
+// `vfmadd213sd`, wenn die CPU FMA hat, und sonst den Weg darunter — und der
+// rechnet dieselbe Zusage AUS, statt sie zu verfehlen. Ein Rueckfall auf
+// `a * b + c` waere die schlimmste Sorte stiller Default: das Ergebnis haengt
+// an der CPU, und zwar nur in den letzten Bits, wo es keiner sieht.
+//
+// Der Rueckfall rechnet ganzzahlig auf den IEEE-754-Bits:
+//
+//   1. Zerlegen in Vorzeichen, Exponent, Mantisse (Subnormale eingeschlossen).
+//   2. Produkt der beiden 53-Bit-Mantissen als 106-Bit-Zahl in zwei Woertern.
+//   3. c auf dieselbe Skala bringen; was darunter herausfaellt, wird zu einem
+//      Klebebit (sticky) zusammengefasst.
+//   4. Addieren oder Subtrahieren in 192 Bit (drei Woerter).
+//   5. Normalisieren, auf 53 Bit runden (zur naechsten geraden Zahl),
+//      zusammensetzen — mit Ueberlauf nach unendlich und Unterlauf in die
+//      Subnormalen.
+//
+// Ganzzahlig und nicht in Gleitkomma, weil die Rundung dann BEWEISBAR ist:
+// es gibt genau eine Stelle, an der gerundet wird, und sie liest Fuehrungsbit,
+// Rundungsbit und Klebebit. Eine Fassung aus f64-Operationen (TwoProduct,
+// TwoSum) braeuchte ein Argument je Teilschritt, dass dort nichts verloren
+// geht — und genau solche Argumente stimmen in Randfaellen nicht.
+//
+// Lyx' `>>` ist ARITHMETISCH (#2 der Sprachfallen), es gibt also eigene
+// logische Schiebehelfer; jeder Zugriff auf die oberen Bits laeuft darueber.
+
+@description("fma(a, b, c) mit einer Rundung — Hardware-FMA oder exakter ganzzahliger Rueckfall")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+unit std.fma;
+
+import std.alloc;
+import std.cpu.features;
+
+// ── Bitmuster eines f64 ─────────────────────────────────────────────────────
+// Ein f64-Wert liegt in Lyx als IEEE-754-Bitmuster im Register; ueber einen
+// 8-Byte-Puffer ist es als int64 lesbar und zurueckschreibbar.
+var _fmPuf: int64 := 0;
+
+fn fmPuf(): int64 {
+  if (_fmPuf == 0) { _fmPuf := alloc(16); }
+  return _fmPuf;
+}
+
+pub fn F64Bits(x: f64): int64 {
+  var p: int64 := fmPuf();
+  pokef64(p, x);
+  return peek64(p);
+}
+
+pub fn BitsF64(b: int64): f64 {
+  var p: int64 := fmPuf();
+  poke64(p, b);
+  return peekf64(p);
+}
+
+// ── logische Schiebehelfer ──────────────────────────────────────────────────
+// `x >> n` ist arithmetisch und zieht das Vorzeichenbit nach. Fuer Bitmuster
+// braucht es die logische Form: erst um eins schieben, das oberste Bit
+// loeschen, dann den Rest.
+pub fn ShrU(x: int64, n: int64): int64 {
+  if (n <= 0) { return x; }
+  if (n >= 64) { return 0; }
+  var t: int64 := (x >> 1) & 9223372036854775807;    // 0x7FFF...
+  if (n == 1) { return t; }
+  return t >> (n - 1);
+}
+
+// Vorzeichenloser Vergleich zweier Bitmuster (fuer die 192-Bit-Rechnung).
+fn uLess(a: int64, b: int64): int64 {
+  var SB: int64 := 1 << 63;
+  if ((a ^ SB) < (b ^ SB)) { return 1; }
+  return 0;
+}
+
+// ── Zerlegung ───────────────────────────────────────────────────────────────
+pub con FMA_EXP_BIAS: int64 := 1023;
+
+fn bitsVorzeichen(b: int64): int64 { return ShrU(b, 63) & 1; }
+fn bitsExponent(b: int64): int64   { return ShrU(b, 52) & 2047; }
+fn bitsMantisse(b: int64): int64   { return b & 4503599627370495; }   // 2^52-1
+
+fn istNaN(b: int64): int64 {
+  if (bitsExponent(b) == 2047 && bitsMantisse(b) != 0) { return 1; }
+  return 0;
+}
+fn istInf(b: int64): int64 {
+  if (bitsExponent(b) == 2047 && bitsMantisse(b) == 0) { return 1; }
+  return 0;
+}
+fn istNull(b: int64): int64 {
+  if (bitsExponent(b) == 0 && bitsMantisse(b) == 0) { return 1; }
+  return 0;
+}
+
+// Stilles NaN. Ein Rechenweg, der NaN erzeugt, liefert immer DASSELBE Muster;
+// ein zufaelliges NaN waere nicht reproduzierbar.
+fn stillesNaN(): int64 { return 9221120237041090560; }   // 0x7FF8000000000000
+
+fn inf(sign: int64): int64 {
+  var b: int64 := 9218868437227405312;                   // 0x7FF0000000000000
+  if (sign != 0) { b := b | (1 << 63); }
+  return b;
+}
+
+fn nullMit(sign: int64): int64 {
+  if (sign != 0) { return 1 << 63; }
+  return 0;
+}
+
+// ── 192-Bit-Rechenwerk (drei Woerter, w2 ist das hoechste) ──────────────────
+//
+// Gebraucht wird es, weil das Produkt 106 Bit hat und c darueber oder darunter
+// liegen kann. Das Fenster ist so gewaehlt, dass beide Beitraege vollstaendig
+// hineinpassen, solange ihr Exponentenabstand unter 128 liegt; darueber kann
+// der kleinere Beitrag nur noch das Klebebit setzen, und genau das ist auch
+// mathematisch der Fall.
+//
+// Die Woerter sind BITMUSTER. Jede Addition braucht den Uebertrag von Hand:
+// `s := a + b` kippt ins Negative, und der Uebertrag ist `s vorzeichenlos
+// kleiner als a`.
+var _w0: int64 := 0;
+var _w1: int64 := 0;
+var _w2: int64 := 0;
+var _klebe: int64 := 0;
+
+fn wNull(): void { _w0 := 0; _w1 := 0; _w2 := 0; }
+
+// 192-Bit-Addition von (b2,b1,b0).
+fn wAdd(b2: int64, b1: int64, b0: int64): void {
+  var s0: int64 := _w0 + b0;
+  var c0: int64 := 0;
+  if (uLess(s0, _w0) != 0) { c0 := 1; }
+  var s1: int64 := _w1 + b1;
+  var c1: int64 := 0;
+  if (uLess(s1, _w1) != 0) { c1 := 1; }
+  var s1b: int64 := s1 + c0;
+  if (uLess(s1b, s1) != 0) { c1 := c1 + 1; }
+  var s2: int64 := _w2 + b2 + c1;
+  _w0 := s0; _w1 := s1b; _w2 := s2;
+}
+
+// 192-Bit-Subtraktion (b2,b1,b0) von den Woertern. Vorbedingung: das Ergebnis
+// ist nicht negativ (der Aufrufer vergleicht vorher).
+fn wSub(b2: int64, b1: int64, b0: int64): void {
+  var l0: int64 := 0;
+  if (uLess(_w0, b0) != 0) { l0 := 1; }
+  var d0: int64 := _w0 - b0;
+  var t1: int64 := _w1 - l0;
+  var l1: int64 := 0;
+  if (uLess(_w1, l0) != 0) { l1 := 1; }
+  if (uLess(t1, b1) != 0) { l1 := l1 + 1; }
+  var d1: int64 := t1 - b1;
+  var d2: int64 := _w2 - b2 - l1;
+  _w0 := d0; _w1 := d1; _w2 := d2;
+}
+
+// Vergleich: sind die Woerter kleiner als (b2,b1,b0)?
+fn wKleiner(b2: int64, b1: int64, b0: int64): int64 {
+  if (_w2 != b2) { return uLess(_w2, b2); }
+  if (_w1 != b1) { return uLess(_w1, b1); }
+  if (_w0 != b0) { return uLess(_w0, b0); }
+  return 0;
+}
+
+fn wIstNull(): int64 {
+  if (_w0 == 0 && _w1 == 0 && _w2 == 0) { return 1; }
+  return 0;
+}
+
+// Links schieben um n (0..191).
+fn wShl(n: int64): void {
+  if (n <= 0) { return; }
+  var k: int64 := n;
+  while (k >= 64) {
+    _w2 := _w1; _w1 := _w0; _w0 := 0;
+    k := k - 64;
+  }
+  if (k == 0) { return; }
+  _w2 := (_w2 << k) | ShrU(_w1, 64 - k);
+  _w1 := (_w1 << k) | ShrU(_w0, 64 - k);
+  _w0 := _w0 << k;
+}
+
+// Rechts schieben um n; alles, was herausfaellt, setzt das Klebebit.
+fn wShrKlebe(n: int64): void {
+  if (n <= 0) { return; }
+  var k: int64 := n;
+  while (k >= 64) {
+    if (_w0 != 0) { _klebe := 1; }
+    _w0 := _w1; _w1 := _w2; _w2 := 0;
+    k := k - 64;
+    if (k > 0 && _w0 != 0 && k >= 64) { _klebe := 1; }
+  }
+  if (k == 0) { return; }
+  var raus: int64 := _w0 & maskeUnten(k);
+  if (raus != 0) { _klebe := 1; }
+  _w0 := ShrU(_w0, k) | (_w1 << (64 - k));
+  _w1 := ShrU(_w1, k) | (_w2 << (64 - k));
+  _w2 := ShrU(_w2, k);
+}
+
+// Index des hoechsten gesetzten Bits (0..191), -1 wenn alles null.
+fn wHochstesBit(): int64 {
+  var w: int64 := _w2;
+  var b: int64 := 128;
+  if (w == 0) { w := _w1; b := 64; }
+  if (w == 0) { w := _w0; b := 0; }
+  if (w == 0) { return 0 - 1; }
+  var i: int64 := 63;
+  while (i >= 0) {
+    if ((ShrU(w, i) & 1) != 0) { return b + i; }
+    i := i - 1;
+  }
+  return 0 - 1;
+}
+
+// 64x64 -> 128 Bit, vorzeichenlos. Zerlegt in 32-Bit-Haelften; `umulhi` waere
+// ein Builtin, aber die Haelftenrechnung braucht kein Ziel-Sonderwissen und
+// laeuft auf jedem Backend.
+var _mulHi: int64 := 0;
+
+fn mul64(a: int64, b: int64): int64 {
+  var m: int64 := 4294967295;                 // 2^32-1
+  var a0: int64 := a & m;
+  var a1: int64 := ShrU(a, 32);
+  var b0: int64 := b & m;
+  var b1: int64 := ShrU(b, 32);
+  var p00: int64 := a0 * b0;
+  var p01: int64 := a0 * b1;
+  var p10: int64 := a1 * b0;
+  var p11: int64 := a1 * b1;
+  var mitte: int64 := ShrU(p00, 32) + (p01 & m) + (p10 & m);
+  var lo: int64 := (p00 & m) | ((mitte & m) << 32);
+  var hi: int64 := p11 + ShrU(p01, 32) + ShrU(p10, 32) + ShrU(mitte, 32);
+  _mulHi := hi;
+  return lo;
+}
+
+// ── Platzierung eines 53-Bit-Werts im Fenstermassstab ──────────────────────
+// Ergebnis in _c2/_c1/_c0; was unter Bit 0 faellt, setzt das Klebebit.
+var _c0: int64 := 0;
+var _c1: int64 := 0;
+var _c2: int64 := 0;
+
+fn cLege(m: int64, d: int64): void {
+  _c0 := 0; _c1 := 0; _c2 := 0;
+  if (m == 0) { return; }
+  if (d >= 0) {
+    if (d >= 192) { return; }                      // oberhalb des Fensters: kommt nicht vor
+    if (d >= 128) { _c2 := m << (d - 128); return; }
+    if (d >= 64) {
+      _c1 := m << (d - 64);
+      if (d > 64) { _c2 := ShrU(m, 128 - d); }
+      return;
+    }
+    _c0 := m << d;
+    if (d > 0) { _c1 := ShrU(m, 64 - d); }
+    return;
+  }
+  var s: int64 := 0 - d;
+  if (s >= 64) {
+    // Alles unter Bit 0 bis auf das, was in _c0 ankommt.
+    if (s >= 128) { _klebe := 1; return; }
+    var oben: int64 := ShrU(m, s - 64);
+    var unten: int64 := m & maskeUnten(s - 64);
+    if (unten != 0) { _klebe := 1; }
+    _c0 := oben;
+    return;
+  }
+  var raus: int64 := m & maskeUnten(s);
+  if (raus != 0) { _klebe := 1; }
+  _c0 := ShrU(m, s);
+}
+
+// ── der exakte Rueckfall ────────────────────────────────────────────────────
+//
+// Die Skala: das Produkt der beiden Mantissen (je 53 Bit, Subnormale
+// eingeschlossen) hat hoechstens 106 Bit und wird im Fenster so gelegt, dass
+// noch Platz nach oben bleibt (Addition kann ein Bit wachsen) und nach unten
+// fuer c, wenn es kleiner ist. Gewaehlt: das Produkt beginnt bei Bit 64.
+//
+// Exponentenrechnung: ein Wert ist `m * 2^e` mit m als Ganzzahl. Fuer einen
+// normalen f64 ist e = E - 1023 - 52, fuer einen subnormalen e = -1074.
+pub con FMA_PROD_SHIFT: int64 := 64;
+
+pub fn FmaExakt(a: f64, b: f64, c: f64): f64 {
+  var ba: int64 := F64Bits(a);
+  var bb: int64 := F64Bits(b);
+  var bc: int64 := F64Bits(c);
+
+  // ── Sonderfaelle, in der Reihenfolge des Standards ──────────────────────
+  // NaN zuerst: jede Rechnung mit NaN liefert NaN.
+  if (istNaN(ba) != 0 || istNaN(bb) != 0 || istNaN(bc) != 0) { return BitsF64(stillesNaN()); }
+  var sa: int64 := bitsVorzeichen(ba);
+  var sb: int64 := bitsVorzeichen(bb);
+  var sc: int64 := bitsVorzeichen(bc);
+  var sp: int64 := sa ^ sb;                       // Vorzeichen des Produkts
+
+  // unendlich * null ist unbestimmt — und zwar BEVOR c angesehen wird.
+  if ((istInf(ba) != 0 && istNull(bb) != 0) || (istInf(bb) != 0 && istNull(ba) != 0)) {
+    return BitsF64(stillesNaN());
+  }
+  if (istInf(ba) != 0 || istInf(bb) != 0) {
+    // Produkt ist unendlich. Nur ein unendliches c mit anderem Vorzeichen ist
+    // unbestimmt; sonst gewinnt das Produkt.
+    if (istInf(bc) != 0 && sc != sp) { return BitsF64(stillesNaN()); }
+    return BitsF64(inf(sp));
+  }
+  if (istInf(bc) != 0) { return c; }
+
+  if (istNull(ba) != 0 || istNull(bb) != 0) {
+    // Produkt ist null. Dann ist das Ergebnis c — mit einer Ausnahme: ist
+    // auch c null, entscheidet das Vorzeichen. Gleiche Vorzeichen behalten
+    // es, verschiedene ergeben +0 (Rundung zur naechsten geraden Zahl).
+    if (istNull(bc) != 0) {
+      if (sc == sp) { return BitsF64(nullMit(sp)); }
+      return BitsF64(nullMit(0));
+    }
+    return c;
+  }
+
+  // ── Zerlegen ────────────────────────────────────────────────────────────
+  var ea: int64 := bitsExponent(ba);
+  var eb: int64 := bitsExponent(bb);
+  var ma: int64 := bitsMantisse(ba);
+  var mb: int64 := bitsMantisse(bb);
+  var expA: int64 := 0 - 1074;
+  if (ea != 0) { ma := ma | 4503599627370496; expA := ea - 1075; }   // 2^52
+  var expB: int64 := 0 - 1074;
+  if (eb != 0) { mb := mb | 4503599627370496; expB := eb - 1075; }
+
+  // ── Produkt ─────────────────────────────────────────────────────────────
+  var plo: int64 := mul64(ma, mb);
+  var phi: int64 := _mulHi;
+  var expP: int64 := expA + expB;
+
+  var mc: int64 := bitsMantisse(bc);
+  var ec: int64 := bitsExponent(bc);
+  var expC: int64 := 0 - 1074;
+  if (ec != 0) { mc := mc | 4503599627370496; expC := ec - 1075; }
+
+  // ── gemeinsame Skala ────────────────────────────────────────────────────
+  //
+  // BEIDE Beitraege muessen in dasselbe Fenster, und zwar so, dass der
+  // groessere oben liegt und nichts herausfaellt. Das hoechste Bit des
+  // Produkts wiegt hoechstens 2^(expP+105), das von c hoechstens 2^(expC+52).
+  // Die Skala (das Gewicht von Bit 0) wird so gewaehlt, dass dieses hoechste
+  // Bit bei etwa Bit 185 sitzt — darueber bleiben sechs Bit fuer den
+  // Uebertrag der Addition.
+  //
+  // Der kleinere Beitrag rutscht dadurch nach unten; was unter Bit 0 fallt,
+  // wird zum Klebebit. Das ist mathematisch genau richtig: diese Bits liegen
+  // mehr als 185 Bit unter dem Ergebnis und koennen die Rundung der 53
+  // Mantissenbits nur noch ueber "Rest nicht null" beeinflussen.
+  //
+  // Eine fruehere Fassung hatte hier einen Sonderzweig "c ist so viel
+  // groesser, dass das Produkt nur noch klebt" mit der Schwelle 130 Bit. Das
+  // war falsch: bei 135 Bit Abstand liegen die oberen Produktbits noch
+  // mitten in der Mantisse von c (gemessen an a=1,386968e-08, b=1,363114e+08,
+  // c=-7,643787e+05 — dort traegt das Produkt die letzten 33 Bit). Der
+  // Differenztest gegen libm fand das in 5963 von 20000 Mustern.
+  var msbP: int64 := expP + 105;
+  var msbC: int64 := expC + 52;
+  var oben2: int64 := msbP;
+  if (msbC > oben2) { oben2 := msbC; }
+  var skala: int64 := oben2 - 185;
+
+  wNull();
+  _klebe := 0;
+  _w1 := plo;
+  _w2 := phi;
+  // Das Fenster traegt das Produkt mit Bit 0 beim Gewicht expP - 64.
+  var dP: int64 := (expP - 64) - skala;
+  if (dP > 0) { wShl(dP); } else if (dP < 0) { wShrKlebe(0 - dP); }
+
+  cLege(mc, expC - skala);
+  var c2: int64 := _c2; var c1: int64 := _c1; var c0: int64 := _c0;
+
+  // ── Addieren oder Subtrahieren ──────────────────────────────────────────
+  var vz: int64 := sp;
+  if (sc == sp) {
+    wAdd(c2, c1, c0);
+  } else {
+    if (wKleiner(c2, c1, c0) != 0) {
+      // c ist groesser: Rollen tauschen, Vorzeichen von c.
+      var p2: int64 := _w2; var p1: int64 := _w1; var p0: int64 := _w0;
+      _w2 := c2; _w1 := c1; _w0 := c0;
+      // Ein vorhandenes Klebebit gehoert zum ABGEZOGENEN Teil: der Betrag
+      // ist um etwas mehr zu verringern.
+      wSub(p2, p1, p0);
+      if (_klebe != 0) {
+        // vom Rest ein halbes letztes Bit abziehen heisst: eine Einheit
+        // unterhalb des Fensters fehlt. Das wird beim Runden als "nicht
+        // genau in der Mitte" gelesen.
+        _klebe := 1;
+      }
+      vz := sc;
+    } else {
+      wSub(c2, c1, c0);
+      if (_klebe != 0) { _klebe := 1; }
+      vz := sp;
+    }
+  }
+
+  if (wIstNull() != 0 && _klebe == 0) {
+    // Exakte Null: bei verschiedenen Vorzeichen ist das Ergebnis +0.
+    if (sc != sp) { return BitsF64(nullMit(0)); }
+    return BitsF64(nullMit(sp));
+  }
+
+  return fmaFertig(vz, skala);
+}
+
+// ── Normalisieren, Runden, Zusammensetzen ───────────────────────────────────
+//
+// Im Fenster steht der Betrag des Ergebnisses als Ganzzahl mal 2^skala. Daraus
+// wird ein f64 mit 53 Bit Mantisse. Gerundet wird GENAU HIER und nur hier:
+// zur naechsten darstellbaren Zahl, bei genau der Mitte zur geraden.
+fn fmaFertig(vz: int64, skala: int64): f64 {
+  var hoch: int64 := wHochstesBit();
+  if (hoch < 0) { return BitsF64(nullMit(vz)); }
+
+  // Wert = Fenster * 2^skala, und das hoechste Bit sitzt bei `hoch`.
+  // Als normale Zahl geschrieben: 1.xxx * 2^(hoch + skala).
+  var e2: int64 := hoch + skala;                  // Exponent des Ergebnisses
+
+  // Ueberlauf: der groesste endliche f64 hat Exponent 1023.
+  if (e2 > 1023) { return BitsF64(inf(vz)); }
+
+  // Wie weit muss das Fenster nach rechts, damit 53 Bit uebrig bleiben?
+  var ziel: int64 := hoch - 52;                   // Bitposition des letzten Mantissenbits
+  var unterlauf: int64 := 0;
+  if (e2 < 0 - 1022) {
+    // Subnormal: das letzte Bit liegt fest bei 2^-1074, nicht relativ zum
+    // hoechsten. Hier entsteht der Genauigkeitsverlust des Unterlaufs — er
+    // gehoert zur EINEN Rundung und nicht in einen zweiten Schritt.
+    ziel := (0 - 1074) - skala;
+    unterlauf := 1;
+    if (ziel > hoch + 1) { 
+      // Alles liegt unterhalb der kleinsten Subnormalen: Richtung Null, aber
+      // die Mitte entscheidet weiter unten ueber das letzte Bit.
+      ziel := hoch + 1;
+    }
+  }
+
+  var mant: int64 := 0;
+  var rund: int64 := 0;
+  var kleb: int64 := _klebe;
+  if (ziel <= 0) {
+    // Keine Verschiebung noetig (das Fenster ist schon klein genug).
+    mant := _w0;
+    if (ziel < 0) {
+      // nach links, es gibt nichts abzuschneiden
+      var li: int64 := 0 - ziel;
+      wShl(li);
+      mant := _w0;
+    }
+  } else {
+    // Rundungsbit ist das Bit direkt unter dem Ziel; alles darunter klebt.
+    var r: int64 := ziel - 1;
+    rund := fmaBitAt(r);
+    if (fmaRestUnter(r) != 0) { kleb := 1; }
+    wShrKlebe(ziel);
+    mant := _w0;
+  }
+
+  // Zur naechsten geraden runden.
+  if (rund != 0) {
+    if (kleb != 0 || (mant & 1) != 0) { mant := mant + 1; }
+  }
+
+  // Die Addition kann die Mantisse ueber 53 Bit heben (z. B. 0x1FFF...F + 1).
+  if (unterlauf == 0) {
+    if (ShrU(mant, 53) != 0) {
+      mant := ShrU(mant, 1);
+      e2 := e2 + 1;
+      if (e2 > 1023) { return BitsF64(inf(vz)); }
+    }
+  } else {
+    // Subnormal: das Exponentenfeld ist 0, die Mantisse traegt den Wert
+    // mal 2^-1074. Traegt sie nach dem Runden das Bit 52, ist daraus die
+    // kleinste NORMALE Zahl geworden (Exponentenfeld 1) — der Uebergang ist
+    // stetig, weil das implizite Bit genau dieses Bit 52 ist. Beide Faelle
+    // schreiben deshalb dieselben unteren 52 Bit; nur das Exponentenfeld
+    // unterscheidet sich, und es ergibt sich aus Bit 52 selbst.
+    var ef0: int64 := ShrU(mant, 52) & 1;
+    var bs: int64 := (mant & 4503599627370495) | (ef0 << 52);
+    if (vz != 0) { bs := bs | (1 << 63); }
+    return BitsF64(bs);
+  }
+
+  // Normal zusammensetzen: Exponentenfeld = e2 + 1023, implizites Bit weg.
+  var ef: int64 := e2 + FMA_EXP_BIAS;
+  if (ef <= 0) {
+    // Sollte nach der Subnormal-Behandlung nicht auftreten; laut scheitern
+    // statt eine Zahl zu erfinden.
+    panic("std.fma: Exponent unter dem Subnormalbereich — Fall nicht behandelt");
+  }
+  if (ef >= 2047) { return BitsF64(inf(vz)); }
+  var bits: int64 := (mant & 4503599627370495) | (ef << 52);
+  if (vz != 0) { bits := bits | (1 << 63); }
+  return BitsF64(bits);
+}
+
+// Bit an Position p des Fensters (0..191).
+fn fmaBitAt(p: int64): int64 {
+  if (p < 0) { return 0; }
+  if (p < 64)  { return ShrU(_w0, p) & 1; }
+  if (p < 128) { return ShrU(_w1, p - 64) & 1; }
+  if (p < 192) { return ShrU(_w2, p - 128) & 1; }
+  return 0;
+}
+
+// Gibt es unterhalb von Position p ein gesetztes Bit?
+// Maske der untersten n Bit. Fuer n == 64 ist `1 << 64` NICHT 0: x86
+// maskiert den Schiebezaehler auf sechs Bit, aus `1 << 64` wird `1 << 0` und
+// damit die Maske 0 — der gesuchte Rest verschwaende still. Genau dieser
+// Fehler kostete 7 von 20000 Mustern im Differenztest gegen libm (je 1 ULP,
+// weil ein Rest unterhalb des Rundungsbits als "genau in der Mitte" gelesen
+// wurde und die Rundung zur geraden Zahl griff).
+fn maskeUnten(n: int64): int64 {
+  if (n <= 0) { return 0; }
+  if (n >= 64) { return 0 - 1; }
+  return (1 << n) - 1;
+}
+
+fn fmaRestUnter(p: int64): int64 {
+  if (p <= 0) { return 0; }
+  if (p <= 64) {
+    if ((_w0 & maskeUnten(p)) != 0) { return 1; }
+    return 0;
+  }
+  if (_w0 != 0) { return 1; }
+  if (p <= 128) {
+    if ((_w1 & maskeUnten(p - 64)) != 0) { return 1; }
+    return 0;
+  }
+  if (_w1 != 0) { return 1; }
+  if ((_w2 & maskeUnten(p - 128)) != 0) { return 1; }
+  return 0;
+}
+
+// ── die oeffentliche Funktion ───────────────────────────────────────────────
+//
+// Nimmt den Hardwarebefehl, wenn die CPU FMA hat, sonst den exakten Weg
+// darueber. BEIDE liefern dasselbe Bitmuster — das ist die Zusage, und sie
+// ist in tests/fma_2403_test.sh gegen die libm-Fassung geprueft.
+var _fmaHw: int64 := 0;
+var _fmaHwGeprueft: int64 := 0;
+var _fmaNurSoft: int64 := 0;
+
+fn fmaHwDa(): int64 {
+  if (_fmaNurSoft != 0) { return 0; }
+  if (_fmaHwGeprueft == 0) {
+    _fmaHwGeprueft := 1;
+    if (CpuHasFMA() != 0) { _fmaHw := 1; }
+  }
+  return _fmaHw;
+}
+
+// Nur den Softwareweg nehmen. Gebraucht, um BEIDE Seiten messen zu koennen:
+// auf einer CPU mit FMA ist der exakte Weg sonst nicht erreichbar (#1823).
+pub fn FmaNurSoftware(an: int64): void {
+  if (an != 0) { _fmaNurSoft := 1; } else { _fmaNurSoft := 0; }
+}
+
+pub fn MathFma(a: f64, b: f64, c: f64): f64 {
+  if (fmaHwDa() != 0) { return fma(a, b, c); }
+  return FmaExakt(a, b, c);
+}

@@ -1,0 +1,205 @@
+// std/cpu/power.lyx — Leistungssteuerung und Taktgrenzen (#2400, Teil von #2396)
+//
+// Messbedingungen waren bisher unsichtbar. Der Entwicklungsrechner laeuft auf
+// Governor `powersave`, und ob Boost freigegeben ist oder die Energiepraeferenz
+// auf `balance_power` steht, tauchte in keinem Messprotokoll auf. Mehrere
+// Postmortems haengen daran: Rauschboden 6,4 %, Vorzeichenwechsel ohne
+// Pinning, "kein Unterschied" verdeckte eine echte Regression.
+//
+// Die vier Taktfelder werden ausdruecklich getrennt gehalten, weil sie
+// verschiedene Dinge sind:
+//
+//   nominal_hz     Basisfrequenz der Hardware (cpuinfo_max_freq bzw. CPUID.16h)
+//   allowed_min_hz Untergrenze, die der Treiber einhalten soll
+//   allowed_max_hz Obergrenze, die der Treiber einhalten soll
+//   requested_hz   der zuletzt ANGEFORDERTE Zustand (scaling_cur_freq)
+//
+// `requested_hz` ist NICHT der Takt. Die Kernel-Dokumentation
+// (admin-guide/pm/cpufreq) sagt das fuer intel_pstate ausdruecklich; der
+// gemessene Takt kommt aus std/cpu/clock.lyx (#2401). Wer die Zahl aus
+// scaling_cur_freq als Takt in ein Protokoll schreibt, berichtet den Wunsch
+// als Messung.
+
+@description("Governor, Boost, EPP und die vier getrennten Taktfelder je CPU")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+unit std.cpu.power;
+
+import std.alloc;
+import std.cpu.status;
+import std.cpu.sysfs;
+
+// Treibername ("intel_pstate", "acpi-cpufreq") — leer, wenn nicht lesbar.
+pub fn CpuTreiber(cpu: int64): pchar {
+  return CpuSysfsText(CpuSysfsPfad(cpu, "cpufreq/scaling_driver"c));
+}
+
+pub fn CpuGovernor(cpu: int64): pchar {
+  return CpuSysfsText(CpuSysfsPfad(cpu, "cpufreq/scaling_governor"c));
+}
+
+pub fn CpuEnergiePraeferenz(cpu: int64): pchar {
+  return CpuSysfsText(CpuSysfsPfad(cpu, "cpufreq/energy_performance_preference"c));
+}
+
+pub fn CpuEnergiePraeferenzZulaessig(cpu: int64): pchar {
+  return CpuSysfsText(CpuSysfsPfad(cpu, "cpufreq/energy_performance_available_preferences"c));
+}
+
+// Ist Boost freigegeben? 1 = ja, 0 = nein.
+//
+// Zwei Quellen mit UMGEKEHRTER Bedeutung: `intel_pstate/no_turbo` ist 1, wenn
+// Boost AUS ist; `cpufreq/boost` ist 1, wenn Boost AN ist. Wer die eine Datei
+// liest und die andere Bedeutung annimmt, berichtet das Gegenteil.
+pub fn CpuBoostFrei(t: int64): void {
+  var nt: int64 := CpuWertNeu();
+  CpuSysfsZahl("/sys/devices/system/cpu/intel_pstate/no_turbo"c,
+               "/sys/devices/system/cpu/intel_pstate/no_turbo (0 = Boost frei)"c, nt);
+  if (CpuWertDa(nt) != 0) {
+    var frei: int64 := 1;
+    if (CpuWert(nt) != 0) { frei := 0; }
+    CpuWertSetzen(t, frei, "intel_pstate/no_turbo (invertiert)"c);
+    return;
+  }
+  var b: int64 := CpuWertNeu();
+  CpuSysfsZahl("/sys/devices/system/cpu/cpufreq/boost"c,
+               "/sys/devices/system/cpu/cpufreq/boost (1 = Boost frei)"c, b);
+  if (CpuWertDa(b) != 0) {
+    CpuWertSetzen(t, CpuWert(b), "cpufreq/boost"c);
+    return;
+  }
+  CpuWertFehlt(t, CPU_ST_UNSUPPORTED, "intel_pstate/no_turbo und cpufreq/boost fehlen beide"c);
+}
+
+// Basisfrequenz in Hz. DREI Quellen, in dieser Reihenfolge — sie bedeuten
+// nicht dasselbe, und genau darum fuehrt der Traeger die benutzte mit:
+//
+//   1. `cpufreq/base_frequency` — der Kernel liest MSR_PLATFORM_INFO.
+//   2. CPUID.16h eax — Basisfrequenz in MHz laut Blatt.
+//   3. `cpufreq/cpuinfo_max_freq` — obere Hardwaregrenze INKLUSIVE Boost,
+//      also etwas anderes; nur als letzter Ausweg und so benannt.
+//
+// Gemessen am 2026-11-06 auf dem i5-8250U weichen Quelle 1 und 2 ab:
+// `base_frequency` sagt 1 600 000 kHz (= 1,6 GHz, was auch im Markennamen
+// steht), CPUID.16h sagt 1800 MHz. Blatt 16h ist auf diesem Teil also nicht
+// die Basisfrequenz des Datenblatts. Deshalb hat die Kernel-Quelle Vorrang,
+// und deshalb steht die Quelle im Bericht: eine Zahl ohne Quelle waere hier
+// nicht einordenbar.
+pub fn CpuNominalHz(cpu: int64, t: int64): void {
+  var bf: int64 := CpuWertNeu();
+  var bfPfad: pchar := CpuSysfsPfad(cpu, "cpufreq/base_frequency"c);
+  CpuSysfsZahl(bfPfad, "cpufreq/base_frequency (MSR_PLATFORM_INFO ueber den Kernel, kHz)"c, bf);
+  if (CpuWertDa(bf) != 0) {
+    CpuWertSetzen(t, CpuWert(bf) * 1000, CpuQuelle(bf));
+    return;
+  }
+  if (cpu_id(0, 0, 0) >= 22) {
+    var mhz: int64 := cpu_id(22, 0, 0) & 65535;
+    if (mhz > 0) {
+      CpuWertSetzen(t, mhz * 1000000, "cpuid.16 eax (Basisfrequenz in MHz; weicht auf manchen Teilen von base_frequency ab)"c);
+      return;
+    }
+  }
+  var k: int64 := CpuWertNeu();
+  var pfad: pchar := CpuSysfsPfad(cpu, "cpufreq/cpuinfo_max_freq"c);
+  CpuSysfsZahl(pfad, pfad, k);
+  if (CpuWertDa(k) == 0) {
+    CpuWertFehlt(t, CpuStatus(k), CpuQuelle(k));
+    return;
+  }
+  CpuWertSetzen(t, CpuWert(k) * 1000, "cpufreq/cpuinfo_max_freq (obere Hardwaregrenze, kHz)"c);
+}
+
+pub fn CpuErlaubtMinHz(cpu: int64, t: int64): void {
+  var k: int64 := CpuWertNeu();
+  var pfad: pchar := CpuSysfsPfad(cpu, "cpufreq/scaling_min_freq"c);
+  CpuSysfsZahl(pfad, pfad, k);
+  if (CpuWertDa(k) == 0) { CpuWertFehlt(t, CpuStatus(k), CpuQuelle(k)); return; }
+  CpuWertSetzen(t, CpuWert(k) * 1000, "cpufreq/scaling_min_freq"c);
+}
+
+pub fn CpuErlaubtMaxHz(cpu: int64, t: int64): void {
+  var k: int64 := CpuWertNeu();
+  var pfad: pchar := CpuSysfsPfad(cpu, "cpufreq/scaling_max_freq"c);
+  CpuSysfsZahl(pfad, pfad, k);
+  if (CpuWertDa(k) == 0) { CpuWertFehlt(t, CpuStatus(k), CpuQuelle(k)); return; }
+  CpuWertSetzen(t, CpuWert(k) * 1000, "cpufreq/scaling_max_freq"c);
+}
+
+// ANGEFORDERTER Zustand, nicht der Takt. Der Funktionsname sagt es, die
+// Quelle sagt es, und der Kommentar sagt es — dreimal, weil genau diese
+// Verwechslung der haeufigste Fehler in Taktprotokollen ist.
+pub fn CpuAngefordertHz(cpu: int64, t: int64): void {
+  var k: int64 := CpuWertNeu();
+  var pfad: pchar := CpuSysfsPfad(cpu, "cpufreq/scaling_cur_freq"c);
+  CpuSysfsZahl(pfad, pfad, k);
+  if (CpuWertDa(k) == 0) {
+    // Auch im Fehlerfall traegt die Quelle die Kennzeichnung: in einer VM
+    // ohne cpufreq (gemessen auf dem CI-Laeufer) fehlt die Datei, und der
+    // Hinweis "ANGEFORDERT" muss trotzdem dastehen — sonst haengt die
+    // Bedeutung des Feldes daran, ob es gerade lesbar ist.
+    CpuWertFehlt(t, CpuStatus(k), "cpufreq/scaling_cur_freq (ANGEFORDERT, nicht gemessen)"c);
+    return;
+  }
+  CpuWertSetzen(t, CpuWert(k) * 1000, "cpufreq/scaling_cur_freq (ANGEFORDERT, nicht gemessen)"c);
+}
+
+// ── Messbedingungen: ein Fingerabdruck fuer vorher/nachher ─────────────────
+//
+// Benchmark-Werkzeuge rufen das VOR und NACH einem Lauf ab. Aendert sich
+// Governor, Boost oder die erlaubte Spanne zwischen den beiden Abrufen, ist
+// die Messung ungueltig — und das muss laut auffallen, nicht in der Streuung
+// verschwinden.
+pub con CPU_MESSBED_SZ: int64 := 40;
+
+pub fn CpuMessbedingungen(cpu: int64): int64 {
+  var m: int64 := alloc(CPU_MESSBED_SZ);
+  if (m == 0) { return 0; }
+  var b: int64 := CpuWertNeu();
+  var mn: int64 := CpuWertNeu();
+  var mx: int64 := CpuWertNeu();
+  CpuBoostFrei(b);
+  CpuErlaubtMinHz(cpu, mn);
+  CpuErlaubtMaxHz(cpu, mx);
+  poke64(m + 0,  CpuWertOder(b, 0 - 1));
+  poke64(m + 8,  CpuWertOder(mn, 0 - 1));
+  poke64(m + 16, CpuWertOder(mx, 0 - 1));
+  poke64(m + 24, CpuTextHash(CpuGovernor(cpu)));
+  poke64(m + 32, CpuTextHash(CpuEnergiePraeferenz(cpu)));
+  return m;
+}
+
+// Gleich? 1 = die Messbedingungen haben sich nicht geaendert.
+pub fn CpuMessbedingungenGleich(a: int64, b: int64): int64 {
+  if (a == 0 || b == 0) { return 0; }
+  var i: int64 := 0;
+  while (i < CPU_MESSBED_SZ) {
+    if (peek64(a + i) != peek64(b + i)) { return 0; }
+    i := i + 8;
+  }
+  return 1;
+}
+
+// Welches Feld hat sich geaendert? Fuer die Meldung, die den Lauf verwirft.
+pub fn CpuMessbedingungenUnterschied(a: int64, b: int64): pchar {
+  if (a == 0 || b == 0) { return "Messbedingungen nicht lesbar"c; }
+  if (peek64(a + 0)  != peek64(b + 0))  { return "Boost-Freigabe geaendert"c; }
+  if (peek64(a + 8)  != peek64(b + 8))  { return "scaling_min_freq geaendert"c; }
+  if (peek64(a + 16) != peek64(b + 16)) { return "scaling_max_freq geaendert"c; }
+  if (peek64(a + 24) != peek64(b + 24)) { return "Governor geaendert"c; }
+  if (peek64(a + 32) != peek64(b + 32)) { return "Energiepraeferenz geaendert"c; }
+  return "unveraendert"c;
+}
+
+// Einfacher Textschluessel (FNV-artig) — nur fuer den Vergleich zweier
+// Abrufe, nie als Kennung nach aussen.
+pub fn CpuTextHash(s: pchar): int64 {
+  var h: int64 := 1469598103934665603;
+  var i: int64 := 0;
+  while (peek8((s as int64) + i) != 0) {
+    h := h ^ peek8((s as int64) + i);
+    h := (h * 1099511628211) & 9223372036854775807;
+    i := i + 1;
+  }
+  return h;
+}

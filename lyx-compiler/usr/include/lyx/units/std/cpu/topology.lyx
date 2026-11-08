@@ -1,0 +1,110 @@
+// std/cpu/topology.lyx — Sockel, Kerne, Threads, SMT, Kerntypen (#2397)
+//
+// Quelle ist vorrangig die x2APIC-Topologie aus CPUID.0xB (bzw. 0x1F auf
+// neueren Teilen), nicht das Zaehlen von Zeilen in /proc/cpuinfo: CPUID sagt,
+// wie die Threads auf Kerne und Sockel VERTEILT sind, /proc/cpuinfo nur, wie
+// viele der Kernel sieht. Beide Zahlen gehoeren in den Bericht, und wenn sie
+// auseinandergehen, ist das eine Aussage (Affinitaet, offline-Kerne,
+// Hypervisor) und kein Fehler.
+//
+// Die drei vorhandenen Funktionen in std/systeminfo.lyx (GetLogicalCores,
+// GetPhysicalCores, GetSMTWidth) bleiben unveraendert bestehen — sie lesen
+// /proc/cpuinfo und sind die Kernel-Sicht. Wer die Hardware-Sicht braucht,
+// nimmt die Funktionen hier. Zweite Stelle, ausdruecklich: beide Wege sind
+// gewollt, sie beantworten verschiedene Fragen.
+
+@description("CPU-Topologie: Sockel, Kerne, Threads, SMT-Breite, Kerntypen")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+unit std.cpu.topology;
+
+import std.cpu.status;
+
+// Threads je Kern (SMT-Breite) aus CPUID.0xB Unterblatt 0.
+// Blatt 0xB Unterblatt 0 beschreibt die SMT-Ebene; ebx nennt die Zahl der
+// logischen Prozessoren auf dieser Ebene.
+pub fn CpuThreadsJeKern(t: int64): void {
+  if (cpu_id(0, 0, 0) < 11) {
+    CpuWertFehlt(t, CPU_ST_UNSUPPORTED, "cpuid.b (Blatt fehlt)"c);
+    return;
+  }
+  var art: int64 := (cpu_id(11, 0, 2) >> 8) & 255;    // ecx Bit 8..15 = Ebenenart
+  if (art != 1) {
+    // Unterblatt 0 ist nicht die SMT-Ebene — dann nennt diese Maschine die
+    // Ebenen anders, und wir raten nicht.
+    CpuWertFehlt(t, CPU_ST_UNSUPPORTED, "cpuid.b.0 (keine SMT-Ebene)"c);
+    return;
+  }
+  var n: int64 := cpu_id(11, 0, 1) & 65535;           // ebx Bit 0..15
+  if (n <= 0) {
+    CpuWertFehlt(t, CPU_ST_NOT_EXPOSED_BY_VM, "cpuid.b.0 ebx == 0"c);
+    return;
+  }
+  CpuWertSetzen(t, n, "cpuid.b.0"c);
+}
+
+// Logische Prozessoren je Paket aus CPUID.0xB Unterblatt 1 (Kern-Ebene).
+pub fn CpuThreadsJePaket(t: int64): void {
+  if (cpu_id(0, 0, 0) < 11) {
+    CpuWertFehlt(t, CPU_ST_UNSUPPORTED, "cpuid.b (Blatt fehlt)"c);
+    return;
+  }
+  var art: int64 := (cpu_id(11, 1, 2) >> 8) & 255;
+  if (art != 2) {
+    CpuWertFehlt(t, CPU_ST_UNSUPPORTED, "cpuid.b.1 (keine Kern-Ebene)"c);
+    return;
+  }
+  var n: int64 := cpu_id(11, 1, 1) & 65535;
+  if (n <= 0) {
+    CpuWertFehlt(t, CPU_ST_NOT_EXPOSED_BY_VM, "cpuid.b.1 ebx == 0"c);
+    return;
+  }
+  CpuWertSetzen(t, n, "cpuid.b.1"c);
+}
+
+// Physische Kerne je Paket = Threads je Paket / Threads je Kern.
+// Fehlt eine der beiden Angaben, fehlt auch diese — eine Division durch einen
+// geratenen Wert waere der stille Default.
+pub fn CpuKerneJePaket(t: int64): void {
+  var a: int64 := CpuWertNeu();
+  var b: int64 := CpuWertNeu();
+  CpuThreadsJePaket(a);
+  CpuThreadsJeKern(b);
+  if (CpuWertDa(a) == 0 || CpuWertDa(b) == 0) {
+    CpuWertFehlt(t, CPU_ST_UNSUPPORTED, "cpuid.b.0 + cpuid.b.1 (eine Ebene fehlt)"c);
+    return;
+  }
+  var je: int64 := CpuWert(b);
+  if (je <= 0) {
+    CpuWertFehlt(t, CPU_ST_UNSUPPORTED, "cpuid.b.0 ebx == 0"c);
+    return;
+  }
+  CpuWertSetzen(t, CpuWert(a) / je, "cpuid.b.0 / cpuid.b.1"c);
+}
+
+// Hat diese CPU verschiedene Kerntypen (P/E-Kerne)? CPUID.0x1A existiert nur
+// auf Hybrid-Teilen; CPUID.7.0:EDX Bit 15 ist das Hybrid-Bit.
+pub fn CpuIstHybrid(t: int64): void {
+  if (cpu_id(0, 0, 0) < 7) {
+    CpuWertFehlt(t, CPU_ST_UNSUPPORTED, "cpuid.7 (Blatt fehlt)"c);
+    return;
+  }
+  var hyb: int64 := (cpu_id(7, 0, 3) >> 15) & 1;      // edx Bit 15
+  CpuWertSetzen(t, hyb, "cpuid.7.0 edx bit 15"c);
+}
+
+// Kerntyp des AUSFUEHRENDEN Kerns aus CPUID.0x1A: eax Bit 24..31
+// (0x20 = Atom/E-Kern, 0x40 = Core/P-Kern). Auf nicht-hybriden Teilen gibt es
+// das Blatt nicht — dann fehlt der Wert, statt "P-Kern" zu behaupten.
+pub fn CpuKerntyp(t: int64): void {
+  if (cpu_id(0, 0, 0) < 26) {
+    CpuWertFehlt(t, CPU_ST_UNSUPPORTED, "cpuid.1a (Blatt fehlt, kein Hybrid-Teil)"c);
+    return;
+  }
+  var art: int64 := (cpu_id(26, 0, 0) >> 24) & 255;
+  if (art == 0) {
+    CpuWertFehlt(t, CPU_ST_UNSUPPORTED, "cpuid.1a eax == 0"c);
+    return;
+  }
+  CpuWertSetzen(t, art, "cpuid.1a eax bit 24..31"c);
+}

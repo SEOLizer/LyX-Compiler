@@ -20,10 +20,19 @@
 // statt Verzweigungen — H ist geheim, ein Sprung auf einem H-Bit waere ein
 // Seitenkanal. Tabellenverfahren (4-Bit-Fenster) waeren schneller, aber die
 // Tabelle haengt an H und wird ueber den Cache beobachtbar.
+//
+// #2390: Mit PCLMULQDQ gibt es dafuer einen Hardwareweg — traegerlose
+// Multiplikation, sprungfrei und tabellenlos, also OHNE den Seitenkanal des
+// Tabellenverfahrens. Er laeuft hinter CpuHasPCLMUL(); der bitweise Weg
+// bleibt als Rueckfall stehen und ist weiter der Vergleichsmassstab
+// (tests/ghash_pclmul_2390_test.sh rechnet beide Wege gegeneinander).
+// Ebenso nutzt die AES-Blockverschluesselung hier AES-NI (#2383), wenn die
+// CPU es kann — damit entfaellt auch der T-Table-Zugriff des Softwarewegs.
 
 unit std.crypto.aesgcm;
 
 import std.alloc;
+import std.cpu.features;   // #2390: CpuHasPCLMUL
 import std.crypto.aes;
 import std.crypto.ct;
 
@@ -183,6 +192,16 @@ fn gcmMixColumns(st: int64): void {
 
 // Verschluesselt den 16-Byte-Block st an seinem Platz.
 fn gcmEncBlock(st: int64, rk: int64, rounds: int64): void {
+    // #2390: AES-NI, wenn die CPU es kann. Der Rundenschluesselplan ist
+    // derselbe (Standard-AES-Schluesselplan, (rounds+1) * 16 Byte
+    // hintereinander), den AESNIEncryptBlock erwartet — gegengeprueft in
+    // tests/ghash_pclmul_2390_test.sh, das beide Wege Byte fuer Byte
+    // vergleicht. Damit entfaellt der T-Table-Zugriff des Softwarewegs und
+    // mit ihm sein Cache-Seitenkanal.
+    if (gcmAesniDa() != 0) {
+        AESNIEncryptBlock(st as pchar, rk as pchar, rounds);
+        return;
+    }
     gcmAddRoundKey(st, rk, 0);
     var r: int64 := 1;
     while (r < rounds) {
@@ -260,6 +279,98 @@ fn gcmMul(zbuf: int64, hbuf: int64): void {
 
 // Z := (Z ^ block) * H, block hat blockLen <= 16 Byte und wird rechts mit
 // Nullen aufgefuellt (SP 800-38D §6.4, Schritt 2).
+// #2390: Schnellweg-Zustand. Zwei feste Kratzbereiche von je 16 Byte, jeder
+// mit EINER Rolle (umgedrehtes H bzw. umgedrehtes Z) und einer von 16 Byte
+// fuer den aufgefuellten Schlussblock. Ein Bereich mit zwei Rollen war schon
+// mehrfach die Ursache fuer "jeder zweite Aufruf falsch".
+var _gcmHRev: int64 := 0;
+var _gcmZRev: int64 := 0;
+var _gcmRest: int64 := 0;
+// Ergebnis von CpuHasPCLMUL(), einmal gemessen. Das Flag ist noetig, weil 0
+// ein gueltiges Ergebnis ist (dieselbe Begruendung wie bei AESNIAvailable).
+var _gcmPclmul: int64 := 0;
+var _gcmPclmulGeprueft: int64 := 0;
+
+fn gcmPclmulDa(): int64 {
+    if (_gcmPclmulGeprueft == 0) {
+        _gcmPclmulGeprueft := 1;
+        if (CpuHasPCLMUL() != 0) { _gcmPclmul := 1; }
+    }
+    return _gcmPclmul;
+}
+
+// Ergebnis von AESNIAvailable(), hinter demselben Schalter wie der
+// GHASH-Schnellweg (siehe AesGcmNurSoftware).
+var _gcmAesni: int64 := 0;
+var _gcmAesniGeprueft: int64 := 0;
+
+fn gcmAesniDa(): int64 {
+    if (_gcmAesniGeprueft == 0) {
+        _gcmAesniGeprueft := 1;
+        if (AESNIAvailable() != 0) { _gcmAesni := 1; }
+    }
+    return _gcmAesni;
+}
+
+// #2390: Schnellwege abschalten (1) oder wieder zulassen (0).
+//
+// Das ist KEIN Abstimmknopf fuer Anwender, sondern die Voraussetzung dafuer,
+// beide Seiten zu messen: ohne ihn ist der Softwareweg auf einer CPU mit
+// PCLMULQDQ und AES-NI nicht erreichbar, und ein Test, der nur den schnellen
+// Weg prueft, waere auch von einer Fassung erfuellt, die immer ihn nimmt
+// (#1823). Nach dem Abschalten rechnet alles bitweise und tabellenbasiert
+// weiter — dasselbe Ergebnis, nur langsamer.
+pub fn AesGcmNurSoftware(an: int64): void {
+    _gcmPclmulGeprueft := 1;
+    _gcmAesniGeprueft := 1;
+    if (an != 0) {
+        _gcmPclmul := 0;
+        _gcmAesni := 0;
+    } else {
+        _gcmPclmul := 0;
+        _gcmAesni := 0;
+        if (CpuHasPCLMUL() != 0) { _gcmPclmul := 1; }
+        if (AESNIAvailable() != 0) { _gcmAesni := 1; }
+    }
+}
+
+// 16 Byte byteweise umgedreht kopieren: die GCM-Ordnung, in der
+// `ghash_blocks` rechnet.
+fn gcmDreh16(ziel: int64, quelle: int64): void {
+    var i: int64 := 0;
+    while (i < 16) {
+        poke8(ziel + i, peek8(quelle + 15 - i));
+        i += 1;
+    }
+}
+
+// #2390: GHASH ueber `len` Byte mit PCLMULQDQ. Z und H werden einmal je
+// Aufruf gedreht, nicht je Block; die Datenbloecke dreht das Builtin.
+// Ein Teilblock am Ende wird mit Nullen aufgefuellt — genau das tut der
+// bitweise Weg auch (gcmGhashBlock verXORt nur blockLen Byte).
+fn gcmGhashDataSchnell(zbuf: int64, hbuf: int64, data: int64, len: int64): void {
+    if (_gcmHRev == 0) {
+        _gcmHRev := alloc(16);
+        _gcmZRev := alloc(16);
+        _gcmRest := alloc(16);
+    }
+    gcmDreh16(_gcmHRev, hbuf);
+    gcmDreh16(_gcmZRev, zbuf);
+    var voll: int64 := len / 16;
+    if (voll > 0) {
+        ghash_blocks(_gcmZRev, _gcmHRev, data, voll);
+    }
+    var rest: int64 := len - voll * 16;
+    if (rest > 0) {
+        var i: int64 := 0;
+        while (i < 16) { poke8(_gcmRest + i, 0); i += 1; }
+        i := 0;
+        while (i < rest) { poke8(_gcmRest + i, peek8(data + voll * 16 + i)); i += 1; }
+        ghash_blocks(_gcmZRev, _gcmHRev, _gcmRest, 1);
+    }
+    gcmDreh16(zbuf, _gcmZRev);
+}
+
 fn gcmGhashBlock(zbuf: int64, hbuf: int64, block: int64, blockLen: int64): void {
     var i: int64 := 0;
     while (i < blockLen) {
@@ -270,6 +381,13 @@ fn gcmGhashBlock(zbuf: int64, hbuf: int64, block: int64, blockLen: int64): void 
 }
 
 fn gcmGhashData(zbuf: int64, hbuf: int64, data: int64, len: int64): void {
+    // #2390: Die Weiche steht HIER und nicht in gcmGhashBlock: der
+    // Hardwareweg lohnt sich ueber viele Bloecke, und das Drehen von Z und H
+    // faellt dann einmal an statt je Block.
+    if (gcmPclmulDa() != 0) {
+        gcmGhashDataSchnell(zbuf, hbuf, data, len);
+        return;
+    }
     var pos: int64 := 0;
     while (pos + 16 <= len) {
         gcmGhashBlock(zbuf, hbuf, data + pos, 16);

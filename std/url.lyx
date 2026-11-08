@@ -1,5 +1,23 @@
 // std/url - URL Parser and Builder
 // URL parsing and manipulation utilities
+//
+// #2366: Die Zerlegungsfunktionen (GetScheme, GetHostname, GetPath, GetQuery,
+// GetFragment, GetUsername, GetPassword) gaben bis 1.2.31J einen ZEIGER IN DIE
+// uebergebene URL zurueck (`return url + pos;`) und schnitten nicht ab. Damit
+// lieferte `GetHostname("https://example.com/a/b")` nicht "example.com",
+// sondern "example.com/a/b" -- den Hostnamen PLUS allem, was danach kommt. Die
+// Angabe stimmte nur fuer den jeweils letzten Bestandteil einer URL.
+//
+// Jetzt schneiden sie ab und liefern eine EIGENE Zeichenkette, so wie es
+// GetQueryParam, URLPercentEncode und URLQueryGet in dieser Unit schon immer
+// taten. Der Speicher kommt aus `alloc` (Kleinspeicher-Pool, #1258); wer ihn
+// freigeben will, nimmt `free(p as int64, StrLen(p) + 1)`. Ein leerer
+// Bestandteil ist weiter das Literal "" und braucht keine Freigabe.
+//
+// Wer den alten Zeiger ins Original braucht (Zerlegung ohne Kopie), nimmt die
+// Positionsfunktionen: URLSchemeEnde, URLHostAnfang, URLHostEnde, URLPfadAnfang,
+// URLQueryAnfang, URLFragmentAnfang. Sie sind die Grundlage der Getter und
+// liefern Versaetze in die uebergebene URL.
 
 @description("URL parsing and percent-encoding")
 @author("Andreas Röne")
@@ -34,6 +52,25 @@ pub con DEFAULT_HTTPS_PORT: int64 := 443;
 // ============================================================================
 // Helper Functions
 // ============================================================================
+
+// #2366: Bestandteil [von, bis) als EIGENE Zeichenkette. Leerer Bereich -> "".
+// Ein Bereich jenseits der Zeichenkette liefert ebenfalls "" statt eines
+// Zeigers hinter das Ende.
+fn urlTeil(url: pchar, von: int64, bis: int64): pchar {
+    var ulen: int64 := StrLen(url);
+    if (von < 0) { von := 0; }
+    if (bis > ulen) { bis := ulen; }
+    if (bis <= von) { return ""; }
+    var n: int64 := bis - von;
+    var ziel: pchar := alloc(n + 1) as pchar;
+    var i: int64 := 0;
+    while (i < n) {
+        StrSetChar(ziel, i, charAtN(url, von + i, ulen));
+        i += 1;
+    }
+    StrSetChar(ziel, n, 0);
+    return ziel;
+}
 
 // Find substring in string, returns position or -1
 // #2352/#2364: Zeichenzugriff mit BEKANNTER Laenge.
@@ -298,37 +335,88 @@ pub fn Parse(url_str: pchar, result: pchar): int64 {
     return 1;
 }
 
+// ============================================================================
+// #2366: Positionen in der uebergebenen URL. Sie sind die Grundlage der
+// Zerlegungsfunktionen unten und die Antwort fuer alle, die OHNE Kopie
+// arbeiten wollen: `url + URLHostAnfang(url)` ist genau der Zeiger, den
+// GetHostname bis 1.2.31J zurueckgab.
+// ============================================================================
+
+// Versatz des ':' von "://", oder -1 ohne Schema.
+pub fn URLSchemeEnde(url: pchar): int64 {
+    return findSchemeEnd(url);
+}
+
+// Erstes Zeichen des Hostnamens. Ohne Schema beginnt die URL mit dem Host
+// (Versatz 0); Anmeldedaten vor einem '@' werden uebersprungen.
+pub fn URLHostAnfang(url: pchar): int64 {
+    var scheme_end: int64 := findSchemeEnd(url);
+    var pos: int64 := 0;
+    if (scheme_end >= 0) { pos := scheme_end + 3; }
+    var at_pos: int64 := findAt(url, pos);
+    if (at_pos >= 0) { pos := at_pos + 1; }
+    return pos;
+}
+
+// Erstes Zeichen NACH dem Hostnamen (':', '/', '?', '#' oder Ende).
+pub fn URLHostEnde(url: pchar): int64 {
+    return findHostEnd(url, URLHostAnfang(url));
+}
+
+// Versatz des '/' , mit dem der Pfad beginnt, oder -1 wenn die URL keinen hat.
+pub fn URLPfadAnfang(url: pchar): int64 {
+    var ulen: int64 := StrLen(url);
+    var pos: int64 := URLHostEnde(url);
+    while (pos < ulen) {
+        var c: int64 := charAtN(url, pos, ulen);
+        if (c == 47) { return pos; }                 // '/'
+        if (c == 63 || c == 35) { return -1; }       // '?' oder '#' -> kein Pfad
+        pos += 1;
+    }
+    return -1;
+}
+
+// Versatz des ersten Zeichens NACH dem '?', oder -1 ohne Query. Ein '?' im
+// Fragment zaehlt nicht -- gesucht wird nur vor dem ersten '#'.
+pub fn URLQueryAnfang(url: pchar): int64 {
+    var ulen: int64 := StrLen(url);
+    var i: int64 := 0;
+    while (i < ulen) {
+        var c: int64 := charAtN(url, i, ulen);
+        if (c == 35) { return -1; }                  // '#' zuerst -> keine Query
+        if (c == 63) { return i + 1; }               // '?'
+        i += 1;
+    }
+    return -1;
+}
+
+// Versatz des ersten Zeichens NACH dem '#', oder -1 ohne Fragment.
+pub fn URLFragmentAnfang(url: pchar): int64 {
+    var ulen: int64 := StrLen(url);
+    var i: int64 := 0;
+    while (i < ulen) {
+        if (charAtN(url, i, ulen) == 35) { return i + 1; }
+        i += 1;
+    }
+    return -1;
+}
+
 // Get scheme from URL
+// #2366: gab vorher `url` zurueck, also die GANZE URL statt des Schemas.
 pub fn GetScheme(url: pchar): pchar {
-    // Scheme is at beginning, before "://"
-    var end: int64 := findSchemeEnd(url);
-    if (end < 0) {
+    var ende: int64 := findSchemeEnd(url);
+    if (ende < 0) {
         return "";
     }
-    return url;
+    return urlTeil(url, 0, ende);
 }
 
 // Get hostname from URL
+// #2366: schneidet ab; vorher kam der Hostname samt Port, Pfad, Query und
+// Fragment zurueck.
 pub fn GetHostname(url: pchar): pchar {
-    // Find "://"
-    var scheme_end: int64 := findSchemeEnd(url);
-    if (scheme_end < 0) {
-        scheme_end := -1;
-    }
-    
-    var pos: int64 := scheme_end + 3;
-    
-    // Skip credentials if present
-    var at_pos: int64 := findAt(url, pos);
-    if (at_pos >= 0) {
-        pos := at_pos + 1;
-    }
-    
-    // Find end of hostname
-    var host_end: int64 := findHostEnd(url, pos);
-    
-    // Return substring
-    return url + pos;
+    var von: int64 := URLHostAnfang(url);
+    return urlTeil(url, von, findHostEnd(url, von));
 }
 
 // Get port from URL (or default port for scheme)
@@ -403,140 +491,84 @@ pub fn GetPort(url: pchar): int64 {
 }
 
 // Get path from URL
+// #2366: schneidet am '?' bzw. '#' ab; vorher kam der Pfad samt Query und
+// Fragment zurueck.
 pub fn GetPath(url: pchar): pchar {
-    var scheme_end: int64 := findSchemeEnd(url);
-    if (scheme_end < 0) {
-        scheme_end := -1;
+    var von: int64 := URLPfadAnfang(url);
+    if (von < 0) { return ""; }
+    var ulen: int64 := StrLen(url);
+    var bis: int64 := von;
+    while (bis < ulen) {
+        var c: int64 := charAtN(url, bis, ulen);
+        if (c == 63 || c == 35) { break; }           // '?' oder '#'
+        bis += 1;
     }
-    
-    var pos: int64 := scheme_end + 3;
-    
-    // Skip credentials
-    var at_pos: int64 := findAt(url, pos);
-    if (at_pos >= 0) {
-        pos := at_pos + 1;
-    }
-    
-    var host_end: int64 := findHostEnd(url, pos);
-    
-    // Find start of path
-    pos := host_end;
-    var ulen3: int64 := StrLen(url);                     // #2352
-    while (pos < ulen3) {
-        var c: int64 := charAtN(url, pos, ulen3);
-        if (c == 47) {  // '/'
-            return url + pos;
-        }
-        if (c == 63 || c == 35) {  // '?' or '#'
-            return "";
-        }
-        pos += 1;
-    }
-    
-    return "";
+    return urlTeil(url, von, bis);
 }
 
 // Get query string from URL
+// #2366: schneidet am '#' ab; vorher kam die Query samt Fragment zurueck --
+// genau das kompensierte URLQueryGet mit einer eigenen Schleife.
 pub fn GetQuery(url: pchar): pchar {
-    var path_end: int64 := StrLen(url);
-    
-    var q_pos: int64 := -1;
-    var i: int64 := 0;
-    while (i < path_end) {
-        var c: int64 := charAtN(url, i, path_end);
-        if (c == 63) {  // '?'
-            q_pos := i + 1;
-        }
-        if (c == 35) {  // '#'
-            break;
-        }
-        i += 1;
+    var von: int64 := URLQueryAnfang(url);
+    if (von < 0) { return ""; }
+    var ulen: int64 := StrLen(url);
+    var bis: int64 := von;
+    while (bis < ulen) {
+        if (charAtN(url, bis, ulen) == 35) { break; }  // '#'
+        bis += 1;
     }
-    
-    if (q_pos > 0 && (q_pos < path_end)) {
-        return url + q_pos;
-    }
-    
-    return "";
+    return urlTeil(url, von, bis);
 }
 
 // Get fragment from URL
+// #2366: eigene Zeichenkette statt eines Zeigers in die URL. Der Wert selbst
+// war hier schon richtig -- das Fragment ist der letzte Bestandteil.
 pub fn GetFragment(url: pchar): pchar {
-    var frag_pos: int64 := -1;
-    var i: int64 := 0;
-    var ulen4: int64 := StrLen(url);                     // #2352
-    
-    while (i < ulen4) {
-        var c: int64 := charAtN(url, i, ulen4);
-        if (c == 35) {  // '#'
-            frag_pos := i + 1;
-            break;
-        }
-        i += 1;
-    }
-    
-    if (frag_pos > 0 && (frag_pos < ulen4)) {
-        return url + frag_pos;
-    }
-    
-    return "";
+    var von: int64 := URLFragmentAnfang(url);
+    if (von < 0) { return ""; }
+    return urlTeil(url, von, StrLen(url));
 }
 
 // Get username from URL
+// #2366: schneidet am ':' bzw. '@' ab; vorher kam der Benutzername samt
+// Passwort, Host und Rest zurueck.
 pub fn GetUsername(url: pchar): pchar {
-    var ulen: int64 := StrLen(url);                      // #2364
     var scheme_end: int64 := findSchemeEnd(url);
-    if (scheme_end < 0) {
-        return "";
-    }
-    
-    var pos: int64 := scheme_end + 3;
-    
+    var pos: int64 := 0;
+    if (scheme_end >= 0) { pos := scheme_end + 3; }
     var at_pos: int64 := findAt(url, pos);
     if (at_pos < 0) {
         return "";
     }
-    
-    // Username is between pos and at_pos
-    // Need to find ':' in between
-    var i: int64 := pos;
-    while (i < at_pos) {
-        if (charAtN(url, i, ulen) == 58) {  // ':'
-            // Found password separator
-            // Username is from pos to i
-            return url + pos;
-        }
-        i += 1;
+    var ulen: int64 := StrLen(url);
+    var bis: int64 := pos;
+    while (bis < at_pos) {
+        if (charAtN(url, bis, ulen) == 58) { break; }   // ':' trennt das Passwort ab
+        bis += 1;
     }
-    
-    // No password, username is from pos to at_pos
-    return url + pos;
+    return urlTeil(url, pos, bis);
 }
 
 // Get password from URL
+// #2366: schneidet am '@' ab; vorher kam das Passwort samt Host und Rest
+// zurueck.
 pub fn GetPassword(url: pchar): pchar {
-    var ulen: int64 := StrLen(url);                      // #2364
     var scheme_end: int64 := findSchemeEnd(url);
-    if (scheme_end < 0) {
-        return "";
-    }
-    
-    var pos: int64 := scheme_end + 3;
-    
+    var pos: int64 := 0;
+    if (scheme_end >= 0) { pos := scheme_end + 3; }
     var at_pos: int64 := findAt(url, pos);
     if (at_pos < 0) {
         return "";
     }
-    
-    // Find ':' between pos and at_pos
+    var ulen: int64 := StrLen(url);
     var i: int64 := pos;
     while (i < at_pos) {
-        if (charAtN(url, i, ulen) == 58) {  // ':'
-            return url + i + 1;
+        if (charAtN(url, i, ulen) == 58) {              // ':'
+            return urlTeil(url, i + 1, at_pos);
         }
         i += 1;
     }
-    
     return "";
 }
 
@@ -946,28 +978,16 @@ pub fn URLPercentDecode(s: pchar): pchar {
 // ============================================================================
 
 pub fn URLQueryGet(url: pchar, key: pchar): pchar {
+    // #2366: GetQuery schnitt das Fragment nicht ab, und diese Funktion hat
+    // es deshalb selbst abgeschnitten. Seit GetQuery am '#' endet, ist diese
+    // Umgehung nicht nur unnoetig, sie waere der naechste Fehler (ein
+    // Workaround, der einen Fehler anderswo kompensiert, wird nach dem
+    // echten Fix selbst zum Bug).
     var query: pchar := GetQuery(url);
-    var q_len: int64 := StrLen(query);
-    if (q_len == 0) {
+    if (StrLen(query) == 0) {
         return "";
     }
-    // GetQuery returns a pointer into the raw URL including any '#fragment'.
-    // Strip the fragment so GetQueryParam doesn't include it in values.
-    var clean_len: int64 := 0;
-    while (clean_len < q_len && charAtN(query, clean_len, q_len) != 35) {
-        clean_len += 1;
-    }
-    if (clean_len == q_len) {
-        return GetQueryParam(query, key);
-    }
-    var clean: pchar := alloc(clean_len + 1) as pchar;
-    var ci: int64 := 0;
-    while (ci < clean_len) {
-        StrSetChar(clean, ci, charAtN(query, ci, q_len));
-        ci += 1;
-    }
-    StrSetChar(clean, clean_len, 0);
-    return GetQueryParam(clean, key);
+    return GetQueryParam(query, key);
 }
 
 // Find position of key= in the query portion url[q_start..url_end). Returns -1 if not found.

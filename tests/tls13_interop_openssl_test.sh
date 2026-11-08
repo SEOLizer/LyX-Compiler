@@ -424,6 +424,46 @@ pruefe() {  # name, bedingung-erfuellt(0/1)
   else echo "FAIL $1"; FAIL=$((FAIL+1)); fi
 }
 
+# #2418: Auf die WIRKUNG warten statt eine Zeit zu schlafen.
+#
+# Warum das nötig war: ein CI-Lauf meldete `FAIL Server gegen s_client,
+# TLS_AES_128_GCM_SHA256`, während BEIDE Seiten Erfolg meldeten — OpenSSL mit
+# `Verify return code: 0 (ok)`, unsere Seite mit `handschlag-fertig … fertig`.
+# Der Durchgang brauchte 27 s gegen 4,5 s bei den beiden folgenden, also
+# ungefähr `sleep 1.5` plus `timeout 25`: s_client lief in sein Zeitlimit und
+# wurde getötet, womit seine Ausgabe unvollständig blieb.
+#
+# Lokal liess sich der Fall NICHT herstellen — weder mit `sleep 0.05` statt
+# `sleep 3` noch mit `timeout 2` statt `timeout 25` wurde der Test rot; die
+# Antwort steht hier nach unter zwei Sekunden vollständig in der Datei. Die
+# Ursache bleibt damit unbelegt. Was aber unabhängig davon falsch war: der
+# Test hing an festen Zeiten, und die hängen an der Maschine.
+#
+# Deshalb wird jetzt gewartet, bis das erwartete MUSTER in der Datei steht,
+# und nur eine Obergrenze begrenzt die Wartezeit. Auf einem schnellen Rechner
+# ist der Test damit schneller, auf einem langsamen hält er länger durch.
+warteAufMuster() {   # datei, muster, max-sekunden
+  local datei="$1" muster="$2" grenze="$3" i=0
+  while [ "$i" -lt "$((grenze * 10))" ]; do
+    [ -f "$datei" ] && grep -q "$muster" "$datei" 2>/dev/null && return 0
+    sleep 0.1
+    i=$((i+1))
+  done
+  return 1
+}
+
+# Wartet, bis der Server auf dem Port lauscht. `sleep 1.5` war eine Annahme
+# über die Startzeit; unter Last ist sie falsch, und zwar in beide Richtungen.
+warteAufPort() {     # port, max-sekunden
+  local port="$1" grenze="$2" i=0
+  while [ "$i" -lt "$((grenze * 10))" ]; do
+    ss -ltn 2>/dev/null | grep -q ":$port " && return 0
+    sleep 0.1
+    i=$((i+1))
+  done
+  return 1
+}
+
 PORT=18560
 freierPort() {
   while ss -ltn 2>/dev/null | grep -q ":$PORT "; do PORT=$((PORT+1)); done
@@ -434,30 +474,62 @@ freierPort() {
 for suite in TLS_AES_128_GCM_SHA256 TLS_AES_256_GCM_SHA384 TLS_CHACHA20_POLY1305_SHA256; do
   p="$(freierPort)"; PORT=$((PORT+1))
   ( ulimit -v 4000000 -c 0; "$TMP/srv" "$p" > "$TMP/srv_$suite.txt" 2>&1 ) &
-  sleep 1.5
+  srvpid=$!
+  warteAufPort "$p" 20 || echo "  HINWEIS: Server lauscht nach 20 s nicht auf $p"
   # -ign_eof, sonst beendet s_client die Verbindung beim EOF auf stdin, bevor
   # unsere Antwort da ist — die Pruefung auf die Nutzdaten waere dann immer rot.
-  ( printf 'GET / HTTP/1.0\r\n\r\n'; sleep 3 ) | timeout 25 openssl s_client \
+  #
+  # #2418: s_client laeuft im Hintergrund und wird beendet, sobald die
+  # ANTWORT da ist. Vorher hing hier `sleep 3` im Erzeuger und `timeout 25`
+  # am Aufruf; lief s_client in das Zeitlimit, war seine Ausgabe
+  # unvollstaendig und der Test rot, obwohl beide Seiten den Handschlag
+  # gemeldet hatten.
+  # Die Anfrage kommt über eine FIFO und nicht über eine Pipeline: so haben
+  # Erzeuger und s_client getrennte PIDs und lassen sich beide beenden,
+  # sobald die Antwort da ist. Mit einer Pipeline wartete `wait` noch auf den
+  # schlafenden Erzeuger — GEMESSEN wurde der Lauf dadurch dreimal so lang
+  # (108 s gegen 36 s), und ein Test, der dreimal so lange braucht, ist keine
+  # Härtung.
+  rm -f "$TMP/fifo_$suite"; mkfifo "$TMP/fifo_$suite"
+  ( printf 'GET / HTTP/1.0\r\n\r\n'; sleep 30 ) > "$TMP/fifo_$suite" &
+  feedpid=$!
+  timeout 40 openssl s_client \
      -connect "127.0.0.1:$p" -ign_eof \
      -servername nexus.example -CAfile "$TMP/certs/tlsca.pem" -alpn h2,http/1.1 \
-     -ciphersuites "$suite" -tls1_3 > "$TMP/os_$suite.txt" 2>&1
-  wait
+     -ciphersuites "$suite" -tls1_3 < "$TMP/fifo_$suite" > "$TMP/os_$suite.txt" 2>&1 &
+  ospid=$!
+  warteAufMuster "$TMP/os_$suite.txt" "Lyx TLS 1.3" 30
+  antwortDa=$?
+  kill "$ospid" "$feedpid" "$srvpid" 2>/dev/null
+  wait "$ospid" "$feedpid" "$srvpid" 2>/dev/null
+  rm -f "$TMP/fifo_$suite"
+  # #2418: Jede der vier Bedingungen wird EINZELN benannt. Vorher stand im
+  # Protokoll nur „FAIL" und eine Zeile mit Cipher und Verify-Code — die
+  # Nutzdatenpruefung kam darin nicht vor, und beim CI-Fehlschlag war
+  # deshalb nicht erkennbar, welche Bedingung gefallen war. Geraten hat es
+  # niemandem geholfen.
+  fehlend=""
+  grep -q "Cipher is $suite" "$TMP/os_$suite.txt" || fehlend="$fehlend cipher"
+  grep -q "Verify return code: 0 (ok)" "$TMP/os_$suite.txt" || fehlend="$fehlend verify"
+  grep -q "Lyx TLS 1.3" "$TMP/os_$suite.txt" || fehlend="$fehlend nutzdaten-bei-openssl"
+  grep -q "empfangen 18 GET / HTTP/1.0" "$TMP/srv_$suite.txt" || fehlend="$fehlend anfrage-im-server"
   ok=1
-  grep -q "Cipher is $suite" "$TMP/os_$suite.txt" || ok=0
-  grep -q "Verify return code: 0 (ok)" "$TMP/os_$suite.txt" || ok=0
-  grep -q "Lyx TLS 1.3" "$TMP/os_$suite.txt" || ok=0
-  grep -q "empfangen 18 GET / HTTP/1.0" "$TMP/srv_$suite.txt" || ok=0
+  [ -n "$fehlend" ] && ok=0
   pruefe "Server gegen s_client, $suite" "$ok"
   if [ "$ok" != 1 ]; then
-    echo "  openssl: $(grep -E 'Cipher is|Verify return code' "$TMP/os_$suite.txt" | tr '\n' ' ')"
+    echo "  gefallene Bedingungen:$fehlend"
+    [ "$antwortDa" != 0 ] && echo "  (die Antwort stand nach 30 s nicht in der openssl-Ausgabe)"
+    echo "  openssl: $(grep -E 'Cipher is|Verify return code|Lyx TLS' "$TMP/os_$suite.txt" | tr '\n' ' ')"
     echo "  lyx:     $(tr '\n' ' ' < "$TMP/srv_$suite.txt")"
+    echo "  openssl-Ausgabe, letzte Zeilen:"
+    tail -5 "$TMP/os_$suite.txt" | sed 's/^/    /'
   fi
 done
 
 # --- 2. unser Server mit verlangtem Client-Zertifikat ---
 p="$(freierPort)"; PORT=$((PORT+1))
 ( ulimit -v 4000000 -c 0; "$TMP/srv" "$p" ec mtls > "$TMP/srv_mtls.txt" 2>&1 ) &
-sleep 1.5
+warteAufPort "$p" 20 || echo "  HINWEIS: Server lauscht nach 20 s nicht auf $p"
 printf 'GET / HTTP/1.0\r\n\r\n' | timeout 25 openssl s_client -connect "127.0.0.1:$p" \
    -servername nexus.example -CAfile "$TMP/certs/tlsca.pem" \
    -cert "$TMP/certs/tlscli.pem" -key "$TMP/certs/tlsclikey.pem" -tls1_3 \
@@ -470,7 +542,7 @@ pruefe "Server verlangt Client-Zertifikat: mit Zertifikat Erfolg" "$ok"
 
 p="$(freierPort)"; PORT=$((PORT+1))
 ( ulimit -v 4000000 -c 0; "$TMP/srv" "$p" ec mtls > "$TMP/srv_mtls2.txt" 2>&1 ) &
-sleep 1.5
+warteAufPort "$p" 20 || echo "  HINWEIS: Server lauscht nach 20 s nicht auf $p"
 printf 'x' | timeout 25 openssl s_client -connect "127.0.0.1:$p" \
    -CAfile "$TMP/certs/tlsca.pem" -tls1_3 > "$TMP/os_mtls2.txt" 2>&1
 wait
@@ -491,7 +563,9 @@ for modus in ohne mit; do
       -tls1_3 -alpn http/1.1 < "$TMP/fifo_$modus" > "$TMP/os_srv_$modus.txt" 2>&1 &
   fi
   ( printf 'pong aus openssl\n'; sleep 8 ) > "$TMP/fifo_$modus" &
-  sleep 1.5
+  # #2418: auch hier auf den Port warten — s_server braucht beim ersten Start
+  # merklich länger als später, und `sleep 1.5` war eine Annahme darüber.
+  warteAufPort "$p" 20 || echo "  HINWEIS: s_server lauscht nach 20 s nicht auf $p"
   if [ "$modus" = mit ]; then
     ( ulimit -v 4000000 -c 0; timeout 25 "$TMP/cli" "$p" ec mtls ) > "$TMP/cli_$modus.txt" 2>&1
   else
@@ -513,8 +587,35 @@ done
 for satz in "rsa rsaca rsa.example" "ed edca ed.example"; do
   set -- $satz; art=$1; ca=$2; host=$3
   p="$(freierPort)"; PORT=$((PORT+1))
-  ( ulimit -v 4000000 -c 0; "$TMP/srv" "$p" "$art" > "$TMP/srv_$art.txt" 2>&1 ) &
-  sleep 1.5
+  # #2418: Der Exit-Code des Servers wird MITGESCHRIEBEN. Ohne ihn stand im
+  # Protokoll nur "Antwort fehlt", und genau daran ist die Ursachensuche
+  # zweimal vorbeigelaufen: der Server starb an einem SIGNAL (rc 141 =
+  # 128+13 = SIGPIPE), was man an der fehlenden Antwort nicht sieht.
+  ( ulimit -v 4000000 -c 0; "$TMP/srv" "$p" "$art" > "$TMP/srv_$art.txt" 2>&1
+    echo "exit=$?" >> "$TMP/srv_$art.txt" ) &
+  warteAufPort "$p" 20 || echo "  HINWEIS: Server lauscht nach 20 s nicht auf $p"
+  # #2418: GEMESSEN, aber Ursache NOCH NICHT gefunden. Stand der Diagnose:
+  #
+  #   * Reproduzierbar mit acht Dauerlast-Prozessen auf acht Kernen: ohne
+  #     Last 3 von 3 Laeufen gruen, mit Last 7 PASS/4 FAIL.
+  #   * Der Server gibt `empfangen 18 GET / HTTP/1.0` aus und kommt NICHT
+  #     bis zu seinem "fertig". Exit-Code 141 = 128+13 = SIGPIPE.
+  #   * s_client laeuft GENAU 40,04 s, also bis in sein `timeout` — er wird
+  #     erschlagen, nicht fertig. Seine Ausgabe bricht beim `---` vor den
+  #     Nutzdaten ab.
+  #
+  # Daraus folgt: BEIDE Seiten warten. SIGPIPE ist die FOLGE (timeout
+  # beendet s_client, danach schreibt der Server in einen toten Socket),
+  # nicht die Ursache.
+  #
+  # Ein groesseres Zeitfenster hilft deshalb NICHT — probiert mit
+  # `sleep 30`/`timeout 40` statt 3/25: unveraendert 7 PASS/4 FAIL und
+  # weiter exit=141. Darum steht hier wieder der alte Wert; wer die Frist
+  # anfasst, behebt nichts.
+  #
+  # Naechster Schritt: strace auf BEIDE Seiten, um zu sehen, wer auf wen
+  # wartet (Server im Schreibpfad nach TlsSchreibe/TlsAusgabe/TCPConnWrite,
+  # s_client in select auf stdin und Socket).
   ( printf 'GET / HTTP/1.0\r\n\r\n'; sleep 3 ) | timeout 25 openssl s_client \
      -connect "127.0.0.1:$p" -ign_eof -servername "$host" \
      -CAfile "$TMP/certs/$ca.pem" -tls1_3 > "$TMP/os_$art.txt" 2>&1
@@ -532,6 +633,9 @@ for satz in "rsa rsaca rsa.example" "ed edca ed.example"; do
   if [ "$ok" != 1 ]; then
     echo "  openssl: $(grep -E 'Peer signature type|Verify return code' "$TMP/os_$art.txt" | tr '\n' ' ')"
     echo "  lyx:     $(tr '\n' ' ' < "$TMP/srv_$art.txt")"
+    # #2418: WO die Gegenstelle abbricht, sagt mehr als dass die Antwort
+    # fehlt. Endet sie beim `---`, ist s_client vor den Nutzdaten gegangen.
+    echo "  openssl-Ausgabe: $(wc -c < "$TMP/os_$art.txt") Byte, letzte Zeile: $(tail -1 "$TMP/os_$art.txt" | cut -c1-60)"
   fi
 
   # dieselbe Art in der Client-Rolle gegen s_server
@@ -542,7 +646,7 @@ for satz in "rsa rsaca rsa.example" "ed edca ed.example"; do
   openssl s_server -accept "$p" -cert "$TMP/certs/$blatt.pem" -key "$TMP/certs/$key.pem" \
     -tls1_3 -quiet < "$TMP/fifo_$art" > "$TMP/os_srv_$art.txt" 2>&1 &
   ( printf 'pong aus openssl\n'; sleep 8 ) > "$TMP/fifo_$art" &
-  sleep 1.5
+  warteAufPort "$p" 20 || echo "  HINWEIS: s_server lauscht nach 20 s nicht auf $p"
   ( ulimit -v 4000000 -c 0; timeout 25 "$TMP/cli" "$p" "$art" ) > "$TMP/cli_$art.txt" 2>&1
   pkill -f "s_server -accept $p" 2>/dev/null
   ok=1

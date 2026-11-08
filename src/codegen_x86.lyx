@@ -1297,14 +1297,25 @@ pub type Codegen = class {
   cpFnNam:        pchar;   // Funktion, die gerade erzeugt wird (0 = unbekannt)
   cpFnLen:        int64;
   zlVrVektor: int64;             // #2335: auf den Vektorweg gelegte Reduktionen
+  zlVsVektor: int64;             // #2360 Scheibe C: vorgespulte Suchschleifen
   zlDivKonst: int64;             // #2330: Divisionen durch Zweierpotenz ohne idiv
   zlDivMagie: int64;             // #2330: Divisionen durch konstanten Divisor ohne idiv
+  zlDivMagieU: int64;            // #2333: dasselbe vorzeichenlos
+  // #2321: Merktabelle fuer cg_findMethodDeclNi. Eintrag 48 Byte:
+  // {pNodes, topLevelHead+1, classIdx+1, Namenszeiger, Namenslaenge, Knoten}
+  mdniTab: int64; mdniCap: int64;
   // #2330: Rueckgabewerte der Magie-Rechnung. Lyx kennt nur einen
   // Rueckgabewert, die Nebenergebnisse liegen deshalb hier.
   dblRest: int64;                // cg_dblMod: reduzierter Rest
   udivRest: int64;               // cg_udiv: Rest der vorzeichenlosen Division
   magieM: int64;                 // cg_magieVz: Faktor (Bitmuster, darf negativ sein)
   magieS: int64;                 // cg_magieVz: Rechtsshift
+  // #2333: dasselbe fuer die VORZEICHENLOSE Division. Eigene Felder, weil
+  // der Faktor anders gerechnet wird und eine dritte Angabe dazukommt.
+  uqRest: int64;                 // cg_uDivMod: Rest
+  magieUM: int64;                // cg_magieUnsig: Faktor (Bitmuster)
+  magieUS: int64;                // cg_magieUnsig: Rechtsshift
+  magieUA: int64;                // cg_magieUnsig: 1 = Zusatzstufe mit Uebertrag
   // #2175: Funktionsindex der obersten Ebene je (Knotentabelle, Kopf,
   // Quelltext), siehe cg_tlEintrag. Eintrag 48 Byte.
   tlTab: int64; tlAnz: int64; tlCap: int64; tlLetzt: int64;
@@ -1397,6 +1408,7 @@ pub type Codegen = class {
   // dieselbe Kodierung wie bei der Marke aus #2206, wo `slot < 0` als
   // "nicht gesetzt" die Stelle immer abgewuergt hat.
   simdZielOff:       int64;
+  shaKOff:           int64;   // #2391: Datenoffset der SHA-256-K-Tabelle, -1 = noch nicht angelegt
   // #2247: `peek32(adr) & 0xFFFFFFFF` ist der vorzeichenLOSE 32-Bit-Zugriff.
   // peek32 erweitert mit Vorzeichen, die Maske schneidet danach die oberen
   // 32 Bit ab — zwei Befehle fuer etwas, das x86 in EINEM kann: ein
@@ -1537,6 +1549,10 @@ pub type Codegen = class {
   debugMode:   int64;
   srcFilePath: pchar;
   srcFileLen:  int64;
+  // #2339: Fuellbytes vor dem ersten NUTZERcode, aus --code-offset. 0 = aus.
+  // Nur fuer Messungen: verschiebt den erzeugten Code als Ganzes, ohne einen
+  // Funktionsrumpf anzufassen.
+  codeFuell: int64;
 
   // WP-BC-48: --runtime-checks — emit bounds/null/zero checks inline
   runtimeChecks: int64;
@@ -8616,6 +8632,103 @@ pub type Codegen = class {
     self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xD0);                    // mov rax, rdx
   }
 
+  // #2391: SHA-NI — die beiden Bausteine der SHA-256-Kompression.
+  //
+  // REGISTERPLAN (verifiziert gegen eine Assembler-Fassung, die beide
+  // NIST-Vektoren fuer SHA-256 bitgleich liefert):
+  //   xmm0       Nachricht — ZWINGEND, `sha256rnds2` liest sie implizit
+  //   xmm1/xmm2  abef / cdgh (der Zustand in der Form, die die Befehle
+  //              brauchen; NICHT ABCDEFGH)
+  //   xmm3       Arbeitsregister
+  //   xmm4..xmm7 die vier Nachrichtenviertel m0..m3
+  //   xmm8/xmm9  Sicherung des Zustands fuer die Schlussaddition
+  //   xmm10      die Byteumkehrmaske
+  //   r8         K-Tabelle, r9 Maske, rdi Zustand, rsi Daten, rdx Bloecke
+  //
+  // Ein Rundenpaar. `koff` ist der Byteabstand in der K-Tabelle.
+  //
+  // Geladen wird mit `movdqu`, NICHT ueber einen Speicheroperanden von
+  // `paddd`: ein Legacy-SSE-Befehl mit m128-Operand verlangt 16-Byte-
+  // Ausrichtung, und die ist im Datensegment nicht zugesagt. Dieselbe
+  // Entscheidung wie im Vektorkern seit 1.2.31A (#2372). Kostet einen
+  // Befehl je Runde und erspart eine Ausrichtungszusage, die sonst
+  // irgendwann still verletzt wird.
+  fn cg_shaRnds(mm: int64, koff: int64) {
+    self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0xC0 + mm);   // movdqa xmm0, xmm<mm>
+    // movdqu xmm3, [r8 + koff] — ModRM reg=3, rm=0 (r8 ueber REX.B)
+    self.cg_e8(0xF3); self.cg_e8(0x41); self.cg_e8(0x0F); self.cg_e8(0x6F);
+    if (koff == 0) {
+      self.cg_e8(0x18);
+    } else if (koff < 128) {
+      self.cg_e8(0x58); self.cg_e8(koff);
+    } else {
+      self.cg_e8(0x98); self.cg_e32(koff);
+    }
+    self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0xFE); self.cg_e8(0xC3);        // paddd xmm0, xmm3
+    self.cg_e8(0x0F); self.cg_e8(0x38); self.cg_e8(0xCB); self.cg_e8(0xD1);        // sha256rnds2 xmm2, xmm1 (, xmm0)
+    self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x70); self.cg_e8(0xC0); self.cg_e8(0x0E);  // pshufd xmm0, xmm0, 0x0E
+    self.cg_e8(0x0F); self.cg_e8(0x38); self.cg_e8(0xCB); self.cg_e8(0xCA);        // sha256rnds2 xmm1, xmm2 (, xmm0)
+  }
+
+  // Ein Viertel des Nachrichtenplans: x := msg2(msg1(x, y) + (w:z >> 4), w).
+  // Die vier Viertel rotieren durch, siehe Aufrufreihenfolge unten.
+  fn cg_shaSched(x: int64, y: int64, z: int64, w: int64) {
+    self.cg_e8(0x0F); self.cg_e8(0x38); self.cg_e8(0xCC); self.cg_e8(0xC0 + x * 8 + y);   // sha256msg1 x, y
+    self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0xD8 + w);           // movdqa xmm3, w
+    self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x3A); self.cg_e8(0x0F); self.cg_e8(0xD8 + z); self.cg_e8(0x04);  // palignr xmm3, z, 4
+    self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0xFE); self.cg_e8(0xC3 + x * 8);       // paddd x, xmm3
+    self.cg_e8(0x0F); self.cg_e8(0x38); self.cg_e8(0xCD); self.cg_e8(0xC0 + x * 8 + w);   // sha256msg2 x, w
+  }
+
+  // Die 64 Rundenkonstanten aus FIPS 180-4, als Bytes ins Datensegment.
+  // Zurueck kommt der Datenoffset der Tabelle; direkt dahinter liegt die
+  // Byteumkehrmaske, deren Offset der Aufrufer selbst errechnet.
+  // Ein 32-Bit-Wort little-endian ins Datensegment.
+  fn cg_edataW(w: int64) {
+    self.cg_edata(w & 255);
+    self.cg_edata((w >> 8) & 255);
+    self.cg_edata((w >> 16) & 255);
+    self.cg_edata((w >> 24) & 255);
+  }
+
+  // EINMAL je Erzeugnis, nicht je Aufrufstelle. Ohne diese Frage lag die
+  // Tabelle (256 Byte, plus 16 fuer die Maske) so oft im Datensegment, wie
+  // `sha256_compress` aufgerufen wird — bei drei Aufrufen 816 statt 272
+  // Byte, und linear wachsend. Aufgefallen beim Abzaehlen der Konstanten im
+  // Erzeugnis, nicht beim Lesen des Codes.
+  fn cg_shaKTabelle(): int64 {
+    if (self.shaKOff >= 0) { return self.shaKOff; }
+    var off: int64 := self.dataLen;
+    self.shaKOff := off;
+    // FIPS 180-4, Tabelle der 64 Rundenkonstanten. WOERTLICH uebernommen
+    // aus der Spezifikation und gegen die verifizierte Assembler-Fassung
+    // gegengerechnet; nicht aus den Kubikwurzeln neu gerechnet.
+    self.cg_edataW(0x428a2f98); self.cg_edataW(0x71374491); self.cg_edataW(0xb5c0fbcf); self.cg_edataW(0xe9b5dba5);
+    self.cg_edataW(0x3956c25b); self.cg_edataW(0x59f111f1); self.cg_edataW(0x923f82a4); self.cg_edataW(0xab1c5ed5);
+    self.cg_edataW(0xd807aa98); self.cg_edataW(0x12835b01); self.cg_edataW(0x243185be); self.cg_edataW(0x550c7dc3);
+    self.cg_edataW(0x72be5d74); self.cg_edataW(0x80deb1fe); self.cg_edataW(0x9bdc06a7); self.cg_edataW(0xc19bf174);
+    self.cg_edataW(0xe49b69c1); self.cg_edataW(0xefbe4786); self.cg_edataW(0xfc19dc6); self.cg_edataW(0x240ca1cc);
+    self.cg_edataW(0x2de92c6f); self.cg_edataW(0x4a7484aa); self.cg_edataW(0x5cb0a9dc); self.cg_edataW(0x76f988da);
+    self.cg_edataW(0x983e5152); self.cg_edataW(0xa831c66d); self.cg_edataW(0xb00327c8); self.cg_edataW(0xbf597fc7);
+    self.cg_edataW(0xc6e00bf3); self.cg_edataW(0xd5a79147); self.cg_edataW(0x6ca6351); self.cg_edataW(0x14292967);
+    self.cg_edataW(0x27b70a85); self.cg_edataW(0x2e1b2138); self.cg_edataW(0x4d2c6dfc); self.cg_edataW(0x53380d13);
+    self.cg_edataW(0x650a7354); self.cg_edataW(0x766a0abb); self.cg_edataW(0x81c2c92e); self.cg_edataW(0x92722c85);
+    self.cg_edataW(0xa2bfe8a1); self.cg_edataW(0xa81a664b); self.cg_edataW(0xc24b8b70); self.cg_edataW(0xc76c51a3);
+    self.cg_edataW(0xd192e819); self.cg_edataW(0xd6990624); self.cg_edataW(0xf40e3585); self.cg_edataW(0x106aa070);
+    self.cg_edataW(0x19a4c116); self.cg_edataW(0x1e376c08); self.cg_edataW(0x2748774c); self.cg_edataW(0x34b0bcb5);
+    self.cg_edataW(0x391c0cb3); self.cg_edataW(0x4ed8aa4a); self.cg_edataW(0x5b9cca4f); self.cg_edataW(0x682e6ff3);
+    self.cg_edataW(0x748f82ee); self.cg_edataW(0x78a5636f); self.cg_edataW(0x84c87814); self.cg_edataW(0x8cc70208);
+    self.cg_edataW(0x90befffa); self.cg_edataW(0xa4506ceb); self.cg_edataW(0xbef9a3f7); self.cg_edataW(0xc67178f2);
+    // Byteumkehrmaske: 03 02 01 00 07 06 05 04 0B 0A 09 08 0F 0E 0D 0C
+    var j: int64 := 0;
+    while (j < 4) {
+      var k: int64 := 3;
+      while (k >= 0) { self.cg_edata(j * 4 + k); k := k - 1; }
+      j := j + 1;
+    }
+    return off;
+  }
+
   // #2213: Ergebnisablage einer Vektoroperation. Erwartet rcx = Elementzahl,
   // liefert rdx = Zielzeiger; rax und r8 werden benutzt, rcx/rdi/rsi muss der
   // Aufrufer selbst sichern (sie gehen durch die Anlage verloren).
@@ -9403,6 +9516,20 @@ pub type Codegen = class {
     if (self.cg_tryFold(rhsNi) == 0) { return 0; }
     var c: int64 := self.foldBuf;
     if (c <= 0) { return 0; }                 // null, negativ: nicht hier
+    // #2333 (Nebenbefund): Divisor 1 lief bis 1.2.31K in den `idiv` — die
+    // Schleife unten schiebt bis t == 1 und liefert k == 0, was `k < 1`
+    // abweist. `x / 1` ist x und `x % 1` ist 0, fuer BEIDE Vorzeichen und
+    // auch fuer den kleinstmoeglichen int64. Der negative Divisor -1 bleibt
+    // absichtlich bei der Division: dort ist INT64_MIN / -1 ein Ueberlauf,
+    // den die Division meldet und eine Negation still falsch rechnen wuerde.
+    if (c == 1) {
+      self.cg_genExpr(lhsNi);                 // rax = Dividend
+      if (op == CGT_PERCENT) {
+        self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xC0);   // xor rax, rax
+      }
+      self.zlDivKonst += 1;
+      return 1;
+    }
     // Zweierpotenz? Und k so klein, dass (2^k - 1) als 32-Bit-Direktwert
     // passt — darueber waere ein weiterer Ladebefehl noetig, und der Fall
     // kommt in der Praxis nicht vor.
@@ -9554,14 +9681,136 @@ pub type Codegen = class {
     return 1;
   }
 
+  // ── #2333: vorzeichenlose Hilfsrechnungen ─────────────────────────────────
+  //
+  // Lyx rechnet in int64, und `>>` ist arithmetisch. Fuer `magicu` nach
+  // Warren (Hacker's Delight, Kap. 10-9) werden Werte bis 2^64-1 gebraucht:
+  // `nc` liegt dicht unter 2^64 und `M` ueberschreitet regelmaessig 2^63.
+  // Alle Werte unten sind deshalb BITMUSTER, und jeder Vergleich laeuft ueber
+  // cg_uLt. cg_dblMod und cg_udiv taugen hier NICHT: beide setzen einen
+  // Modulus <= 2^63-1 voraus.
+
+  // Vorzeichenloser Kleinervergleich zweier Bitmuster. Das oberste Bit beider
+  // Werte umgedreht, dann vorzeichenbehaftet verglichen -- die Ordnung der
+  // umgedrehten Werte ist genau die vorzeichenlose Ordnung der Originale.
+  fn cg_uLt(a: int64, b: int64): int64 {
+    var SB: int64 := 1 << 63;
+    if ((a ^ SB) < (b ^ SB)) { return 1; }
+    return 0;
+  }
+
+  // Vorzeichenlose Division a / b fuer BELIEBIGE Bitmuster (b != 0), Schieben
+  // und Abziehen in 64 Runden. Rest in self.uqRest.
+  //
+  // Der Uebertrag ist der Punkt, an dem eine naive Fassung falsch wird: hat
+  // `r` das oberste Bit gesetzt, dann verliert `r << 1` dieses Bit, der wahre
+  // Wert ist 2r+bit >= 2^64 und damit in jedem Fall >= b. Dann MUSS abgezogen
+  // werden, ohne zu vergleichen -- der Vergleich am gekappten Bitmuster wuerde
+  // das Gegenteil sagen. Eine einzige Subtraktion genuegt, weil r < b gilt:
+  // 2r+bit < 2b+1 <= 2^64 + b.
+  fn cg_uDivMod(a: int64, b: int64): int64 {
+    var SB: int64 := 1 << 63;
+    var q: int64 := 0;
+    var r: int64 := 0;
+    var i: int64 := 63;
+    while (i >= 0) {
+      var bit: int64 := (a >> i) & 1;
+      var ueber: int64 := 0;
+      if ((r & SB) != 0) { ueber := 1; }
+      r := (r << 1) | bit;
+      if (ueber != 0 || self.cg_uLt(r, b) == 0) {
+        r := r - b;
+        q := (q << 1) | 1;
+      } else {
+        q := q << 1;
+      }
+      i := i - 1;
+    }
+    self.uqRest := r;
+    return q;
+  }
+
+  // Faktor, Shift und Merkbit fuer die VORZEICHENLOSE Division durch d
+  // (3 <= d < 2^63, keine Zweierpotenz). Verfahren `magicu` aus Hacker's
+  // Delight, 64-Bit-Breite, ohne 128-Bit-Arithmetik.
+  //
+  // Rueckgabe 1 bei Erfolg: self.magieUM, self.magieUS, self.magieUA gesetzt.
+  // self.magieUA == 1 heisst, dass der Faktor nicht in 64 Bit passt und die
+  // Zusatzstufe mit Uebertrag gebraucht wird -- das ist bei etwa der Haelfte
+  // der Divisoren so.
+  //
+  // Verdopplungen stehen bewusst als `x - (m - x)` bzw. `x + x` da, nie als
+  // `2 * x`: so laeuft die Rechnung auch unter `--overflow-checks` nicht in
+  // einen gemeldeten Ueberlauf (dieselbe Disziplin wie cg_dblMod).
+  fn cg_magieUnsig(d: int64): int64 {
+    var SB: int64 := 1 << 63;                 // 2^63
+    var IMAX: int64 := 0 - 1 - SB;            // 2^63-1
+    var ALLE: int64 := 0 - 1;                 // 2^64-1 als Bitmuster
+    if (d < 3) { return 0; }                  // 0/1/2 und (als Muster) alles >= 2^63
+    var a: int64 := 0;
+
+    // nc = (2^64-1) - ((2^64 - d) mod d)
+    self.cg_uDivMod(0 - d, d);
+    var nc: int64 := ALLE - self.uqRest;
+
+    var q1: int64 := self.cg_uDivMod(SB, nc);
+    var r1: int64 := self.uqRest;
+    var q2: int64 := self.cg_uDivMod(IMAX, d);
+    var r2: int64 := self.uqRest;
+
+    var p: int64 := 63;
+    var fertig: int64 := 0;
+    while (fertig == 0) {
+      p := p + 1;
+      if (p > 127) { return 0; }              // laeuft nicht zusammen
+      // q1 := 2*q1 (+1), r1 := 2*r1 mod nc
+      if (self.cg_uLt(r1, nc - r1) == 0) {
+        q1 := (q1 << 1) | 1;
+        r1 := r1 - (nc - r1);
+      } else {
+        q1 := q1 << 1;
+        r1 := r1 + r1;
+      }
+      // q2 := 2*q2 (+1), r2 := (2*r2 + 1) mod d; dabei den Ueberlauf von q2
+      // merken -- genau er bedeutet "Faktor passt nicht in 64 Bit".
+      if (self.cg_uLt(r2 + 1, d - r2) == 0) {
+        if (self.cg_uLt(q2, IMAX) == 0) { a := 1; }
+        q2 := (q2 << 1) | 1;
+        r2 := (r2 + 1) - (d - r2);
+      } else {
+        if (self.cg_uLt(q2, SB) == 0) { a := 1; }
+        q2 := q2 << 1;
+        r2 := r2 + r2 + 1;
+      }
+      var delta: int64 := d - 1 - r2;
+      if (self.cg_uLt(q1, delta) != 0) { fertig := 0; }
+      else if (q1 == delta && r1 == 0) { fertig := 0; }
+      else { fertig := 1; }
+    }
+
+    var s: int64 := p - 64;
+    if (s < 0 || s > 63) { return 0; }
+    // Die Zusatzstufe schiebt um s-1. Bei s == 0 gaebe das einen Shift um -1
+    // -- der Befehl `shr rax, 255` wuerde etwas voellig anderes tun. Lieber
+    // laut ablehnen und bei `div` bleiben, als still falsch rechnen.
+    if (a != 0 && s < 1) { return 0; }
+    self.magieUM := q2 + 1;
+    self.magieUS := s;
+    self.magieUA := a;
+    return 1;
+  }
+
   // Erzeugt `/` bzw. `%` mit konstantem Divisor als Multiplikation.
   // Rueckgabe 1, wenn Code erzeugt wurde (rax traegt das Ergebnis).
   fn cg_divKonstMagie(op: int64, lhsNi: int64, rhsNi: int64): int64 {
     if (op != CGT_SLASH && op != CGT_PERCENT) { return 0; }
     if (lhsNi < 0 || rhsNi < 0) { return 0; }
     if (self.cg_isF64Expr(lhsNi) != 0 || self.cg_isF64Expr(rhsNi) != 0) { return 0; }
-    // vorzeichenlos bleibt bei `div` (anderer Faktor, Zusatzstufe)
-    if (self.cg_isUnsignedExpr(lhsNi) != 0) { return 0; }
+    // #2333: der vorzeichenlose Fall hat einen eigenen Faktor und eine
+    // Zusatzstufe; er laeuft seit 1.2.31L durch cg_divKonstMagieUnsig.
+    if (self.cg_isUnsignedExpr(lhsNi) != 0) {
+      return self.cg_divKonstMagieUnsig(op, lhsNi, rhsNi);
+    }
     if (self.cg_tryFold(rhsNi) == 0) { return 0; }
     var d: int64 := self.foldBuf;
     if (d < 3) { return 0; }                  // 0, negativ, 1, 2: nicht hier
@@ -9598,6 +9847,66 @@ pub type Codegen = class {
     self.cg_e8(0x48); self.cg_e8(0x29); self.cg_e8(0xD3);                      // sub rbx, rdx
     self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xD8);                      // mov rax, rbx
     self.zlDivMagie += 1;
+    return 1;
+  }
+
+  // #2333: `/` bzw. `%` mit konstantem Divisor fuer einen VORZEICHENLOSEN
+  // Dividenden. Rueckgabe 1, wenn Code erzeugt wurde (rax traegt das
+  // Ergebnis), sonst 0 -- dann bleibt der Aufrufer bei `div`.
+  //
+  // Unterschiede zum vorzeichenbehafteten Weg (cg_divKonstMagie):
+  //   * `mul rcx` (48 F7 E1) statt `imul rcx` -- vorzeichenlose Multiplikation.
+  //   * keine Vorzeichenkorrektur (`sar rax,63` / `sub rdx,rax` entfallen).
+  //   * bei magieUA == 1 vier Befehle statt einem Shift, weil der Faktor nicht
+  //     in 64 Bit passt: q = ((n - t) >>u 1 + t) >>u (s-1), mit t = hohe
+  //     64 Bit des Produkts. Der Zwischenschritt verhindert den Ueberlauf von
+  //     n + t, den eine Addition vor dem Schieben haette.
+  fn cg_divKonstMagieUnsig(op: int64, lhsNi: int64, rhsNi: int64): int64 {
+    if (self.cg_tryFold(rhsNi) == 0) { return 0; }
+    var d: int64 := self.foldBuf;
+    if (d < 3) { return 0; }                  // 0/1/2 und als Muster alles >= 2^63
+    if ((d & (d - 1)) == 0) { return 0; }     // Zweierpotenz: Schritt 1 (#2330)
+    if (self.cg_magieUnsig(d) == 0) { return 0; }
+    var M: int64 := self.magieUM;
+    var sh: int64 := self.magieUS;
+    var zus: int64 := self.magieUA;
+
+    self.cg_genExpr(lhsNi);                                                    // rax = n
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC3);                      // mov rbx, rax (n sichern)
+    self.cg_e8(0x48); self.cg_e8(0xB9); self.cg_e64(M);                        // movabs rcx, M
+    self.cg_e8(0x48); self.cg_e8(0xF7); self.cg_e8(0xE1);                      // mul rcx -> rdx:rax
+    if (zus == 0) {
+      if (sh > 0) {
+        self.cg_e8(0x48); self.cg_e8(0xC1); self.cg_e8(0xEA); self.cg_e8(sh);  // shr rdx, sh
+      }
+    } else {
+      // t liegt in rdx. q = ((n - t) >> 1 + t) >> (sh-1)
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xD8);                    // mov rax, rbx (n)
+      self.cg_e8(0x48); self.cg_e8(0x29); self.cg_e8(0xD0);                    // sub rax, rdx
+      self.cg_e8(0x48); self.cg_e8(0xD1); self.cg_e8(0xE8);                    // shr rax, 1
+      self.cg_e8(0x48); self.cg_e8(0x01); self.cg_e8(0xD0);                    // add rax, rdx
+      if (sh > 1) {
+        self.cg_e8(0x48); self.cg_e8(0xC1); self.cg_e8(0xE8); self.cg_e8(sh - 1); // shr rax, sh-1
+      }
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC2);                    // mov rdx, rax (q)
+    }
+    // q steht jetzt in rdx, n in rbx.
+    if (op == CGT_SLASH) {
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xD0);                    // mov rax, rdx
+      self.zlDivMagieU += 1;
+      return 1;
+    }
+    // Rest: n - q*d. Die unteren 64 Bit sind bei vorzeichenloser wie bei
+    // vorzeichenbehafteter Multiplikation dieselben, `imul` genuegt also.
+    if (d >= 0 - (1 << 31) && d < (1 << 31)) {
+      self.cg_e8(0x48); self.cg_e8(0x69); self.cg_e8(0xD2); self.cg_e32(d);    // imul rdx, rdx, d
+    } else {
+      self.cg_e8(0x48); self.cg_e8(0xB9); self.cg_e64(d);                      // movabs rcx, d
+      self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xAF); self.cg_e8(0xD1);  // imul rdx, rcx
+    }
+    self.cg_e8(0x48); self.cg_e8(0x29); self.cg_e8(0xD3);                      // sub rbx, rdx
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xD8);                      // mov rax, rbx
+    self.zlDivMagieU += 1;
     return 1;
   }
 
@@ -11426,6 +11735,43 @@ pub type Codegen = class {
     var worte: int64 := (bytes + 7) / 8;
     self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC6);   // mov rsi, rax
     self.cg_loadRax(dstOff);
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC7);   // mov rdi, rax
+    self.cg_movRaxImm(worte);
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC1);   // mov rcx, rax
+    self.cg_e8(0xF3); self.cg_e8(0x48); self.cg_e8(0xA5);   // rep movsq
+  }
+
+  // #2421: Dasselbe fuer eine GLOBALE. Zwei Aufzaehlungen derselben Sache —
+  // wer hier eine Bedingung aendert, muss cg_localWertStructBytes mitaendern;
+  // genau dieses Auseinanderlaufen ist der Fehler, den #2421 gemeldet hat.
+  //
+  // Geprueft wird zusaetzlich die Markierung `globalIsArray == 3`: nur dann
+  // hat die Globale einen EIGENEN Block im Datenbereich (#1256/#1299), in den
+  // kopiert werden kann. Ohne Block gibt es nichts zu kopieren, und der
+  // alte Weg (Zeiger uebernehmen) bleibt — bei `@redundant` ist das heute so,
+  // weil dort kein Block angelegt wird.
+  fn cg_globalWertStructBytes(name: pchar, nlen: int64): int64 {
+    var gi: int64 := self.cg_findGlobalIdx(name, nlen);
+    if (gi < 0) { return 0; }
+    if (peek8(self.globalIsArray + gi) != 3) { return 0; }
+    var tb: int64 := self.globalTypeNames + gi * 16;
+    var tp: pchar := peek64(tb) as pchar;
+    var tl: int64 := peek64(tb + 8);
+    if (tp == 0 as pchar || tl <= 0) { return 0; }
+    var ci: int64 := self.cg_findClass(tp, tl);
+    if (ci < 0) { return 0; }
+    if (self.cg_istWertStruct(ci) == 0) { return 0; }
+    return self.cg_classStructSize(ci);
+  }
+
+  // #2421: Kopiert den Struct-INHALT in den Block einer globalen Variablen.
+  // rax traegt die Quelladresse. Aufbau wie cg_emitStructKopieNach, nur dass
+  // die Zieladresse aus dem Datenslot kommt statt aus dem Rahmen.
+  fn cg_emitStructKopieNachGlobal(doff: int64, bytes: int64) {
+    if (bytes <= 0) { return; }
+    var worte: int64 := (bytes + 7) / 8;
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC6);   // mov rsi, rax
+    self.cg_loadRaxGlobal(doff);                             // Zeiger auf den Block
     self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC7);   // mov rdi, rax
     self.cg_movRaxImm(worte);
     self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC1);   // mov rcx, rax
@@ -16948,21 +17294,92 @@ pub type Codegen = class {
   // eine Methode mit zwei Parametern, der zweite trug, was im Register stand.
   // Gesucht wird bei der Klasse, die die Methode DEKLARIERT — bei einer
   // geerbten Methode steht der Rumpf und damit die Vorgabe in der Basisklasse.
+  // #2321: Die Suche nach dem Deklarationsknoten einer Methode lief fuer
+  // JEDEN Methodenaufruf die AST-Geschwisterliste der Klasse ab und trug
+  // damit 3,39 % der Takte des Selbstbaus (Rest aus #2316).
+  //
+  // Gemessen wurde vor dem Bauen, wie #2320 es vormacht — und die Messung hat
+  // die Loesung umgedreht: beim Uebersetzen von src/lyxc.lyx fallen
+  // **91 302 Aufrufe mit 4 164 137 Namensvergleichen** an, also **45,6
+  // Vergleiche je Aufruf**, aber nur **2 163 unmittelbare Wiederholungen
+  // (2,4 %)**. Ein Ein-Eintrag-Merker wie in #2320 (dort 57 % Wiederholungen)
+  // haette hier also fast nichts gebracht; gebraucht wird eine Tabelle, die
+  // ALLE bisherigen Antworten behaelt.
+  //
+  // Schluessel ist {pNodes, topLevelHead, classIdx, Namenszeiger,
+  // Namenslaenge}. `pNodes` und `topLevelHead` gehoeren dazu, weil dieselbe
+  // Knotennummer in einer anderen Knotentabelle etwas anderes bedeutet
+  // (#2176, drei Tabellen je Unit) — denselben Schluessel benutzt schon
+  // cg_klassenDeklNi. Der Namenszeiger darf als Identitaet dienen, weil die
+  // Knotenarena nichts freigibt: dieselbe Adresse ist derselbe Name.
+  //
+  // -1 ("keine Deklaration") wird MITGEMERKT. Ein Merker, der nur Treffer
+  // behaelt, laeuft fuer jeden Fehlschlag wieder die ganze Liste ab, und das
+  // sind hier die langen Laeufe.
+  fn cg_mdniSlot(classIdx: int64, mname: pchar, mlen: int64): int64 {
+    var h: int64 := classIdx * 131 + mlen * 31;
+    h := h + ((mname as int64) >> 3) + (self.pNodes >> 7) + self.topLevelHead;
+    if (h < 0) { h := 0 - h; }
+    return (h & (self.mdniCap - 1)) * 48;
+  }
+
   fn cg_findMethodDeclNi(classIdx: int64, mname: pchar, mlen: int64): int64 {
     if (classIdx < 0 || self.topLevelHead < 0) { return 0 - 1; }
+    // #2321: Tabelle beim ersten Aufruf anlegen. Direkt abgebildet, ein
+    // Eintrag je Schluessel-Hash; eine Kollision ueberschreibt, kostet also
+    // nur den naechsten Durchlauf und nie ein falsches Ergebnis (der ganze
+    // Schluessel wird beim Lesen verglichen).
+    if (self.mdniTab == 0) {
+      self.mdniCap := 4096;
+      self.mdniTab := alloc(self.mdniCap * 48);
+      if (self.mdniTab == 0) { self.mdniCap := 0; }
+      else {
+        // Der Arena-Allokator des Compilers (src/std/alloc.lyx) gibt den
+        // Speicher NICHT genullt heraus. Ein Eintrag mit zufaelligem Inhalt
+        // waere kein falsches Ergebnis (der Schluessel wird vollstaendig
+        // verglichen), aber pNodes == 0 ist der Leer-Marker und muss stimmen.
+        var z: int64 := 0;
+        while (z < self.mdniCap * 48) { poke64(self.mdniTab + z, 0); z := z + 8; }
+      }
+    }
+    var slot: int64 := 0 - 1;
+    if (self.mdniTab != 0) {
+      slot := self.cg_mdniSlot(classIdx, mname, mlen);
+      var e: int64 := self.mdniTab + slot;
+      if (peek64(e) == self.pNodes
+          && peek64(e + 8) == self.topLevelHead + 1
+          && peek64(e + 16) == classIdx + 1
+          && peek64(e + 24) == (mname as int64)
+          && peek64(e + 32) == mlen) {
+        return peek64(e + 40);
+      }
+    }
     var ownIdx: int64 := self.cg_findMethodOwner(classIdx, mname, mlen);
     if (ownIdx < 0) { ownIdx := classIdx; }
     var decl: int64 := self.cg_klassenDeklNi(ownIdx);
-    if (decl < 0) { return 0 - 1; }
-    var m: int64 := self.cg_nc1(decl);
-    while (m >= 0) {
-      if (self.cg_nslen(m) == mlen
-          && self.cg_seq(self.cg_nsval(m), self.cg_nslen(m), mname, mlen) != 0) {   // #2176
-        return m;
+    var erg: int64 := 0 - 1;
+    if (decl >= 0) {
+      var m: int64 := self.cg_nc1(decl);
+      while (m >= 0) {
+        if (self.cg_nslen(m) == mlen
+            && self.cg_seq(self.cg_nsval(m), self.cg_nslen(m), mname, mlen) != 0) {   // #2176
+          erg := m;
+          m := 0 - 1;
+        } else {
+          m := self.cg_nnext(m);
+        }
       }
-      m := self.cg_nnext(m);
     }
-    return 0 - 1;
+    if (slot >= 0) {
+      var e2: int64 := self.mdniTab + slot;
+      poke64(e2, self.pNodes);
+      poke64(e2 + 8, self.topLevelHead + 1);
+      poke64(e2 + 16, classIdx + 1);
+      poke64(e2 + 24, mname as int64);
+      poke64(e2 + 32, mlen);
+      poke64(e2 + 40, erg);
+    }
+    return erg;
   }
 
   // #2173: Knoten der Typdeklaration von Klasse ci in der AKTUELLEN
@@ -19287,6 +19704,244 @@ pub type Codegen = class {
       self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0xEF); self.cg_e8(0xC9);    // pxor xmm1, xmm1
       self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x38); self.cg_e8(0xDD); self.cg_e8(0xC1);  // aesenclast xmm0, xmm1
       self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x7F); self.cg_e8(0x07);    // movdqu [rdi], xmm0
+      self.cg_zeroRax();
+
+    } else if (self.cg_seq(fname, fnlen, "ghash_blocks", 12)) {
+      // #2390: GHASH mit PCLMULQDQ. rdi = Z (16 Byte, GCM-Ordnung),
+      // rsi = H (16 Byte, GCM-Ordnung), rdx = Datenbloecke (roh),
+      // rcx = Anzahl der Bloecke.
+      //
+      // Je Block: Z ^= Block, dann Z := Z * H im GF(2^128). Die
+      // Multiplikation steht als Karatsuba-freie Vierfachform (vier
+      // PCLMULQDQ, danach Mittelteil zusammenlegen) mit der Reduktion aus
+      // Intels Weissbuch "Carry-Less Multiplication and Its Usage for
+      // Computing the GCM Mode" (Shift um 1, dann zwei Stufen aus
+      // pslld/psrld/pslldq/psrldq) [VENDOR].
+      //
+      // Der Schnitt ist derselbe wie bei AES-NI (#2383): EIN Aufruf fuer
+      // viele Bloecke, Z und H bleiben in xmm0/xmm1. Ein Builtin je
+      // Multiplikation haette Z und die acht Zwischenwerte der Reduktion je
+      // Block durch den Speicher geschickt.
+      //
+      // Z und H liegen byteweise UMGEDREHT (GCM-Ordnung); die Datenbloecke
+      // sind roh und werden hier mit pshufb gedreht. Die Maske liegt dafuer
+      // auf dem Stack — sie wird einmal je Aufruf gebaut, nicht je Block.
+      //
+      // Verzweigungsfrei im Datenpfad: die einzige Verzweigung zaehlt die
+      // Bloecke. Keine Tabelle, also kein datenabhaengiger Cachezugriff —
+      // genau der Grund, warum der bitweise Weg daneben stehen bleibt und
+      // nicht ersetzt wird (er ist der Rueckfall ohne PCLMULQDQ).
+      //
+      // Dieselben Bytes stehen in emit_lyxos (ID 564) — die beiden muessen
+      // uebereinstimmen; beide sind aus derselben Beschreibung erzeugt.
+      self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0x07);   // movdqu xmm0, [rdi]  (Z)
+      self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0x0E);   // movdqu xmm1, [rsi]  (H)
+      // pshufb-Maske 0f..00 auf den Stack: der zweite push liegt an der
+      // NIEDRIGEREN Adresse, dort muessen die Bytes 0f 0e 0d 0c 0b 0a 09 08
+      // stehen.
+      self.cg_e8(0x48); self.cg_e8(0xB8); self.cg_e64(283686952306183);       // movabs rax, 0x0001020304050607
+      self.cg_e8(0x50);                                                         // push rax
+      self.cg_e8(0x48); self.cg_e8(0xB8); self.cg_e64(579005069656919567);      // movabs rax, 0x08090a0b0c0d0e0f
+      self.cg_e8(0x50);                                                         // push rax
+      self.cg_e8(0xF3); self.cg_e8(0x44); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0x04); self.cg_e8(0x24);  // movdqu xmm8, [rsp]
+      self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC9);                     // test rcx, rcx
+      self.cg_e8(0x0F); self.cg_e8(0x84); var ghEnde: int64 := self.codeLen; self.cg_e32(0);   // jz ende
+      var ghTop: int64 := self.codeLen;
+      self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0x12);   // movdqu xmm2, [rdx]
+      self.cg_e8(0x66); self.cg_e8(0x41); self.cg_e8(0x0F); self.cg_e8(0x38); self.cg_e8(0x00); self.cg_e8(0xD0);  // pshufb xmm2, xmm8
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0xEF); self.cg_e8(0xC2);   // pxor xmm0, xmm2
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0xD8);   // movdqa xmm3, xmm0
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x3A); self.cg_e8(0x44); self.cg_e8(0xD9); self.cg_e8(0x00);   // pclmulqdq xmm3, xmm1, 0x00   ; a0*b0
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0xE0);   // movdqa xmm4, xmm0
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x3A); self.cg_e8(0x44); self.cg_e8(0xE1); self.cg_e8(0x11);   // pclmulqdq xmm4, xmm1, 0x11   ; a1*b1
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0xE8);   // movdqa xmm5, xmm0
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x3A); self.cg_e8(0x44); self.cg_e8(0xE9); self.cg_e8(0x10);   // pclmulqdq xmm5, xmm1, 0x10
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0xF0);   // movdqa xmm6, xmm0
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x3A); self.cg_e8(0x44); self.cg_e8(0xF1); self.cg_e8(0x01);   // pclmulqdq xmm6, xmm1, 0x01
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0xEF); self.cg_e8(0xEE);   // pxor xmm5, xmm6              ; Mittelteil
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0xF5);   // movdqa xmm6, xmm5
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x73); self.cg_e8(0xFE); self.cg_e8(0x08);   // pslldq xmm6, 8
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x73); self.cg_e8(0xDD); self.cg_e8(0x08);   // psrldq xmm5, 8
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0xEF); self.cg_e8(0xDE);   // pxor xmm3, xmm6              ; xmm3 = untere 128 Bit
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0xEF); self.cg_e8(0xE5);   // pxor xmm4, xmm5              ; xmm4 = obere 128 Bit
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0xF3);   // movdqa xmm6, xmm3            ; 256 Bit um 1 nach links
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0xFC);   // movdqa xmm7, xmm4
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x72); self.cg_e8(0xF3); self.cg_e8(0x01);   // pslld xmm3, 1
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x72); self.cg_e8(0xF4); self.cg_e8(0x01);   // pslld xmm4, 1
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x72); self.cg_e8(0xD6); self.cg_e8(0x1F);   // psrld xmm6, 31
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x72); self.cg_e8(0xD7); self.cg_e8(0x1F);   // psrld xmm7, 31
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0xEE);   // movdqa xmm5, xmm6
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x73); self.cg_e8(0xFF); self.cg_e8(0x04);   // pslldq xmm7, 4
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x73); self.cg_e8(0xFE); self.cg_e8(0x04);   // pslldq xmm6, 4
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x73); self.cg_e8(0xDD); self.cg_e8(0x0C);   // psrldq xmm5, 12
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0xEB); self.cg_e8(0xDE);   // por xmm3, xmm6
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0xEB); self.cg_e8(0xE7);   // por xmm4, xmm7
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0xEB); self.cg_e8(0xE5);   // por xmm4, xmm5
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0xF3);   // movdqa xmm6, xmm3            ; Reduktion, erste Stufe
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0xFB);   // movdqa xmm7, xmm3
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0xEB);   // movdqa xmm5, xmm3
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x72); self.cg_e8(0xF6); self.cg_e8(0x1F);   // pslld xmm6, 31
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x72); self.cg_e8(0xF7); self.cg_e8(0x1E);   // pslld xmm7, 30
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x72); self.cg_e8(0xF5); self.cg_e8(0x19);   // pslld xmm5, 25
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0xEF); self.cg_e8(0xF7);   // pxor xmm6, xmm7
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0xEF); self.cg_e8(0xF5);   // pxor xmm6, xmm5
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0xFE);   // movdqa xmm7, xmm6
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x73); self.cg_e8(0xFE); self.cg_e8(0x0C);   // pslldq xmm6, 12
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x73); self.cg_e8(0xDF); self.cg_e8(0x04);   // psrldq xmm7, 4
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0xEF); self.cg_e8(0xDE);   // pxor xmm3, xmm6
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0xD3);   // movdqa xmm2, xmm3            ; Reduktion, zweite Stufe
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0xEB);   // movdqa xmm5, xmm3
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0xF3);   // movdqa xmm6, xmm3
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x72); self.cg_e8(0xD2); self.cg_e8(0x01);   // psrld xmm2, 1
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x72); self.cg_e8(0xD5); self.cg_e8(0x02);   // psrld xmm5, 2
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x72); self.cg_e8(0xD6); self.cg_e8(0x07);   // psrld xmm6, 7
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0xEF); self.cg_e8(0xD5);   // pxor xmm2, xmm5
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0xEF); self.cg_e8(0xD6);   // pxor xmm2, xmm6
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0xEF); self.cg_e8(0xD7);   // pxor xmm2, xmm7
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0xEF); self.cg_e8(0xDA);   // pxor xmm3, xmm2
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0xEF); self.cg_e8(0xE3);   // pxor xmm4, xmm3
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0xC4);   // movdqa xmm0, xmm4            ; Ergebnis
+      self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC2); self.cg_e8(0x10);   // add rdx, 16
+      self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC9);                     // dec rcx
+      self.cg_e8(0x0F); self.cg_e8(0x85); self.cg_e32(ghTop - (self.codeLen + 4));  // jnz oben (rel32: der Rumpf ist weit ueber 127 Byte, #1915)
+      self.cg_bumpZiel(ghEnde);                                                 // jz-Ziel nachtragen (#2244-Muster)
+      self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x7F); self.cg_e8(0x07);   // movdqu [rdi], xmm0
+      self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC4); self.cg_e8(0x10);   // add rsp, 16 (Maske)
+      self.cg_zeroRax();
+
+    } else if (self.cg_seq(fname, fnlen, "sha256_compress", 15)) {
+      // #2391: sha256_compress(state, data, blocks) — rdi, rsi, rdx.
+      //
+      // Die Befehlsfolge ist NICHT hier entworfen, sondern aus einer
+      // Assembler-Fassung uebernommen, die beide NIST-Vektoren fuer
+      // SHA-256 bitgleich liefert („abc" und die leere Nachricht), unter
+      // `qemu-x86_64 -cpu max` ausgefuehrt. Die Entwicklungsmaschine
+      // (i5-8250U) hat kein SHA-NI; qemu emuliert es, VAES dagegen nicht.
+      // Register und Reihenfolge stehen bei cg_shaRnds.
+      //
+      // Der Zustand kommt und geht in ABCDEFGH (FIPS 180-4). Die Befehle
+      // brauchen ihn als ABEF/CDGH, jeweils lane-verdreht — diese
+      // Umordnung steht vor und hinter der Schleife, nicht beim Aufrufer.
+      var shaK: int64 := self.cg_shaKTabelle();
+      var shaM: int64 := shaK + 256;   // Byteumkehrmaske direkt hinter der Tabelle
+      // Null Bloecke: nichts tun. Ohne diese Frage liefe die Schleife
+      // 2^64 mal durch, denn geprueft wird unten mit `dec`/`jnz`.
+      self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xD2);                       // test rdx, rdx
+      self.cg_e8(0x0F); self.cg_e8(0x84); var shaEnde: int64 := self.codeLen; self.cg_e32(0);  // jz ende
+      self.cg_emitLeaRaxData(shaK);
+      self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xC0);                       // mov r8, rax
+      self.cg_emitLeaRaxData(shaM);
+      self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xC1);                       // mov r9, rax
+      self.cg_e8(0xF3); self.cg_e8(0x45); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0x11);  // movdqu xmm10, [r9]
+      // Zustand laden und nach ABEF / CDGH umordnen
+      self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0x0F);     // movdqu xmm1, [rdi]
+      self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0x57); self.cg_e8(0x10);  // movdqu xmm2, [rdi+16]
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x70); self.cg_e8(0xC9); self.cg_e8(0xB1);  // pshufd xmm1, xmm1, 0xB1
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x70); self.cg_e8(0xD2); self.cg_e8(0x1B);  // pshufd xmm2, xmm2, 0x1B
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0xD9);     // movdqa xmm3, xmm1
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x3A); self.cg_e8(0x0F); self.cg_e8(0xCA); self.cg_e8(0x08);  // palignr xmm1, xmm2, 8
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x3A); self.cg_e8(0x0E); self.cg_e8(0xD3); self.cg_e8(0xF0);  // pblendw xmm2, xmm3, 0xF0
+      var shaTop: int64 := self.codeLen;
+      self.cg_e8(0x66); self.cg_e8(0x44); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0xC1);  // movdqa xmm8, xmm1
+      self.cg_e8(0x66); self.cg_e8(0x44); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0xCA);  // movdqa xmm9, xmm2
+      // Die vier Nachrichtenviertel laden und byteweise drehen (big-endian
+      // im Standard, little-endian im Register).
+      self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0x26);     // movdqu xmm4, [rsi]
+      self.cg_e8(0x66); self.cg_e8(0x41); self.cg_e8(0x0F); self.cg_e8(0x38); self.cg_e8(0x00); self.cg_e8(0xE2);  // pshufb xmm4, xmm10
+      self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0x6E); self.cg_e8(0x10);  // movdqu xmm5, [rsi+16]
+      self.cg_e8(0x66); self.cg_e8(0x41); self.cg_e8(0x0F); self.cg_e8(0x38); self.cg_e8(0x00); self.cg_e8(0xEA);  // pshufb xmm5, xmm10
+      self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0x76); self.cg_e8(0x20);  // movdqu xmm6, [rsi+32]
+      self.cg_e8(0x66); self.cg_e8(0x41); self.cg_e8(0x0F); self.cg_e8(0x38); self.cg_e8(0x00); self.cg_e8(0xF2);  // pshufb xmm6, xmm10
+      self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0x7E); self.cg_e8(0x30);  // movdqu xmm7, [rsi+48]
+      self.cg_e8(0x66); self.cg_e8(0x41); self.cg_e8(0x0F); self.cg_e8(0x38); self.cg_e8(0x00); self.cg_e8(0xFA);  // pshufb xmm7, xmm10
+      // Runden 0..15: noch ohne Plan, die Nachricht steht schon da.
+      self.cg_shaRnds(4, 0);
+      self.cg_shaRnds(5, 16);
+      self.cg_shaRnds(6, 32);
+      self.cg_shaRnds(7, 48);
+      // Runden 16..63: je vier Viertel fortschreiben und verrechnen. Die
+      // Viertel rotieren (4,5,6,7 → 5,6,7,4 → …), darum die vier Zeilen je
+      // Gruppe und nicht eine Schleife — der Emitter rollt sie aus, der
+      // erzeugte Code hat sie dann ohne Zaehler.
+      var shaR: int64 := 64;
+      while (shaR < 256) {
+        self.cg_shaSched(4, 5, 6, 7); self.cg_shaRnds(4, shaR);
+        self.cg_shaSched(5, 6, 7, 4); self.cg_shaRnds(5, shaR + 16);
+        self.cg_shaSched(6, 7, 4, 5); self.cg_shaRnds(6, shaR + 32);
+        self.cg_shaSched(7, 4, 5, 6); self.cg_shaRnds(7, shaR + 48);
+        shaR := shaR + 64;
+      }
+      self.cg_e8(0x66); self.cg_e8(0x41); self.cg_e8(0x0F); self.cg_e8(0xFE); self.cg_e8(0xC8);  // paddd xmm1, xmm8
+      self.cg_e8(0x66); self.cg_e8(0x41); self.cg_e8(0x0F); self.cg_e8(0xFE); self.cg_e8(0xD1);  // paddd xmm2, xmm9
+      self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC6); self.cg_e8(0x40);     // add rsi, 64
+      self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xCA);                       // dec rdx
+      self.cg_e8(0x0F); self.cg_e8(0x85); self.cg_e32(shaTop - self.codeLen - 4); // jnz top
+      // zurueck nach ABCDEFGH
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x70); self.cg_e8(0xC9); self.cg_e8(0x1B);  // pshufd xmm1, xmm1, 0x1B
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x70); self.cg_e8(0xD2); self.cg_e8(0xB1);  // pshufd xmm2, xmm2, 0xB1
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0xD9);     // movdqa xmm3, xmm1
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x3A); self.cg_e8(0x0E); self.cg_e8(0xCA); self.cg_e8(0xF0);  // pblendw xmm1, xmm2, 0xF0
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x3A); self.cg_e8(0x0F); self.cg_e8(0xD3); self.cg_e8(0x08);  // palignr xmm2, xmm3, 8
+      self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x7F); self.cg_e8(0x0F);     // movdqu [rdi], xmm1
+      self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x7F); self.cg_e8(0x57); self.cg_e8(0x10);  // movdqu [rdi+16], xmm2
+      poke32(self.code + shaEnde, self.codeLen - shaEnde - 4);
+      self.cg_zeroRax();
+
+    } else if (self.cg_seq(fname, fnlen, "rdrand64", 8) ||
+               self.cg_seq(fname, fnlen, "rdseed64", 8)) {
+      // #2392: RDRAND/RDSEED. rdi = Zieladresse (8 Byte).
+      //
+      // Rueckgabe ist der ERFOLG (1/0), nicht der Wert: der Befehl setzt CF,
+      // und ohne diese Auskunft waere ein Fehlschlag nicht von einem
+      // gezogenen Wert zu unterscheiden — die Zahl 0 ist ein gueltiges
+      // Ergebnis. Genau das ist der stille Default, den die Projektregeln
+      // verbieten; bei einer Zufallsquelle heisst er "vorhersagbare Bytes".
+      //
+      // Der Wert wird IMMER geschrieben; bei Fehlschlag steht dort nach
+      // Intels Vorgabe 0, und der Aufrufer darf ihn dann nicht benutzen.
+      // Die Wiederholung (RDRAND bis zu 10 Versuche) gehoert in die Unit,
+      // nicht hierher — hier ist kein Platz fuer eine Pause.
+      //
+      // Dieselben Bytes stehen in emit_lyxos (IDs 565/566).
+      var rdOp: int64 := 0xF0;                                                  // rdrand rax (/6)
+      if (self.cg_seq(fname, fnlen, "rdseed64", 8)) { rdOp := 0xF8; }           // rdseed rax (/7)
+      self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xC7); self.cg_e8(rdOp);
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x07);                     // mov [rdi], rax
+      self.cg_e8(0x0F); self.cg_e8(0x92); self.cg_e8(0xC0);                     // setc al
+      self.cg_e8(0x0F); self.cg_e8(0xB6); self.cg_e8(0xC0);                     // movzx eax, al
+
+    } else if (self.cg_seq(fname, fnlen, "fma", 3)) {
+      // #2403: fma(a, b, c) -> a*b + c mit EINER Rundung.
+      // Die drei f64-Argumente liegen als IEEE-Bitmuster in rdi, rsi, rdx
+      // (wie bei fAdd & Co.), das Ergebnis geht als Bitmuster nach rax.
+      //
+      // vfmadd213sd xmm0, xmm1, xmm2 rechnet xmm0 := xmm1 * xmm0 + xmm2.
+      // Mit a in xmm0, b in xmm1 und c in xmm2 ist das b*a + c.
+      //
+      // VEX.LIG.66.0F38.W1 A9 /r, dreibyteige Form:
+      //   C4   Praefix
+      //   E2   R=1 X=1 B=1 (alle Register unter 8), Karte 0F38 = 2
+      //   F1   W=1, vvvv = xmm1 (invertiert 1110), L=0 (skalar), pp=01 (66)
+      //   A9   Opcode
+      //   C2   modrm: reg = xmm0, rm = xmm2
+      //
+      // Der Befehl setzt FMA in der CPU voraus. Geprueft wird das NICHT hier,
+      // sondern beim Aufrufer (std/fma.lyx, CpuHasFMA) — dieselbe Trennung
+      // wie bei AES-NI (#2383) und PCLMULQDQ (#2390). Dieselben Bytes stehen
+      // in emit_lyxos (ID 567).
+      self.cg_e8(0x66); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0x6E); self.cg_e8(0xC7); // movq xmm0, rdi (a)
+      self.cg_e8(0x66); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0x6E); self.cg_e8(0xCE); // movq xmm1, rsi (b)
+      self.cg_e8(0x66); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0x6E); self.cg_e8(0xD2); // movq xmm2, rdx (c)
+      self.cg_e8(0xC4); self.cg_e8(0xE2); self.cg_e8(0xF1); self.cg_e8(0xA9); self.cg_e8(0xC2); // vfmadd213sd xmm0, xmm1, xmm2
+      self.cg_e8(0x66); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0x7E); self.cg_e8(0xC0); // movq rax, xmm0
+
+    } else if (self.cg_seq(fname, fnlen, "cpu_pause", 9)) {
+      // #2392 (Nebenbefund): `cpu_pause` war nur im lyxos-Emitter umgesetzt
+      // (emit_lyxos, ID 240) — auf Linux-x86-64 scheiterte die Uebersetzung
+      // mit "undefined function 'cpu_pause' — no codegen implementation
+      // found". Dieselbe Sache, zwei Aufzaehlungen, eine davon unvollstaendig.
+      // Gebraucht wird es fuer die Pause zwischen zwei RDSEED-Versuchen.
+      self.cg_e8(0xF3); self.cg_e8(0x90);                                       // pause
       self.cg_zeroRax();
 
     } else if (self.cg_seq(fname, fnlen, "fence_sfence", 12)) {
@@ -22697,7 +23352,28 @@ pub type Codegen = class {
           }
         } else {
           var goff: int64 := self.cg_findGlobal(name, nlen);
-          if (goff >= 0) { self.cg_emitGlobalWrite(name, nlen, goff); }   // #1141
+          if (goff >= 0) {
+            // #2421: `g := r` bei einer globalen WERT-Struct kopiert den
+            // INHALT in ihren Block. Bis hierher wurde der ZEIGER
+            // ueberschrieben — die Globale zeigte danach in den Rahmen des
+            // Aufrufers, und sobald der weiterbenutzt wurde, standen
+            // Stapeladressen in den Feldern. Gemeldet wurde es fuer einen
+            // Parameter als Quelle; es traf aber JEDE Quelle, auch ein Local:
+            // dort fiel es nur nicht auf, weil der Rahmen von `main`
+            // weiterlebt (nach `lokal.a := 777` wanderte die Globale mit).
+            //
+            // Dieselbe Rechnung wie fuer Locals in #1351; die beiden
+            // Stellen muessen uebereinstimmen.
+            var gStructBytes: int64 := 0;
+            if (self.cg_nkind(rhs) != CGN_CAST && self.cg_nkind(rhs) != CGN_NEW) {
+              gStructBytes := self.cg_globalWertStructBytes(name, nlen);
+            }
+            if (gStructBytes > 0) {
+              self.cg_emitStructKopieNachGlobal(goff, gStructBytes);
+            } else {
+              self.cg_emitGlobalWrite(name, nlen, goff);   // #1141
+            }
+          }
         }
       } else if (self.cg_nkind(lhs) == CGN_FIELD) {
         // obj.field := rhs
@@ -25417,18 +26093,398 @@ pub type Codegen = class {
     return jUeber;
   }
 
+  // ------------------------------------------------------------------
+  // #2360 Scheibe C: SUCHSCHLEIFE vorspulen.
+  //
+  //   while (i < n) { if (peekW(a + i*W) OP peekW(b + i*W)) { ... } i += 1; }
+  //
+  // mit OP als `==` oder `!=`. Das ist die haeufigste Rumpfform des
+  // Bestandes: gemessen am Selbstbau von src/lyxc.lyx trafen 164
+  // Erkennungsversuche genau sie (Vergleich zweier Lesungen mit
+  // Fruehausstieg), weitere 49 dieselbe Form ohne Ausstieg.
+  //
+  // DER TRICK, DER DIE SCHWIERIGE HUERDE VERMEIDET. #2360 nennt als
+  // eigentliches Problem, dass ein Vektorblock nicht schreiben darf, was die
+  // skalare Fassung nach einem Austritt nicht geschrieben haette. Diese
+  // Umsetzung umgeht das vollstaendig: der Vektorteil fuehrt den Rumpf NIE
+  // aus. Er stellt nur fest, ob in [i, i+E) ueberhaupt ein Treffer liegt, und
+  // springt genau dann weiter, wenn KEINER liegt. Dort tut die skalare
+  // Fassung nichts ausser `i += 1` — das Vorspulen ist also beobachtbar
+  // gleichwertig, und zwar unabhaengig davon, was im if-Zweig steht.
+  //
+  // Liegt ein Treffer im Block, wird `i` auf den BLOCKANFANG gesetzt und die
+  // skalare Schleife arbeitet den Block Element fuer Element ab. Damit
+  // braucht es weder PMOVMSKB-Bitscan noch eine Positionsrechnung, und der
+  // Zweig laeuft am richtigen Index mit der richtigen Wirkung. Die Kosten
+  // sind hoechstens E skalare Durchlaeufe je Fund; bei einer Suchschleife
+  // gibt es genau einen Fund.
+  //
+  // WAS DIE FORM TROTZDEM VERLANGT:
+  //  * Die Bedingung muss NEBENWIRKUNGSFREI sein — `peekW` ist es, ein
+  //    Aufruf waere es nicht. Deshalb genau zwei Lesungen und nichts sonst.
+  //  * Gelesen wird nur innerhalb von [i, n): der letzte Block beginnt
+  //    spaetestens bei n-E. Ueber die Feldgrenze hinaus liest dieser Weg
+  //    also nicht — anders als ein Weg, der den Rest mit einem halben Block
+  //    abdeckt.
+  //  * Keine Ueberlappungspruefung: es wird NICHTS geschrieben.
+  // Lesebreite fuer den SUCHweg. Bewusst eine zweite Aufzaehlung neben
+  // cg_vmBreiteVonName: dort fehlt `peek64` mit Absicht, weil der Rechenweg
+  // fuer 8 Byte keine Ablage hat (`poke64` wird dort ausdruecklich als
+  // STORE_WIDTH_POKE64 abgewiesen). Der Suchweg schreibt nichts und kann 8
+  // Byte vergleichen, sobald PCMPEQQ da ist. Wer hier eine Breite ergaenzt,
+  // prueft die andere Stelle mit — die beiden muessen zusammen wachsen.
+  fn cg_vsLesebreite(nm: pchar, nl: int64): int64 {
+    if (self.cg_seq(nm, nl, "peek8"c, 5))  { return 1; }
+    if (self.cg_seq(nm, nl, "peek16"c, 6)) { return 2; }
+    if (self.cg_seq(nm, nl, "peek32"c, 6)) { return 4; }
+    if (self.cg_seq(nm, nl, "peek64"c, 6)) { return 8; }
+    return 0;
+  }
+
+  fn cg_vsErkennen(ni: int64, kasten: int64): int64 {
+    self.cpVmNi := ni;
+    if (self.debugMode != 0 || self.debugInfoEnabled != 0) { return self._vsNein("VS_DEBUG_MODE"c); }
+    var bed: int64 := self.cg_nc0(ni);
+    if (bed < 0 || self.cg_nkind(bed) != CGN_BINOP) { return self._vsNein("VS_COND_NOT_BINOP"c); }
+    if (self.cg_nival(bed) != CGT_LT) { return self._vsNein("VS_COND_NOT_LT"c); }
+    if (self.cg_nc0(bed) >= 0) { self.cpVmNi := self.cg_nc0(bed); }
+    var iOff: int64 := self.cg_vmIdentOff(self.cg_nc0(bed));
+    var nOff: int64 := self.cg_vmIdentOff(self.cg_nc1(bed));
+    if (iOff == 0) { return self._vsNein("VS_COUNTER_NOT_LOCAL"c); }
+    // Schranke: Local, Ganzzahlliteral oder schlichtes Feld — dieselbe
+    // Aufzaehlung wie in cg_vmErkennen. Eine neue Herkunft muss in BEIDE
+    // (dieselbe Fehlerart ist dreimal belegt: #1787, #1806, #1812).
+    var nArt: int64 := 0;
+    var nLit: int64 := 0;
+    var nObjOff: int64 := 0;
+    var nFOff: int64 := 0;
+    if (nOff == 0) {
+      var nKn: int64 := self.cg_nc1(bed);
+      if (nKn < 0) { return self._vsNein("VS_BOUND_OTHER"c); }
+      var nK: int64 := self.cg_nkind(nKn);
+      if (nK == CGN_LIT_INT) {
+        nLit := self.cg_nival(nKn);
+        if (nLit <= 0) { return self._vsNein("VS_BOUND_LITERAL_EMPTY"c); }
+        nArt := 1;
+      } else if (nK == CGN_FIELD) {
+        var fZ: int64 := alloc(16);
+        if (self.cg_vmFeldSchlicht(nKn, fZ) != 0) { return self._vsNein("VS_BOUND_FIELD_NOT_SIMPLE"c); }
+        nArt := 2;
+        nObjOff := peek64(fZ);
+        nFOff := peek64(fZ + 8);
+      } else { return self._vsNein("VS_BOUND_OTHER"c); }
+    }
+    if (nArt == 0 && iOff == nOff) { return self._vsNein("VS_COUNTER_IS_BOUND"c); }
+    // Rumpf: genau `if (...) { ... }` und `i := i + 1`.
+    var rumpf: int64 := self.cg_nc1(ni);
+    if (rumpf < 0 || self.cg_nkind(rumpf) != CGN_BLOCK) { return self._vsNein("VS_BODY_NOT_BLOCK"c); }
+    var s1: int64 := self.cg_nc0(rumpf);
+    if (s1 < 0 || self.cg_nkind(s1) != CGN_IF) { return self._vsNein("VS_BODY_FIRST_NOT_IF"c); }
+    var s2: int64 := self.cg_nnext(s1);
+    if (s2 < 0 || self.cg_nkind(s2) != CGN_ASSIGN) { return self._vsNein("VS_BODY_SECOND_NOT_ASSIGN"c); }
+    if (self.cg_nnext(s2) != -1) { return self._vsNein("VS_BODY_HAS_THIRD"c); }
+    if (self.cg_vmIdentOff(self.cg_nc0(s2)) != iOff) { return self._vsNein("VS_STEP_TARGET_NOT_LOOP_VAR"c); }
+    var inc: int64 := self.cg_nc1(s2);
+    if (inc < 0 || self.cg_nkind(inc) != CGN_BINOP || self.cg_nival(inc) != CGT_PLUS) { return self._vsNein("VS_STEP_NOT_ADDITION"c); }
+    if (self.cg_vmIdentOff(self.cg_nc0(inc)) != iOff) { return self._vsNein("VS_STEP_OPERAND_NOT_LOOP_VAR"c); }
+    var eins: int64 := self.cg_nc1(inc);
+    if (eins < 0 || self.cg_nkind(eins) != CGN_LIT_INT || self.cg_nival(eins) != 1) { return self._vsNein("VS_STEP_NOT_PLUS_ONE"c); }
+    // Bedingung des if: genau zwei Lesungen derselben Breite, verglichen mit
+    // == oder !=. Jede andere Form wird abgelehnt — ein Aufruf im Vergleich
+    // haette eine Nebenwirkung, und dann waere das Vorspulen beobachtbar.
+    var kb: int64 := self.cg_nc0(s1);
+    if (kb < 0 || self.cg_nkind(kb) != CGN_BINOP) { return self._vsNein("VS_IF_COND_NOT_BINOP"c); }
+    var kop: int64 := self.cg_nival(kb);
+    if (kop != CGT_EQ2 && kop != CGT_NEQ) { return self._vsNein("VS_IF_COND_NOT_EQ_OR_NEQ"c); }
+    var lN: int64 := self.cg_nc0(kb);
+    var rN: int64 := self.cg_nc1(kb);
+    if (lN < 0 || rN < 0) { return self._vsNein("VS_IF_SIDE_MISSING"c); }
+    // #2415: EINE Lesung gegen einen invarianten WERT — die Suche nach einem
+    // Byte (`peek8(a+i) == 32`) oder nach dem Inhalt einer Variablen
+    // (`peek8(a+i) == w`). GEMESSEN am Selbstbau von src/lyxc.lyx: 128 der
+    // 353 Ablehnungen dieses Tores haben genau diese Form (92 gegen ein
+    // Local, 36 gegen ein Literal), und sie scheitern an NICHTS sonst —
+    // Bedingung, Rumpf, Basis und Breite passen alle.
+    //
+    // Der Wert wird vor der Schleife in alle Bahnen gebrochen; danach läuft
+    // derselbe Vergleich wie bei zwei Lesungen. `wertKn` traegt den Knoten
+    // bis in den Emitter.
+    //
+    // Was NICHT zugelassen wird: ein Aufruf, ein Feld oder eine Rechnung als
+    // Wert. Ein Aufruf hätte eine Nebenwirkung, und bei den anderen ist die
+    // Invarianz nicht ohne weiteres zu belegen — ein Vorspulen wäre dann
+    // beobachtbar. Die Zahlen dafür sind klein (1 von 128).
+    var wertKn: int64 := 0 - 1;
+    if (self.cg_nkind(lN) != CGN_CALL || self.cg_nkind(rN) != CGN_CALL) {
+      var lLese: int64 := 0;
+      if (self.cg_nkind(lN) == CGN_CALL
+          && self.cg_vsLesebreite(self.cg_nsval(lN), self.cg_nslen(lN)) != 0) { lLese := 1; }
+      var rLese: int64 := 0;
+      if (self.cg_nkind(rN) == CGN_CALL
+          && self.cg_vsLesebreite(self.cg_nsval(rN), self.cg_nslen(rN)) != 0) { rLese := 1; }
+      if (lLese == rLese) { return self._vsNein("VS_IF_SIDE_NOT_CALL"c); }
+      var andereS: int64 := rN;
+      if (rLese != 0) { andereS := lN; }
+      var akS: int64 := self.cg_nkind(andereS);
+      var invar: int64 := 0;
+      if (akS == CGN_LIT_INT) { invar := 1; }
+      else if (akS == CGN_IDENT && self.cg_vmIdentOff(andereS) != 0) { invar := 1; }
+      if (invar == 0) { return self._vsNein("VS_IF_VALUE_NOT_INVARIANT"c); }
+      wertKn := andereS;
+      // Beide Leseseiten auf DIESELBE setzen: die Zeigerprüfungen gelten dann
+      // zweimal für denselben Zeiger — richtig, nur redundant.
+      if (rLese != 0) { lN := rN; } else { rN := lN; }
+    }
+    var breite: int64 := self.cg_vsLesebreite(self.cg_nsval(lN), self.cg_nslen(lN));
+    if (breite == 0) { return self._vsNein("VS_LEFT_NOT_PEEK"c); }
+    if (self.cg_vsLesebreite(self.cg_nsval(rN), self.cg_nslen(rN)) != breite) { return self._vsNein("VS_WIDTH_MISMATCH"c); }
+    // Breite 8 braucht PCMPEQQ (SSE4.1); ohne das Bit bleibt es skalar.
+    if (breite == 8 && self.cg_cpuHat(1) == 0) { return self._vsNein("VS_NO_SSE41_FOR_PCMPEQQ"c); }
+    if (breite != 1 && breite != 2 && breite != 4 && breite != 8) { return self._vsNein("VS_WIDTH_UNSUPPORTED"c); }
+    var la: int64 := self.cg_nc0(lN);
+    var ra: int64 := self.cg_nc0(rN);
+    if (la < 0 || ra < 0) { return self._vsNein("VS_LOAD_NO_ADDRESS"c); }
+    if (self.cg_nnext(la) != -1 || self.cg_nnext(ra) != -1) { return self._vsNein("VS_LOAD_ARITY_MISMATCH"c); }
+    // Basis je Seite: Rahmenversatz oder invarianter Ausdruck, Index linear
+    // in i mit der Breite als Faktor — dieselben Helfer wie der Rechenweg.
+    var aFz: int64 := alloc(16);
+    poke64(aFz, 0); poke64(aFz + 8, 0);
+    var bFz: int64 := alloc(16);
+    poke64(bFz, 0); poke64(bFz + 8, 0);
+    var aOff: int64 := self.cg_vmBasisVon(la, iOff, breite, ""c, 0);
+    var aKn: int64 := 0 - 1;
+    if (aOff == 0) {
+      aKn := self.cg_vmBasisKnoten(la, iOff, nOff, breite, ""c, 0, aFz);
+      if (aKn < 0) { return self._vsNein("VS_LEFT_BASE_NOT_INVARIANT"c); }
+    }
+    var bOff: int64 := self.cg_vmBasisVon(ra, iOff, breite, ""c, 0);
+    var bKn: int64 := 0 - 1;
+    if (bOff == 0) {
+      bKn := self.cg_vmBasisKnoten(ra, iOff, nOff, breite, ""c, 0, bFz);
+      if (bKn < 0) { return self._vsNein("VS_RIGHT_BASE_NOT_INVARIANT"c); }
+    }
+    // Ein Zeiger, der der Zaehler oder die Schranke selbst ist, waere im
+    // Vektorteil eine andere Groesse als skalar.
+    if (aOff != 0 && aOff == iOff) { return self._vsNein("VS_POINTER_IS_LOOP_VAR"c); }
+    if (bOff != 0 && bOff == iOff) { return self._vsNein("VS_POINTER_IS_LOOP_VAR"c); }
+    if (nArt == 0) {
+      if (aOff != 0 && aOff == nOff) { return self._vsNein("VS_POINTER_IS_BOUND"c); }
+      if (bOff != 0 && bOff == nOff) { return self._vsNein("VS_POINTER_IS_BOUND"c); }
+    }
+    poke64(kasten,      aOff);
+    poke64(kasten + 8,  bOff);
+    poke64(kasten + 16, iOff);
+    poke64(kasten + 24, nOff);
+    poke64(kasten + 32, breite);
+    poke64(kasten + 40, kop);
+    poke64(kasten + 48, nArt);
+    poke64(kasten + 56, nLit);
+    poke64(kasten + 64, nObjOff);
+    poke64(kasten + 72, nFOff);
+    poke64(kasten + 80, aKn);
+    poke64(kasten + 88, bKn);
+    poke64(kasten + 96,  peek64(aFz));   poke64(kasten + 104, peek64(aFz + 8));
+    poke64(kasten + 112, peek64(bFz));   poke64(kasten + 120, peek64(bFz + 8));
+    poke64(kasten + 128, wertKn);        // #2415: -1 = zwei Lesungen
+    return 1;
+  }
+
+  fn _vsNein(code: pchar): int64 {
+    if (self.cpDecAktiv != 0) { self._cpDecAdd(code, 0); }
+    return 0;
+  }
+
+  fn cg_vsSchrankeNachRax(kasten: int64) {
+    // Dieselbe Aufzaehlung wie cg_vmSchrankeNachRax, nur mit den Zellen
+    // DIESES Kastens. Wer dort eine Herkunft ergaenzt, muss sie hier
+    // ergaenzen — die beiden sind zwei Aufzaehlungen derselben Sache.
+    var art: int64 := peek64(kasten + 48);
+    if (art == 1) { self.cg_movRaxImm(peek64(kasten + 56)); return; }
+    if (art == 2) {
+      self.cg_loadRax(peek64(kasten + 64));
+      var fo: int64 := peek64(kasten + 72);
+      if (fo == 0) {
+        self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x00);                      // mov rax, [rax]
+      } else if (fo <= 127) {
+        self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x40); self.cg_e8(fo);      // mov rax, [rax+off8]
+      } else {
+        self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x80); self.cg_e32(fo);     // mov rax, [rax+off32]
+      }
+      return;
+    }
+    self.cg_loadRax(peek64(kasten + 24));
+  }
+
+  // Emittiert das Vorspulen VOR der skalaren Schleife. Es gibt keinen Sprung
+  // ueber die skalare Fassung: sie laeuft danach mit dem vorgespulten `i`
+  // weiter. Deshalb gibt diese Funktion auch keine Flickstelle zurueck.
+  fn cg_vsEmit(kasten: int64) {
+    var aOff: int64 := peek64(kasten);
+    var bOff: int64 := peek64(kasten + 8);
+    var iOff: int64 := peek64(kasten + 16);
+    var breite: int64 := peek64(kasten + 32);
+    var kop: int64 := peek64(kasten + 40);
+    var aKn: int64 := peek64(kasten + 80);
+    var bKn: int64 := peek64(kasten + 88);
+    var wertKn: int64 := peek64(kasten + 128);   // #2415
+    var schub: int64 := 0;
+    if (breite == 2) { schub := 1; }
+    if (breite == 4) { schub := 2; }
+    if (breite == 8) { schub := 3; }
+    var ezb: int64 := 16 >> schub;        // Elemente je 16-Byte-Block
+
+    // rcx = n. Unter einem vollen Block lohnt nichts, und dann wird auch der
+    // Zeigeraufbau gespart (gemessen in #2375 kostete er unter der Schwelle
+    // 9 bis 18 %).
+    self.cg_vsSchrankeNachRax(kasten);
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC1);                          // mov rcx, rax
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xF9); self.cg_e8(ezb);         // cmp rcx, ezb
+    self.cg_e8(0x0F); self.cg_e8(0x8C);                                            // jl ende
+    var jKlein: int64 := self.codeLen; self.cg_e32(0);
+
+    if (aKn < 0 && bKn < 0) {
+      self.cg_loadRax(aOff); self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC7); // mov rdi, rax
+      self.cg_loadRax(bOff); self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC6); // mov rsi, rax
+    } else {
+      // #2363: cg_genExpr belegt rdi und rsi als Halteregister — erst beide
+      // auswerten und sichern, dann in umgekehrter Folge in die Register.
+      if (aKn >= 0) { self.cg_genExpr(aKn); } else { self.cg_loadRax(aOff); }
+      self.cg_e8(0x50);                                                            // push rax
+      if (bKn >= 0) { self.cg_genExpr(bKn); } else { self.cg_loadRax(bOff); }
+      self.cg_e8(0x50);                                                            // push rax
+      self.cg_e8(0x5E);                                                            // pop rsi  (b)
+      self.cg_e8(0x5F);                                                            // pop rdi  (a)
+      // rcx neu: cg_genExpr darf rcx benutzen, und darauf zu vertrauen waere
+      // eine stille Annahme ueber fremden Code.
+      self.cg_vsSchrankeNachRax(kasten);
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC1);                        // mov rcx, rax
+    }
+
+    // #2415: Den invarianten Wert in ALLE Bahnen von xmm2 brechen. Einmal vor
+    // der Schleife — `cpuid`-frei und ohne Speicherzugriff je Durchlauf.
+    //
+    // Der Weg hängt an der Breite, weil `pshufd` auf 32-Bit-Bahnen arbeitet:
+    //   8 Byte: movq + punpcklqdq      (zwei Bahnen)
+    //   4 Byte: movd + pshufd 0        (vier Bahnen)
+    //   2 Byte: movd + pshuflw/pshufd  (acht Bahnen)
+    //   1 Byte: movd + punpcklbw + pshuflw + pshufd (sechzehn Bahnen)
+    // Die schmalen Breiten brauchen die Verdopplung ZUERST, sonst stehen in
+    // den oberen Bytes jeder Bahn Nullen und der Vergleich trifft nie.
+    if (wertKn >= 0) {
+      self.cg_genExpr(wertKn);                                                     // Wert nach rax
+      if (breite == 8) {
+        self.cg_e8(0x66); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0x6E); self.cg_e8(0xD0);  // movq xmm2, rax
+        self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x6C); self.cg_e8(0xD2);                    // punpcklqdq xmm2, xmm2
+      } else {
+        self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x6E); self.cg_e8(0xD0);                    // movd xmm2, eax
+        if (breite == 1) {
+          self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x60); self.cg_e8(0xD2);                  // punpcklbw xmm2, xmm2
+        }
+        if (breite == 1 || breite == 2) {
+          self.cg_e8(0xF2); self.cg_e8(0x0F); self.cg_e8(0x70); self.cg_e8(0xD2); self.cg_e8(0x00); // pshuflw xmm2, xmm2, 0
+        }
+        self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x70); self.cg_e8(0xD2); self.cg_e8(0x00);   // pshufd xmm2, xmm2, 0
+      }
+    }
+
+    // r8 = i (der Zaehler kann beim Eintritt schon ungleich 0 sein)
+    self.cg_loadRax(iOff);
+    self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xC0);                          // mov r8, rax
+
+    var oben: int64 := self.codeLen;                                               // Blockanfang
+    // r9 = r8 + ezb; passt der ganze Block noch unter n?
+    self.cg_e8(0x4D); self.cg_e8(0x89); self.cg_e8(0xC1);                          // mov r9, r8
+    self.cg_e8(0x49); self.cg_e8(0x83); self.cg_e8(0xC1); self.cg_e8(ezb);         // add r9, ezb
+    // ModRM 0xC9 = mod 11, reg 001 (rcx), rm 001 (r9 ueber REX.B). Mit 0xD9
+    // stuende dort reg 011 = rbx — der erste Entwurf hatte genau das, und der
+    // Test lief trotzdem gruen, weil die Registerzuteilung die Schranke
+    // zufaellig in rbx hielt. Gefunden hat es erst das Disassemblat.
+    self.cg_e8(0x49); self.cg_e8(0x39); self.cg_e8(0xC9);                          // cmp r9, rcx
+    self.cg_e8(0x0F); self.cg_e8(0x8F);                                            // jg raus
+    var jRaus1: int64 := self.codeLen; self.cg_e32(0);
+
+    // rdx = a + i*W, r10 = b + i*W
+    self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0xC0);                          // mov rax, r8
+    if (schub > 0) { self.cg_e8(0x48); self.cg_e8(0xC1); self.cg_e8(0xE0); self.cg_e8(schub); }  // shl rax, schub
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xFA);                          // mov rdx, rdi
+    self.cg_e8(0x48); self.cg_e8(0x01); self.cg_e8(0xC2);                          // add rdx, rax
+    self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xF2);                          // mov r10, rsi
+    self.cg_e8(0x49); self.cg_e8(0x01); self.cg_e8(0xC2);                          // add r10, rax
+
+    // #2372: unausgerichtet laden — die Basis ist beliebig ausgerichtet.
+    self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0x02);                    // movdqu xmm0, [rdx]
+    if (wertKn >= 0) {
+      // #2415: die zweite Seite ist der gebrochene Wert, kein zweiter Zeiger.
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0xCA);                  // movdqa xmm1, xmm2
+    } else {
+      self.cg_e8(0xF3); self.cg_e8(0x41); self.cg_e8(0x0F); self.cg_e8(0x6F); self.cg_e8(0x0A);  // movdqu xmm1, [r10]
+    }
+    if (breite == 1) {
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x74); self.cg_e8(0xC1);      // pcmpeqb xmm0, xmm1
+    } else if (breite == 2) {
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x75); self.cg_e8(0xC1);      // pcmpeqw xmm0, xmm1
+    } else if (breite == 4) {
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x76); self.cg_e8(0xC1);      // pcmpeqd xmm0, xmm1
+    } else if (breite == 8) {
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x38); self.cg_e8(0x29); self.cg_e8(0xC1);  // pcmpeqq xmm0, xmm1 (SSE4.1)
+    } else {
+      // Jede Breite ist oben zugelassen oder abgewiesen worden. Faellt hier
+      // doch eine durch, waere ein stiller Default genau die Fehlerart, die
+      // in diesem Uebersetzer 16 verworfene Opcodes gekostet hat.
+      panic("cg_vsEmit: Breite ohne PCMPEQ-Form — Erkennung und Emission sind auseinandergelaufen");
+    }
+    self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0xD7); self.cg_e8(0xC0);        // pmovmskb eax, xmm0
+    // PCMPEQ setzt je Element alle Bits; PMOVMSKB liefert davon 16 Bits.
+    //  * `==` trifft, wenn IRGENDEIN Element gleich ist   -> Maske != 0
+    //  * `!=` trifft, wenn IRGENDEIN Element ungleich ist -> Maske != 0xFFFF
+    // Beides gilt fuer alle Breiten, weil ein ungleiches Element seine
+    // gesamte Bytegruppe auf 0 setzt.
+    if (kop == CGT_EQ2) {
+      self.cg_e8(0x66); self.cg_e8(0x85); self.cg_e8(0xC0);                        // test ax, ax
+    } else {
+      self.cg_e8(0x66); self.cg_e8(0x3D); self.cg_e8(0xFF); self.cg_e8(0xFF);      // cmp ax, 0xFFFF
+    }
+    self.cg_e8(0x0F); self.cg_e8(0x85);                                            // jne raus (Treffer im Block)
+    var jRaus2: int64 := self.codeLen; self.cg_e32(0);
+
+    // Kein Treffer: ganzen Block ueberspringen.
+    self.cg_e8(0x4D); self.cg_e8(0x89); self.cg_e8(0xC8);                          // mov r8, r9
+    self.cg_e8(0xE9); self.cg_e32(oben - self.codeLen - 4);                        // jmp Blockanfang
+
+    poke32(self.code + jRaus1, self.codeLen - jRaus1 - 4);
+    poke32(self.code + jRaus2, self.codeLen - jRaus2 - 4);
+    // i := r8. Bei einem Treffer steht hier der BLOCKANFANG: die skalare
+    // Schleife arbeitet den Block Element fuer Element ab und fuehrt den
+    // Zweig am richtigen Index aus. Bei zu wenigen Restelementen steht der
+    // erreichte Stand da.
+    self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0xC0);                          // mov rax, r8
+    self.cg_storeRax(iOff);
+    poke32(self.code + jKlein, self.codeLen - jKlein - 4);
+    self.zlVsVektor += 1;
+    // Die andere Seite des Berichts: ein Bericht, der nur Ablehnungen zaehlt,
+    // waere auch von einem Vektorisierer erfuellt, der nie etwas anwendet.
+    if (self.cpDecAktiv != 0) { self._cpDecAdd("VS_APPLIED_SKIP_SCAN"c, 1); }
+  }
+
   fn cg_genWhile(ni: int64) {
     // #2194: elementweise Schleife? Dann steht davor die Vektorfassung samt
     // Laufzeitpruefung, und der Sprung darueber wird unten geflickt. Die
     // skalare Fassung bleibt vollstaendig stehen — sie traegt den Fall mit
     // Ueberlappung und ist der Vergleichsweg der Tests.
     var vmUeber: int64 := 0 - 1;
-    var vmKasten: int64 := alloc(168);  // #2350: Art/Wert/Objekt-/Feldversatz der Schranke; #2363: [88..104] Basisknoten der drei Zeiger; #2375: [112] Kopiermarke; #2378: [120..160] Objekt-/Feldversatz je Zeiger
+    var vmKasten: int64 := alloc(168);
+    var vsKasten: int64 := alloc(144);  // #2360 Scheibe C; #2415: +wertKn  // #2350: Art/Wert/Objekt-/Feldversatz der Schranke; #2363: [88..104] Basisknoten der drei Zeiger; #2375: [112] Kopiermarke; #2378: [120..160] Objekt-/Feldversatz je Zeiger
     if (self.cg_vmErkennen(ni, vmKasten) != 0) { vmUeber := self.cg_vmEmit(vmKasten); }
     // #2335: sonst vielleicht eine Reduktion. Die beiden Formen schliessen
     // sich aus — die eine schreibt in ein Feld, die andere in ein Local —,
     // deshalb wird nur gefragt, wenn die erste nicht gegriffen hat.
     else if (self.cg_vrErkennen(ni, vmKasten) != 0) { vmUeber := self.cg_vrEmit(vmKasten); }
+    // #2360 Scheibe C: sonst vielleicht eine Suchschleife, die sich
+    // vorspulen laesst. Sie schliesst die beiden anderen Formen aus (ihr
+    // Rumpf beginnt mit `if`, nicht mit einer Ablage), und sie braucht
+    // KEINEN Sprung ueber die skalare Fassung — das Vorspulen steht davor
+    // und die skalare Schleife laeuft danach mit dem vorgespulten `i`.
+    else if (self.cg_vsErkennen(ni, vsKasten) != 0) { self.cg_vsEmit(vsKasten); }
     var U:              int64 := self.cg_unrollFactor();
     var savedBreakHead: int64 := self.curBreakHead;
     var savedContHead:  int64 := self.curContHead;
@@ -32101,6 +33157,7 @@ pub type Codegen = class {
     self.inlArgCount  := 0;
 
     self.simdZielOff := 1;   // #2213: keine Zielablage
+    self.shaKOff := 0 - 1;   // #2391: K-Tabelle noch nicht im Datensegment
     self.p32Wunsch := 0;     // #2247
     self.mmapOomSprung := 0; // #2296
     self.p32Erfuellt := 0;
@@ -32460,6 +33517,43 @@ pub type Codegen = class {
     self.cg_emitHelpers();
     // Pre-populate builtin constants (mmap flags, O_* modes, etc.)
     self.cg_addBuiltinCons();
+  }
+
+  // #2339: Den erzeugten Code als Ganzes verschieben, um die LAGE der
+  // Schleifen modulo 32 Byte zu veraendern — und nichts anderes.
+  //
+  // Wozu: die Lage eines cmp/jcc-Paares entscheidet messbar ueber die
+  // Laufzeit (1,49x bis 4,24x, siehe cg_rumpfAusrichten). Fuer eine
+  // belastbare Messung muss man denselben Code in mehreren Lagen vermessen
+  // und Median samt Spanne melden. Aus dem QUELLTEXT ist das nicht zu
+  // erreichen, und die drei naheliegenden Wege sind alle falsch:
+  //
+  //   * Zuweisungen auf einen Parameter werden wegoptimiert — die Erzeugnisse
+  //     bleiben byteweise gleich, obwohl der Quelltext waechst.
+  //   * Eine eigene Funktion davor wirkt nicht: die Emissionsreihenfolge ist
+  //     nicht die Deklarationsreihenfolge, die Fuellung landet HINTER den
+  //     Kernen. (Nachgewiesen daran, dass die NOP-Bytes im Erzeugnis
+  //     auftauchen, die Schleifenadresse aber unveraendert bleibt.)
+  //   * Ein `asm`-Block im Rumpf verschiebt zwar, kostet die Funktion aber
+  //     die Registerzuteilung aus #2114: cg_rlLauf setzt bei CGN_ASM das
+  //     Ausschlussbit, weil ein asm-Block r12..r15 ueberschreiben kann.
+  //     Gemessen hat das `int32_mul` von 0,08 s auf 0,25 s gebracht — eine
+  //     Verschlechterung um 3,1x, die wie ein Layout-Effekt aussah.
+  //
+  // Deshalb hier: Fuellung ZWISCHEN Helferblock und erstem Nutzercode. Sie
+  // beruehrt keinen Funktionsrumpf, also keine Optimierungsentscheidung, und
+  // wird nie ausgefuehrt — der Einsprung springt an `main`, nicht hierher.
+  // Die Pruefungen an CG_H_USER bleiben gueltig: sie messen die Laenge des
+  // Helferblocks, und der steht davor.
+  //
+  // Mit codeFuell == 0 wird KEIN Byte ausgegeben; das Erzeugnis ist dann
+  // bitgleich mit dem ohne diese Funktion.
+  fn cg_codeFuellung() {
+    if (self.codeFuell <= 0) { return; }
+    var pos: int64 := self.codeLen;
+    var i: int64 := 0;
+    while (i < self.codeFuell) { self.cg_e8(0x90); i += 1; }
+    self.cg_nopsSchreiben(pos, self.codeFuell);
   }
 
   // WP-R9: Capability-IDs aus AST sammeln (scannt alle @capabilities-Annotationen)

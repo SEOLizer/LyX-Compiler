@@ -5,9 +5,17 @@
  * Uebersetzungen DESSELBEN Programms und nicht zwei verschiedene Programme.
  *
  * Eine idiomatische C-Fassung wuerde uint32_t nehmen und die Maskierung dem
- * Typ ueberlassen; das waere schneller und maesse etwas anderes. Wer die
- * Zahlen gegen "was C kann" halten will, uebersetzt zusaetzlich die
- * uint32_t-Form — dann aber als eigene Zeile im Protokoll, nicht als dieselbe.
+ * Typ ueberlassen; das ist schneller und maesse etwas anderes. Sie steht
+ * seit #2322 als bench/chacha_qr_u32.c daneben und laeuft im Protokoll als
+ * EIGENE Zeile ("gcc -O2 idiomatisch") mit.
+ *
+ * WICHTIG, gemessen am 2026-11-05 (gcc 15.2.0, i5-8250U): gcc zieht diese
+ * gespiegelte Form NICHT zu `rol` zusammen — im Erzeugnis stehen shl/shr/or/
+ * and, waehrend die uint32_t-Fassung vier `rol r32` bekommt. Die Zahl dieser
+ * Datei ist deshalb kein Vergleich gegen "was C kann", sondern gegen "C in
+ * unserer Schreibweise", und gemessen rund doppelt so langsam: 8,3 ns gegen
+ * 4,1 ns je Viertelrunde. Wer aus dieser Zeile einen Gleichstand mit gcc
+ * liest, liest sie falsch.
  */
 #include <stdio.h>
 #include <stdlib.h>
