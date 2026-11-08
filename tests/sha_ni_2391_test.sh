@@ -5,8 +5,12 @@
 # hat KEIN SHA-NI, der Schnellweg ist dort nicht ausfuehrbar. GEMESSEN
 # emuliert `qemu-x86_64 -cpu max` ihn aber korrekt (`-cpu EPYC-Rome`
 # ebenfalls, `-cpu Icelake-Server` NICHT — das CPU-Modell entscheidet).
-# Damit ist der Verhaltensnachweis hier fuehrbar; Takte braucht echte
-# Hardware und sind NICHT Gegenstand dieses Tests.
+# Damit ist der Verhaltensnachweis hier fuehrbar. Die MESSUNG (Abschnitt 6)
+# braucht echte Hardware und laeuft darum nur nativ: eine emulierte Zeit ist
+# fuer Geschwindigkeit wertlos. Auf einer CPU ohne SHA-NI prueft derselbe
+# Abschnitt die Nullprobe — beide Wege fahren dort denselben Code und muessen
+# gleich schnell sein; eine Sonde, die dort einen Unterschied findet, misst
+# sich selbst.
 #
 # Vier Nachweise:
 #   1. NIST-Vektoren ueber den Schnellweg, unter qemu. Darunter ein Fall mit
@@ -18,6 +22,12 @@
 #      mehr erreichbar und eine Regression dort blind.
 #   3. Ohne SHA-NI darf NICHTS ausgefuehrt werden, was es braucht: nativ muss
 #      derselbe Hash herauskommen, und der Schnellweg darf nicht greifen.
+#   5. Erschoepfend ueber die Laengen 0..320: Schnellweg gegen Softwareweg,
+#      und `Sha256Update` stueckweise gegen `SHA256` in einem Zug. Letzteres
+#      prueft die ZWEITE Mehrblockstelle — `Sha256Update` rechnet die
+#      Blockzahl selbst (#2391 Punkt 2).
+#   6. Messung: ist der Schnellweg ueberhaupt schneller? Bis #2391 Punkt 1
+#      war das unbelegt, und es war sein ganzer Zweck.
 #   4. Am Erzeugnis: die Zahl der emittierten SHA-NI-Befehle je Aufrufstelle
 #      gegen die verifizierte Vorlage, und die K-Tabelle nur EINMAL im
 #      Datensegment (nicht je Aufrufstelle).
@@ -118,5 +128,85 @@ if [ -f "$TMP/kat" ]; then
   fi
 fi
 
+
+# ── 5. Erschoepfend ueber alle Laengen, beide Wege und beide Stellen ────────
+if "$LYXC" --std-path=. tests/sha_ni_2391/laengen.lyx -o "$TMP/ln" >"$TMP/b5.log" 2>&1; then
+  ok "laengen_uebersetzt"
+  for umg in nativ qemu; do
+    if [ "$umg" = "qemu" ]; then
+      [ -n "$QEMU" ] || { skip "laengen_qemu (qemu fehlt)"; continue; }
+      out=$($QEMU "$TMP/ln" 2>&1 | grep -v "TCG doesn't support")
+    else
+      out=$("$TMP/ln" 2>&1)
+    fi
+    sn=$(echo "$out" | sed -n 's/^shani_verfuegbar=//p')
+    if echo "$out" | grep -q '^ALLE GLEICH$' && [ "$(echo "$out" | sed -n 's/^fehler_wege=//p')" = "0" ]; then
+      # Unter qemu MUSS der Schnellweg gelaufen sein, sonst sagt die
+      # Gleichheit nur, dass der Softwareweg mit sich selbst uebereinstimmt.
+      if [ "$umg" = "qemu" ] && [ "$sn" != "1" ]; then
+        bad "laengen_qemu_schnellweg_lief_nicht (shani=$sn)"
+      else
+        ok "laengen_${umg}_alle_gleich (shani=$sn)"
+      fi
+    else
+      bad "laengen_${umg}_alle_gleich"; echo "$out" | head -8
+    fi
+  done
+else
+  bad "laengen_uebersetzt"; tail -5 "$TMP/b5.log"
+fi
+
+# ── 6. Messung: Schnellweg gegen Softwareweg ────────────────────────────────
+# Nur NATIV. Unter qemu waere jede Zeit wertlos (Emulation belegt
+# Korrektheit, nie Geschwindigkeit).
+if "$LYXC" --std-path=. tests/sha_ni_2391/takte.lyx -o "$TMP/tk" >"$TMP/b6.log" 2>&1; then
+  ok "takte_uebersetzt"
+  PIN=""; command -v taskset >/dev/null 2>&1 && PIN="taskset -c 1"
+  mout=$(LC_ALL=C $PIN "$TMP/tk" 2>&1)
+  echo "$mout" | sed 's/^/    | /'
+  if ! echo "$mout" | grep -q '^FERTIG$'; then
+    bad "takte_lief_durch"; 
+  else
+    ok "takte_lief_durch"
+    # Faktor und Rauschboden je Laenge als Promille einlesen.
+    prom() { echo "$1" | tr -d ' ' | sed -n "s/^$2=\([0-9]*\),\([0-9]*\)$/\1\2/p"; }
+    fakt=""; rausch=""
+    while IFS= read -r z; do
+      v=$(prom "$z" faktor_sw_durch_hw);   [ -n "$v" ] && fakt="$fakt $v"
+      v=$(prom "$z" rauschboden_faktor);   [ -n "$v" ] && rausch="$rausch $v"
+    done <<<"$mout"
+    nf=$(echo $fakt | wc -w)
+    if [ "$nf" != "6" ]; then
+      bad "takte_sechs_laengen_gemessen (gefunden=$nf)"
+    elif [ "$HAT_SHANI" = "1" ]; then
+      # Diese CPU kann den Schnellweg. Gemessen an den langen Laengen, wo der
+      # Kern und nicht der Aufrufaufwand zaehlt: mindestens Faktor 2,0. Die
+      # Schwelle liegt weit ueber jedem Rauschboden, den die Sonde selbst
+      # meldet; sie prueft den WERT, nicht die Existenz einer Zahl.
+      l16=$(echo $fakt | cut -d" " -f5); l64=$(echo $fakt | cut -d" " -f6)
+      if [ "$l16" -ge 2000 ] && [ "$l64" -ge 2000 ]; then
+        ok "takte_schnellweg_mindestens_2x (16K=$l16 64K=$l64 Promille)"
+      else
+        bad "takte_schnellweg_mindestens_2x (16K=$l16 64K=$l64 Promille, erwartet >=2000)"
+      fi
+    else
+      # Keine SHA-NI: beide Wege sind derselbe Code. Jede Abweichung ueber
+      # 25 % ist die Sonde selbst, nicht der Unterschied zweier Wege.
+      schlecht=0
+      for v in $fakt; do
+        [ "$v" -lt 750 ] && schlecht=$((schlecht+1))
+        [ "$v" -gt 1250 ] && schlecht=$((schlecht+1))
+      done
+      if [ "$schlecht" = "0" ]; then
+        ok "takte_nullprobe_beide_wege_gleich_schnell ($fakt Promille)"
+      else
+        bad "takte_nullprobe (Faktoren $fakt Promille, erwartet 750..1250)"
+      fi
+      skip "takte_schnellweg (diese CPU hat kein SHA-NI — Vergleich nicht fuehrbar)"
+    fi
+  fi
+else
+  bad "takte_uebersetzt"; tail -5 "$TMP/b6.log"
+fi
 echo "=== Results: $PASS passed, $FAIL failed, $SKIP skipped ==="
 [ "$FAIL" -eq 0 ] || exit 1
