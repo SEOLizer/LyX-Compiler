@@ -1,0 +1,133 @@
+// #2391 Punkt 1: Messung. Belegt — oder widerlegt —, dass der Schnellweg
+// schneller ist als der Softwareweg. Bis hierher war das UNBELEGT, und es war
+// der ganze Zweck des Schnellwegs.
+//
+// Messaufbau, und warum er so aussieht:
+//
+//   * Messgroesse ist ZEIT (us) ueber `NowUs`. Takte waeren besser, aber
+//     `sys_rdtsc` ist ein lyxos-Builtin (#2427) und auf Linux nicht
+//     uebersetzbar; ein `asm{}`-Block schaltet r12..r15 ab und macht die
+//     Sonde selbst zum Flaschenhals.
+//   * A/B-PAARE, abwechselnd hw/sw in jeder Runde, nicht Block gegen Block —
+//     ein Lastwechsel waehrend der Messung traefe sonst nur eine Seite.
+//   * MEDIAN ueber die Runden, nicht Mittel.
+//   * RAUSCHBODEN: in jeder Runde wird der Schnellweg ZWEIMAL gemessen. Die
+//     Spanne dieser beiden Zahlen ist die Untergrenze, unter der kein
+//     Unterschied etwas bedeutet.
+//   * Der Kern wird ueber `Sha256Update` auf einem vorangelegten Kontext
+//     gemessen. `SHA256()` legt je Aufruf 128 B fuer den Padblock an; bei
+//     kurzen Nachrichten misst man sonst den Allokator.
+//   * Jede Messung hasht dieselbe Bytemenge (ZIEL_BYTES), damit die Zahlen
+//     ueber die Laengen hinweg vergleichbar sind.
+import std.crypto.sha256;
+import std.cpu.features;
+import std.time;
+
+// Hasht `ziel` Bytes in Stuecken von `len` und gibt die Dauer in us zurueck.
+fn messe(d: int64, len: int64, ziel: int64, ctx: int64, out: int64): int64 {
+  var runden: int64 := ziel / len;
+  if (runden < 1) { runden := 1; }
+  var t0: int64 := NowUs();
+  var i: int64 := 0;
+  while (i < runden) {
+    Sha256Init(ctx);
+    Sha256Update(ctx, d, len);
+    Sha256Final(ctx, out);
+    i := i + 1;
+  }
+  var t1: int64 := NowUs();
+  return t1 - t0;
+}
+
+fn median(arr: int64, n: int64): int64 {
+  var i: int64 := 1;
+  while (i < n) {
+    var v: int64 := peek64(arr + i * 8);
+    var j: int64 := i - 1;
+    while (j >= 0 && peek64(arr + j * 8) > v) {
+      poke64(arr + (j + 1) * 8, peek64(arr + j * 8));
+      j := j - 1;
+    }
+    poke64(arr + (j + 1) * 8, v);
+    i := i + 1;
+  }
+  return peek64(arr + (n / 2) * 8);
+}
+
+// Prozent mit einer Dezimalstelle, als zwei Ganzzahlen ausgegeben.
+fn zeigVerhaeltnis(name: pchar, zaehler: int64, nenner: int64) {
+  PrintStr(name);
+  if (nenner <= 0) { PrintLn("n/a"); return; }
+  var promille: int64 := (zaehler * 1000) / nenner;
+  PrintInt(promille / 1000); PrintStr(",");
+  var rest: int64 := promille % 1000;
+  if (rest < 100) { PrintStr("0"); }
+  if (rest <  10) { PrintStr("0"); }
+  PrintInt(rest);
+  PrintLn("");
+}
+
+fn main(): int64 {
+  var RUNDEN:     int64 := 9;
+  var ZIEL_BYTES: int64 := 4194304;
+
+  SHA256ForceSoftware(0);
+  var shani: int64 := SHA256NIAvailable();
+  PrintStr("shani_verfuegbar="); PrintInt(shani); PrintLn("");
+  PrintStr("runden=");           PrintInt(RUNDEN); PrintLn("");
+  PrintStr("ziel_bytes=");       PrintInt(ZIEL_BYTES); PrintLn("");
+  if (shani == 0) {
+    PrintLn("KEIN_VERGLEICH diese CPU hat kein SHA-NI — nur der Softwareweg ist erreichbar");
+  }
+
+  var MAXLEN: int64 := 65536;
+  var d: int64 := alloc(MAXLEN + 64);
+  var i: int64 := 0;
+  while (i < MAXLEN) { poke8(d + i, (i * 31 + 7) % 251); i := i + 1; }
+  var ctx: int64 := alloc(Sha256CtxSize());
+  var out: int64 := alloc(40);
+
+  var laengen: int64 := alloc(48);
+  poke64(laengen +  0, 64);
+  poke64(laengen +  8, 256);
+  poke64(laengen + 16, 1024);
+  poke64(laengen + 24, 4096);
+  poke64(laengen + 32, 16384);
+  poke64(laengen + 40, 65536);
+
+  var hwA: int64 := alloc(RUNDEN * 8);
+  var hwB: int64 := alloc(RUNDEN * 8);
+  var swA: int64 := alloc(RUNDEN * 8);
+
+  // Aufwaermen: erster Aufruf misst den Seitenfehler, nicht den Kern.
+  SHA256ForceSoftware(0); messe(d, 4096, 262144, ctx, out);
+  SHA256ForceSoftware(1); messe(d, 4096, 262144, ctx, out);
+
+  var li: int64 := 0;
+  while (li < 6) {
+    var len: int64 := peek64(laengen + li * 8);
+    var r: int64 := 0;
+    while (r < RUNDEN) {
+      SHA256ForceSoftware(0); poke64(hwA + r * 8, messe(d, len, ZIEL_BYTES, ctx, out));
+      SHA256ForceSoftware(1); poke64(swA + r * 8, messe(d, len, ZIEL_BYTES, ctx, out));
+      SHA256ForceSoftware(0); poke64(hwB + r * 8, messe(d, len, ZIEL_BYTES, ctx, out));
+      r := r + 1;
+    }
+    var mhwA: int64 := median(hwA, RUNDEN);
+    var mhwB: int64 := median(hwB, RUNDEN);
+    var msw:  int64 := median(swA, RUNDEN);
+
+    PrintStr("len="); PrintInt(len);
+    PrintStr(" hw_us="); PrintInt(mhwA);
+    PrintStr(" sw_us="); PrintInt(msw);
+    PrintStr(" hw2_us="); PrintInt(mhwB);
+    PrintLn("");
+    zeigVerhaeltnis("  faktor_sw_durch_hw=", msw, mhwA);
+    var spanne: int64 := mhwA - mhwB;
+    if (spanne < 0) { spanne := 0 - spanne; }
+    zeigVerhaeltnis("  rauschboden_faktor=", mhwA + spanne, mhwA);
+    li := li + 1;
+  }
+  PrintLn("FERTIG");
+  return 0;
+}

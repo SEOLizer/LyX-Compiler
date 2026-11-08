@@ -124,19 +124,38 @@ pub fn SHA256NIAvailable(): int64 {
     return v;
 }
 
-// Process one 64-byte (512-bit) block into the 8-word state buffer
-fn sha256Block(state: int64, block: int64): void {
-    // #2391: Schnellweg. Die Abfrage steht VOR jeder Vorarbeit — der
-    // Softwareweg unten legt sich einen Kratzbereich an und baut die
-    // K-Tabelle, und beides waere hier verloren.
-    //
-    // Ohne SHA-NI wird `sha256_compress` NICHT aufgerufen: der Befehl loest
-    // dort SIGILL aus. Das ist kein stiller Default, sondern ein lauter
-    // Abbruch — die Weiche hier ist die einzige Stelle, die ihn verhindert.
+// #2391: Blockfolge. Der Schnellweg haelt den Zustand ueber ALLE Bloecke in
+// den Registern; nur Eintritt und Austritt lesen und schreiben `state`. Darum
+// bekommt `sha256_compress` die ganze Folge und nicht Block fuer Block einen
+// Aufruf. Der Softwareweg kann das nicht — er legt den Zustand nach jedem
+// Block ab — und laeuft deshalb hier in der Schleife.
+//
+// Die Abfrage steht VOR jeder Vorarbeit: `sha256BlockSoft` legt sich einen
+// Kratzbereich an und baut die K-Tabelle, und beides waere hier verloren.
+//
+// Ohne SHA-NI wird `sha256_compress` NICHT aufgerufen: der Befehl loest dort
+// SIGILL aus. Diese Weiche ist die einzige Stelle, die ihn verhindert.
+fn sha256Blocks(state: int64, data: int64, n: int64): void {
+    if (n <= 0) { return; }
     if (SHA256NIAvailable() != 0) {
-        sha256_compress(state, block, 1);
+        sha256_compress(state, data, n);
         return;
     }
+    var b: int64 := 0;
+    while (b < n) {
+        sha256BlockSoft(state, data + b * 64);
+        b += 1;
+    }
+}
+
+// Process one 64-byte (512-bit) block into the 8-word state buffer
+fn sha256Block(state: int64, block: int64): void {
+    sha256Blocks(state, block, 1);
+}
+
+// Softwarefassung eines einzelnen Blocks. Bleibt als Vergleichsmassstab im
+// Repo und ist der Weg auf jeder CPU ohne SHA-NI.
+fn sha256BlockSoft(state: int64, block: int64): void {
     if (sha256Scratch() == 0) { panic("SHA-256: kein Speicher fuer die Rundentabelle (#1318)"); }
     var W: int64 := _sha256W;
     var K: int64 := _sha256K;
@@ -232,11 +251,11 @@ pub fn SHA256(data: int64, len: int64, out: int64): void {
     poke32(state + 28, 0x5be0cd19);
 
     // Process all complete 64-byte blocks
-    var processed: int64 := 0;
-    while (processed + 64 <= len) {
-        sha256Block(state, data + processed);
-        processed += 64;
-    }
+    // #2391: alle vollen Bloecke in EINEM Aufruf — der Schnellweg haelt den
+    // Zustand dann ueber die ganze Folge in den Registern.
+    var blocks:    int64 := len / 64;
+    var processed: int64 := blocks * 64;
+    sha256Blocks(state, data, blocks);
 
     // Build final padded block(s): at most 2 blocks (128 bytes)
     var padBuf: int64 := alloc(128);
@@ -265,8 +284,9 @@ pub fn SHA256(data: int64, len: int64, out: int64): void {
     poke8(padBuf + lenOff + 6, (bitLen >>  8) & 0xFF);
     poke8(padBuf + lenOff + 7,  bitLen        & 0xFF);
 
-    sha256Block(state, padBuf);
-    if (remaining >= 56) { sha256Block(state, padBuf + 64); }
+    var padBlocks: int64 := 1;
+    if (remaining >= 56) { padBlocks := 2; }
+    sha256Blocks(state, padBuf, padBlocks);
 
     // Write 32-byte big-endian digest
     i := 0;
@@ -368,10 +388,12 @@ pub fn Sha256Update(ctx: int64, data: int64, len: int64): void {
         }
     }
 
-    while (pos + 64 <= len) {
-        sha256Block(ctx + S256_H_OFF, data + pos);
-        poke64(ctx + S256_LEN_OFF, peek64(ctx + S256_LEN_OFF) + 64);
-        pos += 64;
+    // #2391: dieselbe Folge in einem Aufruf wie in SHA256().
+    var full: int64 := (len - pos) / 64;
+    if (full > 0) {
+        sha256Blocks(ctx + S256_H_OFF, data + pos, full);
+        poke64(ctx + S256_LEN_OFF, peek64(ctx + S256_LEN_OFF) + full * 64);
+        pos += full * 64;
     }
 
     while (pos < len) {
