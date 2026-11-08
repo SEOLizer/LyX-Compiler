@@ -773,7 +773,7 @@ test: lyxc
 	@bash tests/crypto_kette_rsa_ed25519_test.sh
 	@bash tests/tls13_handschlag_test.sh
 	@bash tests/tls13_schluesselarten_test.sh
-	@bash tests/tls13_interop_openssl_test.sh
+	@echo "--- TLS-Interop gegen OpenSSL: in tests/known-red.txt (!flaky, #2418) ---"
 	@bash tests/ir_datei_builtins_test.sh
 	@bash tests/unit_private_globals_test.sh
 	@bash tests/ir_kein_stiller_ausdruck_test.sh
@@ -1351,21 +1351,42 @@ test-lyx-integration: lyxc
 # Die .sh-Eintraege aus tests/known-red.txt. Sie laufen, ihr Fehlschlag ist
 # erwartet und bricht nichts ab — aber wenn einer wieder gruen wird, wird
 # DIESES Ziel rot, damit der Eintrag verschwindet statt zu veralten.
+# #2418: `!flaky` wirkt jetzt AUCH hier. Die Markierung ist in
+# tests/known-red.txt seit #1153 beschrieben ("ohne die Markierung faerbt
+# jeder zufaellige Durchlauf das Ziel rot, weil ein bekannt roter Test gruen
+# wurde"), war aber nur in tests/run_lyx_tests.sh umgesetzt — fuer die
+# .lyx-Eintraege. Dieses Ziel schnitt `!flaky` bloss aus dem Pfad und
+# behandelte den Eintrag wie jeden anderen.
+#
+# Folge: ein .sh-Eintrag, der NUR UNTER LAST faellt, war hier nicht
+# unterbringbar. Gruen lief er oft, und jeder gruene Lauf machte das Ziel rot.
+#
+# Ein markierter Eintrag meldet seinen gruenen Lauf weiterhin — er bleibt
+# sichtbar —, faerbt das Ziel aber nicht. Unmarkierte Eintraege verhalten
+# sich unveraendert: wird einer gruen, wird das Ziel rot, damit die Liste
+# nicht stillschweigend veraltet. Beide Seiten sind geprueft.
 .PHONY: test-known-red
 test-known-red: lyxc
-	@fail=0; n=0; \
+	@fail=0; n=0; nf=0; \
 	while read -r line; do \
-	  line="$${line%%\#*}"; line="$$(printf '%s' "$$line" | sed -e 's/[[:space:]]*$$//' -e 's/[[:space:]]*!flaky$$//')"; \
+	  line="$${line%%\#*}"; line="$$(printf '%s' "$$line" | sed -e 's/[[:space:]]*$$//')"; \
+	  flaky=0; \
+	  case "$$line" in *!flaky) flaky=1; line="$$(printf '%s' "$$line" | sed -e 's/[[:space:]]*!flaky$$//')" ;; esac; \
 	  case "$$line" in ''|*.lyx) continue ;; esac; \
 	  n=$$((n+1)); \
 	  if bash "$$line" >/dev/null 2>&1; then \
-	    echo "WIEDER GRUEN $$line — Eintrag aus tests/known-red.txt streichen"; \
-	    fail=$$((fail+1)); \
+	    if [ "$$flaky" = 1 ]; then \
+	      echo "gruen (flaky) $$line — faellt nur unter Last, Eintrag bleibt"; \
+	      nf=$$((nf+1)); \
+	    else \
+	      echo "WIEDER GRUEN $$line — Eintrag aus tests/known-red.txt streichen"; \
+	      fail=$$((fail+1)); \
+	    fi; \
 	  else \
 	    echo "bekannt rot   $$line"; \
 	  fi; \
 	done < tests/known-red.txt; \
-	echo "known-red (.sh): $$n geprueft, $$fail unerwartet gruen"; \
+	echo "known-red (.sh): $$n geprueft, $$fail unerwartet gruen, $$nf flaky-gruen"; \
 	test $$fail -eq 0
 
 # LyxOS-Tests aus tests/ (nicht tests/lyxos/ -- dafuer gibt es `test-lyxos`).
