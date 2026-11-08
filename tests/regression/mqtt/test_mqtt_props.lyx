@@ -1,0 +1,155 @@
+// tests/regression/mqtt/test_mqtt_props.lyx
+// MQTT-5-Properties: typisierter Vertrag.
+// Beide Seiten gemessen: zulaessige Property im richtigen Paket MQ_OK mit
+// richtigem WERT, unzulaessige mit exaktem Fehlercode. Unbekannter Identifier
+// wird abgewiesen, NICHT uebersprungen.
+import std.io;
+import std.mqtt.wire;
+import std.mqtt.props;
+
+var fehler: int64 := 0;
+
+fn chk(name: pchar, ist: int64, soll: int64) {
+  if (ist != soll) {
+    fehler := fehler + 1;
+    Print("FAIL "); Print(name); Print(" ist="); PrintInt(ist);
+    Print(" soll="); PrintInt(soll); Print("\n");
+  }
+}
+
+fn main(): int64 {
+  // --- Vertragstabelle ----------------------------------------------------
+  chk("typ payload format", MqPropTyp(MQ_P_PAYLOAD_FORMAT), MQ_PT_BYTE);
+  chk("typ topic alias", MqPropTyp(MQ_P_TOPIC_ALIAS), MQ_PT_U16);
+  chk("typ session expiry", MqPropTyp(MQ_P_SESSION_EXPIRY), MQ_PT_U32);
+  chk("typ subscription id", MqPropTyp(MQ_P_SUBSCRIPTION_ID), MQ_PT_VARINT);
+  chk("typ content type", MqPropTyp(MQ_P_CONTENT_TYPE), MQ_PT_UTF8);
+  chk("typ correlation data", MqPropTyp(MQ_P_CORRELATION_DATA), MQ_PT_BIN);
+  chk("typ user property", MqPropTyp(MQ_P_USER_PROPERTY), MQ_PT_PAIR);
+  // Luecken in Tabelle 2.4 sind keine Properties.
+  chk("typ 0", MqPropTyp(0), 0);
+  chk("typ 4", MqPropTyp(4), 0);
+  chk("typ 20", MqPropTyp(20), 0);
+  chk("typ 43", MqPropTyp(43), 0);
+  // Will Delay gehoert NUR zu den Will-Properties, nicht ins CONNECT selbst.
+  chk("will delay in will",
+      (MqPropErlaubt(MQ_P_WILL_DELAY) & MqPropKontext(MQ_CTX_WILL)) != 0 as int64, 1);
+  chk("will delay nicht in connect",
+      (MqPropErlaubt(MQ_P_WILL_DELAY) & MqPropKontext(MQ_CONNECT)) != 0 as int64, 0);
+  chk("topic alias nur publish",
+      (MqPropErlaubt(MQ_P_TOPIC_ALIAS) & MqPropKontext(MQ_CONNECT)) != 0 as int64, 0);
+  chk("subid in publish",
+      (MqPropErlaubt(MQ_P_SUBSCRIPTION_ID) & MqPropKontext(MQ_PUBLISH)) != 0 as int64, 1);
+  chk("subid wiederholbar in publish",
+      MqPropWiederholbar(MQ_P_SUBSCRIPTION_ID, MQ_PUBLISH) as int64, 1);
+  chk("subid einmalig in subscribe",
+      MqPropWiederholbar(MQ_P_SUBSCRIPTION_ID, MQ_SUBSCRIBE) as int64, 0);
+  chk("user prop wiederholbar",
+      MqPropWiederholbar(MQ_P_USER_PROPERTY, MQ_PUBLISH) as int64, 1);
+  // Wertebereiche
+  chk("payload format 2", MqPropWertPruefe(MQ_P_PAYLOAD_FORMAT, 2), MQ_E_PROP_WERT);
+  chk("payload format 1", MqPropWertPruefe(MQ_P_PAYLOAD_FORMAT, 1), MQ_OK);
+  chk("receive max 0", MqPropWertPruefe(MQ_P_RECEIVE_MAX, 0), MQ_E_PROP_WERT);
+  chk("receive max 1", MqPropWertPruefe(MQ_P_RECEIVE_MAX, 1), MQ_OK);
+  chk("topic alias 0", MqPropWertPruefe(MQ_P_TOPIC_ALIAS, 0), MQ_E_PROP_WERT);
+  chk("max packet 0", MqPropWertPruefe(MQ_P_MAX_PACKET_SIZE, 0), MQ_E_PROP_WERT);
+  chk("max qos 2", MqPropWertPruefe(MQ_P_MAX_QOS, 2), MQ_E_PROP_WERT);
+  chk("subid 0", MqPropWertPruefe(MQ_P_SUBSCRIPTION_ID, 0), MQ_E_PROP_WERT);
+
+  // --- Schreiben und wieder lesen -----------------------------------------
+  var buf: int64 := alloc(512);
+  var ct: pchar := "text/plain";
+  var un: pchar := "ort";
+  var uv: pchar := "kueche";
+  // Block ab Offset 1 aufbauen (1 Byte Reserve fuer die Blocklaenge).
+  var p: int64 := 1;
+  p := MqPropByteSchreib(buf, 512, p, MQ_P_PAYLOAD_FORMAT, 1);
+  chk("schreib payload format", p, 3);
+  p := MqPropU32Schreib(buf, 512, p, MQ_P_MESSAGE_EXPIRY, 3600);
+  chk("schreib message expiry", p, 8);
+  p := MqPropStrSchreib(buf, 512, p, MQ_P_CONTENT_TYPE, ct as int64, 10);
+  p := MqPropU16Schreib(buf, 512, p, MQ_P_TOPIC_ALIAS, 7);
+  p := MqPropPaarSchreib(buf, 512, p, un as int64, 3, uv as int64, 6);
+  p := MqPropPaarSchreib(buf, 512, p, uv as int64, 6, un as int64, 3);
+  if (p < 0) { Print("FAIL schreibkette rc="); PrintInt(p); Print("\n"); return 1; }
+  var blockLen: int64 := p - 1;
+  chk("reserve", MqPropsReserve(blockLen), 1);
+  var vp: int64 := MqVarintSchreib(buf, 512, 0, blockLen);
+  chk("blocklaenge geschrieben", vp, 1);
+
+  var tab: int64 := alloc(32 * MqPropEintragGroesse());
+  var anz: int64 := alloc(8);
+  var ende: int64 := MqPropsLies(buf, p, 0, MQ_PUBLISH, tab, 32, anz);
+  chk("props lies ende", ende, p);
+  chk("props anzahl", peek64(anz), 6);
+  var e: int64 := MqPropFinde(tab, 6, MQ_P_PAYLOAD_FORMAT);
+  chk("payload format gefunden", e != 0 as int64, 1);
+  chk("payload format wert", peek64(e + MQ_PE_WERT), 1);
+  e := MqPropFinde(tab, 6, MQ_P_MESSAGE_EXPIRY);
+  chk("message expiry wert", peek64(e + MQ_PE_WERT), 3600);
+  e := MqPropFinde(tab, 6, MQ_P_TOPIC_ALIAS);
+  chk("topic alias wert", peek64(e + MQ_PE_WERT), 7);
+  e := MqPropFinde(tab, 6, MQ_P_CONTENT_TYPE);
+  chk("content type laenge", peek64(e + MQ_PE_LEN), 10);
+  chk("content type erstes byte",
+      peek8(buf + peek64(e + MQ_PE_WERT)) & 0xFF, 116);          // 't'
+  // Reihenfolge der wiederholten User Properties bleibt erhalten (M5-01).
+  var e4: int64 := tab + 4 * MqPropEintragGroesse();
+  var e5: int64 := tab + 5 * MqPropEintragGroesse();
+  chk("user prop 1 id", peek64(e4 + MQ_PE_ID), MQ_P_USER_PROPERTY);
+  chk("user prop 1 namelaenge", peek64(e4 + MQ_PE_LEN), 3);
+  chk("user prop 1 wertlaenge", MqPePairWertLen(e4), 6);
+  chk("user prop 2 namelaenge", peek64(e5 + MQ_PE_LEN), 6);
+  chk("user prop 2 wertlaenge", MqPePairWertLen(e5), 3);
+  chk("user prop 2 wert erstes byte",
+      peek8(buf + MqPePairWertOff(e5)) & 0xFF, 111);             // 'o'
+
+  // --- Abweisungen --------------------------------------------------------
+  // (a) dieselben Bytes im falschen Paket: Topic Alias gibt es nur im PUBLISH
+  chk("falsches paket", MqPropsLies(buf, p, 0, MQ_CONNACK, tab, 32, anz),
+      MQ_E_PROP_PAKET);
+  // (b) unbekannter Identifier wird abgewiesen, nicht uebersprungen
+  var ub: int64 := alloc(16);
+  poke8(ub + 0, 3);        // Blocklaenge 3
+  poke8(ub + 1, 99);       // Identifier 99 existiert nicht
+  poke8(ub + 2, 0);
+  poke8(ub + 3, 0);
+  chk("unbekannte property", MqPropsLies(ub, 4, 0, MQ_PUBLISH, tab, 32, anz),
+      MQ_E_PROP_UNBEKANNT);
+  // (c) nicht wiederholbare Property doppelt
+  var dp: int64 := alloc(16);
+  poke8(dp + 0, 4);
+  poke8(dp + 1, MQ_P_PAYLOAD_FORMAT); poke8(dp + 2, 1);
+  poke8(dp + 3, MQ_P_PAYLOAD_FORMAT); poke8(dp + 4, 0);
+  chk("doppelte property", MqPropsLies(dp, 5, 0, MQ_PUBLISH, tab, 32, anz),
+      MQ_E_PROP_DOPPELT);
+  // (d) Wert ausserhalb des Bereichs
+  var wp: int64 := alloc(16);
+  poke8(wp + 0, 2);
+  poke8(wp + 1, MQ_P_PAYLOAD_FORMAT); poke8(wp + 2, 9);
+  chk("wert ausserhalb", MqPropsLies(wp, 3, 0, MQ_PUBLISH, tab, 32, anz),
+      MQ_E_PROP_WERT);
+  // (e) Blocklaenge behauptet mehr Bytes als vorliegen
+  var kp: int64 := alloc(16);
+  poke8(kp + 0, 50);
+  poke8(kp + 1, MQ_P_PAYLOAD_FORMAT); poke8(kp + 2, 1);
+  chk("block zu lang", MqPropsLies(kp, 3, 0, MQ_PUBLISH, tab, 32, anz),
+      MQ_E_PROP_LAENGE);
+  // (f) letzte Property ragt ueber die Blockgrenze hinaus
+  var rp: int64 := alloc(16);
+  poke8(rp + 0, 1);                               // Block: 1 Byte
+  poke8(rp + 1, MQ_P_PAYLOAD_FORMAT);             // braucht aber 2
+  poke8(rp + 2, 1);
+  chk("property ragt hinaus", MqPropsLies(rp, 3, 0, MQ_PUBLISH, tab, 32, anz),
+      MQ_E_UNVOLLSTAENDIG);
+  // (g) Ergebnistabelle zu klein wird gemeldet, nicht gekuerzt
+  chk("tabelle klein", MqPropsLies(buf, p, 0, MQ_PUBLISH, tab, 2, anz),
+      MQ_E_PROP_TABELLE);
+  // (h) Schreiben mit falschem Typ
+  chk("schreib falscher typ",
+      MqPropByteSchreib(buf, 512, 0, MQ_P_SESSION_EXPIRY, 1), MQ_E_PROP_WERT);
+
+  if (fehler == 0) { Print("ALL PASS\n"); return 0; }
+  Print("FAILS: "); PrintInt(fehler); Print("\n");
+  return 1;
+}

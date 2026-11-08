@@ -1,0 +1,398 @@
+// tests/regression/mqtt/test_mqtt_packet.lyx
+// Pakete beider Fassungen: kodieren, ueber das Framing zurueckholen,
+// dekodierte WERTE pruefen. Dazu die Abweisungen mit exaktem Fehlercode.
+// Ein Durchlauf mit Fragmentierung an jeder Bytegrenze belegt, dass der Weg
+// ueber das Framing dasselbe Ergebnis liefert.
+import std.io;
+import std.mqtt.wire;
+import std.mqtt.props;
+import std.mqtt.packet;
+
+var fehler: int64 := 0;
+
+fn chk(name: pchar, ist: int64, soll: int64) {
+  if (ist != soll) {
+    fehler := fehler + 1;
+    Print("FAIL "); Print(name); Print(" ist="); PrintInt(ist);
+    Print(" soll="); PrintInt(soll); Print("\n");
+  }
+}
+
+var z: int64 := 0;
+var rpuf: int64 := 0;
+var verbr: int64 := 0;
+var erg: int64 := 0;
+var tab: int64 := 0;
+
+// Schickt ein fertiges Paket durch das Framing und dekodiert es.
+fn durch(pkt: int64, pktLen: int64, version: int64): int64 {
+  MqRahmenNeu(z, rpuf, 4096, 1048576);
+  var rc: int64 := MqRahmenFuettere(z, pkt, pktLen, verbr);
+  if (rc != MQ_RAHMEN_FERTIG) { return rc; }
+  return MqPaketLies(MqRahmenRumpf(z), MqRahmenRumpfLen(z),
+                     MqRahmenTyp(z), MqRahmenFlags(z), version, erg, tab, 32);
+}
+
+// Derselbe Weg, aber an jeder Bytegrenze zerschnitten; Ergebnis muss gleich sein.
+fn durchZerschnitten(name: pchar, pkt: int64, pktLen: int64, version: int64) {
+  var schnitt: int64 := 1;
+  while (schnitt < pktLen) {
+    MqRahmenNeu(z, rpuf, 4096, 1048576);
+    var r1: int64 := MqRahmenFuettere(z, pkt, schnitt, verbr);
+    var r2: int64 := MqRahmenFuettere(z, pkt + schnitt, pktLen - schnitt, verbr);
+    if (r1 != MQ_RAHMEN_TEIL || r2 != MQ_RAHMEN_FERTIG) {
+      fehler := fehler + 1;
+      Print("FAIL framing "); Print(name); Print(" schnitt=");
+      PrintInt(schnitt); Print("\n");
+      return;
+    }
+    var rc: int64 := MqPaketLies(MqRahmenRumpf(z), MqRahmenRumpfLen(z),
+                                 MqRahmenTyp(z), MqRahmenFlags(z), version,
+                                 erg, tab, 32);
+    if (rc != MQ_OK) {
+      fehler := fehler + 1;
+      Print("FAIL dekode "); Print(name); Print(" schnitt=");
+      PrintInt(schnitt); Print(" rc="); PrintInt(rc); Print("\n");
+      return;
+    }
+    schnitt := schnitt + 1;
+  }
+}
+
+fn main(): int64 {
+  z := alloc(MqRahmenGroesse());
+  rpuf := alloc(4096);
+  verbr := alloc(8);
+  erg := alloc(MqErgGroesse());
+  tab := alloc(32 * MqPropEintragGroesse());
+  var buf: int64 := alloc(4096);
+  var topic: pchar := "haus/kueche/temp";
+  var nutz: pchar := "22.5";
+  var cid: pchar := "lyx-1";
+  var user: pchar := "andreas";
+  var pass: pchar := "geheim";
+
+  // --- PUBLISH QoS 1, MQTT 3.1.1 ------------------------------------------
+  var n: int64 := MqPublishSchreib(buf, 4096, MQ_V311, topic as int64, 16,
+                                   nutz as int64, 4, 1, true, false, 42, 0, 0);
+  // 2 Byte Fixed Header + 2+16 Topic + 2 PktId + 4 Payload
+  chk("publish311 laenge", n, 26);
+  chk("publish311 kopf", peek8(buf + 0) & 0xFF, 0x33);   // PUBLISH|QoS1|RETAIN
+  chk("publish311 remlen", peek8(buf + 1) & 0xFF, 24);
+  chk("publish311 dekode", durch(buf, n, MQ_V311), MQ_OK);
+  chk("publish311 typ", peek64(erg + MQ_R_TYP), MQ_PUBLISH);
+  chk("publish311 qos", peek64(erg + MQ_R_QOS), 1);
+  chk("publish311 retain", peek64(erg + MQ_R_RETAIN), 1);
+  chk("publish311 dup", peek64(erg + MQ_R_DUP), 0);
+  chk("publish311 pktid", peek64(erg + MQ_R_PKTID), 42);
+  chk("publish311 topiclen", peek64(erg + MQ_R_TOPIC_LEN), 16);
+  chk("publish311 nutzlen", peek64(erg + MQ_R_NUTZ_LEN), 4);
+  chk("publish311 nutz byte0",
+      peek8(MqRahmenRumpf(z) + peek64(erg + MQ_R_NUTZ_OFF)) & 0xFF, 50);  // '2'
+  chk("publish311 keine props", peek64(erg + MQ_R_PROPS_OFF), 0);
+  durchZerschnitten("publish311", buf, n, MQ_V311);
+
+  // --- PUBLISH QoS 0 mit leerer Payload (F-01) ----------------------------
+  n := MqPublishSchreib(buf, 4096, MQ_V311, topic as int64, 16, 0, 0,
+                        0, false, false, 0, 0, 0);
+  chk("publish leer laenge", n, 20);
+  chk("publish leer dekode", durch(buf, n, MQ_V311), MQ_OK);
+  chk("publish leer nutzlen", peek64(erg + MQ_R_NUTZ_LEN), 0);
+  chk("publish leer pktid", peek64(erg + MQ_R_PKTID), 0);
+
+  // --- PUBLISH MQTT 5 mit Properties --------------------------------------
+  var pb: int64 := alloc(256);
+  var ct: pchar := "text/plain";
+  var p2: int64 := MqPropByteSchreib(pb, 256, 0, MQ_P_PAYLOAD_FORMAT, 1);
+  p2 := MqPropU32Schreib(pb, 256, p2, MQ_P_MESSAGE_EXPIRY, 60);
+  p2 := MqPropStrSchreib(pb, 256, p2, MQ_P_CONTENT_TYPE, ct as int64, 10);
+  p2 := MqPropU16Schreib(pb, 256, p2, MQ_P_TOPIC_ALIAS, 3);
+  chk("prop block laenge", p2, 23);
+  n := MqPublishSchreib(buf, 4096, MQ_V5, topic as int64, 16,
+                        nutz as int64, 4, 2, false, false, 7, pb, p2);
+  chk("publish5 dekode", durch(buf, n, MQ_V5), MQ_OK);
+  chk("publish5 qos", peek64(erg + MQ_R_QOS), 2);
+  chk("publish5 pktid", peek64(erg + MQ_R_PKTID), 7);
+  chk("publish5 propsanz", peek64(erg + MQ_R_PROPS_ANZ), 4);
+  var e: int64 := MqPropFinde(tab, 4, MQ_P_TOPIC_ALIAS);
+  chk("publish5 topic alias", peek64(e + MQ_PE_WERT), 3);
+  e := MqPropFinde(tab, 4, MQ_P_MESSAGE_EXPIRY);
+  chk("publish5 message expiry", peek64(e + MQ_PE_WERT), 60);
+  chk("publish5 nutzlen", peek64(erg + MQ_R_NUTZ_LEN), 4);
+  durchZerschnitten("publish5", buf, n, MQ_V5);
+  // Dieselben Bytes als 3.1.1 gelesen ergeben KEINEN Fehler: ein PUBLISH ist
+  // nicht selbstbeschreibend, der Property-Block wandert in die Payload. Die
+  // Fassung kommt aus dem CONNECT, nicht aus dem Paket — darum fuehrt der
+  // Protokollteil sie mit, und der Codec glaubt ihr. Belegt am WERT:
+  // 23 Property-Bytes plus 1 Laengenbyte landen in der Nutzlast.
+  chk("publish5 als v311 rc", durch(buf, n, MQ_V311), MQ_OK);
+  chk("publish5 als v311 nutzlen", peek64(erg + MQ_R_NUTZ_LEN), 4 + 1 + p2);
+
+  // --- PUBLISH: Abweisungen -----------------------------------------------
+  chk("publish qos0 mit pktid",
+      MqPublishSchreib(buf, 4096, MQ_V311, topic as int64, 16, 0, 0,
+                       0, false, false, 5, 0, 0), MQ_E_PKTID_NULL);
+  chk("publish qos1 ohne pktid",
+      MqPublishSchreib(buf, 4096, MQ_V311, topic as int64, 16, 0, 0,
+                       1, false, false, 0, 0, 0), MQ_E_PKTID_FEHLT);
+  chk("publish qos3",
+      MqPublishSchreib(buf, 4096, MQ_V311, topic as int64, 16, 0, 0,
+                       3, false, false, 1, 0, 0), MQ_E_SUBOPT);
+  var wild: pchar := "haus/+";
+  chk("publish wildcard topic",
+      MqPublishSchreib(buf, 4096, MQ_V311, wild as int64, 6, 0, 0,
+                       0, false, false, 0, 0, 0), MQ_E_TOPIC_WILDCARD);
+  chk("publish props unter v311",
+      MqPublishSchreib(buf, 4096, MQ_V311, topic as int64, 16, 0, 0,
+                       0, false, false, 0, pb, p2), MQ_E_SUBOPT_V5);
+  chk("publish leerer topic v311",
+      MqPublishSchreib(buf, 4096, MQ_V311, topic as int64, 0, 0, 0,
+                       0, false, false, 0, 0, 0), MQ_E_TOPIC_EMPTY);
+  chk("publish puffer klein",
+      MqPublishSchreib(buf, 8, MQ_V311, topic as int64, 16, 0, 0,
+                       0, false, false, 0, 0, 0), MQ_E_PUFFER_KLEIN);
+
+  // --- CONNECT 3.1.1 ------------------------------------------------------
+  n := MqConnectSchreib(buf, 4096, MQ_V311, cid as int64, 5, 60, true,
+                        user as int64, 7, pass as int64, 6,
+                        0, 0, 0, 0, 0, false, 0, 0, 0, 0);
+  chk("connect311 kopf", peek8(buf + 0) & 0xFF, 0x10);
+  chk("connect311 dekode", durch(buf, n, MQ_V311), MQ_OK);
+  chk("connect311 level", peek64(erg + MQ_R_LEVEL), 4);
+  chk("connect311 keepalive", peek64(erg + MQ_R_KEEPALIVE), 60);
+  // Clean Session + Username + Password
+  chk("connect311 flags", peek64(erg + MQ_R_CFLAGS), 0xC2);
+  chk("connect311 clientidlen", peek64(erg + MQ_R_TOPIC_LEN), 5);
+  durchZerschnitten("connect311", buf, n, MQ_V311);
+  // Will mit QoS und Retain
+  var wt: pchar := "haus/offline";
+  var wp: pchar := "1";
+  n := MqConnectSchreib(buf, 4096, MQ_V311, cid as int64, 5, 30, false,
+                        0, 0, 0, 0, wt as int64, 12, wp as int64, 1,
+                        2, true, 0, 0, 0, 0);
+  chk("connect311 will dekode", durch(buf, n, MQ_V311), MQ_OK);
+  chk("connect311 will flags", peek64(erg + MQ_R_CFLAGS), 0x34);
+  // Will-QoS ohne Will-Flag ist unzulaessig
+  chk("connect will qos ohne will",
+      MqConnectSchreib(buf, 4096, MQ_V311, cid as int64, 5, 30, false,
+                       0, 0, 0, 0, 0, 0, 0, 0, 1, false, 0, 0, 0, 0),
+      MQ_E_CONNFLAGS);
+  // Password ohne Username: unter 3.1.1 unzulaessig
+  chk("connect pass ohne user",
+      MqConnectSchreib(buf, 4096, MQ_V311, cid as int64, 5, 30, false,
+                       0, 0, pass as int64, 6, 0, 0, 0, 0, 0, false, 0, 0, 0, 0),
+      MQ_E_CONNFLAGS);
+  // Properties unter 3.1.1
+  chk("connect props unter v311",
+      MqConnectSchreib(buf, 4096, MQ_V311, cid as int64, 5, 30, false,
+                       0, 0, 0, 0, 0, 0, 0, 0, 0, false, pb, p2, 0, 0),
+      MQ_E_SUBOPT_V5);
+
+  // --- CONNECT MQTT 5 mit Session Expiry ----------------------------------
+  var cb: int64 := alloc(64);
+  var cp: int64 := MqPropU32Schreib(cb, 64, 0, MQ_P_SESSION_EXPIRY, 300);
+  cp := MqPropU16Schreib(cb, 64, cp, MQ_P_RECEIVE_MAX, 32);
+  n := MqConnectSchreib(buf, 4096, MQ_V5, cid as int64, 5, 60, true,
+                        0, 0, 0, 0, 0, 0, 0, 0, 0, false, cb, cp, 0, 0);
+  chk("connect5 dekode", durch(buf, n, MQ_V5), MQ_OK);
+  chk("connect5 level", peek64(erg + MQ_R_LEVEL), 5);
+  chk("connect5 propsanz", peek64(erg + MQ_R_PROPS_ANZ), 2);
+  e := MqPropFinde(tab, 2, MQ_P_SESSION_EXPIRY);
+  chk("connect5 session expiry", peek64(e + MQ_PE_WERT), 300);
+  e := MqPropFinde(tab, 2, MQ_P_RECEIVE_MAX);
+  chk("connect5 receive max", peek64(e + MQ_PE_WERT), 32);
+  durchZerschnitten("connect5", buf, n, MQ_V5);
+  // Falscher Protocol Level gegen die erwartete Fassung
+  chk("connect5 als v311 gelesen", durch(buf, n, MQ_V311), MQ_E_PROTOLEVEL);
+
+  // --- CONNACK ------------------------------------------------------------
+  var ca: int64 := alloc(16);
+  poke8(ca + 0, 0x20); poke8(ca + 1, 0x02);
+  poke8(ca + 2, 0x01); poke8(ca + 3, 0x00);
+  chk("connack dekode", durch(ca, 4, MQ_V311), MQ_OK);
+  chk("connack session present", peek64(erg + MQ_R_SESSION), 1);
+  chk("connack reason", peek64(erg + MQ_R_REASON), 0);
+  // Reservierte Bits im Acknowledge-Flag-Byte
+  poke8(ca + 2, 0x02);
+  chk("connack reservierte bits", durch(ca, 4, MQ_V311), MQ_E_SESSION_FLAGS);
+  // Ablehnung wird strukturiert gemeldet (V-03)
+  poke8(ca + 2, 0x00); poke8(ca + 3, 0x05);
+  chk("connack abgelehnt dekode", durch(ca, 4, MQ_V311), MQ_OK);
+  chk("connack abgelehnt reason", peek64(erg + MQ_R_REASON), 5);
+  // MQTT 5: CONNACK mit Assigned Client Identifier
+  var c5: int64 := alloc(64);
+  poke8(c5 + 0, 0x20);
+  var bodyLen: int64 := 0;
+  poke8(c5 + 2, 0x00);                       // Session Present 0
+  poke8(c5 + 3, 0x00);                       // Reason 0
+  poke8(c5 + 4, 9);                          // Property-Blocklaenge
+  poke8(c5 + 5, MQ_P_ASSIGNED_CLIENTID);
+  poke8(c5 + 6, 0x00); poke8(c5 + 7, 6);
+  poke8(c5 + 8, 97); poke8(c5 + 9, 98); poke8(c5 + 10, 99);
+  poke8(c5 + 11, 49); poke8(c5 + 12, 50); poke8(c5 + 13, 51);
+  bodyLen := 12;
+  poke8(c5 + 1, bodyLen);
+  chk("connack5 dekode", durch(c5, 2 + bodyLen, MQ_V5), MQ_OK);
+  chk("connack5 propsanz", peek64(erg + MQ_R_PROPS_ANZ), 1);
+  e := MqPropFinde(tab, 1, MQ_P_ASSIGNED_CLIENTID);
+  chk("connack5 clientid len", peek64(e + MQ_PE_LEN), 6);
+
+  // --- Acks ---------------------------------------------------------------
+  n := MqAckSchreib(buf, 4096, MQ_V311, MQ_PUBACK, 42, 0, 0, 0);
+  chk("puback311 laenge", n, 4);
+  chk("puback311 dekode", durch(buf, n, MQ_V311), MQ_OK);
+  chk("puback311 pktid", peek64(erg + MQ_R_PKTID), 42);
+  n := MqAckSchreib(buf, 4096, MQ_V311, MQ_PUBREL, 42, 0, 0, 0);
+  chk("pubrel311 flags", peek8(buf + 0) & 0xFF, 0x62);
+  chk("pubrel311 dekode", durch(buf, n, MQ_V311), MQ_OK);
+  // MQTT 5 kurz (nur PktId) und lang (Reason)
+  n := MqAckSchreib(buf, 4096, MQ_V5, MQ_PUBACK, 9, 0, 0, 0);
+  chk("puback5 kurz laenge", n, 4);
+  chk("puback5 kurz dekode", durch(buf, n, MQ_V5), MQ_OK);
+  chk("puback5 kurz reason", peek64(erg + MQ_R_REASON), 0);
+  n := MqAckSchreib(buf, 4096, MQ_V5, MQ_PUBACK, 9, 0x10, 0, 0);
+  chk("puback5 reason laenge", n, 5);
+  chk("puback5 reason dekode", durch(buf, n, MQ_V5), MQ_OK);
+  chk("puback5 reason wert", peek64(erg + MQ_R_REASON), 0x10);
+  // Negativer Reason Code ist unter 3.1.1 nicht ausdrueckbar
+  chk("puback311 mit reason",
+      MqAckSchreib(buf, 4096, MQ_V311, MQ_PUBACK, 9, 0x10, 0, 0),
+      MQ_E_SUBOPT_V5);
+  chk("ack pktid 0", MqAckSchreib(buf, 4096, MQ_V5, MQ_PUBACK, 0, 0, 0, 0),
+      MQ_E_PKTID_NULL);
+  chk("ack falscher typ",
+      MqAckSchreib(buf, 4096, MQ_V5, MQ_PUBLISH, 1, 0, 0, 0), MQ_E_TYP);
+  // Packet Identifier 0 auf der Leitung
+  var nullid: int64 := alloc(8);
+  poke8(nullid + 0, 0x40); poke8(nullid + 1, 0x02);
+  poke8(nullid + 2, 0x00); poke8(nullid + 3, 0x00);
+  chk("puback pktid 0 gelesen", durch(nullid, 4, MQ_V311), MQ_E_PKTID_NULL);
+
+  // --- SUBSCRIBE ----------------------------------------------------------
+  var f1: pchar := "haus/+/temp";
+  var f2: pchar := "haus/#";
+  var ftab: int64 := alloc(3 * 24);
+  poke64(ftab + 0, f1 as int64); poke64(ftab + 8, 11); poke64(ftab + 16, 1);
+  poke64(ftab + 24, f2 as int64); poke64(ftab + 32, 6); poke64(ftab + 40, 0);
+  n := MqSubscribeSchreib(buf, 4096, MQ_V311, 17, ftab, 2, 0, 0);
+  chk("subscribe311 kopf", peek8(buf + 0) & 0xFF, 0x82);
+  chk("subscribe311 dekode", durch(buf, n, MQ_V311), MQ_OK);
+  chk("subscribe311 pktid", peek64(erg + MQ_R_PKTID), 17);
+  var it: int64 := alloc(24);
+  var pos: int64 := peek64(erg + MQ_R_NUTZ_OFF);
+  pos := MqSubscribeNaechster(MqRahmenRumpf(z), MqRahmenRumpfLen(z), pos, it);
+  chk("subscribe311 filter1 len", peek64(it + 8), 11);
+  chk("subscribe311 filter1 opt", peek64(it + 16), 1);
+  pos := MqSubscribeNaechster(MqRahmenRumpf(z), MqRahmenRumpfLen(z), pos, it);
+  chk("subscribe311 filter2 len", peek64(it + 8), 6);
+  chk("subscribe311 ende",
+      MqSubscribeNaechster(MqRahmenRumpf(z), MqRahmenRumpfLen(z), pos, it),
+      MQ_E_LEER);
+  durchZerschnitten("subscribe311", buf, n, MQ_V311);
+  // MQTT-5-Options unter 3.1.1: No Local gesetzt
+  poke64(ftab + 16, MqSubOptBaue(1, true, false, MQ_RH_SEND));
+  chk("subscribe311 nolocal",
+      MqSubscribeSchreib(buf, 4096, MQ_V311, 17, ftab, 2, 0, 0),
+      MQ_E_SUBOPT_V5);
+  // Unter MQTT 5 zulaessig, und die Options kommen unveraendert zurueck
+  n := MqSubscribeSchreib(buf, 4096, MQ_V5, 17, ftab, 2, 0, 0);
+  chk("subscribe5 dekode", durch(buf, n, MQ_V5), MQ_OK);
+  pos := peek64(erg + MQ_R_NUTZ_OFF);
+  pos := MqSubscribeNaechster(MqRahmenRumpf(z), MqRahmenRumpfLen(z), pos, it);
+  chk("subscribe5 opt nolocal", MqSubOptNoLocal(peek64(it + 16)) as int64, 1);
+  chk("subscribe5 opt qos", MqSubOptQos(peek64(it + 16)), 1);
+  // No Local auf Shared Subscription ist Protokollfehler (F-05)
+  var sf: pchar := "$share/g/haus/#";
+  poke64(ftab + 0, sf as int64); poke64(ftab + 8, 15);
+  poke64(ftab + 16, MqSubOptBaue(0, true, false, MQ_RH_SEND));
+  chk("subscribe5 nolocal shared",
+      MqSubscribeSchreib(buf, 4096, MQ_V5, 17, ftab, 1, 0, 0), MQ_E_NL_SHARED);
+  poke64(ftab + 16, MqSubOptBaue(0, false, false, MQ_RH_SEND));
+  n := MqSubscribeSchreib(buf, 4096, MQ_V5, 17, ftab, 1, 0, 0);
+  chk("subscribe5 shared ok", durch(buf, n, MQ_V5), MQ_OK);
+  // Retain Handling 3 ist reserviert
+  poke64(ftab + 16, MqSubOptBaue(0, false, false, 3));
+  chk("subscribe5 rh3",
+      MqSubscribeSchreib(buf, 4096, MQ_V5, 17, ftab, 1, 0, 0), MQ_E_SUBOPT);
+  chk("subscribe ohne filter",
+      MqSubscribeSchreib(buf, 4096, MQ_V5, 17, ftab, 0, 0, 0), MQ_E_LEER);
+  chk("subscribe pktid 0",
+      MqSubscribeSchreib(buf, 4096, MQ_V5, 0, ftab, 1, 0, 0), MQ_E_PKTID_NULL);
+  // SUBSCRIBE ohne Nutzlast auf der Leitung
+  var leer: int64 := alloc(8);
+  poke8(leer + 0, 0x82); poke8(leer + 1, 0x02);
+  poke8(leer + 2, 0x00); poke8(leer + 3, 0x11);
+  chk("subscribe leer gelesen", durch(leer, 4, MQ_V311), MQ_E_LEER);
+
+  // --- UNSUBSCRIBE / SUBACK / UNSUBACK ------------------------------------
+  var utab: int64 := alloc(2 * 16);
+  poke64(utab + 0, f1 as int64); poke64(utab + 8, 11);
+  n := MqUnsubscribeSchreib(buf, 4096, MQ_V311, 18, utab, 1, 0, 0);
+  chk("unsubscribe kopf", peek8(buf + 0) & 0xFF, 0xA2);
+  chk("unsubscribe dekode", durch(buf, n, MQ_V311), MQ_OK);
+  chk("unsubscribe pktid", peek64(erg + MQ_R_PKTID), 18);
+  var sa: int64 := alloc(16);
+  poke8(sa + 0, 0x90); poke8(sa + 1, 0x04);
+  poke8(sa + 2, 0x00); poke8(sa + 3, 0x11);
+  poke8(sa + 4, 0x01); poke8(sa + 5, 0x80);        // QoS 1 gewaehrt, Fehler
+  chk("suback dekode", durch(sa, 6, MQ_V311), MQ_OK);
+  chk("suback anzahl", MqAckReasonAnzahl(erg), 2);
+  chk("suback reason0", MqAckReason(MqRahmenRumpf(z), erg, 0), 1);
+  chk("suback reason1", MqAckReason(MqRahmenRumpf(z), erg, 1), 0x80);
+  chk("suback reason2", MqAckReason(MqRahmenRumpf(z), erg, 2), -1);
+  // UNSUBACK: 3.1.1 ohne Reason Codes, MQTT 5 mit
+  var ua: int64 := alloc(16);
+  poke8(ua + 0, 0xB0); poke8(ua + 1, 0x02);
+  poke8(ua + 2, 0x00); poke8(ua + 3, 0x12);
+  chk("unsuback311 dekode", durch(ua, 4, MQ_V311), MQ_OK);
+  poke8(ua + 1, 0x03); poke8(ua + 4, 0x00);
+  chk("unsuback311 mit reason", durch(ua, 5, MQ_V311), MQ_E_REMLEN);
+  poke8(ua + 1, 0x04); poke8(ua + 4, 0x00); poke8(ua + 5, 0x11);
+  chk("unsuback5 dekode", durch(ua, 6, MQ_V5), MQ_OK);
+  chk("unsuback5 reason0", MqAckReason(MqRahmenRumpf(z), erg, 0), 0x11);
+
+  // --- PING / DISCONNECT / AUTH -------------------------------------------
+  n := MqLeerSchreib(buf, 4096, MQ_PINGREQ);
+  chk("pingreq laenge", n, 2);
+  chk("pingreq dekode", durch(buf, n, MQ_V311), MQ_OK);
+  chk("pingreq typ", peek64(erg + MQ_R_TYP), MQ_PINGREQ);
+  // PINGREQ mit Rumpf ist ein Protokollfehler
+  var pr: int64 := alloc(8);
+  poke8(pr + 0, 0xC0); poke8(pr + 1, 0x01); poke8(pr + 2, 0x00);
+  chk("pingreq mit rumpf", durch(pr, 3, MQ_V311), MQ_E_REMLEN);
+  n := MqDisconnectSchreib(buf, 4096, MQ_V311, 0, 0, 0);
+  chk("disconnect311 laenge", n, 2);
+  chk("disconnect311 dekode", durch(buf, n, MQ_V311), MQ_OK);
+  n := MqDisconnectSchreib(buf, 4096, MQ_V5, 0x04, 0, 0);   // Disconnect with Will
+  chk("disconnect5 laenge", n, 3);
+  chk("disconnect5 dekode", durch(buf, n, MQ_V5), MQ_OK);
+  chk("disconnect5 reason", peek64(erg + MQ_R_REASON), 0x04);
+  chk("disconnect311 mit reason",
+      MqDisconnectSchreib(buf, 4096, MQ_V311, 0x04, 0, 0), MQ_E_SUBOPT_V5);
+  // Server Reference im DISCONNECT (M5-06)
+  var sr: pchar := "mqtt.example.net:8883";
+  var sb: int64 := alloc(64);
+  var sp: int64 := MqPropStrSchreib(sb, 64, 0, MQ_P_SERVER_REFERENCE,
+                                    sr as int64, 21);
+  n := MqDisconnectSchreib(buf, 4096, MQ_V5, 0x9C, sb, sp);
+  chk("disconnect5 serverref dekode", durch(buf, n, MQ_V5), MQ_OK);
+  chk("disconnect5 serverref reason", peek64(erg + MQ_R_REASON), 0x9C);
+  e := MqPropFinde(tab, peek64(erg + MQ_R_PROPS_ANZ), MQ_P_SERVER_REFERENCE);
+  chk("disconnect5 serverref len", peek64(e + MQ_PE_LEN), 21);
+  // AUTH nur unter MQTT 5
+  var am: pchar := "SCRAM-SHA-256";
+  var ab: int64 := alloc(64);
+  var ap: int64 := MqPropStrSchreib(ab, 64, 0, MQ_P_AUTH_METHOD, am as int64, 13);
+  n := MqAuthSchreib(buf, 4096, MQ_V5, 0x18, ab, ap);     // Continue authentication
+  chk("auth5 dekode", durch(buf, n, MQ_V5), MQ_OK);
+  chk("auth5 reason", peek64(erg + MQ_R_REASON), 0x18);
+  e := MqPropFinde(tab, peek64(erg + MQ_R_PROPS_ANZ), MQ_P_AUTH_METHOD);
+  chk("auth5 method len", peek64(e + MQ_PE_LEN), 13);
+  chk("auth unter v311", MqAuthSchreib(buf, 4096, MQ_V311, 0x18, ab, ap),
+      MQ_E_VERSION);
+  chk("auth paket unter v311 gelesen", durch(buf, n, MQ_V311), MQ_E_VERSION);
+
+  if (fehler == 0) { Print("ALL PASS\n"); return 0; }
+  Print("FAILS: "); PrintInt(fehler); Print("\n");
+  return 1;
+}

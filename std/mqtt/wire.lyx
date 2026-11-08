@@ -1,0 +1,460 @@
+// std/mqtt/wire.lyx — MQTT-Drahtformat: Primitiven und inkrementelles Framing.
+//
+// Netzfrei und ALLOKATIONSFREI. Jeder Puffer kommt vom Aufrufer; der Rumpf
+// eines eingehenden Pakets wird nie erst eingelesen und danach gegen die
+// Groessengrenze gehalten (R-03): die Grenze greift, sobald die Remaining
+// Length vollstaendig dekodiert ist.
+//
+// Normbezug: MQTT 3.1.1 §2.2, §1.5; MQTT 5.0 §2.1.4, §1.5.
+unit std.mqtt.wire;
+
+import std.mqtt.topic;    // MQ_OK, MQ_E_UTF8_*, MqUtf8Pruefe
+
+// --- Fehlercodes (Bereich -220..-249) --------------------------------------
+pub con MQ_E_PUFFER_KLEIN: int64   := -220;  // Schreibpuffer reicht nicht
+pub con MQ_E_UNVOLLSTAENDIG: int64 := -221;  // Lesen braucht mehr Bytes
+pub con MQ_E_VARINT_LANG: int64    := -222;  // > 4 Byte Remaining Length
+pub con MQ_E_VARINT_WERT: int64    := -223;  // Wert > 268435455
+pub con MQ_E_PAKET_GROSS: int64    := -224;  // ueber lokaler Paketgrenze
+pub con MQ_E_RUMPF_KLEIN: int64    := -225;  // Rumpfpuffer zu klein
+pub con MQ_E_TYP: int64            := -226;  // Pakettyp 0 oder 15
+pub con MQ_E_FLAGS: int64          := -227;  // Fixed-Header-Flags unzulaessig
+pub con MQ_E_LAENGE: int64         := -228;  // Feldlaenge passt nicht in Rumpf
+pub con MQ_E_ZUSTAND: int64        := -229;  // Framing-Zustand unzulaessig
+
+// --- Grenzen ---------------------------------------------------------------
+pub con MQ_VARINT_MAX: int64 := 268435455;   // 4 Byte, MQTT §2.2.3
+pub con MQ_U16_MAX: int64    := 65535;
+
+// --- Pakettypen ------------------------------------------------------------
+pub con MQ_CONNECT: int64     := 1;
+pub con MQ_CONNACK: int64     := 2;
+pub con MQ_PUBLISH: int64     := 3;
+pub con MQ_PUBACK: int64      := 4;
+pub con MQ_PUBREC: int64      := 5;
+pub con MQ_PUBREL: int64      := 6;
+pub con MQ_PUBCOMP: int64     := 7;
+pub con MQ_SUBSCRIBE: int64   := 8;
+pub con MQ_SUBACK: int64      := 9;
+pub con MQ_UNSUBSCRIBE: int64 := 10;
+pub con MQ_UNSUBACK: int64    := 11;
+pub con MQ_PINGREQ: int64     := 12;
+pub con MQ_PINGRESP: int64    := 13;
+pub con MQ_DISCONNECT: int64  := 14;
+pub con MQ_AUTH: int64        := 15;         // nur MQTT 5.0
+
+// --- Protokollfassungen ----------------------------------------------------
+pub con MQ_V311: int64 := 4;                 // Protocol Level 4
+pub con MQ_V5: int64   := 5;                 // Protocol Level 5
+
+// ===========================================================================
+// Variable Byte Integer
+// ===========================================================================
+
+// Anzahl Bytes, die `v` als Variable Byte Integer belegt. -1 bei Ueberschreitung.
+pub fn MqVarintLen(v: int64): int64 {
+  if (v < 0) { return -1; }
+  if (v < 128) { return 1; }
+  if (v < 16384) { return 2; }
+  if (v < 2097152) { return 3; }
+  if (v <= MQ_VARINT_MAX) { return 4; }
+  return -1;
+}
+
+// Schreibt `v` an buf+pos. Rueckgabe: neue Position oder Fehlercode.
+pub fn MqVarintSchreib(buf: int64, cap: int64, pos: int64, v: int64): int64 {
+  if (v < 0 || v > MQ_VARINT_MAX) { return MQ_E_VARINT_WERT; }
+  var p: int64 := pos;
+  var rest: int64 := v;
+  var erster: bool := true;
+  while (erster || rest > 0) {
+    erster := false;
+    if (p >= cap) { return MQ_E_PUFFER_KLEIN; }
+    var b: int64 := rest & 0x7F;
+    rest := rest / 128;
+    if (rest > 0) { b := b | 0x80; }
+    poke8(buf + p, b);
+    p := p + 1;
+  }
+  return p;
+}
+
+// Liest einen Variable Byte Integer. `aus` ist die Adresse eines int64-Platzes
+// fuer den Wert (0 erlaubt). Rueckgabe: neue Position, MQ_E_UNVOLLSTAENDIG
+// wenn die Bytes noch fehlen, oder ein Fehlercode.
+pub fn MqVarintLies(buf: int64, len: int64, pos: int64, aus: int64): int64 {
+  var p: int64 := pos;
+  var wert: int64 := 0;
+  var mult: int64 := 1;
+  var n: int64 := 0;
+  while (n < 4) {
+    if (p >= len) { return MQ_E_UNVOLLSTAENDIG; }
+    var b: int64 := peek8(buf + p) & 0xFF;
+    p := p + 1;
+    n := n + 1;
+    wert := wert + (b & 0x7F) * mult;
+    if ((b & 0x80) == 0) {
+      if (aus != 0) { poke64(aus, wert); }
+      return p;
+    }
+    mult := mult * 128;
+  }
+  return MQ_E_VARINT_LANG;         // viertes Byte hatte noch das Fortsetzungsbit
+}
+
+// ===========================================================================
+// Festbreite und Felder
+// ===========================================================================
+
+pub fn MqU8Lies(buf: int64, len: int64, pos: int64, aus: int64): int64 {
+  if (pos < 0 || pos + 1 > len) { return MQ_E_UNVOLLSTAENDIG; }
+  if (aus != 0) { poke64(aus, peek8(buf + pos) & 0xFF); }
+  return pos + 1;
+}
+
+pub fn MqU8Schreib(buf: int64, cap: int64, pos: int64, v: int64): int64 {
+  if (pos + 1 > cap) { return MQ_E_PUFFER_KLEIN; }
+  poke8(buf + pos, v & 0xFF);
+  return pos + 1;
+}
+
+// 16 Bit Big Endian. Byteweise gelesen: peek16 liefert vorzeichenbehaftet und
+// in Host-Reihenfolge (CLAUDE.md, "peek32 erweitert vorzeichenbehaftet").
+pub fn MqU16Lies(buf: int64, len: int64, pos: int64, aus: int64): int64 {
+  if (pos < 0 || pos + 2 > len) { return MQ_E_UNVOLLSTAENDIG; }
+  var hi: int64 := peek8(buf + pos) & 0xFF;
+  var lo: int64 := peek8(buf + pos + 1) & 0xFF;
+  if (aus != 0) { poke64(aus, hi * 256 + lo); }
+  return pos + 2;
+}
+
+pub fn MqU16Schreib(buf: int64, cap: int64, pos: int64, v: int64): int64 {
+  if (v < 0 || v > MQ_U16_MAX) { return MQ_E_LAENGE; }
+  if (pos + 2 > cap) { return MQ_E_PUFFER_KLEIN; }
+  poke8(buf + pos, (v / 256) & 0xFF);
+  poke8(buf + pos + 1, v & 0xFF);
+  return pos + 2;
+}
+
+// 32 Bit Big Endian (Four Byte Integer, MQTT 5.0 §1.5.5).
+pub fn MqU32Lies(buf: int64, len: int64, pos: int64, aus: int64): int64 {
+  if (pos < 0 || pos + 4 > len) { return MQ_E_UNVOLLSTAENDIG; }
+  var v: int64 := 0;
+  var i: int64 := 0;
+  while (i < 4) {
+    v := v * 256 + (peek8(buf + pos + i) & 0xFF);
+    i := i + 1;
+  }
+  if (aus != 0) { poke64(aus, v); }
+  return pos + 4;
+}
+
+pub fn MqU32Schreib(buf: int64, cap: int64, pos: int64, v: int64): int64 {
+  if (v < 0 || v > 4294967295) { return MQ_E_LAENGE; }
+  if (pos + 4 > cap) { return MQ_E_PUFFER_KLEIN; }
+  poke8(buf + pos + 0, (v / 16777216) & 0xFF);
+  poke8(buf + pos + 1, (v / 65536) & 0xFF);
+  poke8(buf + pos + 2, (v / 256) & 0xFF);
+  poke8(buf + pos + 3, v & 0xFF);
+  return pos + 4;
+}
+
+// Binary Data / UTF-8 String: Laengenpraefix + Nutzdaten. Es wird NICHT kopiert
+// — `aus` erhaelt (Offset, Laenge) als Blick in `buf` (R-05: der Besitzer ist
+// der Eingangspuffer, die Sicht gilt nur bis zum naechsten Fuettern).
+pub fn MqBinLies(buf: int64, len: int64, pos: int64, aus: int64): int64 {
+  if (pos < 0 || pos + 2 > len) { return MQ_E_UNVOLLSTAENDIG; }
+  var n: int64 := (peek8(buf + pos) & 0xFF) * 256 + (peek8(buf + pos + 1) & 0xFF);
+  var np: int64 := pos + 2;
+  if (np + n > len) { return MQ_E_UNVOLLSTAENDIG; }
+  if (aus != 0) {
+    poke64(aus + 0, np);
+    poke64(aus + 8, n);
+  }
+  return np + n;
+}
+
+// Wie MqBinLies, prueft zusaetzlich MQTT-UTF-8 (nicht streng: eingehende
+// Werte duerfen die SHOULD-NOT-Zeichen tragen, MQTT 5.0 §1.5.4).
+pub fn MqStrLies(buf: int64, len: int64, pos: int64, aus: int64): int64 {
+  if (pos < 0 || pos + 2 > len) { return MQ_E_UNVOLLSTAENDIG; }
+  var n: int64 := (peek8(buf + pos) & 0xFF) * 256 + (peek8(buf + pos + 1) & 0xFF);
+  var np: int64 := pos + 2;
+  if (np + n > len) { return MQ_E_UNVOLLSTAENDIG; }
+  var rc: int64 := MqUtf8Pruefe(buf + np, n, false);
+  if (rc != MQ_OK) { return rc; }
+  if (aus != 0) {
+    poke64(aus + 0, np);
+    poke64(aus + 8, n);
+  }
+  return np + n;
+}
+
+pub fn MqBinSchreib(buf: int64, cap: int64, pos: int64,
+                    daten: int64, n: int64): int64 {
+  if (n < 0 || n > MQ_U16_MAX) { return MQ_E_LAENGE; }
+  var p: int64 := MqU16Schreib(buf, cap, pos, n);
+  if (p < 0) { return p; }
+  if (p + n > cap) { return MQ_E_PUFFER_KLEIN; }
+  var i: int64 := 0;
+  while (i < n) {
+    poke8(buf + p + i, peek8(daten + i) & 0xFF);
+    i := i + 1;
+  }
+  return p + n;
+}
+
+// Wie MqBinSchreib, prueft den Wert streng (ausgehende Richtung).
+pub fn MqStrSchreib(buf: int64, cap: int64, pos: int64,
+                    str: int64, n: int64): int64 {
+  var rc: int64 := MqUtf8Pruefe(str, n, true);
+  if (rc != MQ_OK) { return rc; }
+  return MqBinSchreib(buf, cap, pos, str, n);
+}
+
+// ===========================================================================
+// Direkte Leser ohne Kratzpuffer
+// ===========================================================================
+// Die Funktionen oben geben ihr Ergebnis in eine Ausgabeadresse. Innerhalb des
+// Codecs braucht es dafuer keinen Speicher: alle Werte sind nicht-negativ und
+// jeder Fehlercode ist negativ, also traegt der Rueckgabewert beides. Die
+// Position rueckt um eine feste Breite (1/2/4) bzw. um MqVarintBytes weiter.
+// Dadurch kommt der Codec ohne alloc aus — wichtig, weil std/alloc.lyx je
+// Allokation ein mmap macht und der Property-Leser sonst pro Feld eines haette.
+
+pub fn MqU8Wert(buf: int64, len: int64, pos: int64): int64 {
+  if (pos < 0 || pos + 1 > len) { return MQ_E_UNVOLLSTAENDIG; }
+  return peek8(buf + pos) & 0xFF;
+}
+
+pub fn MqU16Wert(buf: int64, len: int64, pos: int64): int64 {
+  if (pos < 0 || pos + 2 > len) { return MQ_E_UNVOLLSTAENDIG; }
+  return (peek8(buf + pos) & 0xFF) * 256 + (peek8(buf + pos + 1) & 0xFF);
+}
+
+pub fn MqU32Wert(buf: int64, len: int64, pos: int64): int64 {
+  if (pos < 0 || pos + 4 > len) { return MQ_E_UNVOLLSTAENDIG; }
+  var v: int64 := 0;
+  var i: int64 := 0;
+  while (i < 4) {
+    v := v * 256 + (peek8(buf + pos + i) & 0xFF);
+    i := i + 1;
+  }
+  return v;
+}
+
+// Wert eines Variable Byte Integer.
+pub fn MqVarintWert(buf: int64, len: int64, pos: int64): int64 {
+  var wert: int64 := 0;
+  var mult: int64 := 1;
+  var n: int64 := 0;
+  while (n < 4) {
+    if (pos + n >= len) { return MQ_E_UNVOLLSTAENDIG; }
+    var b: int64 := peek8(buf + pos + n) & 0xFF;
+    wert := wert + (b & 0x7F) * mult;
+    n := n + 1;
+    if ((b & 0x80) == 0) { return wert; }
+    mult := mult * 128;
+  }
+  return MQ_E_VARINT_LANG;
+}
+
+// Anzahl Bytes, die derselbe Variable Byte Integer belegt (1..4).
+pub fn MqVarintBytes(buf: int64, len: int64, pos: int64): int64 {
+  var n: int64 := 0;
+  while (n < 4) {
+    if (pos + n >= len) { return MQ_E_UNVOLLSTAENDIG; }
+    var b: int64 := peek8(buf + pos + n) & 0xFF;
+    n := n + 1;
+    if ((b & 0x80) == 0) { return n; }
+  }
+  return MQ_E_VARINT_LANG;
+}
+
+// Laenge eines laengenpraefigierten Feldes (Binary Data). Die Nutzdaten
+// beginnen bei pos + 2 und enden bei pos + 2 + Laenge.
+pub fn MqFeldLen(buf: int64, len: int64, pos: int64): int64 {
+  if (pos < 0 || pos + 2 > len) { return MQ_E_UNVOLLSTAENDIG; }
+  var n: int64 := (peek8(buf + pos) & 0xFF) * 256 + (peek8(buf + pos + 1) & 0xFF);
+  if (pos + 2 + n > len) { return MQ_E_UNVOLLSTAENDIG; }
+  return n;
+}
+
+// Wie MqFeldLen, prueft zusaetzlich MQTT-UTF-8 (nicht streng, eingehend).
+pub fn MqStrFeldLen(buf: int64, len: int64, pos: int64): int64 {
+  var n: int64 := MqFeldLen(buf, len, pos);
+  if (n < 0) { return n; }
+  var rc: int64 := MqUtf8Pruefe(buf + pos + 2, n, false);
+  if (rc != MQ_OK) { return rc; }
+  return n;
+}
+
+// ===========================================================================
+// Fixed Header
+// ===========================================================================
+
+// Zulaessige Flags im ersten Byte je Pakettyp. PUBLISH traegt DUP/QoS/RETAIN
+// und wird gesondert geprueft; PUBREL, SUBSCRIBE, UNSUBSCRIBE verlangen 0x02,
+// alle anderen 0x00 (MQTT 3.1.1 §2.2.2, MQTT 5.0 §2.1.3).
+pub fn MqFlagsPruefe(typ: int64, flags: int64): int64 {
+  if (typ == MQ_PUBLISH) {
+    var qos: int64 := (flags / 2) & 0x03;
+    if (qos == 3) { return MQ_E_FLAGS; }
+    return MQ_OK;
+  }
+  if (typ == MQ_PUBREL || typ == MQ_SUBSCRIBE || typ == MQ_UNSUBSCRIBE) {
+    if (flags != 0x02) { return MQ_E_FLAGS; }
+    return MQ_OK;
+  }
+  if (typ == MQ_CONNECT || typ == MQ_CONNACK || typ == MQ_PUBACK ||
+      typ == MQ_PUBREC || typ == MQ_PUBCOMP || typ == MQ_SUBACK ||
+      typ == MQ_UNSUBACK || typ == MQ_PINGREQ || typ == MQ_PINGRESP ||
+      typ == MQ_DISCONNECT || typ == MQ_AUTH) {
+    if (flags != 0x00) { return MQ_E_FLAGS; }
+    return MQ_OK;
+  }
+  // Kein Catch-all: Typ 0 ist reserviert, alles andere kommt hier nicht an.
+  return MQ_E_TYP;
+}
+
+// Prueft, ob `typ` in der gewaehlten Fassung ueberhaupt existiert.
+pub fn MqTypGueltig(typ: int64, version: int64): bool {
+  if (typ < 1 || typ > 15) { return false; }
+  if (typ == MQ_AUTH) { return version == MQ_V5; }
+  return true;
+}
+
+// ===========================================================================
+// Inkrementelles Framing
+// ===========================================================================
+// Zustandsblock, Offsets von Hand (sizeof zaehlt verschachtelte Structs nur
+// mit 8 Byte, #1886 — darum kein Struct).
+pub con MQ_RZ_ZUSTAND: int64  := 0;    // 0 Typbyte, 1 Remaining Length, 2 Rumpf
+pub con MQ_RZ_KOPF: int64     := 8;    // erstes Byte
+pub con MQ_RZ_REMLEN: int64   := 16;   // dekodierte Remaining Length
+pub con MQ_RZ_RLWERT: int64   := 24;   // Teilwert waehrend der Dekodierung
+pub con MQ_RZ_RLMULT: int64   := 32;   // Multiplikator
+pub con MQ_RZ_RLBYTES: int64  := 40;   // gelesene Laengenbytes
+pub con MQ_RZ_GELESEN: int64  := 48;   // Rumpfbytes im Puffer
+pub con MQ_RZ_MAXPAKET: int64 := 56;   // lokale Obergrenze inkl. Kopf
+pub con MQ_RZ_PUFFER: int64   := 64;   // Rumpfpuffer
+pub con MQ_RZ_CAP: int64      := 72;   // Kapazitaet des Rumpfpuffers
+pub con MQ_RZ_GROESSE: int64  := 80;
+
+// Ergebnisse von MqRahmenFuettere.
+pub con MQ_RAHMEN_TEIL: int64   := 1;  // mehr Bytes noetig
+pub con MQ_RAHMEN_FERTIG: int64 := 2;  // vollstaendiges Paket liegt vor
+
+pub fn MqRahmenGroesse(): int64 { return MQ_RZ_GROESSE; }
+
+// `maxPaket` ist die lokale Obergrenze fuer das GESAMTE Paket einschliesslich
+// Fixed Header (Standardprofil: 1 MiB). `cap` muss den groessten erwarteten
+// Rumpf fassen, sonst meldet das Framing MQ_E_RUMPF_KLEIN statt zu wachsen.
+pub fn MqRahmenNeu(z: int64, puffer: int64, cap: int64, maxPaket: int64) {
+  poke64(z + MQ_RZ_ZUSTAND, 0);
+  poke64(z + MQ_RZ_KOPF, 0);
+  poke64(z + MQ_RZ_REMLEN, 0);
+  poke64(z + MQ_RZ_RLWERT, 0);
+  poke64(z + MQ_RZ_RLMULT, 1);
+  poke64(z + MQ_RZ_RLBYTES, 0);
+  poke64(z + MQ_RZ_GELESEN, 0);
+  poke64(z + MQ_RZ_MAXPAKET, maxPaket);
+  poke64(z + MQ_RZ_PUFFER, puffer);
+  poke64(z + MQ_RZ_CAP, cap);
+}
+
+// Nach MQ_RAHMEN_FERTIG: Zustand fuer das naechste Paket zuruecksetzen.
+pub fn MqRahmenWeiter(z: int64) {
+  poke64(z + MQ_RZ_ZUSTAND, 0);
+  poke64(z + MQ_RZ_KOPF, 0);
+  poke64(z + MQ_RZ_REMLEN, 0);
+  poke64(z + MQ_RZ_RLWERT, 0);
+  poke64(z + MQ_RZ_RLMULT, 1);
+  poke64(z + MQ_RZ_RLBYTES, 0);
+  poke64(z + MQ_RZ_GELESEN, 0);
+}
+
+pub fn MqRahmenTyp(z: int64): int64 { return (peek64(z + MQ_RZ_KOPF) / 16) & 0x0F; }
+pub fn MqRahmenFlags(z: int64): int64 { return peek64(z + MQ_RZ_KOPF) & 0x0F; }
+pub fn MqRahmenRumpfLen(z: int64): int64 { return peek64(z + MQ_RZ_REMLEN); }
+pub fn MqRahmenRumpf(z: int64): int64 { return peek64(z + MQ_RZ_PUFFER); }
+
+// Fuettert bis zu `len` Bytes. `verbrauchtAus` ist 0 oder die Adresse eines
+// int64-Platzes, der die Zahl der uebernommenen Bytes erhaelt — der Rest
+// gehoert zum naechsten Paket und wird beim naechsten Aufruf gefuettert.
+// Rueckgabe: MQ_RAHMEN_TEIL, MQ_RAHMEN_FERTIG oder Fehlercode.
+pub fn MqRahmenFuettere(z: int64, daten: int64, len: int64,
+                        verbrauchtAus: int64): int64 {
+  if (len < 0) { return MQ_E_LAENGE; }
+  var i: int64 := 0;
+  var rc: int64 := MQ_RAHMEN_TEIL;
+  while (i < len) {
+    var zustand: int64 := peek64(z + MQ_RZ_ZUSTAND);
+    if (zustand == 0) {
+      var b: int64 := peek8(daten + i) & 0xFF;
+      i := i + 1;
+      var typ: int64 := (b / 16) & 0x0F;
+      if (typ == 0) {
+        if (verbrauchtAus != 0) { poke64(verbrauchtAus, i); }
+        return MQ_E_TYP;
+      }
+      poke64(z + MQ_RZ_KOPF, b);
+      poke64(z + MQ_RZ_ZUSTAND, 1);
+    } else if (zustand == 1) {
+      var b2: int64 := peek8(daten + i) & 0xFF;
+      i := i + 1;
+      var nb: int64 := peek64(z + MQ_RZ_RLBYTES);
+      var wert: int64 := peek64(z + MQ_RZ_RLWERT);
+      var mult: int64 := peek64(z + MQ_RZ_RLMULT);
+      wert := wert + (b2 & 0x7F) * mult;
+      nb := nb + 1;
+      poke64(z + MQ_RZ_RLWERT, wert);
+      poke64(z + MQ_RZ_RLBYTES, nb);
+      if ((b2 & 0x80) != 0) {
+        if (nb >= 4) {
+          if (verbrauchtAus != 0) { poke64(verbrauchtAus, i); }
+          return MQ_E_VARINT_LANG;
+        }
+        poke64(z + MQ_RZ_RLMULT, mult * 128);
+      } else {
+        // Grenze greift hier — VOR dem Einlesen des Rumpfes (R-03).
+        var gesamt: int64 := 1 + nb + wert;
+        if (gesamt > peek64(z + MQ_RZ_MAXPAKET)) {
+          if (verbrauchtAus != 0) { poke64(verbrauchtAus, i); }
+          return MQ_E_PAKET_GROSS;
+        }
+        if (wert > peek64(z + MQ_RZ_CAP)) {
+          if (verbrauchtAus != 0) { poke64(verbrauchtAus, i); }
+          return MQ_E_RUMPF_KLEIN;
+        }
+        poke64(z + MQ_RZ_REMLEN, wert);
+        poke64(z + MQ_RZ_ZUSTAND, 2);
+        if (wert == 0) {
+          if (verbrauchtAus != 0) { poke64(verbrauchtAus, i); }
+          return MQ_RAHMEN_FERTIG;
+        }
+      }
+    } else if (zustand == 2) {
+      var noch: int64 := peek64(z + MQ_RZ_REMLEN) - peek64(z + MQ_RZ_GELESEN);
+      var da: int64 := len - i;
+      var nehme: int64 := noch;
+      if (da < noch) { nehme := da; }
+      var ziel: int64 := peek64(z + MQ_RZ_PUFFER) + peek64(z + MQ_RZ_GELESEN);
+      var k: int64 := 0;
+      while (k < nehme) {
+        poke8(ziel + k, peek8(daten + i + k) & 0xFF);
+        k := k + 1;
+      }
+      i := i + nehme;
+      poke64(z + MQ_RZ_GELESEN, peek64(z + MQ_RZ_GELESEN) + nehme);
+      if (peek64(z + MQ_RZ_GELESEN) == peek64(z + MQ_RZ_REMLEN)) {
+        if (verbrauchtAus != 0) { poke64(verbrauchtAus, i); }
+        return MQ_RAHMEN_FERTIG;
+      }
+    } else {
+      return MQ_E_ZUSTAND;
+    }
+  }
+  if (verbrauchtAus != 0) { poke64(verbrauchtAus, i); }
+  return rc;
+}
