@@ -587,8 +587,35 @@ done
 for satz in "rsa rsaca rsa.example" "ed edca ed.example"; do
   set -- $satz; art=$1; ca=$2; host=$3
   p="$(freierPort)"; PORT=$((PORT+1))
-  ( ulimit -v 4000000 -c 0; "$TMP/srv" "$p" "$art" > "$TMP/srv_$art.txt" 2>&1 ) &
+  # #2418: Der Exit-Code des Servers wird MITGESCHRIEBEN. Ohne ihn stand im
+  # Protokoll nur "Antwort fehlt", und genau daran ist die Ursachensuche
+  # zweimal vorbeigelaufen: der Server starb an einem SIGNAL (rc 141 =
+  # 128+13 = SIGPIPE), was man an der fehlenden Antwort nicht sieht.
+  ( ulimit -v 4000000 -c 0; "$TMP/srv" "$p" "$art" > "$TMP/srv_$art.txt" 2>&1
+    echo "exit=$?" >> "$TMP/srv_$art.txt" ) &
   warteAufPort "$p" 20 || echo "  HINWEIS: Server lauscht nach 20 s nicht auf $p"
+  # #2418: GEMESSEN, aber Ursache NOCH NICHT gefunden. Stand der Diagnose:
+  #
+  #   * Reproduzierbar mit acht Dauerlast-Prozessen auf acht Kernen: ohne
+  #     Last 3 von 3 Laeufen gruen, mit Last 7 PASS/4 FAIL.
+  #   * Der Server gibt `empfangen 18 GET / HTTP/1.0` aus und kommt NICHT
+  #     bis zu seinem "fertig". Exit-Code 141 = 128+13 = SIGPIPE.
+  #   * s_client laeuft GENAU 40,04 s, also bis in sein `timeout` — er wird
+  #     erschlagen, nicht fertig. Seine Ausgabe bricht beim `---` vor den
+  #     Nutzdaten ab.
+  #
+  # Daraus folgt: BEIDE Seiten warten. SIGPIPE ist die FOLGE (timeout
+  # beendet s_client, danach schreibt der Server in einen toten Socket),
+  # nicht die Ursache.
+  #
+  # Ein groesseres Zeitfenster hilft deshalb NICHT — probiert mit
+  # `sleep 30`/`timeout 40` statt 3/25: unveraendert 7 PASS/4 FAIL und
+  # weiter exit=141. Darum steht hier wieder der alte Wert; wer die Frist
+  # anfasst, behebt nichts.
+  #
+  # Naechster Schritt: strace auf BEIDE Seiten, um zu sehen, wer auf wen
+  # wartet (Server im Schreibpfad nach TlsSchreibe/TlsAusgabe/TCPConnWrite,
+  # s_client in select auf stdin und Socket).
   ( printf 'GET / HTTP/1.0\r\n\r\n'; sleep 3 ) | timeout 25 openssl s_client \
      -connect "127.0.0.1:$p" -ign_eof -servername "$host" \
      -CAfile "$TMP/certs/$ca.pem" -tls1_3 > "$TMP/os_$art.txt" 2>&1
@@ -606,6 +633,9 @@ for satz in "rsa rsaca rsa.example" "ed edca ed.example"; do
   if [ "$ok" != 1 ]; then
     echo "  openssl: $(grep -E 'Peer signature type|Verify return code' "$TMP/os_$art.txt" | tr '\n' ' ')"
     echo "  lyx:     $(tr '\n' ' ' < "$TMP/srv_$art.txt")"
+    # #2418: WO die Gegenstelle abbricht, sagt mehr als dass die Antwort
+    # fehlt. Endet sie beim `---`, ist s_client vor den Nutzdaten gegangen.
+    echo "  openssl-Ausgabe: $(wc -c < "$TMP/os_$art.txt") Byte, letzte Zeile: $(tail -1 "$TMP/os_$art.txt" | cut -c1-60)"
   fi
 
   # dieselbe Art in der Client-Rolle gegen s_server
