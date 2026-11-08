@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.33D
+VERSION   := 1.2.33E
 VERSION_DATE := 2026-11-07
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -365,6 +365,8 @@ test: lyxc
 	@bash tests/aes_ni_test.sh
 	@echo "--- GHASH mit PCLMULQDQ, AES-NI in AES-GCM, beide Wege gleich (#2390) ---"
 	@bash tests/ghash_pclmul_2390_test.sh
+	@echo "--- SHA-NI-Schnellweg fuer SHA-256, beide Wege gleich (#2391) ---"
+	@bash tests/sha_ni_2391_test.sh
 	@echo "--- fma mit einer Rundung, Hardware und exakter Rueckfall gegen libm (#2403) ---"
 	@bash tests/fma_2403_test.sh
 	@echo "--- memcpy: jedes Byte und Waechter, alle Wegegrenzen des Helfers (#2353) ---"
