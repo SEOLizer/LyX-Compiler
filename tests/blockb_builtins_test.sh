@@ -44,17 +44,20 @@ for fall in \
   else bad "lyxos: $name" "$(grep -oE 'unbekannter Name im Aufruf.*|unbekannter Builtin.*|Builtin-ID [0-9]+ .*' "$TMP/l" | head -1)"; fi
 done
 
-# ioctl stand bis 1.1.4M in der Liste oben, als baue es. Es baute auch — nur
-# emittierte es 0x0301, eine Nummer aus der Entwurfs-ABI, die es im LyxOS-Kernel
-# nicht gibt (implementiert: 0-228 und 300-326). Der erzeugte Aufruf ging ins
-# Leere. Seit #1734 meldet der Bau das, und das ist hier die Erwartung.
+# #2011: ioctl BAUT jetzt. 0x0301 = 769 ist seit WP-E im Kernel
+# (`ring3.lyx`: `0x0301 sys_ioctl(fd, request, arg)`), und die Aufrufform
+# stimmt — drei Argumente hier, drei dort. Bis dahin meldete der Waechter aus
+# #1734 die fehlende Nummer; diese Erwartung ist damit ueberholt.
+#
+# Geprueft wird jetzt das Gegenteil: es muss BAUEN. Ein Test, der weiter eine
+# Ablehnung verlangt, waere rot geworden, sobald die Luecke zugeht — genau der
+# Fall, vor dem CLAUDE.md warnt ("Ein Test darf nicht voraussetzen, dass eine
+# Luecke offen bleibt").
 printf 'fn main(): int64 { return ioctl(1, 0, 0); }\n' > "$TMP/i.lyx"
-if timeout 300 "$LYXC" --std-path="$ROOT" --target=lyxos "$TMP/i.lyx" -o "$TMP/i.out" >"$TMP/li" 2>&1; then
-  bad "lyxos: ioctl meldet" "baut durch, obwohl 0x0301 im Kernel fehlt"
-elif grep -q "gibt es in LyxOS nicht" "$TMP/li"; then
-  ok "lyxos: ioctl meldet die fehlende Nummer (#1734)"
+if "$LYXC" --std-path="$ROOT" --target=lyxos "$TMP/i.lyx" -o "$TMP/i.lbf" >"$TMP/i.log" 2>&1; then
+  ok "lyxos: ioctl baut (769, seit #2011)"
 else
-  bad "lyxos: ioctl meldet" "scheitert, aber nicht an der Nummernpruefung"
+  bad "lyxos: ioctl baut" "$(grep -m1 -iE 'error' "$TMP/i.log")"
 fi
 
 # --- 2: und sie rechnen richtig ----------------------------------------------
