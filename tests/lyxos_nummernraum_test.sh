@@ -75,12 +75,16 @@ pruefe_baut   "sys_timer_create (1282)" "sys_timer_create(0, 1, 0)"
 pruefe_baut   "sys_pledge (1795)"     "sys_pledge(1, 1)"
 pruefe_baut   "sys_task_spawn (2816)" "sys_task_spawn(1, 1, 1, 0)"
 pruefe_meldet "sys_ai_infer (0x0804)" "sys_ai_infer(1, 1, 1, 0)"
-# #2441-Abgleich: war eine Entwurfsnummer ohne Kernelhandler. Seit LyxOS
-# a9e1b19 gibt es den ganzen Block 0x0C00-0x0C04 (kernel/iofs18.lyx, LX-18),
-# und 3072 nimmt dort (disk_id, pfad) — zwei Argumente wie hier. Die Pruefung
-# ist deshalb umgedreht: sie darf nicht voraussetzen, dass die Luecke offen
-# bleibt.
-pruefe_baut   "sys_iofs_mount (0x0C00)" "sys_iofs_mount(1, 0)"
+# #2011 (WP-G3) und #2441-Abgleich: IOFS hat der Kernel seit lyx-os 5871f8e
+# (kernel/iofs18.lyx), hier auf den ENTWURFSNUMMERN 0x0C00-0x0C04 — anders als
+# bei LX-09, denn 3072 kollidiert mit nichts. Diese Zeile setzte voraus, dass
+# die Luecke offen bleibt, und wurde zweimal nachgezogen.
+#
+# Geprueft wird die NUMMER am Erzeugnis, nicht nur dass es uebersetzt: ein
+# Aufruf kann durchkommen und die falsche Nummer tragen, und auf lyxos faellt
+# das erst am Geraet auf.
+pruefe_bytes "sys_iofs_mount emittiert 3072" \
+    'fn main(): int64 { return sys_iofs_mount(1, 0); }' "3072" ""
 pruefe_baut   "sys_trace_event (2561)" "sys_trace_event(1, 1)"
 
 echo "-- LX-VFS-Block: belegt, war faelschlich abgewiesen --"
@@ -232,11 +236,32 @@ pruefe_meldet_text() {   # Name, Aufruf, erwarteter Textbaustein
     fi
 }
 
-pruefe_meldet_text "sys_thread_spawn" "sys_thread_spawn(0,0,0,0)" "sys_spawn_child"
-pruefe_meldet_text "sys_thread_exit"  "sys_thread_exit(0)"      "kein Thread-Ende"
-pruefe_meldet_text "sys_wait"         "sys_wait(0,0,0)"         "nicht vorgesehen"
-pruefe_meldet_text "sys_priority"     "sys_priority(0,0)"       "314/315"
-pruefe_meldet_text "sys_signal_mask"  "sys_signal_mask(0,0)"    "kein Signalmodell"
+# #2011 (WP-G4): diese fuenf hat der Kernel seit lyx-os 5871f8e
+# (kernel/proc09.lyx, kernel/task13.lyx) — 352-356. Hier stand bis dahin die
+# Gegenprobe, dass sie mit einer erklaerenden Meldung ABGEWIESEN werden; der
+# Test setzte damit voraus, dass die Luecke offen bleibt, und wurde beim
+# Schliessen rot. Jetzt wird am ERZEUGNIS geprueft, welche Nummer herauskommt.
+#
+# Eine Verbotsnummer gibt es hier nicht: die alten Zweige riefen
+# meldeKeinKernelAufruf und emittierten gar nichts, es kann also keine
+# Altnummer stehengeblieben sein. Die Gegenseite deckt `pruefe_meldet` weiter
+# oben ab (sys_ai_infer 0x0804 u. a.) — Aufrufe, die der Kernel NICHT hat,
+# muessen weiterhin laut scheitern.
+#
+# Die Nummern liegen im FREIEN Bereich, nicht auf den Entwurfsnummern:
+# 0x0000-0x000D ist im Kernel sys_read, sys_close und Nachbarn. Derselbe Grund
+# wie bei sys_spawn (91) und sys_getpid (136), und derselbe Fehler, der
+# sys_gettid einmal auf die 8 (sys_lseek) gelegt hat.
+pruefe_bytes "sys_thread_spawn emittiert 352" \
+    'fn main(): int64 { return sys_thread_spawn(0,0,0,0); }' "352" ""
+pruefe_bytes "sys_thread_exit emittiert 353" \
+    'fn main(): int64 { sys_thread_exit(0); return 0; }' "353" ""
+pruefe_bytes "sys_wait emittiert 354" \
+    'fn main(): int64 { return sys_wait(0,0,0); }' "354" ""
+pruefe_bytes "sys_priority emittiert 355" \
+    'fn main(): int64 { return sys_priority(0,0); }' "355" ""
+pruefe_bytes "sys_signal_mask emittiert 356" \
+    'fn main(): int64 { return sys_signal_mask(0,0); }' "356" ""
 
 # #2011: sys_gettid und sys_getrandom hat der Kernel seit lyx-os 6187de3 —
 # 257 bzw. 258. Hier stand bis dahin die Gegenprobe, dass sie ABGELEHNT
