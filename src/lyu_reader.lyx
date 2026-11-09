@@ -13,6 +13,15 @@ con LYU_R_M2: int64 := 85;  // 'U'
 // die Datei am Stueck.
 pub con LYU_MAX_BYTES: int64 := 67108864;
 
+// #2445: hoechste Formatfassung, die dieser Leser versteht. Eine hoehere wird
+// ABGEWIESEN und nicht geraten: bis 1.2.33x las LyrInit die Zahl und benutzte
+// sie nur fuer die Frage, ob die drei v2-Metadatenfelder dastehen -- eine
+// Fassung 3 waere damit als 2 gelesen worden, und jedes Feld dahinter waere um
+// die Laenge des neuen Kopfteils verschoben. Wer das Format erweitert, erhoeht
+// hier UND in src/lyu_writer.lyx (LYU_W_VER) und in _irLyuIrVersatz
+// (src/ir_lower.lyx) -- drei Leser derselben Sache.
+pub con LYU_R_VER_MAX: int64 := 2;
+
 // #2142: Arten im Anhangverzeichnis (Aufbau: Kopfkommentar in lyu_writer.lyx).
 pub con LYU_ANH_ENUMS:   int64 := 1;
 pub con LYU_ANH_GLOBALS: int64 := 2;
@@ -117,13 +126,31 @@ pub type LyuReader = class {
   pub konOffset:   int64;   // #2014 Stufe 1: Konstantenwerte
   pub symStart:    int64;   // #2014: Beginn der Symboltabelle
   pub valid:       bool;
+  // #2445: Lesen jenseits des Puffers. `_u8` liefert dort 0 und kann das nicht
+  // melden -- eine abgeschnittene Datei liest sich dadurch als Nullen, also
+  // symCount 0 und alle Offsets 0. Das ist ein GUELTIGER Zustand (eine Unit
+  // ohne Symbole, #1966), und genau deshalb wurde aus einer auf 40 Byte
+  // gekuerzten std/fs.lyu die Meldung "undefined symbol 'SEEK_END'" statt
+  // eines Hinweises auf die Datei. Der Merker trennt die beiden Faelle.
+  pub ueberlauf:   int64;
+  // #2445: Grund des Fehlschlags von LyrInit, 0 wenn keiner. Der Leser kennt
+  // den Dateinamen nicht -- die Aufrufer setzen ihn davor; der Grund gehoert
+  // hierher, weil nur hier bekannt ist, WAS nicht stimmte.
+  pub grund:       pchar;
+  // #2445: Zahl zum Grund, wenn eine dazugehoert (gelesene Formatfassung,
+  // Dateigroesse), sonst 0. "unbekannte Formatfassung" ohne die Zahl laesst
+  // offen, ob die Datei zu alt oder zu neu ist -- und das entscheidet, ob der
+  // Compiler oder die Datei erneuert werden muss.
+  pub grundZahl:   int64;
   // #2014 Stufen 2–4: Puffer fuer LyrDeklText
   tx:    int64;
   txLen: int64;
   txCap: int64;
 
   fn _u8(): int64 {
-    if (self.pos >= self.size) { return 0; }
+    // #2445: Der Rueckgabewert bleibt 0 -- die Leser dahinter rechnen damit.
+    // Neu ist nur, dass es AKTENKUNDIG wird.
+    if (self.pos >= self.size) { self.ueberlauf := 1; return 0; }
     var v: int64 := peek8(self.data + self.pos) & 255;
     self.pos += 1;
     return v;
@@ -160,22 +187,39 @@ pub type LyuReader = class {
 
   // Parse header. Returns true if valid magic + supported version.
   pub fn LyrInit(fileData: int64, fileSize: int64): bool {
-    self.data  := fileData;
-    self.size  := fileSize;
-    self.pos   := 0;
-    self.valid := false;
+    self.data      := fileData;
+    self.size      := fileSize;
+    self.pos       := 0;
+    self.valid     := false;
+    self.ueberlauf := 0;          // #2445
+    self.grund     := 0 as pchar;  // #2445
+    self.grundZahl := 0;           // #2445
 
-    if (fileSize < 10) { return false; }
+    if (fileSize < 10) {
+      self.grund := "Datei ist kuerzer als der Kopf, Byte"c;
+      self.grundZahl := fileSize;
+      return false;
+    }
 
     // Magic
-    if (self._u8() != LYU_R_M0) { return false; }
-    if (self._u8() != LYU_R_M1) { return false; }
-    if (self._u8() != LYU_R_M2) { return false; }
+    if (self._u8() != LYU_R_M0 || self._u8() != LYU_R_M1 || self._u8() != LYU_R_M2) {
+      self.grund := "kein LYU-Kopf (Magic stimmt nicht)"c;
+      return false;
+    }
     self._u8();  // NUL
 
     self.version := self._u16le();
     self.arch    := self._u8();
     self.flags   := self._u8();
+
+    // #2445: unbekannte Fassung wird abgewiesen, nicht geraten.
+    if (self.version < 1 || self.version > LYU_R_VER_MAX) {
+      // Die Zahl gehoert dazu: zu alt heisst "neu vorkompilieren", zu neu
+      // heisst "dieser Compiler ist der aeltere".
+      self.grund := "Formatfassung nicht unterstuetzt (verstanden wird bis 2), gelesen"c;
+      self.grundZahl := self.version;
+      return false;
+    }
 
     // Unit name
     var ulen: int64 := self._u16le();
@@ -202,8 +246,42 @@ pub type LyuReader = class {
     // wo sie anfaengt.
     self.symStart := self.pos;
 
+    // #2445: Hat das Lesen des Kopfes den Puffer verlassen, ist die Datei
+    // abgeschnitten. Ohne diese Frage waeren symCount und alle Offsets 0 --
+    // nicht von einer Unit ohne Symbole zu unterscheiden.
+    if (self.ueberlauf != 0) {
+      self.grund := "Datei ist abgeschnitten (Kopf reicht ueber das Ende)"c;
+      return false;
+    }
+    // Ein Offset hinter dem Dateiende zeigt ins Leere. Gelesen wird dort
+    // spaeter, nicht hier -- dann aber ohne jede Grenze.
+    if (self.konOffset > self.size || self.debugOffset > self.size
+        || self.resOffset > self.size || self.symStart > self.size) {
+      self.grund := "Abschnittsversatz liegt hinter dem Dateiende"c;
+      return false;
+    }
+
     self.valid := true;
     return true;
+  }
+
+  // #2445: Grund des letzten LyrInit-Fehlschlags, 0 wenn keiner. Zusammen mit
+  // dem Dateinamen des Aufrufers ergibt das eine Meldung, die auf die Datei
+  // zeigt statt auf ein Symbol, das sie haette tragen sollen.
+  pub fn LyrGrund(): pchar {
+    if (self.grund == 0 as pchar) { return "ohne Angabe"c; }
+    return self.grund;
+  }
+
+  // #2445: Grund samt Zahl auf stderr. Die Aufrufer haben den Pfad davor
+  // geschrieben; hier kommt, was nicht stimmte.
+  pub fn LyrGrundMelden() {
+    EPrintStr(self.LyrGrund());
+    if (self.grundZahl != 0) {
+      EPrintStr(" "c);
+      EPrintInt(self.grundZahl);
+    }
+    EPrintStrLn(""c);
   }
 
   fn _archStr(a: int64): pchar { return LyuArchName(a); }

@@ -484,6 +484,8 @@ test: lyxc
 	@bash tests/audio_fs_symbolkollision_test.sh
 	@echo "--- #2444: jede Unit hat ein .lyu im Paketbaum ---"
 	@bash tests/paket_lyu_vollstaendig_test.sh
+	@echo "--- #2445: unbrauchbare .lyu nennt die Datei ---"
+	@bash tests/lyu_leser_laut_test.sh
 	@echo "--- std.aero: Atmosphaere, Flugleistung, Vorhersage, Profile, Warteschleifen ---"
 	@bash tests/aero_test.sh
 	@bash tests/ee_test.sh
