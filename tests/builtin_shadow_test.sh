@@ -58,9 +58,10 @@ EXPECTED_CON = {
     "PROT_READ", "PROT_RW", "PROT_WRITE",
     # #2137: open-Flags. x86 (cg_addBuiltinCons) und der IR-Weg
     # (_irEingebauteKonst) ersetzten sie schon immer; sema kennt sie seither
-    # ebenfalls. std/fs.lyx, std/audio.lyx und src/std/lyxos/fs.lyx deklarieren
-    # dieselben Werte (0, 1, 2, 64, 512, 1024) — gemessen neben std.fs in
-    # tests/sema_reste_2137_test.sh.
+    # ebenfalls. std/fs.lyx und src/std/lyxos/fs.lyx deklarieren dieselben
+    # Werte (0, 1, 2, 64, 512, 1024) — gemessen neben std.fs in
+    # tests/sema_reste_2137_test.sh. std/audio.lyx hat seine Zweitfassung mit
+    # #2441 abgegeben: sie machte std.audio und std.fs unvereinbar.
     "O_APPEND", "O_CREAT", "O_RDONLY", "O_RDWR", "O_TRUNC", "O_WRONLY",
 }
 
