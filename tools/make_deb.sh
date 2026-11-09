@@ -1,13 +1,23 @@
 #!/usr/bin/env bash
 # tools/make_deb.sh — Paketbaum befüllen und das .deb bauen.
 #
-# Warum es dieses Skript gibt: der Paketbaum ist eine ZWEITE Ablage derselben
-# Bibliothek. Der Import-Resolver bevorzugt .lyx vor .lyu, die gepackten
-# Quelltexte sind also funktional maßgeblich — weicht der Baum von std/ ab,
-# übersetzt ein installiertes lyxc gegen eine andere Bibliothek als die
-# getestete. Genau das war #1362 (296 von 391 Units kaputt, für `make test`
-# unsichtbar). Deshalb kopiert dieses Skript nicht nur, es räumt auch auf
-# (--delete) und prüft das Ergebnis, bevor es paketiert.
+# Warum es dieses Skript gibt: das Paket enthält eine ZWEITE Ablage der
+# Bibliothek, und was dort landet, muss zum geprüften Stand gehören. Bis
+# 1.2.34B lagen die .lyx-Quelltexte mit im Paket; weil der Import-Resolver
+# .lyx vor .lyu bevorzugt, waren sie funktional maßgeblich — und eine
+# veraltete Kopie übersetzte beim Benutzer gegen eine andere Bibliothek als
+# die getestete (#1362: 296 von 391 Units kaputt, für `make test` unsichtbar).
+#
+# Seit #2447 liefert das Paket KEINEN Lyx-Quellcode mehr, sondern nur `lyxc`,
+# die vorkompilierten .lyu, Handbuchseite und Copyright. Die Quellen kommen
+# aus dem LPM-Paket `std` (#2448); wer gegen sie übersetzen will, zeigt
+# `--std-path` bzw. `LYX_STD_PATH` auf den Cache.
+#
+# ACHTUNG, bekannte Einschränkung (#2449): der x86-Codegen übersetzt
+# importierte Units aus der QUELLE — gemessen scheitern 192 von 489
+# Unit-Importen gegen einen reinen .lyu-Baum. x86-Benutzer brauchen die
+# Quellen also weiter, und genau deshalb steht der Bezugsweg in der
+# Handbuchseite.
 #
 # Aufruf:
 #   tools/make_deb.sh                 # Architektur von dpkg erfragen
@@ -26,7 +36,10 @@ BIN_DST="$PKG_DIR/usr/local/bin"
 CONTROL="$PKG_DIR/DEBIAN/control"
 MAN_DST="$PKG_DIR/usr/share/man/man1"
 DOC_DST="$PKG_DIR/usr/share/doc/lyx-compiler"
-QUELLEN=(std data KassenSichV)
+# #2447: KassenSichV stand hier mit. Es sind neun Delphi-.pas und ein README —
+# gar keine Lyx-Units, und mit der Entscheidung "kein Quellcode im Paket" wird
+# es als eigenes Artefakt ausgeliefert.
+QUELLEN=(std data)
 
 ARCH=""
 OUTDIR="."
@@ -116,20 +129,39 @@ fi
 DEB="$OUTDIR/lyxc_${VERSION}_${ARCH}.deb"
 echo "Version $VERSION, Architektur $ARCH → $DEB"
 
-# ── 3. Quellen in den Paketbaum ──────────────────────────────────────────────
-# rsync --delete räumt Dateien weg, die in der Quelle nicht mehr existieren.
-# Die vorkompilierten .lyu sind ausgenommen: sie haben keine Entsprechung in
-# std/ und würden sonst bei jedem Lauf gelöscht.
-
-command -v rsync >/dev/null || fehler "rsync wird gebraucht (Aufräumen verwaister Dateien)."
-
+# ── 3. Vorkompilate prüfen ───────────────────────────────────────────────────
+# Die .lyu liegen bereits im Paketbaum: `make precompile-units` erzeugt sie
+# dorthin (Regel $(UNITS_DST)/%.lyu). Kopiert wird hier also nichts mehr --
+# geprüft wird, dass zu JEDER Quelle ein Vorkompilat vorliegt. Fehlte eines,
+# verlöre der Benutzer die Unit ersatzlos, und zwar ohne Meldung: eine Unit,
+# die es nicht gibt, ist von einer Unit ohne Symbole nicht zu unterscheiden
+# (#2444).
 for q in "${QUELLEN[@]}"; do
   [ -d "$q" ] || fehler "Quellverzeichnis '$q' fehlt."
-  mkdir -p "$UNITS_DST/$q"
-  rsync -a --delete --exclude='*.lyu' --exclude='.git' \
-        "$q/" "$UNITS_DST/$q/"
-  printf '  %-14s %5d Dateien\n' "$q" "$(find "$UNITS_DST/$q" -type f ! -name '*.lyu' | wc -l)"
+  fehlend=""
+  n=0
+  while IFS= read -r f; do
+    n=$((n + 1))
+    lyu="$UNITS_DST/${f%.lyx}.lyu"
+    [ -f "$lyu" ] || fehlend="$fehlend $f"
+  done < <(find "$q" -name '*.lyx' | sort)
+  if [ -n "$fehlend" ]; then
+    printf '%s\n' $fehlend | head -10 >&2
+    fehler "$(printf '%s\n' $fehlend | wc -l) von $n Units ohne .lyu — 'make precompile-units' fahren."
+  fi
+  printf '  %-14s %5d Units, %5d Vorkompilate\n' "$q" "$n" \
+         "$(find "$UNITS_DST/$q" -name '*.lyu' | wc -l)"
 done
+
+# Kein Quellcode im Paketbaum. Die Prüfung steht hier und nicht erst am
+# fertigen Paket, damit ein versehentlich wieder hineinkopierter Baum sofort
+# auffällt statt erst beim Benutzer.
+quellreste="$(find "$UNITS_DST" -name '*.lyx' -o -name '*.pas' -o -name '*.dpr' | head -5)"
+if [ -n "$quellreste" ]; then
+  printf '%s\n' "$quellreste" >&2
+  fehler "Quelldateien im Paketbaum — seit #2447 liefert das Paket keine aus.
+        Entfernen: find $UNITS_DST -name '*.lyx' -delete"
+fi
 
 mkdir -p "$BIN_DST"
 install -m 755 ./lyxc "$BIN_DST/lyxc"
@@ -178,15 +210,33 @@ if [ -f CHANGELOG.md ]; then
   chmod 644 "$DOC_DST/changelog.gz"
 fi
 
-# Gegenprobe: nach dem Kopieren muss jede Quelle im Baum inhaltsgleich sein.
-# Ohne sie wäre eine halb durchgelaufene Kopie nicht von Erfolg zu
-# unterscheiden.
-for q in "${QUELLEN[@]}"; do
-  if ! diff -rq --exclude='*.lyu' "$q" "$UNITS_DST/$q" >/dev/null; then
-    diff -rq --exclude='*.lyu' "$q" "$UNITS_DST/$q" | head -5 >&2
-    fehler "'$q' und die Paketkopie weichen nach dem Kopieren ab."
+# #2447: Hier stand die Gegenprobe "jede Quelle ist im Baum inhaltsgleich".
+# Sie entfällt mit den Quellen. An ihre Stelle tritt die Frage, ob die
+# ausgelieferten .lyu zum aktuellen Quellstand gehören — und die ist jetzt
+# beantwortbar, weil zweimaliges Vorkompilieren bytegleiche Dateien ergibt
+# (#2446, über alle 500 Units gemessen).
+#
+# Geprüft wird eine Auswahl, nicht alle 500: ein voller Durchlauf dauert
+# Minuten, und `make deb` soll bezahlbar bleiben. Die Vollprüfung macht
+# `make precompile-units` von selbst, weil dort jede Quelle neuer als ihr
+# Vorkompilat erkannt und neu übersetzt wird.
+echo "Stichprobe: stimmen die .lyu mit den Quellen überein?"
+stich="std/fs.lyx std/io.lyx std/string.lyx std/url.lyx std/crypto/sha256.lyx"
+tmpv="$(mktemp -d)"
+abweichung=""
+for f in $stich; do
+  [ -f "$f" ] || continue
+  if ! ./lyxc "$f" --compile-unit -o "$tmpv/p.lyu" --std-path=. >"$tmpv/log" 2>&1; then
+    rm -rf "$tmpv"; fehler "$f lässt sich nicht vorkompilieren: $(grep -m1 -i error "$tmpv/log")"
   fi
+  cmp -s "$tmpv/p.lyu" "$UNITS_DST/${f%.lyx}.lyu" || abweichung="$abweichung $f"
 done
+rm -rf "$tmpv"
+if [ -n "$abweichung" ]; then
+  fehler "Vorkompilat weicht von der Quelle ab:$abweichung
+        'make precompile-units' fahren; die .lyu im Paketbaum sind veraltet."
+fi
+echo "  Stichprobe stimmt."
 
 # ── 4. control stempeln ──────────────────────────────────────────────────────
 [ -f "$CONTROL" ] || fehler "$CONTROL fehlt."
@@ -240,8 +290,15 @@ if [ "$VERIFY" -eq 1 ]; then
   dpkg-deb --extract "$DEB" "$tmp"
   cmp -s ./lyxc "$tmp/usr/local/bin/lyxc" \
     || fehler "lyxc im Paket weicht vom gebauten Binary ab."
-  n_units="$(find "$tmp/usr/include/lyx/units" -name '*.lyx' | wc -l)"
-  [ "$n_units" -gt 0 ] || fehler "keine .lyx im Paket — der Paketbaum war leer."
+  # #2447: Hier stand `-name '*.lyx'` und die Forderung "mehr als 0". Nach dem
+  # Umstieg wäre genau das der Fehlerfall, und die alte Prüfung hätte ihn
+  # bestätigt statt gemeldet.
+  n_quellen="$(find "$tmp/usr/include/lyx/units" \( -name '*.lyx' -o -name '*.pas' \) | wc -l)"
+  [ "$n_quellen" -eq 0 ] || fehler "$n_quellen Quelldatei(en) im fertigen Paket — seit #2447 liefert es keine aus."
+  n_units="$(find "$tmp/usr/include/lyx/units" -name '*.lyu' | wc -l)"
+  n_soll="$(find std data -name '*.lyx' | wc -l)"
+  [ "$n_units" -eq "$n_soll" ] \
+    || fehler "Paket enthält $n_units .lyu, die Quelle hat $n_soll Units — 'make precompile-units' fahren."
 
   # Handbuchseite: liegt sie richtig, ist sie gepackt, und findet mandb sie?
   mp="$tmp/usr/share/man/man1/lyxc.1.gz"
@@ -263,7 +320,7 @@ if [ "$VERIFY" -eq 1 ]; then
   fi
 
   [ -f "$tmp/usr/share/doc/lyx-compiler/copyright" ] || fehler "copyright fehlt im Paket (Policy 12.5)."
-  echo "  $PKGNAME $VERSION/$ARCH stimmen, lyxc identisch, $n_units .lyx-Quelltexte enthalten."
+  echo "  $PKGNAME $VERSION/$ARCH stimmen, lyxc identisch, $n_units Vorkompilate, 0 Quelldateien."
 fi
 
 echo ""
