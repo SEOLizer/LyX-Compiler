@@ -157,11 +157,18 @@ fi
 # --- 5. Bezug aus dem Cache: uebersetzen UND ausfuehren ----------------------
 # Die Wirkung, nicht das Vorhandensein. Ein Test, der nur das Entpacken prueft,
 # waere auch von einem Paket erfuellt, dessen Units nicht uebersetzen.
-pkg="$(find "$TMP/out" -name 'std-*.lxpkg' 2>/dev/null | head -1)"
+# Jedes .lxpkg, nicht "std-*": der Name steckt im Dateinamen, und das Muster
+# "std-*" fand "lyx-std-dev-0.1.0.lxpkg" nicht mehr -- Teil 5 wurde dann als
+# UEBERSPRUNGEN gemeldet, was wie "kein lpm da" aussieht und keine Luecke.
+pkg="$(find "$TMP/out" -name '*.lxpkg' 2>/dev/null | head -1)"
 if [ -z "$pkg" ] || ! command -v lpm >/dev/null; then
   skip "kein Paket gebaut (lpm fehlt) — Bezug aus dem Cache nicht gemessen"
 else
-  v="$(basename "$pkg" .lxpkg | sed 's/^std-//')"
+  # Name und Fassung aus dem Manifest, nicht aus dem Dateinamen geraten: der
+  # Name ist seit dem 2026-11-09 "lyx-std-dev" (siehe Kopf des Generators), und
+  # ein Test, der "std" annimmt, prueft dann etwas anderes als das Erzeugnis.
+  nm="$(grep -m1 '^name' "$TMP/exp/lyx.toml" | sed 's/.*"\(.*\)".*/\1/')"
+  v="$(grep -m1 '^version' "$TMP/exp/lyx.toml" | sed 's/.*"\(.*\)".*/\1/')"
   # EIGENES Heimatverzeichnis: lpm leitet seinen Cache aus HOME ab
   # (lpm/core/cache.lyx:48, lpm/cli/commands.lyx:84 liest HOME aus envp).
   # Ohne das schriebe dieser Test in den echten ~/.lpm/cache des Benutzers --
@@ -169,8 +176,8 @@ else
   # --offline dazu: der Cache-Treffer genuegt, und ein Netzzugriff machte den
   # Test von der Registry abhaengig.
   mkdir -p "$TMP/home"
-  if HOME="$TMP/home" lpm --offline cache add "$pkg" std "$v" >"$TMP/add.log" 2>&1; then
-    cachedir="$TMP/home/.lpm/cache/std/$v"
+  if HOME="$TMP/home" lpm --offline cache add "$pkg" "$nm" "$v" >"$TMP/add.log" 2>&1; then
+    cachedir="$TMP/home/.lpm/cache/$nm/$v"
     printf 'import std.io;\nimport std.string;\nfn main(): int64 { PrintLn(StrConcat("a"c, "b"c)); return 0; }\n' \
       > "$TMP/p.lyx"
     if ( cd "$TMP" && ulimit -v 4000000; LYX_STD_PATH="$cachedir" "$LYXC" "$TMP/p.lyx" -o "$TMP/p" ) >"$TMP/c.log" 2>&1; then
@@ -185,15 +192,25 @@ else
     fi
     # [build.units] an der WIRKUNG pruefen, nicht an der Form: ein Eintrag,
     # den `lpm resolve` nicht findet, ist eine Behauptung ohne Deckung.
-    rp="$( cd "$TMP" && HOME="$TMP/home" lpm --offline resolve "std.fs" --entry 2>/dev/null | tail -1)"
+    rp="$( cd "$TMP" && HOME="$TMP/home" lpm --offline resolve "$nm.fs" --entry 2>/dev/null | tail -1)"
     case "$rp" in
-      */std/fs.lyx) ok "lpm resolve std.fs liefert $rp" ;;
-      *)            nok "lpm resolve std.fs liefert '$rp' statt eines Pfads auf std/fs.lyx" ;;
+      */std/fs.lyx) ok "lpm resolve $nm.fs liefert $rp" ;;
+      *)            nok "lpm resolve $nm.fs liefert '$rp' statt eines Pfads auf std/fs.lyx" ;;
     esac
+    # Gegenprobe zum NAMEN: unter "lyx-std-dev" darf `resolve std.fs` NICHT
+    # treffen -- lpm bildet den Importnamen auf den Paketnamen ab. Ohne diese
+    # Haelfte bliebe unklar, ob der Treffer oben am Namen oder am Zufall liegt.
+    if [ "$nm" != "std" ]; then
+      if ( cd "$TMP" && HOME="$TMP/home" lpm --offline resolve "std.fs" --entry ) >/dev/null 2>&1; then
+        nok "resolve std.fs trifft, obwohl das Paket '$nm' heisst"
+      else
+        ok "resolve std.fs trifft nicht — der Paketname bindet (Paket heisst '$nm')"
+      fi
+    fi
     # Und die Gegenseite: eine mehrstufige Unit ist ueber resolve NICHT
     # erreichbar. Ohne diese Haelfte koennte der Abschnitt stillschweigend
     # unvollstaendig sein und der Test waere zufrieden.
-    if ( cd "$TMP" && HOME="$TMP/home" lpm --offline resolve "std.net.types" --entry ) >/dev/null 2>&1; then
+    if ( cd "$TMP" && HOME="$TMP/home" lpm --offline resolve "$nm.net.types" --entry ) >/dev/null 2>&1; then
       ok "lpm resolve std.net.types geht jetzt auch — Eintraege nachziehen"
     else
       ok "mehrstufige Units bleiben resolve-fremd (erwartet, siehe Kopf)"

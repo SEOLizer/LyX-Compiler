@@ -65,6 +65,17 @@ cd "$ROOT" || exit 1
 VERSION=""
 OUTDIR="$ROOT/dist"
 EXPORT=""
+# Paketname. Entschieden am 2026-11-09: `lyx-std-dev`, nicht `std`.
+#
+# Was das kostet, gehoert hierher und nicht in eine Fussnote: `lpm resolve`
+# bildet den IMPORTNAMEN auf den PAKETNAMEN ab. Unter `lyx-std-dev` findet
+# `lpm resolve std.fs` das Paket also NICHT -- wohl aber
+# `lpm resolve lyx-std-dev.fs`. Fuer den heutigen Bezugsweg (LYX_STD_PATH auf
+# das Cache-Verzeichnis) ist das ohne Belang, denn dort zaehlen Pfade. Fuer die
+# kuenftige Compiler-Integration (lyx-lpm/docs/compiler-integration.md) ist es
+# eine Festlegung: ein Paket, das `import std.*` automatisch bedient, muesste
+# `std` heissen.
+NAME="lyx-std-dev"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -73,6 +84,8 @@ while [ $# -gt 0 ]; do
     --outdir)    OUTDIR="$2"; shift 2 ;;
     --outdir=*)  OUTDIR="${1#*=}"; shift ;;
     --export)    EXPORT="$2"; shift 2 ;;
+    --name)      NAME="$2"; shift 2 ;;
+    --name=*)    NAME="${1#*=}"; shift ;;
     -h|--help)   sed -n '2,40p' "$0"; exit 0 ;;
     *)           echo "unbekannte Option: $1" >&2; exit 2 ;;
   esac
@@ -86,10 +99,18 @@ command -v lpm >/dev/null || fehler "lpm nicht gefunden (PATH: ~/.local/bin)."
 # Keine Ableitung aus der Compilerversion: deren Suffix (1.2.34B) faellt in
 # SvParse still weg, zwei Bauten eines Tages waeren dieselbe Paketversion.
 if [ -z "$VERSION" ]; then
-  [ -f "$ROOT/dist/std-version.txt" ] \
-    && VERSION="$(cat "$ROOT/dist/std-version.txt")" \
+  [ -f "$ROOT/dist/$NAME-version.txt" ] \
+    && VERSION="$(cat "$ROOT/dist/$NAME-version.txt")" \
     || VERSION="0.1.0"
 fi
+# Nur Zeichen, die lpm zulaesst ([a-z0-9_/.-], keine Grossbuchstaben, keine
+# ".."-Segmente). Ein abgewiesener Name faellt sonst erst beim publish auf --
+# nach dem Packen.
+case "$NAME" in
+  *[!a-z0-9_/.-]*) fehler "Paketname '$NAME' hat unzulaessige Zeichen (erlaubt: a-z 0-9 _ / . -)." ;;
+  *..*)            fehler "Paketname '$NAME' hat ein '..'-Segment." ;;
+  ""|-*)           fehler "Paketname '$NAME' ist leer oder beginnt mit '-'." ;;
+esac
 case "$VERSION" in
   [0-9]*.[0-9]*.[0-9]*)
       rest="${VERSION##*.}"
@@ -104,7 +125,7 @@ LYXC_V="$(./lyxc --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-
 [ -n "$EXPORT" ] || EXPORT="$(mktemp -d)"
 mkdir -p "$EXPORT" "$OUTDIR"
 
-echo "Paket std $VERSION (gebaut gegen lyxc $LYXC_V)"
+echo "Paket $NAME $VERSION (gebaut gegen lyxc $LYXC_V)"
 
 # ── Quellen exportieren ──────────────────────────────────────────────────────
 # Nur .lyx und die READMEs: die .lyu gehoeren ins deb, nicht hierher, und ein
@@ -126,7 +147,7 @@ n_lyu="$(find "$EXPORT" -name '*.lyu' | wc -l)"
 # ── Manifest ─────────────────────────────────────────────────────────────────
 cat > "$EXPORT/lyx.toml" <<TOML
 [package]
-name        = "std"
+name        = "$NAME"
 version     = "$VERSION"
 author      = "Andreas Röne <andreas.roene@seolizer.de>"
 license     = "MIT"
@@ -155,8 +176,8 @@ entry = "std/io.lyx"
 # Ueber den heutigen Bezugsweg sind ALLE Units erreichbar, auch die
 # mehrstufigen:
 #
-#     lpm install std
-#     export LYX_STD_PATH=~/.lpm/cache/std/$VERSION
+#     lpm install $NAME
+#     export LYX_STD_PATH=~/.lpm/cache/$NAME/$VERSION
 #
 # Dort loest der Compiler ueber PFADE auf -- \`import std.cloud.gcp.jwt\`
 # findet std/cloud/gcp/jwt.lyx, weil die Dateien ihre Verzeichnisstruktur
@@ -240,13 +261,13 @@ if [ "$sha1" != "$sha2" ]; then
         ist (lpm packt ALLES daraus), sonst ist es ein lpm-Defekt."
 fi
 
-ziel="$OUTDIR/std-$VERSION.lxpkg"
+ziel="$OUTDIR/$NAME-$VERSION.lxpkg"
 cp "$pkg" "$ziel"
 # Das Archiv NICHT im Exportverzeichnis liegen lassen: `lpm pack` ueberspringt
 # vorhandene .lxpkg zwar, aber es zaehlt bei jeder Pruefung der Dateizahl mit
 # und verschiebt damit den Abstand zu PK_MAX_FILES um eins.
 rm -f "$pkg"
-echo "$VERSION" > "$OUTDIR/std-version.txt"
+echo "$VERSION" > "$OUTDIR/$NAME-version.txt"
 
 grep -i "warning" "$WERK/pack2.log" | head -5
 echo ""
@@ -256,4 +277,4 @@ echo ""
 echo "Veroeffentlichen (eigener Schritt, nicht hier):"
 echo "  cd $EXPORT && lpm publish"
 echo "Beziehen:"
-echo "  lpm install std && export LYX_STD_PATH=~/.lpm/cache/std/$VERSION"
+echo "  lpm install $NAME && export LYX_STD_PATH=~/.lpm/cache/$NAME/$VERSION"
