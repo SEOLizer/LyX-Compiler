@@ -570,6 +570,12 @@ pub type Sema = class {
 
   // WP-35: actual byte count of the last file read by _sema_readFile (binary-safe, no StrLen)
   lastReadSize: int64;
+  // #2445: Die Datei war DA, lieferte aber nichts (0 Byte oder abgebrochener
+  // Lesevorgang). _sema_readFile gibt dafuer dieselbe 0 zurueck wie fuer "gibt
+  // es nicht", und der Import meldete daraufhin "Modul nicht gefunden (weder
+  // .lyx noch .lyu)" -- wer das liest, prueft Suchpfade statt der Datei. Der
+  // Merker haelt den Unterschied fest, der Pfad steht in lastReadPath.
+  lastReadLeer: int64;
   lastReadPath: int64;   // #1098: welcher Pfad tatsaechlich geoeffnet wurde
   lastReadVertraut: int64;   // #2202: lag die zuletzt gelesene Datei im massgeblichen Baum?
   ffiHerkunftFremd: int64;   // #2202: Unit heisst std./src., kommt aber nicht aus dem Baum
@@ -2018,6 +2024,7 @@ pub type Sema = class {
   fn _sema_readFile(path: pchar): pchar {
     var fd: int64 := open(path, 0, 0);
     self.lastReadPath := path as int64;
+    self.lastReadLeer := 0;   // #2445: gilt je Leseversuch
     if (fd < 0) {
       // Paketwurzeln aus einer Projektdatei (*.lpf). Ein LPM-Paket liegt im
       // Cache flach — `vega.types` ist dort `<cache>/types.lyx`, nicht
@@ -2127,7 +2134,7 @@ pub type Sema = class {
     // kanonische Pfad kommt aus /proc/self/fd, nicht aus dem Suchweg.
     self.lastReadVertraut := HerkunftImBaum(fd, self.stdPath as pchar);
     var size: int64 := lseek(fd, 0, 2);
-    if (size <= 0) { close(fd); return 0 as pchar; }
+    if (size <= 0) { self.lastReadLeer := 1; close(fd); return 0 as pchar; }
     // WP-31: Dateigrößen-Limit 256 MB — verhindert OOM durch präparierte .lyu/.lyx-Eingaben
     if (size > 268435456) {
       PrintStr("error: _sema_readFile: Unit überschreitet 256-MB-Limit\n"c);
@@ -2136,7 +2143,9 @@ pub type Sema = class {
     lseek(fd, 0, 0);
     var buf: int64 := alloc(size + 1);
     var bytesRead: int64 := read(fd, buf as pchar, size);
-    if bytesRead != size { close(fd); return 0 as pchar; }  // WP-27: partieller Read → Fehler
+    // WP-27: partieller Read → Fehler. #2445: und zwar ein benennbarer; vorher
+    // war er von "Datei fehlt" nicht zu unterscheiden.
+    if bytesRead != size { self.lastReadLeer := 1; close(fd); return 0 as pchar; }
     poke8(buf + size, 0);
     close(fd);
     self.lastReadSize := size;  // WP-35: expose actual byte count for binary-safe callers
@@ -2616,6 +2625,19 @@ pub type Sema = class {
         lyuSrc := self._sema_readFile(ab as pchar);
       }
       if (lyuSrc == 0 as pchar) { lyuSrc := self._sema_readFile(lyuPath); }
+      // #2445: Die .lyu ist da, gibt aber nichts her (0 Byte oder abgebrochener
+      // Lesevorgang). Ohne diese Frage lief der Weg weiter bis "Modul nicht
+      // gefunden (weder .lyx noch .lyu)" -- eine Meldung, die auf den Suchpfad
+      // zeigt, obwohl die Datei am richtigen Platz liegt.
+      if (lyuSrc == 0 as pchar && self.lastReadLeer != 0) {
+        EPrintStr("sema error: .lyu nicht lesbar: "c);
+        EPrintStr(self.lastReadPath as pchar);
+        EPrintStrLn(" -- Datei ist leer oder liess sich nicht vollstaendig lesen"c);
+        EPrintStrLn("  Abhilfe: neu vorkompilieren (make precompile-units) oder das Paket erneuern."c);
+        self.hadError   := 1;
+        self.errorCount += 1;
+        return;
+      }
       if (lyuSrc != 0 as pchar) {
         impVertraut := self.lastReadVertraut;   // #2202: Herkunft der .lyu
         // WP-35: use actual file size (not StrLen) — .lyu is binary and contains null bytes
@@ -2640,6 +2662,27 @@ pub type Sema = class {
         var sdLB: int64 := alloc(8);
         poke64(sdLB, 0);
         if (sdR.LyrInit(lyuSrc as int64, lyuSize)) { sdTxt := sdR.LyrDeklText(sdLB); }
+        else {
+          // #2445: Hier wurde der Fehlschlag verworfen und einfach
+          // weitergemacht. Die Datei las sich dann als Nullen (LyuReader._u8
+          // liefert jenseits des Puffers 0), also symCount 0 und alle Offsets
+          // 0 -- nicht zu unterscheiden von einer Unit ohne Symbole, die
+          // GUELTIG ist (#1966). Eine auf 40 Byte gekuerzte std/fs.lyu
+          // meldete dadurch "undefined symbol 'SEEK_END'", und wer das liest,
+          // sucht den Fehler in seinem Programm statt in der Datei.
+          //
+          // Gemeldet wird hier und nicht im Leser: nur hier ist der PFAD
+          // bekannt, und der ist die halbe Auskunft.
+          EPrintStr("sema error: .lyu nicht lesbar: "c);
+          EPrintStr(self.lastReadPath as pchar);
+          EPrintStr(" -- "c);
+          sdR.LyrGrundMelden();
+          EPrintStrLn("  Die Datei traegt die Unit, deren Quelle fehlt; sie kann nicht uebersprungen werden."c);
+          EPrintStrLn("  Abhilfe: neu vorkompilieren (make precompile-units) oder das Paket erneuern."c);
+          self.hadError   := 1;
+          self.errorCount += 1;
+          return;
+        }
         if (sdTxt == 0) {
           self._sema_parseLyuSyms(lyuSrc, lyuSize, sdR, 0);
           self._sema_lyuEnums(lyuSrc, lyuSize);   // #2142
