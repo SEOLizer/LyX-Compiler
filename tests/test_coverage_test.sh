@@ -68,6 +68,13 @@ is_exempt() {
                                           # zwei Ableitungen, die
                                           # erbfeld_ir_test.sh auf drei Zielen
                                           # ausfuehrt. basis hat kein main.
+    # #2447: rp/a.lyx stand nur im Kommentar darunter, nicht als Eintrag. Es
+    # galt trotzdem als abgedeckt, weil die Pruefung den Dateinamen UNGEANKERT
+    # im Makefile sucht: "a.lyx" ist als Regex "a" + ein beliebiges Zeichen +
+    # "lyx" und traf irgendeine Zeile, die mit #2447 wegfiel. Die Luecke war
+    # also die ganze Zeit da und nur verdeckt.
+    data/erbevmt/rp/a.lyx)   return 0 ;;  # #1998: Ableitung ohne main, von
+                                          # erbe_vmt_ir_test.sh mitgenutzt.
     data/erbevmt/main.lyx)   return 0 ;;  # #1998: Pruefdaten, kein Test. Eine
                                           # Basis mit VIRTUELLER Methode in
                                           # eigener Unit; erst die VMT und die

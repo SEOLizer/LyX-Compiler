@@ -21,7 +21,10 @@ FAIL=0
 _pass() { echo "PASS $1"; PASS=$((PASS+1)); }
 _fail() { echo "FAIL $1: $2"; FAIL=$((FAIL+1)); }
 
-CT_LYX="lyx-compiler/usr/include/lyx/units/std/crypto/ct.lyx"
+# #2447: zeigte auf die Kopie im Paketbaum. Das Paket liefert keinen
+# Quellcode mehr aus; massgeblich ist ohnehin die kanonische Quelle unter
+# std/ -- die Kopie war nur eine zweite Ablage derselben Datei.
+CT_LYX="std/crypto/ct.lyx"
 
 # ── A: Regression — andere ct-Funktionen weiterhin korrekt ───────────────────
 

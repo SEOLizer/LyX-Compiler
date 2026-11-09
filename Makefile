@@ -33,7 +33,7 @@ SHARE_DST := $(PKG_DIR)/usr/share/lyx
 UNITS_LYU := $(patsubst std/%.lyx,  $(UNITS_DST)/%.lyu, $(UNITS_SRC))
 DATA_LYU  := $(patsubst data/%.lyx, $(DATA_DST)/%.lyu,  $(DATA_SRC))
 
-.PHONY: build bootstrap singularity test test-external test-lyxos test-lyx-integration test-known-red snapshot snapshot-update clean package precompile-units install-bin install-data lic_build_flags keygen sync-units-src deb
+.PHONY: build bootstrap singularity test test-external test-lyxos test-lyx-integration test-known-red snapshot snapshot-update clean package precompile-units install-bin install-data lic_build_flags keygen deb
 
 # ── Compiler bauen ────────────────────────────────────────────────────────────
 
@@ -1033,8 +1033,8 @@ test: lyxc
 	@echo "--- Wert statt Adresse: Feldzugriff, Verkettung, Array-Parameter, FloatToStr (19 Pruefungen) ---"
 	@bash tests/value_vs_address_test.sh
 	@echo "OK"
-	@echo "--- Paketbaum deckt sich mit std/ und uebersetzt (3 Pruefungen) ---"
-	@bash tests/packaged_units_sync_test.sh
+	@echo "--- #2447: der Paketbaum traegt nur Vorkompilate (4 Pruefungen) ---"
+	@bash tests/paket_ohne_quellen_test.sh
 	@echo "OK"
 	@echo "--- Grammatik-Hinweise: Generics, match-Auffangfall, StrNew, free, Closure (11 Pruefungen) ---"
 	@bash tests/grammar_hints_test.sh
@@ -1268,28 +1268,22 @@ snapshot-update: lyxc
 deb: precompile-units install-data
 	@bash tools/make_deb.sh $(DEB_ARCH)
 
-package: sync-units-src precompile-units install-bin install-data
+# #2447: `sync-units-src` stand hier als erste Abhaengigkeit und kopierte die
+# .lyx-Quelltexte in den Paketbaum. Das Paket liefert keine mehr aus; die .lyu
+# erzeugt `precompile-units` direkt an ihren Platz im Baum.
+package: precompile-units install-bin install-data
 	dpkg-deb --build $(PKG_DIR) $(DEB_NAME)
 	@echo ""
 	@echo "Paket fertig: $(DEB_NAME)"
 
-# Gepackte .lyx-Quelltexte aus der kanonischen Source synchronisieren.
-# Der Import-Resolver (sema.lyx) bevorzugt .lyx vor .lyu — die gepackten
-# .lyx sind also funktional autoritativ und MÜSSEN der Source entsprechen,
-# sonst kompiliert ein installiertes lyxc gegen veraltete stdlib.
-sync-units-src:
-	@echo "Synchronisiere std/ + data/ .lyx → Paketbaum..."
-	@for f in $(UNITS_SRC); do \
-		dst=$(UNITS_DST)/$${f#std/}; \
-		mkdir -p $$(dirname $$dst); \
-		cp $$f $$dst; \
-	done
-	@for f in $(DATA_SRC); do \
-		dst=$(DATA_DST)/$${f#data/}; \
-		mkdir -p $$(dirname $$dst); \
-		cp $$f $$dst; \
-	done
-	@echo "$(words $(UNITS_SRC) $(DATA_SRC)) .lyx-Quelltexte synchronisiert."
+# #2447: Hier stand `sync-units-src`. Es kopierte std/, data/ und KassenSichV/
+# als .lyx in den Paketbaum, weil der Import-Resolver .lyx vor .lyu bevorzugt
+# und die gepackten Quelltexte damit funktional massgeblich waren. Seit #2447
+# liefert das Paket keinen Quellcode mehr aus: die Quellen kommen aus dem
+# LPM-Paket `std` (#2448), und im Paket liegen nur die Vorkompilate.
+#
+# Das Ziel ist ersatzlos weg und nicht bloss leer: ein leeres Ziel, das
+# weiterhin aufgerufen wird, sieht wie eine Massnahme aus und ist keine.
 
 # Pass 1 DARF scheitern: eine Unit, deren Import noch kein .lyu hat, kommt erst
 # im zweiten Lauf durch — deshalb `-k` und das verworfene stderr, dessen
