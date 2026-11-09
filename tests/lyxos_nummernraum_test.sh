@@ -74,7 +74,12 @@ pruefe_baut   "sys_timer_create (1282)" "sys_timer_create(0, 1, 0)"
 pruefe_baut   "sys_pledge (1795)"     "sys_pledge(1, 1)"
 pruefe_baut   "sys_task_spawn (2816)" "sys_task_spawn(1, 1, 1, 0)"
 pruefe_meldet "sys_ai_infer (0x0804)" "sys_ai_infer(1, 1, 1, 0)"
-pruefe_meldet "sys_iofs_mount (0x0C00)" "sys_iofs_mount(1, 0)"
+# #2441-Abgleich: war eine Entwurfsnummer ohne Kernelhandler. Seit LyxOS
+# a9e1b19 gibt es den ganzen Block 0x0C00-0x0C04 (kernel/iofs18.lyx, LX-18),
+# und 3072 nimmt dort (disk_id, pfad) — zwei Argumente wie hier. Die Pruefung
+# ist deshalb umgedreht: sie darf nicht voraussetzen, dass die Luecke offen
+# bleibt.
+pruefe_baut   "sys_iofs_mount (0x0C00)" "sys_iofs_mount(1, 0)"
 pruefe_baut   "sys_trace_event (2561)" "sys_trace_event(1, 1)"
 
 echo "-- LX-VFS-Block: belegt, war faelschlich abgewiesen --"
