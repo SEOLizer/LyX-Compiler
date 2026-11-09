@@ -482,6 +482,8 @@ test: lyxc
 	@bash tests/alsa_format_test.sh
 	@echo "--- #2441: std.audio + std.fs gemeinsam importierbar ---"
 	@bash tests/audio_fs_symbolkollision_test.sh
+	@echo "--- #2444: jede Unit hat ein .lyu im Paketbaum ---"
+	@bash tests/paket_lyu_vollstaendig_test.sh
 	@echo "--- std.aero: Atmosphaere, Flugleistung, Vorhersage, Profile, Warteschleifen ---"
 	@bash tests/aero_test.sh
 	@bash tests/ee_test.sh
@@ -1285,6 +1287,15 @@ sync-units-src:
 	done
 	@echo "$(words $(UNITS_SRC) $(DATA_SRC)) .lyx-Quelltexte synchronisiert."
 
+# Pass 1 DARF scheitern: eine Unit, deren Import noch kein .lyu hat, kommt erst
+# im zweiten Lauf durch — deshalb `-k` und das verworfene stderr, dessen
+# Meldungen hier Erwartung und nicht Befund sind. Streng ist Pass 2 (kein `-k`):
+# was dort noch scheitert, bricht den Lauf ab.
+#
+# Was dieses Ziel NICHT leistet: es laeuft nur bei `make package`. Wer eine Unit
+# hinzufuegt und es nicht fahrt, checkt einen Paketbaum ohne deren .lyu ein --
+# 15 Units waren so unbemerkt ohne Vorkompilat (#2444). Dagegen wacht
+# tests/paket_lyu_vollstaendig_test.sh im `test`-Ziel.
 precompile-units: lyxc
 	@echo "Pass 1: Kompiliere Units..."
 	@$(MAKE) --no-print-directory -k $(UNITS_LYU) $(DATA_LYU) 2>/dev/null; true
