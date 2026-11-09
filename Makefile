@@ -488,6 +488,8 @@ test: lyxc
 	@bash tests/lyu_leser_laut_test.sh
 	@echo "--- #2446: .lyu ist reproduzierbar und ortsunabhaengig ---"
 	@bash tests/lyu_reproduzierbar_test.sh
+	@echo "--- #2448: LPM-Paket std ---"
+	@bash tests/lpm_std_paket_test.sh
 	@echo "--- std.aero: Atmosphaere, Flugleistung, Vorhersage, Profile, Warteschleifen ---"
 	@bash tests/aero_test.sh
 	@bash tests/ee_test.sh
