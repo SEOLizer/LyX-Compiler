@@ -268,6 +268,15 @@ case "$PKGNAME" in
 esac
 [ "${#PKGNAME}" -ge 2 ] || fehler "Paketname '$PKGNAME' ist kürzer als zwei Zeichen (Policy 5.6.1)."
 
+# #2448: Das Paket verweist in der Handbuchseite auf `lpm install std` --
+# ohne lpm ist die Standardbibliothek nicht beziehbar, und ohne sie scheitern
+# auf x86 192 von 489 Unit-Importen (#2449). Die Empfehlung gehoert deshalb in
+# control, und dass sie dort steht, wird geprueft statt vorausgesetzt.
+grep -q '^Recommends:.*lyx-lpm' "$CONTROL" \
+  || fehler "control fuehrt kein 'Recommends: lyx-lpm'.
+        Das Handbuch nennt 'lpm install std' als Bezugsweg der Bibliothek;
+        ohne die Empfehlung bekommt der Benutzer das Werkzeug nicht genannt."
+
 echo "control: Version $VERSION, Architecture $ARCH"
 
 # ── 5. Bauen ─────────────────────────────────────────────────────────────────
