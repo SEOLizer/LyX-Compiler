@@ -477,6 +477,7 @@ der eingesetzte Wert steht jeweils fest.
 | 541 | Linux-Syscall unshare (Nr. 1) | `sys_unshare` | #2021 |
 | 542 | Linux-Syscall epoll_pwait (Nr. 6) | `sys_epoll_pwait` | #2021 |
 | 543 | Linux-Syscall getpgid (Nr. 1) | `sys_getpgid` | #2021 |
+| 544 | Linux-Syscall clock_gettime (Nr. 113) | `clock_gettime`, `sys_clock_gettime` | #2021; `LSC_MAX` — die obere Grenze des Bereichs 440…544
 | 546 | Linux-Syscall mmap (Nr. 222, sechs Argumente) | `mmap` | #2122; nur arm64/android-arm64/riscv, LyxOS behaelt IRO_ALLOC; ausserhalb LSC_MIN..LSC_MAX, die Backends fragen `IstLinuxSys` |
 | 547 | Linux-Syscall newfstatat (Nr. 79) | `stat`, `sys_stat`, `lstat`, `sys_lstat`, `sys_newfstatat` | #2156; nur arm64/riscv (generische ABI ohne stat/lstat), dirfd AT_FDCWD, lstat mit AT_SYMLINK_NOFOLLOW |
 | 548 | Linux-Syscall readlinkat (Nr. 78) | `readlink`, `sys_readlink`, `sys_readlinkat` | #2156; nur arm64/riscv, dirfd AT_FDCWD |
@@ -536,6 +537,10 @@ arbeiten auf 16-Byte-Bloecken im Speicher, weil Lyx keinen 128-Bit-Werttyp hat.
 | 561 | ganze Blockentschluesselung (`AESDEC`/`AESDECLAST`, aequivalenter inverser Plan) | `aes_dec_block(dst, src, drk, rounds)` | wie 560 | #2383 |
 | 562 | `AESIMC` auf einem Block | `aes_imc(dst, src)` | wie 560 | #2383 |
 | 563 | `AESENCLAST` gegen einen Nullschluessel = tabellenfreies SubBytes | `aes_subword(dst, src)` | wie 560 | #2383 |
+| 564 | GHASH ueber ganze Bloecke (`PCLMULQDQ`-Kette) | `ghash_blocks(z, h, data, blocks)` | wie 560 | #2390 |
+| 565 | Hardware-Zufall aus dem Rauschgenerator (`RDRAND`) | `rdrand64()` | wie 560 | #2390 |
+| 566 | Hardware-Saat (`RDSEED`) | `rdseed64()` | wie 560 | #2390 |
+| 567 | verschmolzene Multiplikation und Addition (`VFMADD213SD`) | `fma(a, b, c)` | x86-Familie; lyxos ueber die ID (`emit_lyxos` 2500) | #2403 |
 
 | 568 | ganze SHA-256-Kompression (`SHA256RNDS2`/`MSG1`/`MSG2`) | `sha256_compress(state, data, blocks)` | **nur ELF-x86** (0/1/5/6/13), NICHT lyxos (14) — dort PANIC, weil `emit_lyxos` keine SHA-NI-Fassung hat und unbehandelte IDs stumm verwirft | #2391 |
 

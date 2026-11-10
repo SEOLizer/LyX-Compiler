@@ -1106,7 +1106,7 @@ test: lyxc
 	@echo "--- pub wird beim Import ausgewertet (6 Pruefungen) ---"
 	@bash tests/pub_visibility_test.sh
 	@echo "OK"
-	@echo "--- Builtin-IDs eindeutig vergeben (2 tests) ---"
+	@echo "--- Builtin-IDs: Belegungsliste, Eindeutigkeit, Backend-Abdeckung (4 tests) ---"
 	@bash tests/builtin_id_test.sh
 	@echo "OK"
 	@echo "--- Kurzschluss von && und || (10 tests) ---"
