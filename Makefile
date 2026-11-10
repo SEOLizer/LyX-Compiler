@@ -315,6 +315,8 @@ test: lyxc
 	@bash tests/disasm_test.sh
 	@bash tests/iso_verzeichnisse_test.sh
 	@bash tests/win64_syscalls_test.sh
+	@echo "--- win64: Datei-API ueber Win32 statt roher Syscalls (#2461) ---"
+	@bash tests/win64_datei_api_test.sh
 	@bash tests/ir_argslots_test.sh
 	@bash tests/include_pfade_test.sh
 	@bash tests/weiche_schluesselwoerter_test.sh

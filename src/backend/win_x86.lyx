@@ -115,6 +115,15 @@ con WIN_PATCH_OFF_IDX:    int64 := 8;
 con WIN_PATCH_OFF_KIND:   int64 := 24;
 con WIN_PATCH_KIND_EXTERN: int64 := 3;
 
+// #2461: Zahl der kernel32-Funktionen, die die LAUFZEIT selbst braucht.
+// Stand bis 1.2.34B an vier Stellen als nackte 7 im Code; wer eine Funktion
+// hinzufuegte und eine Stelle uebersah, bekam eine Import-Tabelle, deren
+// Namensablage gegen die IAT verschoben war — und zwar ohne Meldung.
+con WIN_RT_IMPORTS:       int64 := 11;
+// Summe der Namensbloecke (hint 2 + Name + NUL) dieser zehn, in der
+// Reihenfolge, in der wxb_writeRdata sie schreibt.
+con WIN_RT_NAMES_SZ:      int64 := 12 + 14 + 15 + 18 + 15 + 25 + 14 + 14 + 11 + 14 + 19;
+
 con WIN_RDATA_IDT_OFF:    int64 := 0;    // Import Directory Table (2 * 20 = 40 bytes)
 con WIN_RDATA_INT_OFF:    int64 := 40;   // Import Name Table (5+1 * 8 = 48 bytes)
 con WIN_RDATA_IAT_OFF:    int64 := 88;   // Import Address Table (5+1 * 8 = 48 bytes)
@@ -195,6 +204,17 @@ pub type WinX86Backend = class {
   // #2154: Offsets der beiden IAT-Aufrufe in win_print_strn (-1 = keiner).
   psnGhCallOff:    int64;
   psnWfCallOff:    int64;
+
+  // #2461: Lage der IAT-Aufrufe in den vier Datei-Helfern. Jede Zelle wird in
+  // wxb_patchIAT eingetragen; -1 heisst "Helfer nicht erzeugt".
+  fwWfCallOff:     int64;   // call [WriteFile]   in win_file_write
+  fwGhCallOff:     int64;   // call [GetStdHandle] in win_file_write
+  frRfCallOff:     int64;   // call [ReadFile]    in win_file_read
+  frGhCallOff:     int64;   // call [GetStdHandle] in win_file_read
+  foCfCallOff:     int64;   // call [CreateFileA] in win_file_open
+  fcChCallOff:     int64;   // call [CloseHandle] in win_file_close
+  fsSpCallOff:     int64;   // call [SetFilePointerEx] in win_file_seek
+  fxEpCallOff:     int64;   // call [ExitProcess] in win_proc_exit
 
   // ------------------------------------------------------------------
   // Code buffer primitives
@@ -953,6 +973,10 @@ pub type WinX86Backend = class {
     var ghRVA:  int64 := rdataRVA + iat0 + 32;  // GetStdHandle
     var gesRVA: int64 := rdataRVA + iat0 + 40;  // GetEnvironmentStringsA (#1677)
     var vfRVA:  int64 := rdataRVA + iat0 + 48;  // VirtualFree (#1678)
+    var cfRVA:  int64 := rdataRVA + iat0 + 56;  // CreateFileA (#2461)
+    var rfRVA:  int64 := rdataRVA + iat0 + 64;  // ReadFile (#2461)
+    var chRVA:  int64 := rdataRVA + iat0 + 72;  // CloseHandle (#2461)
+    var spRVA:  int64 := rdataRVA + iat0 + 80;  // SetFilePointerEx (#2461)
     if (self.envCallOff >= 0) {
       self.wxb_patch32(self.envCallOff + 2, gesRVA - (WIN_TEXT_RVA + self.envCallOff + 6));
     }
@@ -1034,6 +1058,34 @@ pub type WinX86Backend = class {
     if (self.vfreeCallOff >= 0) {
       var rvaF: int64 := vfRVA - (textBase + self.vfreeCallOff + 6);
       self.wxb_patch32(self.vfreeCallOff + 2, rvaF);
+    }
+
+    // #2461: die vier Datei-Helfer. Jede Zelle wird einzeln eingetragen —
+    // eine Sammelbedingung ueber alle sechs Offsets wuerde einen fehlenden
+    // Helfer stillschweigend mitnehmen.
+    if (self.fwGhCallOff >= 0) {
+      self.wxb_patch32(self.fwGhCallOff + 2, ghRVA - (textBase + self.fwGhCallOff + 6));
+    }
+    if (self.fwWfCallOff >= 0) {
+      self.wxb_patch32(self.fwWfCallOff + 2, wfRVA - (textBase + self.fwWfCallOff + 6));
+    }
+    if (self.frGhCallOff >= 0) {
+      self.wxb_patch32(self.frGhCallOff + 2, ghRVA - (textBase + self.frGhCallOff + 6));
+    }
+    if (self.frRfCallOff >= 0) {
+      self.wxb_patch32(self.frRfCallOff + 2, rfRVA - (textBase + self.frRfCallOff + 6));
+    }
+    if (self.foCfCallOff >= 0) {
+      self.wxb_patch32(self.foCfCallOff + 2, cfRVA - (textBase + self.foCfCallOff + 6));
+    }
+    if (self.fcChCallOff >= 0) {
+      self.wxb_patch32(self.fcChCallOff + 2, chRVA - (textBase + self.fcChCallOff + 6));
+    }
+    if (self.fsSpCallOff >= 0) {
+      self.wxb_patch32(self.fsSpCallOff + 2, spRVA - (textBase + self.fsSpCallOff + 6));
+    }
+    if (self.fxEpCallOff >= 0) {
+      self.wxb_patch32(self.fxEpCallOff + 2, epRVA - (textBase + self.fxEpCallOff + 6));
     }
   }
 
@@ -1165,8 +1217,31 @@ pub type WinX86Backend = class {
     // ein beliebiger NT-Dienst mit den Argumenten in den falschen Registern.
     var vfreeOff: int64 := self.codeLen;
     self.wxb_emitVFree();
+    // #2461: die vier Datei-Builtins. Die Helfer stehen hinter dem
+    // Benutzercode, genau wie die beiden Speicher-Helfer darueber.
+    var fwOff: int64 := self.codeLen;
+    self.wxb_emitFileWrite();
+    var frOff: int64 := self.codeLen;
+    self.wxb_emitFileRead();
+    var foOff: int64 := self.codeLen;
+    self.wxb_emitFileOpen();
+    var fcOff: int64 := self.codeLen;
+    self.wxb_emitFileClose();
+    var fsOff: int64 := self.codeLen;
+    self.wxb_emitFileSeek();
+    var fxOff: int64 := self.codeLen;
+    self.wxb_emitProcExit();
+
     self.wxb_replaceMmap(vallocOff, userEnd);
     self.wxb_replaceMunmap(vfreeOff, userEnd);
+    // Reihenfolge der Nummern: write(1), read(0), open(2), close(3).
+    var nW: int64 := self.wxb_replaceSyscallNr(1, fwOff, userEnd);
+    var nR: int64 := self.wxb_replaceSyscallNr(0, frOff, userEnd);
+    var nO: int64 := self.wxb_replaceSyscallNr(2, foOff, userEnd);
+    var nC: int64 := self.wxb_replaceSyscallNr(3, fcOff, userEnd);
+    var nS: int64 := self.wxb_replaceSyscallNr(8, fsOff, userEnd);
+    var nX: int64 := self.wxb_replaceSyscallNr(231, fxOff, userEnd);
+    var _ersetzt: int64 := nW + nR + nO + nC + nS + nX;
     self.wxb_pruefeSyscalls(userEnd);
 
     // Patch IAT indirect call rel32 fields now that codeLen is final
@@ -1308,6 +1383,278 @@ pub type WinX86Backend = class {
     }
   }
 
+  // ==================================================================
+  // #2461: Datei- und Konsolen-Ein-/Ausgabe ueber die Win32-API.
+  //
+  // Bis 1.2.34B emittierte der Codegen fuer `write`, `read`, `open` und
+  // `close` auch auf win64 den ROHEN Linux-Syscall. Auf echtem Windows 11
+  // trifft der einen fremden NT-Dienst und tut nichts; unter wine faellt es
+  // nicht auf, weil wine den Prozess auf dem Linux-Kern ausfuehrt. Gemessen
+  // am 2026-11-10: `PrintStr` (Builtin, Helferpfad) kam an, `PrintStrLn`
+  // (std.io, write-Syscall) nicht — `lyxc.exe --version` gab "lyxc Build:"
+  // aus, `--help` gar nichts.
+  //
+  // Ersetzt wird wie bei mmap/munmap: die Helfer stehen hinter dem
+  // Benutzercode, und jedes `mov eax,nr; syscall` wird zum Aufruf.
+  //
+  // FESTLEGUNG zur Abbildung fd -> HANDLE: 0, 1 und 2 bedeuten stdin, stdout
+  // und stderr und werden ueber GetStdHandle aufgeloest; jeder andere Wert
+  // IST das HANDLE, das win_file_open geliefert hat. Das ist eindeutig, weil
+  // Windows Kernel-Handles immer als Vielfache von vier vergibt — 1, 2 und 3
+  // koennen also kein echtes Handle sein. Die Grenze liegt deshalb bei 3.
+  // ==================================================================
+
+  // win_file_write: Eintritt wie Linux write — rdi = fd, rsi = Puffer,
+  // rdx = Laenge. Rueckgabe: geschriebene Bytes, oder -1.
+  fn wxb_emitFileWrite() {
+    self.wxb_ce8(0x55);                                                        // push rbp
+    self.wxb_ce8(0x48); self.wxb_ce8(0x89); self.wxb_ce8(0xE5);                // mov rbp, rsp
+    self.wxb_ce8(0x53);                                                        // push rbx
+    self.wxb_ce8(0x48); self.wxb_ce8(0x83); self.wxb_ce8(0xE4); self.wxb_ce8(0xF0);  // and rsp, -16
+    self.wxb_ce8(0x48); self.wxb_ce8(0x83); self.wxb_ce8(0xEC); self.wxb_ce8(0x40);  // sub rsp, 0x40
+    self.wxb_ce8(0x48); self.wxb_ce8(0x89); self.wxb_ce8(0xD3);                // mov rbx, rdx (Laenge)
+    self.wxb_ce8(0x48); self.wxb_ce8(0x83); self.wxb_ce8(0xFF); self.wxb_ce8(0x03);  // cmp rdi, 3
+    // Das Sprungziel liegt HINTER `mov rdi, rax`, nicht davor. Mit 13 statt 16
+    // landete der Sprung genau auf dieser Zeile und ueberschrieb das echte
+    // Handle mit dem Inhalt von rax — Dateien waren damit nicht beschreibbar,
+    // die Konsole schon (die nimmt den GetStdHandle-Zweig). Gemessen: write
+    // auf eine Datei lieferte -1, write auf stdout 10.
+    self.wxb_ce8(0x7D); self.wxb_ce8(0x10);                                    // jge +16 (echtes Handle)
+    self.wxb_ce8(0xB9); self.wxb_ce8(0xF6); self.wxb_ce8(0xFF); self.wxb_ce8(0xFF); self.wxb_ce8(0xFF);  // mov ecx, -10
+    self.wxb_ce8(0x29); self.wxb_ce8(0xF9);                                    // sub ecx, edi  (-10-fd)
+    self.fwGhCallOff := self.codeLen;
+    self.wxb_ce8(0xFF); self.wxb_ce8(0x15); self.wxb_ce32(0);                  // call [GetStdHandle]
+    self.wxb_ce8(0x48); self.wxb_ce8(0x89); self.wxb_ce8(0xC7);                // mov rdi, rax
+    self.wxb_ce8(0x48); self.wxb_ce8(0x89); self.wxb_ce8(0xF9);                // mov rcx, rdi  (hFile)
+    self.wxb_ce8(0x48); self.wxb_ce8(0x89); self.wxb_ce8(0xF2);                // mov rdx, rsi  (Puffer)
+    self.wxb_ce8(0x49); self.wxb_ce8(0x89); self.wxb_ce8(0xD8);                // mov r8, rbx   (Laenge)
+    self.wxb_ce8(0x4C); self.wxb_ce8(0x8D); self.wxb_ce8(0x4C); self.wxb_ce8(0x24); self.wxb_ce8(0x38);  // lea r9,[rsp+0x38]
+    self.wxb_ce8(0x48); self.wxb_ce8(0xC7); self.wxb_ce8(0x44); self.wxb_ce8(0x24); self.wxb_ce8(0x20);
+    self.wxb_ce32(0);                                                          // mov qword[rsp+0x20],0 (lpOverlapped)
+    self.wxb_ce8(0x48); self.wxb_ce8(0xC7); self.wxb_ce8(0x44); self.wxb_ce8(0x24); self.wxb_ce8(0x38);
+    self.wxb_ce32(0);                                                          // mov qword[rsp+0x38],0 (Zaehler)
+    self.fwWfCallOff := self.codeLen;
+    self.wxb_ce8(0xFF); self.wxb_ce8(0x15); self.wxb_ce32(0);                  // call [WriteFile]
+    self.wxb_ce8(0x85); self.wxb_ce8(0xC0);                                    // test eax, eax
+    self.wxb_ce8(0x74); self.wxb_ce8(0x06);                                    // je +6
+    self.wxb_ce8(0x8B); self.wxb_ce8(0x44); self.wxb_ce8(0x24); self.wxb_ce8(0x38);  // mov eax,[rsp+0x38]
+    self.wxb_ce8(0xEB); self.wxb_ce8(0x07);                                    // jmp +7
+    self.wxb_ce8(0x48); self.wxb_ce8(0xC7); self.wxb_ce8(0xC0);
+    self.wxb_ce8(0xFF); self.wxb_ce8(0xFF); self.wxb_ce8(0xFF); self.wxb_ce8(0xFF);  // mov rax, -1
+    self.wxb_ce8(0x48); self.wxb_ce8(0x8D); self.wxb_ce8(0x65); self.wxb_ce8(0xF8);  // lea rsp,[rbp-8]
+    self.wxb_ce8(0x5B);                                                        // pop rbx
+    self.wxb_ce8(0x5D);                                                        // pop rbp
+    self.wxb_ce8(0xC3);                                                        // ret
+  }
+
+  // win_file_read: rdi = fd, rsi = Puffer, rdx = Laenge. Gleicher Bau wie
+  // win_file_write, nur ReadFile statt WriteFile.
+  fn wxb_emitFileRead() {
+    self.wxb_ce8(0x55);
+    self.wxb_ce8(0x48); self.wxb_ce8(0x89); self.wxb_ce8(0xE5);
+    self.wxb_ce8(0x53);
+    self.wxb_ce8(0x48); self.wxb_ce8(0x83); self.wxb_ce8(0xE4); self.wxb_ce8(0xF0);
+    self.wxb_ce8(0x48); self.wxb_ce8(0x83); self.wxb_ce8(0xEC); self.wxb_ce8(0x40);
+    self.wxb_ce8(0x48); self.wxb_ce8(0x89); self.wxb_ce8(0xD3);
+    self.wxb_ce8(0x48); self.wxb_ce8(0x83); self.wxb_ce8(0xFF); self.wxb_ce8(0x03);
+    self.wxb_ce8(0x7D); self.wxb_ce8(0x10);        // jge +16, siehe win_file_write
+    self.wxb_ce8(0xB9); self.wxb_ce8(0xF6); self.wxb_ce8(0xFF); self.wxb_ce8(0xFF); self.wxb_ce8(0xFF);
+    self.wxb_ce8(0x29); self.wxb_ce8(0xF9);
+    self.frGhCallOff := self.codeLen;
+    self.wxb_ce8(0xFF); self.wxb_ce8(0x15); self.wxb_ce32(0);
+    self.wxb_ce8(0x48); self.wxb_ce8(0x89); self.wxb_ce8(0xC7);
+    self.wxb_ce8(0x48); self.wxb_ce8(0x89); self.wxb_ce8(0xF9);
+    self.wxb_ce8(0x48); self.wxb_ce8(0x89); self.wxb_ce8(0xF2);
+    self.wxb_ce8(0x49); self.wxb_ce8(0x89); self.wxb_ce8(0xD8);
+    self.wxb_ce8(0x4C); self.wxb_ce8(0x8D); self.wxb_ce8(0x4C); self.wxb_ce8(0x24); self.wxb_ce8(0x38);
+    self.wxb_ce8(0x48); self.wxb_ce8(0xC7); self.wxb_ce8(0x44); self.wxb_ce8(0x24); self.wxb_ce8(0x20);
+    self.wxb_ce32(0);
+    self.wxb_ce8(0x48); self.wxb_ce8(0xC7); self.wxb_ce8(0x44); self.wxb_ce8(0x24); self.wxb_ce8(0x38);
+    self.wxb_ce32(0);
+    self.frRfCallOff := self.codeLen;
+    self.wxb_ce8(0xFF); self.wxb_ce8(0x15); self.wxb_ce32(0);                  // call [ReadFile]
+    self.wxb_ce8(0x85); self.wxb_ce8(0xC0);
+    self.wxb_ce8(0x74); self.wxb_ce8(0x06);
+    self.wxb_ce8(0x8B); self.wxb_ce8(0x44); self.wxb_ce8(0x24); self.wxb_ce8(0x38);
+    self.wxb_ce8(0xEB); self.wxb_ce8(0x07);
+    self.wxb_ce8(0x48); self.wxb_ce8(0xC7); self.wxb_ce8(0xC0);
+    self.wxb_ce8(0xFF); self.wxb_ce8(0xFF); self.wxb_ce8(0xFF); self.wxb_ce8(0xFF);
+    self.wxb_ce8(0x48); self.wxb_ce8(0x8D); self.wxb_ce8(0x65); self.wxb_ce8(0xF8);
+    self.wxb_ce8(0x5B);
+    self.wxb_ce8(0x5D);
+    self.wxb_ce8(0xC3);
+  }
+
+  // win_file_open: rdi = Pfad, rsi = Linux-Flags, rdx = Modus (ungenutzt —
+  // Windows kennt keine Rechtebits an dieser Stelle; der Wert wird verworfen
+  // und NICHT heimlich als etwas anderes gedeutet).
+  // Abbildung: O_WRONLY(1)/O_RDWR(2) -> GENERIC_WRITE/beide, sonst
+  // GENERIC_READ. O_CREAT(0x40) mit O_TRUNC(0x200) -> CREATE_ALWAYS, allein
+  // -> OPEN_ALWAYS, ohne -> OPEN_EXISTING.
+  fn wxb_emitFileOpen() {
+    self.wxb_ce8(0x55);
+    self.wxb_ce8(0x48); self.wxb_ce8(0x89); self.wxb_ce8(0xE5);
+    self.wxb_ce8(0x48); self.wxb_ce8(0x83); self.wxb_ce8(0xE4); self.wxb_ce8(0xF0);
+    self.wxb_ce8(0x48); self.wxb_ce8(0x83); self.wxb_ce8(0xEC); self.wxb_ce8(0x50);  // sub rsp,0x50
+    self.wxb_ce8(0xBA); self.wxb_ce8(0x00); self.wxb_ce8(0x00); self.wxb_ce8(0x00); self.wxb_ce8(0x80);  // mov edx, GENERIC_READ
+    self.wxb_ce8(0x89); self.wxb_ce8(0xF0);                                    // mov eax, esi
+    self.wxb_ce8(0x83); self.wxb_ce8(0xE0); self.wxb_ce8(0x03);                // and eax, 3
+    self.wxb_ce8(0x83); self.wxb_ce8(0xF8); self.wxb_ce8(0x01);                // cmp eax, 1
+    self.wxb_ce8(0x75); self.wxb_ce8(0x05);                                    // jne +5
+    self.wxb_ce8(0xBA); self.wxb_ce8(0x00); self.wxb_ce8(0x00); self.wxb_ce8(0x00); self.wxb_ce8(0x40);  // GENERIC_WRITE
+    self.wxb_ce8(0x83); self.wxb_ce8(0xF8); self.wxb_ce8(0x02);                // cmp eax, 2
+    self.wxb_ce8(0x75); self.wxb_ce8(0x05);                                    // jne +5
+    self.wxb_ce8(0xBA); self.wxb_ce8(0x00); self.wxb_ce8(0x00); self.wxb_ce8(0x00); self.wxb_ce8(0xC0);  // beides
+    self.wxb_ce8(0x41); self.wxb_ce8(0xBB); self.wxb_ce8(0x03); self.wxb_ce8(0x00); self.wxb_ce8(0x00); self.wxb_ce8(0x00);  // r11d = OPEN_EXISTING
+    self.wxb_ce8(0xF7); self.wxb_ce8(0xC6); self.wxb_ce8(0x40); self.wxb_ce8(0x00); self.wxb_ce8(0x00); self.wxb_ce8(0x00);  // test esi, O_CREAT
+    self.wxb_ce8(0x74); self.wxb_ce8(0x16);                                    // je +22
+    self.wxb_ce8(0xF7); self.wxb_ce8(0xC6); self.wxb_ce8(0x00); self.wxb_ce8(0x02); self.wxb_ce8(0x00); self.wxb_ce8(0x00);  // test esi, O_TRUNC
+    self.wxb_ce8(0x74); self.wxb_ce8(0x08);                                    // je +8
+    self.wxb_ce8(0x41); self.wxb_ce8(0xBB); self.wxb_ce8(0x02); self.wxb_ce8(0x00); self.wxb_ce8(0x00); self.wxb_ce8(0x00);  // CREATE_ALWAYS
+    self.wxb_ce8(0xEB); self.wxb_ce8(0x06);                                    // jmp +6
+    self.wxb_ce8(0x41); self.wxb_ce8(0xBB); self.wxb_ce8(0x04); self.wxb_ce8(0x00); self.wxb_ce8(0x00); self.wxb_ce8(0x00);  // OPEN_ALWAYS
+    self.wxb_ce8(0x48); self.wxb_ce8(0x89); self.wxb_ce8(0xF9);                // mov rcx, rdi (Pfad)
+    self.wxb_ce8(0x41); self.wxb_ce8(0xB8); self.wxb_ce8(0x03); self.wxb_ce8(0x00); self.wxb_ce8(0x00); self.wxb_ce8(0x00);  // r8d = SHARE_READ|WRITE
+    self.wxb_ce8(0x45); self.wxb_ce8(0x31); self.wxb_ce8(0xC9);                // xor r9d, r9d
+    self.wxb_ce8(0x4C); self.wxb_ce8(0x89); self.wxb_ce8(0x5C); self.wxb_ce8(0x24); self.wxb_ce8(0x20);  // [rsp+0x20] = r11
+    self.wxb_ce8(0x48); self.wxb_ce8(0xC7); self.wxb_ce8(0x44); self.wxb_ce8(0x24); self.wxb_ce8(0x28);
+    self.wxb_ce32(0x80);                                                       // FILE_ATTRIBUTE_NORMAL
+    self.wxb_ce8(0x48); self.wxb_ce8(0xC7); self.wxb_ce8(0x44); self.wxb_ce8(0x24); self.wxb_ce8(0x30);
+    self.wxb_ce32(0);                                                          // hTemplateFile = NULL
+    self.foCfCallOff := self.codeLen;
+    self.wxb_ce8(0xFF); self.wxb_ce8(0x15); self.wxb_ce32(0);                  // call [CreateFileA]
+    // CreateFileA liefert im Fehlerfall INVALID_HANDLE_VALUE = -1; genau das
+    // erwartet der Aufrufer von `open` als Fehlerwert. Keine Umrechnung.
+    self.wxb_ce8(0x48); self.wxb_ce8(0x89); self.wxb_ce8(0xEC);                // mov rsp, rbp
+    self.wxb_ce8(0x5D);                                                        // pop rbp
+    self.wxb_ce8(0xC3);                                                        // ret
+  }
+
+  // win_file_close: rdi = fd. Die drei Standardkanaele werden NICHT
+  // geschlossen — ihre Handles gehoeren dem Prozess, nicht dem Aufrufer.
+  fn wxb_emitFileClose() {
+    self.wxb_ce8(0x55);
+    self.wxb_ce8(0x48); self.wxb_ce8(0x89); self.wxb_ce8(0xE5);
+    self.wxb_ce8(0x48); self.wxb_ce8(0x83); self.wxb_ce8(0xE4); self.wxb_ce8(0xF0);
+    self.wxb_ce8(0x48); self.wxb_ce8(0x83); self.wxb_ce8(0xEC); self.wxb_ce8(0x20);
+    self.wxb_ce8(0x48); self.wxb_ce8(0x83); self.wxb_ce8(0xFF); self.wxb_ce8(0x03);  // cmp rdi, 3
+    self.wxb_ce8(0x7C); self.wxb_ce8(0x0D);                                    // jl +13 (Standardkanal)
+    self.wxb_ce8(0x48); self.wxb_ce8(0x89); self.wxb_ce8(0xF9);                // mov rcx, rdi
+    self.fcChCallOff := self.codeLen;
+    self.wxb_ce8(0xFF); self.wxb_ce8(0x15); self.wxb_ce32(0);                  // call [CloseHandle]
+    self.wxb_ce8(0x85); self.wxb_ce8(0xC0);                                    // test eax, eax
+    self.wxb_ce8(0x74); self.wxb_ce8(0x04);                                    // je +4 (Fehler)
+    self.wxb_ce8(0x31); self.wxb_ce8(0xC0);                                    // xor eax, eax
+    self.wxb_ce8(0xEB); self.wxb_ce8(0x07);                                    // jmp +7
+    self.wxb_ce8(0x48); self.wxb_ce8(0xC7); self.wxb_ce8(0xC0);
+    self.wxb_ce8(0xFF); self.wxb_ce8(0xFF); self.wxb_ce8(0xFF); self.wxb_ce8(0xFF);  // mov rax, -1
+    self.wxb_ce8(0x48); self.wxb_ce8(0x89); self.wxb_ce8(0xEC);                // mov rsp, rbp
+    self.wxb_ce8(0x5D);
+    self.wxb_ce8(0xC3);
+  }
+
+  // win_file_seek: rdi = fd, rsi = Abstand, rdx = Bezug (0 Anfang, 1 Stelle,
+  // 2 Ende). Die drei Linux-Werte sind zahlengleich mit FILE_BEGIN,
+  // FILE_CURRENT und FILE_END — deshalb keine Umrechnung, aber auch kein
+  // Durchreichen eines unbekannten Werts: alles ausser 0..2 lehnt Windows
+  // selbst ab und wir geben dessen Fehler weiter.
+  // Die Standardkanaele sind nicht positionierbar und liefern -1.
+  fn wxb_emitFileSeek() {
+    self.wxb_ce8(0x55);
+    self.wxb_ce8(0x48); self.wxb_ce8(0x89); self.wxb_ce8(0xE5);
+    self.wxb_ce8(0x48); self.wxb_ce8(0x83); self.wxb_ce8(0xE4); self.wxb_ce8(0xF0);
+    self.wxb_ce8(0x48); self.wxb_ce8(0x83); self.wxb_ce8(0xEC); self.wxb_ce8(0x40);
+    self.wxb_ce8(0x48); self.wxb_ce8(0x83); self.wxb_ce8(0xFF); self.wxb_ce8(0x03);  // cmp rdi, 3
+    self.wxb_ce8(0x7C); self.wxb_ce8(0x28);                                    // jl +40 -> Fehlerzweig
+    self.wxb_ce8(0x49); self.wxb_ce8(0x89); self.wxb_ce8(0xD1);                // mov r9, rdx (Bezug) ZUERST
+    self.wxb_ce8(0x48); self.wxb_ce8(0x89); self.wxb_ce8(0xF9);                // mov rcx, rdi
+    self.wxb_ce8(0x48); self.wxb_ce8(0x89); self.wxb_ce8(0xF2);                // mov rdx, rsi (Abstand)
+    self.wxb_ce8(0x4C); self.wxb_ce8(0x8D); self.wxb_ce8(0x44); self.wxb_ce8(0x24); self.wxb_ce8(0x38);  // lea r8,[rsp+0x38]
+    self.wxb_ce8(0x48); self.wxb_ce8(0xC7); self.wxb_ce8(0x44); self.wxb_ce8(0x24); self.wxb_ce8(0x38);
+    self.wxb_ce32(0);
+    self.fsSpCallOff := self.codeLen;
+    self.wxb_ce8(0xFF); self.wxb_ce8(0x15); self.wxb_ce32(0);                  // call [SetFilePointerEx]
+    self.wxb_ce8(0x85); self.wxb_ce8(0xC0);                                    // test eax, eax
+    self.wxb_ce8(0x74); self.wxb_ce8(0x07);                                    // je +7
+    self.wxb_ce8(0x48); self.wxb_ce8(0x8B); self.wxb_ce8(0x44); self.wxb_ce8(0x24); self.wxb_ce8(0x38);  // mov rax,[rsp+0x38]
+    self.wxb_ce8(0xEB); self.wxb_ce8(0x07);                                    // jmp +7
+    self.wxb_ce8(0x48); self.wxb_ce8(0xC7); self.wxb_ce8(0xC0);
+    self.wxb_ce8(0xFF); self.wxb_ce8(0xFF); self.wxb_ce8(0xFF); self.wxb_ce8(0xFF);  // mov rax, -1
+    self.wxb_ce8(0x48); self.wxb_ce8(0x89); self.wxb_ce8(0xEC);
+    self.wxb_ce8(0x5D);
+    self.wxb_ce8(0xC3);
+  }
+
+  // win_proc_exit: rdi = Rueckgabewert, wie Linux exit_group. Kehrt nie
+  // zurueck.
+  //
+  // Ohne diese Abbildung war ein Abbruch auf Windows WIRKUNGSLOS: der rohe
+  // exit_group-Syscall tat nichts, und die Ausfuehrung lief hinter der Stelle
+  // weiter, an der das Programm aufgeben wollte. In lyxc.exe betraf das 831
+  // von 889 verbliebenen Syscalls — jeder Fehlerpfad des Compilers.
+  fn wxb_emitProcExit() {
+    self.wxb_ce8(0x48); self.wxb_ce8(0x89); self.wxb_ce8(0xF9);                // mov rcx, rdi
+    self.wxb_ce8(0x48); self.wxb_ce8(0x83); self.wxb_ce8(0xE4); self.wxb_ce8(0xF0);  // and rsp, -16
+    self.wxb_ce8(0x48); self.wxb_ce8(0x83); self.wxb_ce8(0xEC); self.wxb_ce8(0x20);  // sub rsp, 0x20
+    self.fxEpCallOff := self.codeLen;
+    self.wxb_ce8(0xFF); self.wxb_ce8(0x15); self.wxb_ce32(0);                  // call [ExitProcess]
+    // Erreicht der Befehl danach doch Boden, ist etwas grundlegend falsch —
+    // int3 statt ret, damit es auffaellt statt still weiterzulaufen.
+    self.wxb_ce8(0xCC);
+  }
+
+  // #2461: Ersetzt jedes `syscall` mit der Nummer `nr` im Bereich
+  // [WIN_USER_OFF, endOff) durch einen Aufruf von `helferOff`.
+  //
+  // Beide Ladeformen werden erkannt, weil der Codegen beide erzeugt: die
+  // breite `48 B8 nr 00*7` (12 Byte mit dem syscall) und die schmale
+  // `B8 nr 00 00 00` (7 Byte). wxb_replaceMmap kannte anfangs nur die breite
+  // und ging an zwei Dutzend Stellen still vorbei (#1678) — dieselbe Falle.
+  //
+  // Rueckgabe: Zahl der ersetzten Stellen. Der Aufrufer meldet sie; eine
+  // Ersetzung, die nichts findet, ist ein Befund und kein Erfolg.
+  fn wxb_replaceSyscallNr(nr: int64, helferOff: int64, endOff: int64): int64 {
+    var n: int64 := 0;
+    var i: int64 := WIN_USER_OFF;
+    while (i + 7 <= endOff) {
+      var breit: int64 := 0;
+      if ((i + 12) <= endOff &&
+          peek8(self.code + i) == 0x48 && peek8(self.code + i + 1) == 0xB8 &&
+          peek8(self.code + i + 2) == nr && peek8(self.code + i + 3) == 0x00 &&
+          peek8(self.code + i + 4) == 0x00 && peek8(self.code + i + 5) == 0x00 &&
+          peek8(self.code + i + 6) == 0x00 && peek8(self.code + i + 7) == 0x00 &&
+          peek8(self.code + i + 8) == 0x00 && peek8(self.code + i + 9) == 0x00 &&
+          peek8(self.code + i + 10) == 0x0F && peek8(self.code + i + 11) == 0x05) {
+        breit := 1;
+      }
+      var schmal: int64 := 0;
+      if (breit == 0 &&
+          peek8(self.code + i) == 0xB8 && peek8(self.code + i + 1) == nr &&
+          peek8(self.code + i + 2) == 0x00 && peek8(self.code + i + 3) == 0x00 &&
+          peek8(self.code + i + 4) == 0x00 &&
+          peek8(self.code + i + 5) == 0x0F && peek8(self.code + i + 6) == 0x05) {
+        schmal := 1;
+      }
+      if (breit != 0 || schmal != 0) {
+        var laenge: int64 := 7;
+        if (breit != 0) { laenge := 12; }
+        var rel: int64 := helferOff - (i + 5);
+        poke8(self.code + i, 0xE8);
+        poke8(self.code + i + 1, rel & 0xFF);
+        poke8(self.code + i + 2, (rel >> 8) & 0xFF);
+        poke8(self.code + i + 3, (rel >> 16) & 0xFF);
+        poke8(self.code + i + 4, (rel >> 24) & 0xFF);
+        var p: int64 := 5;
+        while (p < laenge) { poke8(self.code + i + p, 0x90); p := p + 1; }
+        n := n + 1;
+        i := i + laenge;
+      } else {
+        i := i + 1;
+      }
+    }
+    return n;
+  }
+
   // #1678: Nach dem Ersetzen nachsehen, ob noch ein rohes `syscall` im
   // Benutzercode steht.
   //
@@ -1334,7 +1681,9 @@ pub type WinX86Backend = class {
       EPrintInt(n);
       EPrintStrLn(" rohe Linux-Syscalls im erzeugten Code (#1678)."c);
       EPrintStrLn("  Auf Windows trifft jeder davon einen fremden NT-Dienst."c);
-      EPrintStrLn("  mmap und munmap sind ersetzt; der Rest hat noch keinen Ersatz."c);
+      EPrintStrLn("  Ersetzt sind mmap, munmap, write, read, open, close, lseek"c);
+      EPrintStrLn("  und exit_group;"c);
+      EPrintStrLn("  der Rest hat noch keinen Ersatz."c);
     }
   }
 
@@ -1440,14 +1789,39 @@ pub type WinX86Backend = class {
     while (dn < nDll) { runtimeNames := runtimeNames + peek64(self.impDllLen + dn * 8) + 1; dn := dn + 1; }
     // Reihenfolge der Laufzeitnamen: WriteFile, ExitProcess, VirtualAlloc,
     // GetCommandLineA, GetStdHandle, GetEnvironmentStringsA, VirtualFree.
-    var rtOff: int64 := alloc(7 * 8);
-    poke64(rtOff,      runtimeNames);
-    poke64(rtOff + 8,  runtimeNames + 12);
-    poke64(rtOff + 16, runtimeNames + 12 + 14);
-    poke64(rtOff + 24, runtimeNames + 12 + 14 + 15);
-    poke64(rtOff + 32, runtimeNames + 12 + 14 + 15 + 18);
-    poke64(rtOff + 40, runtimeNames + 12 + 14 + 15 + 18 + 15);   // #1677
-    poke64(rtOff + 48, runtimeNames + 12 + 14 + 15 + 18 + 15 + 25);   // #1678 VirtualFree
+    // #2461: Die Kette wird gerechnet, nicht abgeschrieben. Vorher stand jede
+    // Teilsumme ausgeschrieben da; die achte haette man leicht falsch addiert.
+    var rtLen: int64 := alloc(WIN_RT_IMPORTS * 8);
+    poke64(rtLen,      12);   // WriteFile
+    poke64(rtLen + 8,  14);   // ExitProcess
+    poke64(rtLen + 16, 15);   // VirtualAlloc
+    poke64(rtLen + 24, 18);   // GetCommandLineA
+    poke64(rtLen + 32, 15);   // GetStdHandle
+    poke64(rtLen + 40, 25);   // GetEnvironmentStringsA (#1677)
+    poke64(rtLen + 48, 14);   // VirtualFree (#1678)
+    poke64(rtLen + 56, 14);   // CreateFileA (#2461)
+    poke64(rtLen + 64, 11);   // ReadFile (#2461)
+    poke64(rtLen + 72, 14);   // CloseHandle (#2461)
+    poke64(rtLen + 80, 19);   // SetFilePointerEx: hint 2 + 16 + NUL = 19
+    var rtOff: int64 := alloc(WIN_RT_IMPORTS * 8);
+    var rtAcc: int64 := runtimeNames;
+    var rtI: int64 := 0;
+    while (rtI < WIN_RT_IMPORTS) {
+      poke64(rtOff + rtI * 8, rtAcc);
+      rtAcc := rtAcc + peek64(rtLen + rtI * 8);
+      rtI := rtI + 1;
+    }
+    // Gegenprobe: die gerechnete Summe muss die Konstante treffen, mit der
+    // wxb_planImports die Namensablage vorgemerkt hat. Laufen die beiden
+    // auseinander, zeigen INT und IAT auf fremde Namen.
+    if ((rtAcc - runtimeNames) != WIN_RT_NAMES_SZ) {
+      EPrintStr("win64: Namensablage der Laufzeit: "c);
+      EPrintInt(rtAcc - runtimeNames);
+      EPrintStr(" Bytes, WIN_RT_NAMES_SZ sagt "c);
+      EPrintInt(WIN_RT_NAMES_SZ);
+      EPrintStrLn(" (#2461)."c);
+      exit(70);
+    }
 
     // #1676: Die Reihenfolge muss der aus wxb_planImports entsprechen: je DLL
     // erst INT, dann IAT. Geschrieben wurden zuvor ERST alle INTs und DANACH
@@ -1461,7 +1835,7 @@ pub type WinX86Backend = class {
       while (durchgang < 2) {          // 0 = INT, 1 = IAT — bitgleich
         if (d2 == 0) {
           var r: int64 := 0;
-          while (r < 7) { self.wxb_oe64(rdataRVA + peek64(rtOff + r * 8)); r := r + 1; }
+          while (r < WIN_RT_IMPORTS) { self.wxb_oe64(rdataRVA + peek64(rtOff + r * 8)); r := r + 1; }
         }
         // #1676: eigene Externs dieser DLL — der Namensoffset kommt aus der
         // Tabelle aus wxb_planImports, nicht aus einer zweiten Rechnung.
@@ -1493,7 +1867,8 @@ pub type WinX86Backend = class {
       d3 := d3 + 1;
     }
 
-    // ---- hint + Name der fuenf Laufzeitfunktionen ----
+    // ---- hint + Name der Laufzeitfunktionen (WIN_RT_IMPORTS Stueck) ----
+    var rtNamesStart: int64 := self.outLen;
     self.wxb_oName("WriteFile"c, 9);
     self.wxb_oName("ExitProcess"c, 11);
     self.wxb_oName("VirtualAlloc"c, 12);
@@ -1501,6 +1876,24 @@ pub type WinX86Backend = class {
     self.wxb_oName("GetStdHandle"c, 12);
     self.wxb_oName("GetEnvironmentStringsA"c, 22);   // #1677: hint+22+NUL = 25
     self.wxb_oName("VirtualFree"c, 11);              // #1678: hint+11+NUL = 14
+    self.wxb_oName("CreateFileA"c, 11);              // #2461: hint+11+NUL = 14
+    self.wxb_oName("ReadFile"c, 8);                  // #2461: hint+8+NUL  = 11
+    self.wxb_oName("CloseHandle"c, 11);              // #2461: hint+11+NUL = 14
+    self.wxb_oName("SetFilePointerEx"c, 16);        // #2461: hint+16+NUL = 19
+
+    // #2461: Die Gegenprobe oben vergleicht zwei RECHNUNGEN; waren beide
+    // falsch, stimmten sie trotzdem ueberein — genau so ist "SetFilePointerEx"
+    // mit 20 statt 19 Bytes durchgerutscht und hat jeden eigenen Extern um ein
+    // Byte verschoben (tests/win64_pe_test.sh: 10 FAIL). Hier wird deshalb
+    // gegen die TATSAECHLICH geschriebenen Bytes geprueft.
+    if ((self.outLen - rtNamesStart) != WIN_RT_NAMES_SZ) {
+      EPrintStr("win64: Laufzeitnamen geschrieben: "c);
+      EPrintInt(self.outLen - rtNamesStart);
+      EPrintStr(" Bytes, WIN_RT_NAMES_SZ sagt "c);
+      EPrintInt(WIN_RT_NAMES_SZ);
+      EPrintStrLn(" (#2461)."c);
+      exit(70);
+    }
 
     // ---- hint + Name je eigenem Extern ----
     var e2: int64 := 0;
@@ -1638,7 +2031,7 @@ pub type WinX86Backend = class {
     var dllCnt: int64 := alloc(64 * 8);      // Zahl der Funktionen je DLL
     poke64(dllPtr, "kernel32.dll"c as int64);
     poke64(dllLen, 12);
-    poke64(dllCnt, 7);                        // die sieben der Laufzeit (#1677, #1678)
+    poke64(dllCnt, WIN_RT_IMPORTS);           // die der Laufzeit (#1677, #1678, #2461)
     var nDll: int64 := 1;
 
     var e: int64 := 0;
@@ -1685,7 +2078,7 @@ pub type WinX86Backend = class {
     var used: int64 := alloc(64 * 8);
     var u: int64 := 0;
     while (u < nDll) { poke64(used + u * 8, 0); u := u + 1; }
-    poke64(used, 7);                         // DLL 0: sieben sind vergeben (#1677, #1678)
+    poke64(used, WIN_RT_IMPORTS);            // DLL 0: die der Laufzeit sind vergeben
     e := 0;
     while (e < self.externCount) {
       var eb2: int64 := self.externBuf + e * WIN_EXTERN_SZ;
@@ -1708,7 +2101,7 @@ pub type WinX86Backend = class {
     var namesOff: int64 := off;
     var d4: int64 := 0;
     while (d4 < nDll) { off := off + peek64(dllLen + d4 * 8) + 1; d4 := d4 + 1; }
-    off := off + 12 + 14 + 15 + 18 + 15 + 25 + 14;  // die sieben Namen der Laufzeit (#1677, #1678)
+    off := off + WIN_RT_NAMES_SZ;   // die Namen der Laufzeit (#1677, #1678, #2461)
     // #1676: Den Offset seines Namensblocks bekommt JEDER Extern hier fest
     // zugewiesen. Zuvor rechnete ihn jede Schreibstelle fuer sich nach — INT,
     // IAT und die Namensablage also dreimal —, und die Rechnungen liefen
@@ -1932,6 +2325,14 @@ pub type WinX86Backend = class {
     self.vfreeCallOff    := 0 - 1;
     self.psnGhCallOff    := 0 - 1;
     self.psnWfCallOff    := 0 - 1;
+    self.fwWfCallOff     := 0 - 1;   // #2461
+    self.fwGhCallOff     := 0 - 1;
+    self.frRfCallOff     := 0 - 1;
+    self.frGhCallOff     := 0 - 1;
+    self.foCfCallOff     := 0 - 1;
+    self.fcChCallOff     := 0 - 1;
+    self.fsSpCallOff     := 0 - 1;
+    self.fxEpCallOff     := 0 - 1;
     self.argcStoreOff    := 0 - 1;
     self.argvStoreOff    := 0 - 1;
     self.envStoreOff     := 0 - 1;   // #1677
