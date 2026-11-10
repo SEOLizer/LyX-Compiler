@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.35A
+VERSION   := 1.2.35B
 VERSION_DATE := 2026-11-10
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -315,6 +315,8 @@ test: lyxc
 	@bash tests/disasm_test.sh
 	@bash tests/iso_verzeichnisse_test.sh
 	@bash tests/win64_syscalls_test.sh
+	@echo "--- win64: Datei-API ueber Win32 statt roher Syscalls (#2461) ---"
+	@bash tests/win64_datei_api_test.sh
 	@bash tests/ir_argslots_test.sh
 	@bash tests/include_pfade_test.sh
 	@bash tests/weiche_schluesselwoerter_test.sh

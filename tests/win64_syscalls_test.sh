@@ -29,7 +29,17 @@ no() { echo "FAIL $1${2:+: $2}"; FAIL=$((FAIL+1)); }
 # Stand 1.1.5C: drei, alle nachweislich unerreichbar (siehe unten). Die Zahl
 # ist eine SCHRANKE, kein Ziel — sie darf nur sinken. Wer sie erhoehen will,
 # braucht einen Grund im Ticket.
-ERLAUBT=3
+#
+# #2461: von drei auf NULL gesenkt. Seit write/read/open/close/lseek ueber die
+# Win32-API gehen und exit_group auf ExitProcess, enthalten diese drei
+# Programme keinen rohen Syscall mehr — gemessen, nicht gehofft. Die Schranke
+# auf 3 stehen zu lassen waere eine Waechtermeldung, die nichts mehr bewacht.
+#
+# Null ist hier die richtige Schranke und kein Uebermut: taucht wieder einer
+# auf, ist das eine neue Luecke und soll laut sein. Grosse Programme (lyxc.exe
+# selbst) tragen weiterhin welche — Prozess- und Verzeichnisaufrufe, die
+# dieser Test nicht erzeugt.
+ERLAUBT=0
 
 zaehle() {   # Datei -> "gesamt|nr:anzahl,..."
   python3 - "$1" <<'PY'
@@ -135,7 +145,11 @@ for fall in "alloc:$P_ALLOC" "direkt:$P_DIREKT" "array:$P_ARRAY"; do
   # Die beiden Nummern, um die es in #1678 geht, muessen VERSCHWUNDEN sein.
   # Die Gesamtzahl allein genuegt nicht: sie koennte stimmen, waehrend
   # ausgerechnet mmap oder munmap noch drinsteht.
-  for nr in 9 11; do
+  # #2461: dazu die fuenf Datei-Nummern. Sie gehoeren zur selben Familie:
+  # write(1), read(0), open(2), close(3), lseek(8). Dass die Gesamtzahl passt,
+  # sagt ueber die EINZELNE Nummer nichts — genau deshalb steht hier eine
+  # Liste und keine Summe.
+  for nr in 9 11 0 1 2 3 8; do
     if echo "$verteilung" | grep -qE "(^|,)$nr:"; then
       no "$name: Syscall $nr steht noch im Code" "$verteilung"
     else
