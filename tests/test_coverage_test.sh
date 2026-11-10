@@ -73,6 +73,14 @@ is_exempt() {
     # im Makefile sucht: "a.lyx" ist als Regex "a" + ein beliebiges Zeichen +
     # "lyx" und traf irgendeine Zeile, die mit #2447 wegfiel. Die Luecke war
     # also die ganze Zeit da und nur verdeckt.
+    # #2451: Pruefdaten fuer tests/dce_ir_import_test.sh, keine Tests. helfer.lyx
+    # ist eine Unit ohne main; prog.lyx und prog_gross.lyx sind zwei
+    # Verbraucher, die der Test gegeneinander haelt (gleicher Wert, aber
+    # unterschiedlich viel benutzt -- daran wird gemessen, dass Unerreichbares
+    # wegfaellt).
+    data/dce2451/dce2451/helfer.lyx) return 0 ;;
+    data/dce2451/prog.lyx)           return 0 ;;
+    data/dce2451/prog_gross.lyx)     return 0 ;;
     data/erbevmt/rp/a.lyx)   return 0 ;;  # #1998: Ableitung ohne main, von
                                           # erbe_vmt_ir_test.sh mitgenutzt.
     data/erbevmt/main.lyx)   return 0 ;;  # #1998: Pruefdaten, kein Test. Eine

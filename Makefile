@@ -480,6 +480,8 @@ test: lyxc
 	@bash tests/geraet_liste_test.sh
 	@echo "--- std.audio.alsa: Fehlerkonvention und Formatwahl (#1930) ---"
 	@bash tests/alsa_format_test.sh
+	@echo "--- #2451: der IR-Import nimmt nur das Benutzte ---"
+	@bash tests/dce_ir_import_test.sh
 	@echo "--- #2441: std.audio + std.fs gemeinsam importierbar ---"
 	@bash tests/audio_fs_symbolkollision_test.sh
 	@echo "--- #2444: jede Unit hat ein .lyu im Paketbaum ---"

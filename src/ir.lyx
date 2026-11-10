@@ -1509,3 +1509,111 @@ pub type IRModule = class {
   }
 }
 ;
+
+// ===========================================================================
+// #2451: Erreichbare Funktionen eines IR-Moduls
+// ===========================================================================
+//
+// Beim Import ueber die .lyu haengt ir_lower das IR der GANZEN Unit an das
+// Modul (#1977), und `emit()` der Backends laeuft ueber jede Funktion darin.
+// Zwei gemessene Folgen:
+//
+//   * Groesse. `import std.io; PrintLn("x")` ergab auf arm64 ein Erzeugnis von
+//     112 048 Byte -- fuer einen Einzeiler.
+//   * Fehler aus TOTEM Code. `import std.fs; return SEEK_END` scheiterte mit
+//     "arm64: Builtin-ID 236 wird im Linux-Zweig nicht behandelt", obwohl das
+//     Programm keine Funktion aus std.fs ruft: die Luecke steckt in einer
+//     Funktion, die niemand braucht.
+//
+// Diese Funktion markiert, was von einem Einstieg aus erreichbar ist. Der
+// Aufrufer entscheidet, ob er das benutzt -- sie aendert nichts am Modul.
+//
+// WELCHE KANTEN ES GIBT, abgelesen an ir_lower und nicht geraten:
+//
+//   IRO_CALL        src1 = Index in funcBuffer (direkter Aufruf)
+//   IRO_FUNC_ADDR   src1 = Index in funcBuffer (Funktionszeiger, Closure)
+//
+// Alles andere fuehrt keinen Funktionsindex: IRO_CALL_EXTERN nennt Bibliothek
+// und Namen als strBuf-Offsets, IRO_CALL_INDIRECT ruft ueber einen Temp, und
+// der kommt aus IRO_FUNC_ADDR -- damit ist das Ziel schon markiert.
+//
+// VIRTUELLE METHODEN brauchen hier NICHTS Eigenes, und das ist der Grund,
+// warum diese Rechnung so kurz sein darf: auf dem IR-Weg gibt es keine VMT im
+// Speicher. `ir_lower` senkt einen virtuellen Aufruf als Vergleichskette ueber
+// die type-id mit je einem DIREKTEN IRO_CALL auf jedes Override (siehe
+// lowerCall, "VIRTUELLE Switch-Dispatch ueber type-id"). Jedes Ziel steht also
+// als Aufruf im Befehlsstrom. Wer das aendert und Methodenadressen in eine
+// Tabelle legt, muss diese Tabelle hier als Wurzel nachtragen -- sonst
+// verschwinden Methoden, die nur ueber sie erreichbar sind.
+//
+// Der Einstieg `main` ruft `__lyx_modinit` selbst (#2123), die Initialisierer
+// kommen also ueber eine gewoehnliche Kante mit.
+//
+// Rueckgabe: Puffer mit einem Byte je Funktion (1 = erreichbar), oder 0, wenn
+// der Einstieg nicht gefunden wurde. 0 heisst fuer den Aufrufer: NICHTS
+// weglassen. Lieber ein zu grosses Erzeugnis als ein fehlender Rumpf.
+pub fn IrErreichbare(irMod: int64, startName: pchar, startLen: int64): int64 {
+  if irMod == 0 { return 0; }
+  var funcBuf:  int64 := peek64(irMod + IR_MOD_OFF_FUNCBUF);
+  var funcN:    int64 := peek64(irMod + IR_MOD_OFF_FUNCLEN);
+  var instrBuf: int64 := peek64(irMod + IR_MOD_OFF_INSTRBUF);
+  var strBuf:   int64 := peek64(irMod + IR_MOD_OFF_STRBUF);
+  if funcN <= 0 { return 0; }
+
+  // Einstieg suchen. Gibt es ihn nicht, wird nicht geraten.
+  var start: int64 := 0 - 1;
+  var fi: int64 := 0;
+  while fi < funcN {
+    var nOff: int64 := peek64(funcBuf + fi * IR_FUNC_SIZE);
+    var nLen: int64 := peek64(funcBuf + fi * IR_FUNC_SIZE + IR_FUNC_OFF_NAMELEN);
+    if nLen == startLen {
+      var gleich: int64 := 1;
+      var k: int64 := 0;
+      while k < nLen {
+        if peek8(strBuf + nOff + k) != (StrCharAt(startName, k) & 255) { gleich := 0; k := nLen; }
+        k := k + 1;
+      }
+      if gleich != 0 { start := fi; fi := funcN; }
+    }
+    fi := fi + 1;
+  }
+  if start < 0 { return 0; }
+
+  var lebt: int64 := alloc(funcN);
+  var z: int64 := 0;
+  while z < funcN { poke8(lebt + z, 0); z := z + 1; }
+
+  // Arbeitsliste statt Rekursion: eine Unit kann tausende Funktionen fuehren,
+  // und eine Rekursion darueber steht unter `ulimit -v` als erstes am Rand.
+  var liste: int64 := alloc(funcN * 8);
+  var n: int64 := 0;
+  poke8(lebt + start, 1);
+  poke64(liste, start);
+  n := 1;
+
+  while n > 0 {
+    n := n - 1;
+    var f: int64 := peek64(liste + n * 8);
+    var iOff: int64 := peek64(funcBuf + f * IR_FUNC_SIZE + IR_FUNC_OFF_INSTRSOFF);
+    var iCnt: int64 := peek64(funcBuf + f * IR_FUNC_SIZE + IR_FUNC_OFF_INSTRCOUNT);
+    var j: int64 := 0;
+    while j < iCnt {
+      var ins: int64 := instrBuf + (iOff + j) * IR_INSTR_SIZE;
+      var op:  int64 := peek64(ins);
+      if (op == IRO_CALL || op == IRO_FUNC_ADDR) {
+        var ziel: int64 := peek64(ins + IR_INSTR_OFF_SRC1);
+        if (ziel >= 0 && ziel < funcN) {
+          if peek8(lebt + ziel) == 0 {
+            poke8(lebt + ziel, 1);
+            poke64(liste + n * 8, ziel);
+            n := n + 1;
+          }
+        }
+      }
+      j := j + 1;
+    }
+  }
+
+  free(liste, funcN * 8);
+  return lebt;
+}

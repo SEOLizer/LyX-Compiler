@@ -129,6 +129,7 @@ pub type EmitRISCV64 = class {
   gotOff:        int64;   // Code-Offset des ersten GOT-Platzes (-1 = keiner)
   dynStartOff:   int64;   // Code-Offset des libc-Startwegs (-1 = keiner)
   noLibcInit:    int64;   // --no-libc-init: main direkt, ohne __libc_start_main
+  lebendBuf:     int64;   // #2451: 1 Byte je Funktion, 0 = nichts weglassen
   // #2162: --shared. Je Export mit Gleitkomma {funcId, sig, huellenOff}
   // (24 Byte); sig wie lyxc._armSoSignaturen: n | arten << 8 | rueck << 32.
   isShared:      int64;
@@ -675,15 +676,16 @@ pub type EmitRISCV64 = class {
       if labelId != -2 {
       var target:  int64 := -1;
       if ptype == RV_PATCH_BL || ptype == RV_PATCH_FADDR {
-        // #1740: funcAddrs kommt aus alloc und ist null. Ein Ziel 0 ist nur
-        // fuer die ZUERST erzeugte Funktion echt; fuer jede andere heisst es
-        // „noch nicht erzeugt". Vorher wurde jeder Vorwaertsaufruf auf
-        // Code-Offset 0 gepatcht und sprang damit in die erste Funktion —
-        // aus `alloc(64)` wurde ein Selbstaufruf von main bis zum
-        // Stapelueberlauf (#1740).
+        // #1740 verlangte, ein Ziel 0 nur fuer die ZUERST erzeugte Funktion
+        // als echt zu nehmen -- sonst sprang jeder Vorwaertsaufruf auf
+        // Code-Offset 0 und damit in die erste Funktion (Selbstaufruf von main
+        // bis zum Stapelueberlauf). Die Regel hing daran, dass Funktion 0
+        // zuerst erzeugt wird.
+        // #2451: Mit dem Schnitt gilt das nicht mehr -- wird Funktion 0
+        // weggelassen, liegt eine andere bei Offset 0. Deshalb ist funcAddrs
+        // jetzt auf -1 VORBELEGT, und ein Offset 0 ist eine echte Adresse.
         if labelId >= 0 && labelId < self.funcCap {
           target := peek64(self.funcAddrs + labelId * 8);
-          if target == 0 { if labelId != 0 { target := -1; } }
         }
       } else {
         if labelId >= 0 && labelId < self.labelCap { target := peek64(self.labelAddrs + labelId * 8); }
@@ -2195,6 +2197,8 @@ pub type EmitRISCV64 = class {
     self.funcCap    := self.getFuncCount() + 1;
     if self.funcCap < 256 { self.funcCap := 256; }
     self.funcAddrs  := alloc(self.funcCap * 8);
+    var rvFa: int64 := 0;
+    while rvFa < self.funcCap { poke64(self.funcAddrs + rvFa * 8, 0 - 1); rvFa := rvFa + 1; }   // #2451
     self.funcCount  := 0;
     self.globRelocBuf   := alloc(256 * 16);
     self.globRelocCap   := 256;
@@ -2210,6 +2214,7 @@ pub type EmitRISCV64 = class {
     self.gotOff        := -1;
     self.dynStartOff   := -1;
     self.noLibcInit    := 0;
+    self.lebendBuf     := 0;   // #2451
     self.isShared      := 0;
     self.soHuCap       := 8;
     self.soHuTab       := alloc(self.soHuCap * 24);
@@ -2219,7 +2224,17 @@ pub type EmitRISCV64 = class {
   pub fn emit(): int64 {
     var n: int64 := self.getFuncCount();
     var i: int64 := 0;
-    while i < n { self.emitFunc(i); i := i + 1; }
+    // #2451: Unerreichbares nicht emittieren -- dieselbe Rechnung wie im
+    // arm64-Zweig (IrErreichbare in src/ir.lyx), damit beide IR-Ziele dasselbe
+    // Erzeugnis tragen. Uebersprungen wird die EMISSION, nicht der Platz in
+    // der Tabelle: Indizes und Relokationen bleiben, und ein uebersehener
+    // Aufruf bleibt als offener Patch stehen und scheitert laut.
+    while i < n {
+      var tot: int64 := 0;
+      if (self.lebendBuf != 0 && peek8(self.lebendBuf + i) == 0) { tot := 1; }
+      if tot == 0 { self.emitFunc(i); }
+      i := i + 1;
+    }
     // #1740: jetzt steht jede Funktionsadresse fest — offene Vorwaertsaufrufe
     // aufloesen.
     // #2162: mit FFI startet main ueber __libc_start_main (wie arm64, WP-A5),
@@ -2732,6 +2747,8 @@ pub type EmitRISCV64 = class {
 
   pub fn setNoLibcInit(v: int64) { self.noLibcInit := v; }
   pub fn setShared(v: int64) { self.isShared := v; }
+  // #2451: siehe IrErreichbare in src/ir.lyx.
+  pub fn setLebend(buf: int64) { self.lebendBuf := buf; }
   pub fn getFuncAddrs(): int64 { return self.funcAddrs; }
 
   // Huelle vormerken (vor emit); liefert ihren Index fuer getSoHuelleOff.
