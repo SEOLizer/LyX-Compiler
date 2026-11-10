@@ -21,8 +21,8 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.34B
-VERSION_DATE := 2026-11-08
+VERSION   := 1.2.35A
+VERSION_DATE := 2026-11-10
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
 UNITS_DST := $(PKG_DIR)/usr/include/lyx/units/std
@@ -33,7 +33,7 @@ SHARE_DST := $(PKG_DIR)/usr/share/lyx
 UNITS_LYU := $(patsubst std/%.lyx,  $(UNITS_DST)/%.lyu, $(UNITS_SRC))
 DATA_LYU  := $(patsubst data/%.lyx, $(DATA_DST)/%.lyu,  $(DATA_SRC))
 
-.PHONY: build bootstrap singularity test test-external test-lyxos test-lyx-integration test-known-red snapshot snapshot-update clean package precompile-units install-bin install-data lic_build_flags keygen deb
+.PHONY: build bootstrap singularity test test-external test-lyxos test-lyx-integration test-known-red snapshot snapshot-update clean package precompile-units install-bin install-data lic_build_flags keygen deb dist dist-win64 dist-linux
 
 # ── Compiler bauen ────────────────────────────────────────────────────────────
 
@@ -335,6 +335,10 @@ test: lyxc
 	@bash tests/oop_laufzeit_test.sh
 	@echo "--- arm64: Erzeugnisse ausfuehren, nicht nur uebersetzen (#1769) ---"
 	@bash tests/arm64_laufzeit_test.sh
+	@echo "--- ClassName() liefert auf allen Zielen denselben Namen (#2426) ---"
+	@bash tests/classname_2426_test.sh
+	@echo "--- rmdir entfernt auf arm64 und riscv wirklich (#2450) ---"
+	@bash tests/rmdir_2450_test.sh
 	@echo "--- parallel Array<f32>: Werte auf x86-64 UND arm64 (#2183, #2184, #2185) ---"
 	@bash tests/simd_f32_test.sh
 	@echo "--- --std-path ist autoritativ, kein stiller Rueckfall (#2201) ---"
@@ -1264,6 +1268,22 @@ snapshot-update: lyxc
 	@bash tests/run_snapshot_tests.sh --update
 
 # ── Paketierung ───────────────────────────────────────────────────────────────
+
+# Auslieferbaum je Backend unter build/<backend>/ — Binary, zielabhaengige
+# .lyu und Datendateien in einem Verzeichnis, aus dem sich ein Installer
+# bauen laesst. Getrennt vom .deb, weil das .deb nur x86-64-Linux kennt.
+#
+# Warum je Backend ein eigener Unit-Baum: eine .lyu ist zielabhaengig
+# (std/math.lyx als linux und als win64 ergibt zwei verschiedene Dateien).
+# Ein gemeinsames include/ waere fuer jedes Ziel ausser einem still falsch.
+dist: lyxc
+	@bash tools/build_dist.sh
+
+dist-win64: lyxc
+	@bash tools/build_dist.sh win64
+
+dist-linux: lyxc
+	@bash tools/build_dist.sh linux-x86_64
 
 # Fertiges .deb mit Version und Architektur im Namen. Das Skript füllt den
 # Paketbaum (std, data, KassenSichV), räumt verwaiste Dateien weg, stempelt

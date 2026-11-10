@@ -483,6 +483,7 @@ der eingesetzte Wert steht jeweils fest.
 | 548 | Linux-Syscall readlinkat (Nr. 78) | `readlink`, `sys_readlink`, `sys_readlinkat` | #2156; nur arm64/riscv, dirfd AT_FDCWD |
 | 549 | Linux-Syscall symlinkat (Nr. 36) | `symlink` | #2156; nur arm64/riscv, newdirfd AT_FDCWD |
 | 550 | Linux-Syscall fstat (Nr. 80) | `sys_fstat` | #2156; nur arm64/riscv |
+| 551 | Linux-Syscall unlinkat (Nr. 35) | `rmdir` | #2450; nur arm64/riscv, dirfd AT_FDCWD, Flag AT_REMOVEDIR (0x200). Auf lyxos bleibt `rmdir` die ID 236 (sys_unlink mit UNLINK_DIR) — und die meldet dort, dass es die Nummer nicht gibt (#2011) |
 
 ## Bereich 253 … 262 — CPU-Abfrage und Bit-Rechenwerke (#2187, #2190, #2177)
 
