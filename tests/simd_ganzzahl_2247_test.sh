@@ -318,13 +318,26 @@ LYX
 # ------------------------------------------------------------------
 lyxosmuster() { # name, typ, hex, soll-vorhanden(1/0)
   local name="$1" typ="$2" hex="$3" soll="$4"
+  # #2451: `rechne` MUSS von main gerufen werden. Vorher stand hier
+  # `fn main(): int64 { return 0; }`, und die Vektorfunktion war totes
+  # Gewicht -- der Test verliess sich darauf, dass der Compiler sie trotzdem
+  # emittiert. Seit #2451 laesst der lyxos-Zweig Unerreichbares weg, und die
+  # Muster waren folgerichtig nicht mehr im Erzeugnis.
+  #
+  # Der Zustand wird hergestellt, nicht ausgenommen: so misst der Test das
+  # Muster in Code, der wirklich im Erzeugnis landet -- vorher haette er auch
+  # eine Vektorisierung bestaetigt, die nur in unerreichbarem Code steht.
   cat > "$TMP/lo.lyx" <<LYXEOF
 unit main;
 fn rechne(a: parallel Array<$typ>, b: parallel Array<$typ>): int64 {
   var c: parallel Array<$typ> = a + b;
   return c[0] as int64;
 }
-fn main(): int64 { return 0; }
+fn main(): int64 {
+  var x: parallel Array<$typ> = parallel Array<$typ>(8);
+  var y: parallel Array<$typ> = parallel Array<$typ>(8);
+  return rechne(x, y);
+}
 LYXEOF
   if ! (cd "$ROOT" && timeout 200 "$LYXC" --std-path="$ROOT" --target=lyxos "$TMP/lo.lyx" -o "$TMP/lo" >"$TMP/lo.log" 2>&1); then
     no "$name" "uebersetzt nicht: $(grep -m1 -iE 'error|Opcode' "$TMP/lo.log" | head -c 90)"; return
