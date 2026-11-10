@@ -3644,6 +3644,66 @@ pub type IRLower = class {
       if mcCNameL > 0 {
         var mNameP: pchar := self.nodeSVal(expr);
         var mNameL: int64 := self.nodeSLen(expr);
+        // #2426: `obj.ClassName()` — ein Builtin an JEDER Klasse (seit 1.1.3D),
+        // bisher aber nur in codegen_x86 umgesetzt. Auf dem IR-Weg lief der
+        // Aufruf in die gewoehnliche Methodenaufloesung, fand dort nichts und
+        // scheiterte mit "Methode nicht aufloesbar" (lyxos, arm64, riscv —
+        // alle drei gemessen). Vor der Meldung aus #1976 war derselbe Fall
+        // STILL: ClassName() lieferte 0, und `PCharEqual(self.ClassName() as
+        // pchar, name)` verglich gegen Adresse 0.
+        //
+        // Dieselbe Unterscheidung wie auf x86 (codegen_x86.cg_genCall):
+        //   * Klasse MIT type-id -> DYNAMISCHER Name. Eine Variable vom
+        //     Basisklassentyp meldet die tatsaechliche Klasse.
+        //   * Klasse OHNE type-id -> der statische Name ist die einzige und
+        //     richtige Antwort; das Objekt traegt nichts, woran sich mehr
+        //     erkennen liesse. Dieselbe Grenze, die `is` zieht (ebnf.md 20.1).
+        //
+        // Der Weg ueber obj[0] ist NICHT der von x86: dort steht der
+        // VMT-Zeiger und der Name bei [VMT-8], hier die globale type-id
+        // (= Registry-Index, siehe lowerNew). Verglichen wird deshalb gegen
+        // die Registry, wie es die virtuelle Dispatch und der
+        // Interface-Aufruf in dieser Funktion schon tun.
+        if (self.seq(mNameP, mNameL, "ClassName"c, 9) && self.nodeC1(expr) < 0) {
+          var cnVmt: int64 := 0;
+          if mcLocal >= 0 { cnVmt := self._hasVmt(mcLocal); }
+          else { cnVmt := self._tregHasVmtG(self._tregFind(mcCName, mcCNameL)); }
+          // Der Empfaenger wird in JEDEM Fall ausgewertet — er kann Wirkung
+          // haben (`liste.Kopf().ClassName()`).
+          var cnSelf: int64 := self.lowerExpr(mcBaseNode);
+          var cnStat: int64 := self.irAddString(mcCName, mcCNameL);
+          if cnVmt == 0 {
+            self.irAddInstrDirect(IRO_CONST_STR, mcDest, -1, -1, cnStat);
+            return mcDest;
+          }
+          var cnTid: int64 := self.allocTemp();
+          self.irAddInstrDirect(IRO_LOAD_FIELD, cnTid, cnSelf, 0, 0);   // tid = obj[0]
+          // Vorbelegung mit dem statischen Namen: trifft keine id, ist das
+          // die richtige Antwort und kein stiller Null-Zeiger.
+          self.irAddInstrDirect(IRO_CONST_STR, mcDest, -1, -1, cnStat);
+          var cnEnd: int64 := self.genLabel();
+          var cnI: int64 := 0;
+          while cnI < self._tregN {
+            // Nur Klassen MIT type-id kommen als Laufzeittyp in Frage — nur
+            // sie schreiben ihren Index nach obj[0].
+            if self._tregHasVmtG(cnI) != 0 {
+              var cnC: int64 := self.allocTemp();
+              self.irAddInstrDirect(IRO_CONST_INT, cnC, -1, -1, cnI);
+              var cnCmp: int64 := self.allocTemp();
+              self.irAddInstrDirect(IRO_CMP_EQ, cnCmp, cnTid, cnC, 0);
+              var cnNext: int64 := self.genLabel();
+              self.irEmitBrFalse(cnCmp, cnNext);
+              var cnOff: int64 := self.irAddString(peek64(self._tregNameP + cnI * 8) as pchar,
+                                                   peek64(self._tregNameL + cnI * 8));
+              self.irAddInstrDirect(IRO_CONST_STR, mcDest, -1, -1, cnOff);
+              self.irEmitJmp(cnEnd);
+              self.irEmitLabel(cnNext);
+            }
+            cnI += 1;
+          }
+          self.irEmitLabel(cnEnd);
+          return mcDest;
+        }
         // Virtuell? Fast lokal, sonst via Registry (importiert).
         var mcVirt: int64 := 0;
         if mcLocal >= 0 { mcVirt := self._methodVirtual(mcLocal, mNameP, mNameL); }
@@ -5319,6 +5379,16 @@ pub type IRLower = class {
       }
       if (self.seq(fname, fnlen, "sys_readlinkat", 14)) { return self._lscRuf(LSC_READLINKAT, arg0, dest); }
       if (self.seq(fname, fnlen, "sys_fstat", 9)) { return self._lscRuf(LSC_FSTAT, arg0, dest); }
+      // #2450: rmdir(pfad) -> unlinkat(AT_FDCWD, pfad, AT_REMOVEDIR).
+      // Gehoerte von Anfang an in diese Aufzaehlung: der Zweig weiter unten
+      // senkt `rmdir` auf die LyxOS-ID 236 (sys_unlink mit UNLINK_DIR), und
+      // die hat auf arm64 und riscv keine Bedeutung. Gemessen brach damit
+      // schon `import std.fs; return SEEK_END` ab, obwohl kein fs-Aufruf
+      // vorkommt. AT_REMOVEDIR ist 0x200 = 512 (linux/fcntl.h), dirfd setzt
+      // _lscAt wie bei stat/readlink auf AT_FDCWD.
+      if (self.seq(fname, fnlen, "rmdir", 5)) {
+        return self._lscAt(LSC_UNLINKAT, arg0, dest, 1, 512);
+      }
       if (self.seq(fname, fnlen, "symlink", 7)) {
         // symlinkat(ziel, newdirfd, link) — dirfd steht in der MITTE.
         var slB: int64 := self.tempCount;
