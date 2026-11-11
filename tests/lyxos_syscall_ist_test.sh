@@ -106,6 +106,70 @@ PY
 pruefe "rohe Emissionsstellen nennen nur belegte Nummern" "$TMP/roh.txt" \
        "Diese Stellen umgehen lyxosNummerBelegt() — die Nummer muss trotzdem existieren."
 
+# --- Helferstellen: emitVfsSyscall(nr, ...) --------------------------------
+# #2469: die Pruefung oben sieht nur `emitMovRaxImm`. Die Helferaufrufe sind
+# die HAEUFIGEREN (gemessen 120 gegen 39 auf fe5980bb) und blieben ungeprueft.
+# Sie sind nicht still -- emitVfsSyscall prueft die Nummer selbst (#1734) --,
+# aber der Fehler faellt erst dem ersten auf, der den Aufruf benutzt. Hier
+# faellt er beim Testlauf auf, mit Zeile und Namen.
+#
+# Die Nummer steht als erstes Argument; ein Fenster ueber Folgezeilen wie beim
+# rohen Muster braucht es nicht.
+ERLAUBT="tests/lyxos-helfer-allow.txt"
+python3 - "$QUELLE" "$TMP/soll.txt" "$ERLAUBT" "$TMP/helfer-tot.txt" > "$TMP/helfer.txt" 2> "$TMP/helfer.err" <<'PY'
+import re, sys, os
+
+quelle, sollp, erlaubtp, totp = sys.argv[1:5]
+zeilen = open(quelle, encoding='utf-8', errors='replace').read().split("\n")
+soll = set(int(x) for x in open(sollp))
+
+# Ausnahmen: "<Nummer>\t<Builtin>\t<Begruendung>"
+erlaubt = {}
+if os.path.exists(erlaubtp):
+    for z in open(erlaubtp, encoding='utf-8'):
+        z = z.split('#', 1)[0].rstrip("\n")
+        if not z.strip():
+            continue
+        t = z.split("\t")
+        if len(t) < 3 or not t[0].strip().isdigit():
+            print(f"{erlaubtp}: Zeile nicht im Format <Nummer>TAB<Builtin>TAB<Begruendung>: {z[:60]}",
+                  file=sys.stderr)
+            continue
+        erlaubt[int(t[0])] = t[1].strip()
+
+pat = re.compile(r'\bemitVfsSyscall(?:AB)?\(\s*(0x[0-9A-Fa-f]+|\d+)')
+gesehen = set()
+treffer = 0
+for i, l in enumerate(zeilen, 1):
+    for m in pat.finditer(l):
+        nr = int(m.group(1), 0)
+        if nr in soll:
+            continue
+        gesehen.add(nr)
+        if nr in erlaubt:
+            continue
+        print(f"{quelle}:{i}: Helfer-Syscall-Nummer {nr} ({m.group(1)}) steht nicht im Ist-Stand")
+        treffer += 1
+
+# Gegenrichtung in eine eigene Datei: Eintraege ohne Stelle.
+with open(totp, 'w', encoding='utf-8') as fh:
+    for nr, nm in sorted(erlaubt.items()):
+        if nr not in gesehen:
+            fh.write(f"{nr} ({nm}): keine Helferstelle nennt diese Nummer mehr\n")
+PY
+RC_H=$?
+if [ -s "$TMP/helfer.err" ]; then
+    echo "FAIL Helferpruefung selbst gescheitert:"; sed 's/^/  /' "$TMP/helfer.err"
+    FAIL=$((FAIL + 1))
+fi
+pruefe "Helferstellen nennen nur belegte oder eingetragene Nummern" "$TMP/helfer.txt" \
+       "emitVfsSyscall prueft die Nummer (#1734) -- der Aufruf scheitert beim Uebersetzen. Entweder die echte Kernelnummer einsetzen oder die Stelle mit Begruendung in $ERLAUBT eintragen."
+
+# Gegenrichtung: ein Eintrag, dessen Stelle inzwischen eine belegte Nummer
+# nennt, verdeckt beim naechsten Mal einen echten Fall.
+pruefe "kein veralteter Eintrag in der Ausnahmeliste" "$TMP/helfer-tot.txt" \
+       "Streichen, sonst deckt die Liste den naechsten echten Fall zu."
+
 # --- Abgleich gegen das LyxOS-Repo, falls vorhanden ------------------------
 echo "-- Abgleich gegen das LyxOS-Repo --"
 ABGLEICH=$(tools/lyxos_syscall_abgleich.sh 2>&1); RC=$?
