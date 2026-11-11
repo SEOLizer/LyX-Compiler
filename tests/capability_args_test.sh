@@ -85,7 +85,7 @@ $M" "unbekanntes Capability-Argument"
 # verdraengen.
 rejects "gueltiger Name, Wert ausserhalb des Bereichs" \
   "@capabilities([hardware.gpio(pin: 999)])
-$M" "Pin außerhalb"
+$M" "Pin ausserhalb"
 
 # --- 2. Gueltige Namen werden als folgenlos gemeldet ----------------------
 #

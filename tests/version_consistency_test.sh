@@ -79,7 +79,7 @@ check src/lyxc.lyx "Bootstrap-Zeile" \
   "$(sed -n 's/.*PrintStrLn("lyxc \([0-9A-Za-z.]*\) (bootstrap)");.*/\1/p' "$ROOT/src/lyxc.lyx" | head -1)"
 
 check src/lyxc.lyx "Copyright-Banner" \
-  "$(sed -n 's/.*PrintStr("lyxc \([0-9A-Za-z.]*\) — Copyright.*/\1/p' "$ROOT/src/lyxc.lyx" | head -1)"
+  "$(sed -n 's/.*PrintStr("lyxc \([0-9A-Za-z.]*\) -- Copyright.*/\1/p' "$ROOT/src/lyxc.lyx" | head -1)"
 
 check ebnf.md "Titel" \
   "$(sed -n '1s/^# Lyx \([0-9A-Za-z.]*\) .*/\1/p' "$ROOT/ebnf.md")"

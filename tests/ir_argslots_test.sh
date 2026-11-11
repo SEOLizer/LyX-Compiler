@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# tests/ir_argslots_test.sh — #1388: die IR-Strecke unter qemu MESSEN, nicht
+# tests/ir_argslots_test.sh -- #1388: die IR-Strecke unter qemu MESSEN, nicht
 # nur uebersetzen.
 #
 # Der fruehere Nachweis zu #1388 hat die erzeugten BYTES geprueft. Die Bytes
-# entstanden auch — nur rechneten sie falsch:
+# entstanden auch -- nur rechneten sie falsch:
 #
 #   * Aufrufargumente lagen in den Slots 0..N, wo die Parameter und
 #     Temporaeren der Funktion selbst liegen. `fn f(p) { StrLen("abcd"c); return p; }`
 #     lieferte fuer f(9) den Wert 44.
 #   * peek/poke lasen Slot 0 statt des hohen Argumentblocks, den ir_lower
-#     seit #839 benutzt — auf arm64 ein Segfault bei jedem peek8.
+#     seit #839 benutzt -- auf arm64 ein Segfault bei jedem peek8.
 #   * `"abc"c` war vier Zeichen lang: die Laenge rechnete mit zwei
 #     Anfuehrungszeichen und uebersah das `c` dahinter.
-#   * STUR/LDUR kuerzten Offsets ausserhalb von simm9 still auf neun Bit —
+#   * STUR/LDUR kuerzten Offsets ausserhalb von simm9 still auf neun Bit --
 #     ab Slot 32 traf der Zugriff eine fremde Stelle.
 #
 # Gemessen wird deshalb mit qemu-aarch64: der Rueckgabewert des Programms ist
@@ -31,7 +31,7 @@ QEMU=""
 . "$ROOT/tests/lib/qemu.sh"   # #2048: beide Paketnamen
 [ -n "$QEMU_ARM64" ] && QEMU="$QEMU_ARM64"
 if [ -z "$QEMU" ]; then
-  echo "SKIP qemu-aarch64 nicht vorhanden — ohne Laufzeit misst dieser Test nichts"
+  echo "SKIP qemu-aarch64 nicht vorhanden -- ohne Laufzeit misst dieser Test nichts"
   echo "----"; echo "0 PASS, 0 FAIL"; exit 0
 fi
 
@@ -163,7 +163,7 @@ laufRV() {   # Name, Quelle, erwarteter Rueckgabewert
 }
 [ -z "$QEMURV" ] && echo "SKIP qemu-riscv64 nicht vorhanden"
 
-# StrSub — der letzte Name, an dem std.io auf arm64 scheiterte.
+# StrSub -- der letzte Name, an dem std.io auf arm64 scheiterte.
 STRSUB='fn main(): int64 {
   var s: pchar := StrSub("abcdef"c, 2, 3);
   if (StrLen(s) != 3) { return 1; }
@@ -192,7 +192,7 @@ ITS='fn main(): int64 {
 laufRV "IntToStr rechnet richtig" "$ITS" 42
 
 # Der Fall aus dem Ticket selbst: import std.io + PrintLn. Geprueft wird die
-# AUSGABE, nicht nur der Rueckgabewert — ein Programm, das nichts druckt,
+# AUSGABE, nicht nur der Rueckgabewert -- ein Programm, das nichts druckt,
 # kaeme sonst als gruen durch.
 IO='import std.io;
 fn main(): int64 { PrintLn("hallo"); return 0; }'
@@ -210,7 +210,7 @@ for ziel in arm64 riscv; do
 done
 
 # Cortex-M: StrLen geht (rechnet ohne Betriebssystem), StrSub und IntToStr
-# nicht — sie brauchen einen Puffer, der den Aufruf ueberlebt. Geprueft wird,
+# nicht -- sie brauchen einen Puffer, der den Aufruf ueberlebt. Geprueft wird,
 # dass die Grenze GEMELDET wird statt still zu wirken. Ausfuehren laesst sich
 # das Ziel hier nicht; das ist der Unterschied zu den Faellen oben und der
 # Grund, warum hier nur der Bau geprueft wird.

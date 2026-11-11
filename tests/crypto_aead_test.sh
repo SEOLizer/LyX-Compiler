@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
-# tests/crypto_aead_test.sh — #2096 Etappe B: AES-GCM (SP 800-38D) und
+# tests/crypto_aead_test.sh -- #2096 Etappe B: AES-GCM (SP 800-38D) und
 # ChaCha20-Poly1305 (RFC 8439) gegen festgeschriebene Referenzwerte.
 #
 # Geprueft wird die WIRKUNG, nicht das Vorhandensein: Ciphertext und Tag
 # byteweise vollstaendig, dazu der Rundlauf (Open liefert den Klartext
-# zurueck) und beide Ablehnungsfaelle — verfaelschtes Tag und verfaelschte
+# zurueck) und beide Ablehnungsfaelle -- verfaelschtes Tag und verfaelschte
 # AAD muessen false liefern. Ein Test, der nur "Tag entstanden" oder "16 Byte
 # geschrieben" prueft, waere blind fuer ein falsches Tag.
 #
 # Herkunft der Erwartungen (gegengerechnet mit python-cryptography 46.0.5):
 #   - AES-128/256-GCM, Nonce 12 Byte (TLS) sowie 8 und 16 Byte (dort laeuft
 #     J0 ueber GHASH, ein anderer Zweig), AAD 0/13/16/20, Klartext
-#     0/16/17/60/64/65 Byte — die Laengen liegen um die Blockgrenze.
+#     0/16/17/60/64/65 Byte -- die Laengen liegen um die Blockgrenze.
 #   - GHASH einzeln ueber 48 und 20 Byte (Teilblock wird rechts genullt).
 #   - ChaCha20 Blockfunktion: RFC 8439 §2.4.2 (Schluessel 00..1f, Nonce
-#     00..004a0000 0000, Zaehler 1) — buchstaeblich der Strom aus dem RFC.
+#     00..004a0000 0000, Zaehler 1) -- buchstaeblich der Strom aus dem RFC.
 #   - Poly1305: RFC 8439 §2.5.2 ("Cryptographic Forum Research Group",
 #     Tag a8061dc1305136c6c22b8baf0c0127a9), dazu Vielfaches von 16, Teilblock
 #     und leere Nachricht.

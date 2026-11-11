@@ -65,7 +65,7 @@ esac
 # geblieben waere.
 kette_roh="${zeile#*erkannt: }"
 schlecht=""
-printf '%s' "$kette_roh" | awk -F' → ' '{for (i=1;i<=NF;i++) print $i}' > "$TMP/glieder.txt"
+printf '%s' "$kette_roh" | awk -F' -> ' '{for (i=1;i<=NF;i++) print $i}' > "$TMP/glieder.txt"
 while IFS= read -r g; do
   case "$g" in
     *[!a-zA-Z0-9_.]*) schlecht="$schlecht [$g]" ;;
@@ -85,8 +85,8 @@ case "$kette" in
   *zb*) ok "Kette nennt zb" ;;
   *) no "Kette nennt zb" "$kette" ;;
 esac
-erster="$(printf '%s' "$kette" | awk -F' → ' '{print $1}')"
-letzter="$(printf '%s' "$kette" | awk -F' → ' '{print $NF}')"
+erster="$(printf '%s' "$kette" | awk -F' -> ' '{print $1}')"
+letzter="$(printf '%s' "$kette" | awk -F' -> ' '{print $NF}')"
 if [ -n "$erster" ] && [ "$erster" = "$letzter" ]; then ok "Kette ist geschlossen ($erster … $letzter)"
 else no "Kette ist geschlossen" "'$erster' vs '$letzter'"; fi
 
@@ -127,7 +127,7 @@ done
 if [ -z "$fehlt" ]; then ok "Dreier-Zyklus nennt alle drei Units"
 else no "Dreier-Zyklus nennt alle drei Units" "fehlt:$fehlt ($zeile3)"; fi
 
-glieder="$(printf '%s' "${zeile3#*erkannt: }" | awk -F' → ' '{print NF}')"
+glieder="$(printf '%s' "${zeile3#*erkannt: }" | awk -F' -> ' '{print NF}')"
 if [ "$glieder" = "4" ]; then ok "Dreier-Zyklus hat vier Glieder (geschlossen)"
 else no "Dreier-Zyklus hat vier Glieder" "$glieder Glieder: ${zeile3#*erkannt: }"; fi
 

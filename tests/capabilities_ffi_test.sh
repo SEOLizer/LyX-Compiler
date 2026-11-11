@@ -125,7 +125,7 @@ fn main(): int64 { return 0; }'
 # schlicht abgeschaltet.
 weist_ab "zwei pchar OHNE Groesse bleiben abgewiesen" '@cap(system.exit)
 extern fn zwei(a: pchar, b: pchar): int64 link "libc.so.6";
-fn main(): int64 { return 0; }' "ohne Größenlimit"
+fn main(): int64 { return 0; }' "ohne Groessenlimit"
 
 # ===========================================================================
 # #1276 — fcntl im seccomp-Filter
