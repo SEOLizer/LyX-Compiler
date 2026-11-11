@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.36B
+VERSION   := 1.2.36C
 VERSION_DATE := 2026-11-11
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -317,6 +317,12 @@ test: lyxc
 	@bash tests/win64_syscalls_test.sh
 	@echo "--- win64: Datei-API ueber Win32 statt roher Syscalls (#2461) ---"
 	@bash tests/win64_datei_api_test.sh
+	@echo "--- win64: FFI ab dem fuenften Argument (#2467) ---"
+	@bash tests/win64_ffi_viele_argumente_test.sh
+	@echo "--- IR-Weg: mulhi/umulhi (#2460) ---"
+	@bash tests/ir_mulhi_test.sh
+	@echo "--- IR-Weg: Feld eines importierten Typs (#2459) ---"
+	@bash tests/ir_feld_importierter_typ_test.sh
 	@bash tests/ir_argslots_test.sh
 	@bash tests/include_pfade_test.sh
 	@bash tests/weiche_schluesselwoerter_test.sh

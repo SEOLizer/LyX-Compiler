@@ -223,8 +223,10 @@ compile_ok "poke32f_compiles" 'fn main(): int64 { var b: int64 := mmap(0, 4096, 
 # abgewiesen und erreicht diese Stelle gar nicht.
 #
 # Hier stand bis 1.2.9A `EPrintFloat`; seit #2042 wird es gelowert, der Test
-# waere damit an einer geschlossenen Luecke haengengeblieben. Jetzt `mulhi`.
-# Wird auch das umgesetzt, den naechsten Kandidaten so finden (36 waren es
+# waere damit an einer geschlossenen Luecke haengengeblieben. Danach `mulhi`;
+# seit #2460 wird auch das gelowert (Ids 569/570), also jetzt `divrem128` —
+# derselbe Herkunftszusammenhang (#1552), dieselbe offene Stelle im IR-Weg.
+# Wird auch das umgesetzt, den naechsten Kandidaten so finden (32 waren es
 # zuletzt) -- und NICHT die Erwartung loeschen:
 #
 #   python3 - <<EOF
@@ -238,7 +240,7 @@ compile_ok "poke32f_compiles" 'fn main(): int64 { var b: int64 := mmap(0, 4096, 
 # "unbekannter Builtin/Funktion" — die Meldung klang nach einer Luecke in der
 # Builtin-Tabelle und hat die Fehlersuche bei einer verschachtelten Funktion
 # in die falsche Richtung geschickt.
-compile_fail "hardened_catchall" 'fn main(): int64 { var x: int64 := mulhi(3, 4); return 0; }' "unbekannter Name im Aufruf"
+compile_fail "hardened_catchall" 'fn main(): int64 { var x: int64 := divrem128(1, 2, 3, 0); return 0; }' "unbekannter Name im Aufruf"
 
 echo "Ergebnis: $PASS PASS, $FAIL FAIL"
 [ "$FAIL" -eq 0 ]
