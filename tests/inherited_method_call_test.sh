@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
-# tests/inherited_method_call_test.sh — #1120: geerbte NICHT-virtuelle Methode.
+# tests/inherited_method_call_test.sh -- #1120: geerbte NICHT-virtuelle Methode.
 #
 # `b.G()` auf einer abgeleiteten Klasse brach die Uebersetzung ab:
 #
-#   error: undefined function 'B_G' — no codegen implementation found
+#   error: undefined function 'B_G' -- no codegen implementation found
 #
 # Der Aufruf wurde auf den gemangelten Namen der STATISCHEN Klasse des
 # Empfaengers abgebildet. Anders als die Felder wird eine Methode aber nicht in
-# die abgeleitete Klasse kopiert — der Rumpf steht unter `A_G`, ein `B_G` gibt
+# die abgeleitete Klasse kopiert -- der Rumpf steht unter `A_G`, ein `B_G` gibt
 # es nie. Der Fehler nannte damit einen Namen, den niemand geschrieben hat, und
 # zwang dazu, jede geerbte Methode `virtual` zu machen (nur dann lief der
 # Aufruf ueber die VMT), auch wo keine Ueberschreibung vorgesehen war.
 #
 # Behoben ueber eine Liste der je Klasse DEKLARIERTEN Methoden im
 # Klassen-Layout (VMTLIST fuehrt nur die virtuellen) und `cg_findMethodOwner`,
-# das die Vererbungskette ueber `CG_CLASS_OFF_PARENTIDX` hochlaeuft — dieselbe
+# das die Vererbungskette ueber `CG_CLASS_OFF_PARENTIDX` hochlaeuft -- dieselbe
 # Kette, die `cg_isDescendantClass` schon benutzt.
 #
 # Geprueft wird das ERGEBNIS des Aufrufs, nicht nur die Uebersetzbarkeit: die
@@ -56,7 +56,7 @@ type A = class { v: int64; fn G(): int64 { return 7; } };
 type B = class extends A { fn H(): int64 { return 1; } };
 fn main(): int64 { var b: B := new B(); PrintLn(b.G()); return 0; }" '7'
 
-# Die geerbte Methode arbeitet auf einem ererbten Feld — self muss stimmen,
+# Die geerbte Methode arbeitet auf einem ererbten Feld -- self muss stimmen,
 # nicht nur der Name aufloesbar sein.
 out "geerbte Methode benutzt self auf ererbtem Feld" "$K
 type A = class { v: int64; fn G(): int64 { return self.v + 1; } };
@@ -101,7 +101,7 @@ type C = class extends B { };
 fn main(): int64 { var c: C := new C(); PrintLn(c.G()); return 0; }" '9'
 
 # --- Gegenproben: die anderen Aufrufwege bleiben --------------------------
-# `virtual` laeuft weiter ueber die VMT, also nach dem DYNAMISCHEN Typ — hier
+# `virtual` laeuft weiter ueber die VMT, also nach dem DYNAMISCHEN Typ -- hier
 # muss B_G treffen, obwohl die Variable als A deklariert ist.
 out "virtual bleibt spaet gebunden" "$K
 type A = class { v: int64; virtual fn G(): int64 { return 7; } };
@@ -109,7 +109,7 @@ type B = class extends A { override fn G(): int64 { return 9; } };
 fn main(): int64 { var a: A := new B(); PrintLn(a.G()); return 0; }" '9'
 
 # super.G() geht weiter DIREKT zur Elternimplementierung (#1091) und nicht
-# ueber die VMT — sonst riefe es sich endlos selbst.
+# ueber die VMT -- sonst riefe es sich endlos selbst.
 out "super erreicht die Elternimplementierung (#1091)" "$K
 type A = class { v: int64; virtual fn G(): int64 { return 7; } };
 type B = class extends A { override fn G(): int64 { return super.G() + 1; } };
@@ -130,7 +130,7 @@ type B = class extends A { w: int64; };
 fn main(): int64 { var b: B := new B(); b.v := 3; b.w := 4; PrintLn(b.v + b.w); return 0; }" '7'
 
 # --- Der Fehler bleibt laut ----------------------------------------------
-# Eine Methode, die es NIRGENDS in der Kette gibt, muss weiterhin melden — die
+# Eine Methode, die es NIRGENDS in der Kette gibt, muss weiterhin melden -- die
 # Aufloesung darf nicht in einen stillen Default fallen.
 fails "unbekannte Methode meldet weiterhin" "$K
 type A = class { v: int64; };

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tests/ir_struct_test.sh — lokale Strukturen auf dem IR-Weg (#1835).
+# tests/ir_struct_test.sh -- lokale Strukturen auf dem IR-Weg (#1835).
 #
 # `var r: TR; r.L := 1; r.R := 9; return r.L + r.R;` faultete auf arm64 und
 # riscv (SIGSEGV), waehrend dasselbe Programm auf --target=linux 10 lieferte.
@@ -7,15 +7,15 @@
 #
 # URSACHE (src/ir_lower.lyx, lowerStmt/NK_VAR_DECL): `var a: [N]T` ohne Init
 # bekam mit dem ARM64-FIX Heap-Speicher, der Struktur-Fall daneben wurde nie
-# nachgezogen. Der Slot blieb uninitialisiert — und `r.L := 1` lowert zu
+# nachgezogen. Der Slot blieb uninitialisiert -- und `r.L := 1` lowert zu
 # IRO_STORE_FIELD(offset, wert, BASIS), wobei Basis der WERT des Slots ist:
 # bei einer Klasseninstanz der Heap-Zeiger, bei einer Struktur Muell.
 #
 # Der x86-Produktiv-Codegen erzeugt direkt aus dem AST und ist nicht betroffen
-# — deshalb war dasselbe Programm als ELF richtig und auf jedem IR-Ziel kaputt.
+# -- deshalb war dasselbe Programm als ELF richtig und auf jedem IR-Ziel kaputt.
 #
 # WARUM HIER KEIN lyxos: der lokale LBF-Lader fuehrt das Abbild unter LINUX
-# aus. LyxOS liefert Syscall-Ergebnisse in rdx, Linux in rax — eine Struktur
+# aus. LyxOS liefert Syscall-Ergebnisse in rdx, Linux in rax -- eine Struktur
 # fordert Speicher an und bekaeme hier eine Muelladresse. Dieselbe Grenze wie
 # bei den allokierenden Builtins (#1832). Gemessen wird darum auf arm64 und
 # riscv; beide gehen denselben Weg durch ir_lower.
@@ -38,10 +38,10 @@ fall() {  # name, rumpf, erwarteter Rueckgabewert
     local q=""
     if [ "$ziel" = "arm64" ]; then
       [ -n "$QEMU_ARM64" ] && q="$QEMU_ARM64"
-      if [ -z "$q" ]; then echo "SKIP arm64/$1: qemu fehlt — ohne Laufzeit misst das nichts"; continue; fi
+      if [ -z "$q" ]; then echo "SKIP arm64/$1: qemu fehlt -- ohne Laufzeit misst das nichts"; continue; fi
     elif [ "$ziel" = "riscv" ]; then
       [ -n "$QEMU_RISCV64" ] && q="$QEMU_RISCV64"
-      if [ -z "$q" ]; then echo "SKIP riscv/$1: qemu fehlt — ohne Laufzeit misst das nichts"; continue; fi
+      if [ -z "$q" ]; then echo "SKIP riscv/$1: qemu fehlt -- ohne Laufzeit misst das nichts"; continue; fi
     fi
     if ! timeout 200 "$LYXC" --std-path="$ROOT" "$TMP/s.lyx" --target="$ziel" -o "$TMP/s.out" >"$TMP/s.log" 2>&1; then
       echo "FAIL $ziel/$1: uebersetzt nicht: $(grep -im1 error "$TMP/s.log")"; FAIL=$((FAIL+1)); continue
@@ -58,7 +58,7 @@ fall() {  # name, rumpf, erwarteter Rueckgabewert
 fall "struct_lokal" \
   'fn main(): int64 { var r: TR; r.L := 1; r.R := 9; return r.L + r.R; }' 10
 
-# Uebergabe an eine Funktion — der Lesepfad ueber eine fremde Basis.
+# Uebergabe an eine Funktion -- der Lesepfad ueber eine fremde Basis.
 fall "struct_als_parameter" \
   'fn S(r: TR): int64 { return r.L + r.R; }
 fn main(): int64 { var r: TR; r.L := 1; r.R := 9; return S(r); }' 10
@@ -86,7 +86,7 @@ fn main(): int64 { var q: IQ := new TQ(); return Drin(q.Hol(0), 5); }' 7
 # Instanziierung auffaellt, statt still auf einen leeren Block zu zeigen.
 #
 # Ganz OHNE Startwert laesst sema eine Klassenvariable gar nicht erst zu
-# ("Variable hat Klassentyp ohne Startwert — `new` oder `null` angeben") —
+# ("Variable hat Klassentyp ohne Startwert -- `new` oder `null` angeben") --
 # ein erster Anlauf dieses Falls scheiterte daran. Genau deshalb greift der
 # Struktur-Zweig nur bei Strukturen: fuer Klassen gibt es den Fall nicht.
 fall "klasse_bleibt_null" \

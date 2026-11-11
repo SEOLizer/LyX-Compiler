@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# tests/operator_overloading_ir_test.sh — #2060: Operator-Ueberladung
+# tests/operator_overloading_ir_test.sh -- #2060: Operator-Ueberladung
 # (ebnf §15.3) auch auf den IR-Zielen.
 #
 # Hat der linke Operand einen Klassentyp, der die passende Methode definiert,
 # ist `a + b` der Aufruf `a.Add(b)`, `a == b` ist `a.Eq(b)`, `a[i]` ist
 # `a.Get(i)`. Umgesetzt war das nur im x86-Codegen. Der IR-Weg behielt fuer
-# jeden Operator die eingebaute Bedeutung — auf zwei Objektzeigern heisst
+# jeden Operator die eingebaute Bedeutung -- auf zwei Objektzeigern heisst
 # das: `a + b` addiert Adressen und benutzt die Summe als Objekt (Absturz),
 # `a[i]` indiziert roh in den Objektspeicher, `a == b` vergleicht Adressen.
 # Nichts davon meldete etwas.
@@ -16,7 +16,7 @@
 #     Inhaltsvergleich (beim Vormessen stimmte `a < b` genau deshalb). Die
 #     Vergleichsfaelle laufen darum in beiden Anlagereihenfolgen.
 #   * Die Gegenseite: wo KEINE Ueberladung greift, bleibt der Operator, was
-#     er war — Zahlen, Zeiger, Klassen ohne die Methode, Arrays von Objekten.
+#     er war -- Zahlen, Zeiger, Klassen ohne die Methode, Arrays von Objekten.
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LYXC="${LYXC:-$ROOT/lyxc}"
@@ -29,7 +29,7 @@ nok() { echo "FAIL $1"; FAIL=$((FAIL+1)); }
 mkdir -p "$TMP/w/bib"
 
 # Die Klasse, an der fast alle Faelle haengen. `gZ` zaehlt die Aufrufe von
-# Add — fuer die Pruefung, dass kein Operand zweimal ausgewertet wird.
+# Add -- fuer die Pruefung, dass kein Operand zweimal ausgewertet wird.
 KOPF='unit main;
 var gZ: int64 := 0;
 type V = class { x: int64;
@@ -63,8 +63,8 @@ fall() {
       continue
     fi
     case "$ziel" in
-      arm64) [ -n "$QEMU_ARM64" ]   || { nok "$was [$ziel]: qemu fehlt — NICHT gemessen"; continue; }; pre="$QEMU_ARM64" ;;
-      riscv) [ -n "$QEMU_RISCV64" ] || { nok "$was [$ziel]: qemu fehlt — NICHT gemessen"; continue; }; pre="$QEMU_RISCV64" ;;
+      arm64) [ -n "$QEMU_ARM64" ]   || { nok "$was [$ziel]: qemu fehlt -- NICHT gemessen"; continue; }; pre="$QEMU_ARM64" ;;
+      riscv) [ -n "$QEMU_RISCV64" ] || { nok "$was [$ziel]: qemu fehlt -- NICHT gemessen"; continue; }; pre="$QEMU_RISCV64" ;;
     esac
     local rc
     rc="$( ( timeout 60 $pre "$bin" >/dev/null 2>&1 ) 2>/dev/null; echo $? )"
@@ -92,7 +92,7 @@ echo "--- #2060: die Vergleiche, in BEIDEN Anlagereihenfolgen ---"
 fall "== -> Eq (zwei Objekte, gleicher Inhalt)" '  var a: V := mk(3); var b: V := mk(3); return (a == b) + 10;' 11
 #
 # Fuer die Ordnung haengt das Ergebnis eines Adressvergleichs daran, welches
-# Objekt zuerst angelegt wurde. Mit a zuerst UND mit b zuerst — eine der
+# Objekt zuerst angelegt wurde. Mit a zuerst UND mit b zuerst -- eine der
 # beiden Fassungen faellt bei einem Adressvergleich durch.
 #   (a < b) * 8 + (a <= b) * 4 + (a > b) * 2 + (a >= b), mit a.x = 9, b.x = 4:
 #   0 + 0 + 2 + 1 = 3
@@ -100,7 +100,7 @@ fall "<  <=  >  >=  (a zuerst angelegt)" \
   '  var a: V := mk(9); var b: V := mk(4); return (a < b) * 8 + (a <= b) * 4 + (a > b) * 2 + (a >= b);' 3
 fall "<  <=  >  >=  (b zuerst angelegt)" \
   '  var b: V := mk(4); var a: V := mk(9); return (a < b) * 8 + (a <= b) * 4 + (a > b) * 2 + (a >= b);' 3
-# Und <= / >= am Gleichstand — dort unterscheiden sie sich von < / >.
+# Und <= / >= am Gleichstand -- dort unterscheiden sie sich von < / >.
 fall "<= und >= bei gleichem Inhalt" \
   '  var a: V := mk(5); var b: V := mk(5); return (a <= b) * 2 + (a >= b) + (a < b) * 8 + (a > b) * 16;' 3
 
@@ -136,7 +136,7 @@ echo
 echo "--- #2060: ein GEERBTER Operator wirkt ---"
 #
 # Die Ableitung definiert nichts selbst. Auf dem x86-Weg war genau das bis
-# 1.2.11F ebenfalls falsch (gesucht wurde nur in der Klasse selbst) — hier
+# 1.2.11F ebenfalls falsch (gesucht wurde nur in der Klasse selbst) -- hier
 # stimmen die Wege jetzt ueberein.
 cat > "$TMP/w/erbe.lyx" <<'EOF'
 unit main;
@@ -207,7 +207,7 @@ EOF
 fall "Klasse ohne Eq: == bleibt der Vergleich der Objekte" "ohne.lyx" 30 "$TMP/w"
 #
 # Ein ARRAY von Klassenwerten ist kein Klassenobjekt (#1109). `cs[1]` ist der
-# Elementzugriff und darf nicht zu `cs.Get(1)` werden — obwohl die Klasse der
+# Elementzugriff und darf nicht zu `cs.Get(1)` werden -- obwohl die Klasse der
 # ELEMENTE ein Get hat.
 cat > "$TMP/w/feld.lyx" <<'EOF'
 unit main;
@@ -238,10 +238,10 @@ if ( cd "$ROOT" && timeout 300 "$LYXC" examples/basics/text_operators.lyx -o "$T
     if ! ( cd "$ROOT" && timeout 300 "$LYXC" --target="$ziel" examples/basics/text_operators.lyx -o "$TMP/to_$ziel" ) >"$TMP/bl.log" 2>&1; then
       nok "text_operators [$ziel]: uebersetzt nicht ($(grep -m1 -E '^lyxc:|error' "$TMP/bl.log"))"; continue
     fi
-    [ -n "$pre" ] || { nok "text_operators [$ziel]: qemu fehlt — NICHT gemessen"; continue; }
+    [ -n "$pre" ] || { nok "text_operators [$ziel]: qemu fehlt -- NICHT gemessen"; continue; }
     ist="$( ( timeout 60 $pre "$TMP/to_$ziel" 2>&1 ) 2>/dev/null )"
     if [ "$ist" = "$soll" ]; then ok "text_operators [$ziel]: Ausgabe wie auf x86 ($(printf '%s\n' "$ist" | wc -l) Zeilen)"
-    else nok "text_operators [$ziel]: weicht ab — erste Abweichung: $(diff <(printf '%s\n' "$soll") <(printf '%s\n' "$ist") | grep -m1 '^>')"; fi
+    else nok "text_operators [$ziel]: weicht ab -- erste Abweichung: $(diff <(printf '%s\n' "$soll") <(printf '%s\n' "$ist") | grep -m1 '^>')"; fi
   done
 else
   nok "text_operators uebersetzt auf x86 nicht ($(grep -m1 -E '^lyxc:|error' "$TMP/bl.log"))"

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tests/wcet_test.sh — #1139: `@wcet(N)` wird nachgewiesen.
+# tests/wcet_test.sh -- #1139: `@wcet(N)` wird nachgewiesen.
 #
 # Bis 1.0.14K war das Attribut ein blosser Vermerk: geparst, in seiner
 # Argumentform geprueft, am Knoten notiert -- und seit #1099 meldete jedes
@@ -51,14 +51,14 @@ K='import src.std.io;'
 fails "Repro: Schranke 10, Rumpf laeuft eine Million Mal" "$K
 @wcet(10)
 fn Endlos(): int64 { var i: int64 := 0; while (i < 1000000) { i := i + 1; } return i; }
-fn main(): int64 { PrintLn(Endlos()); return 0; }" "@wcet(10) verletzt — der Rumpf laeuft bis zu 1000000 Iterationen"
+fn main(): int64 { PrintLn(Endlos()); return 0; }" "@wcet(10) verletzt -- der Rumpf laeuft bis zu 1000000 Iterationen"
 
 # Die Meldung nennt beide Zahlen. Ohne die tatsaechliche Iterationszahl weiss
 # man nicht, auf welchen Wert man die Schranke setzen muesste.
 fails "Meldung nennt Schranke und Iterationen" "$K
 @wcet(5)
 fn F(): int64 { var s: int64 := 0; for i := 1 to 20 { s := s + 1; } return s; }
-fn main(): int64 { PrintLn(F()); return 0; }" "@wcet(5) verletzt — der Rumpf laeuft bis zu 20 Iterationen"
+fn main(): int64 { PrintLn(F()); return 0; }" "@wcet(5) verletzt -- der Rumpf laeuft bis zu 20 Iterationen"
 
 # --- Die abzaehlbaren Schleifenformen ------------------------------------
 out "for ... to unter der Schranke" "$K
@@ -234,7 +234,7 @@ case "$wmsg" in
   *) echo "PASS Vermerk 'nicht nachgewiesen' ist weg"; PASS=$((PASS+1)) ;;
 esac
 
-# @integrity meldet seit 1.1.15A (#1878) NICHT mehr — es wird nachgewiesen.
+# @integrity meldet seit 1.1.15A (#1878) NICHT mehr -- es wird nachgewiesen.
 # `@dal` bleibt als Vertreter der unbewiesenen Attribute stehen, sonst pruefte
 # der Block nur noch eine leere Menge.
 printf '%s\n' "$K
@@ -260,13 +260,13 @@ esac
 # --- Geschachtelte Funktionen (#1261) ------------------------------------
 # Bis 1.0.16J kam ein Attribut an einer GESCHACHTELTEN Funktion gar nicht durch
 # den Parser (`undefined function 'stack_limit'`); hier stand deshalb nur der
-# Beleg, dass es nicht still danebengeht. Jetzt wird es angenommen — und der
+# Beleg, dass es nicht still danebengeht. Jetzt wird es angenommen -- und der
 # Nachweis greift auch dort.
 #
 # Beim Umdrehen kam ein zweiter Fehler zum Vorschein: der Aufrufgraph schrieb
 # jeden Aufruf "der zuletzt davorstehenden fn-Deklaration" zu. Der Knoten einer
 # geschachtelten Funktion entsteht aber MITTEN im Rumpf der aeusseren, also vor
-# dem Aufruf, der sie ruft — die Kante zeigte auf sie selbst, und `@wcet`
+# dem Aufruf, der sie ruft -- die Kante zeigte auf sie selbst, und `@wcet`
 # meldete an einer voellig schleifenfoermigen Funktion "ist rekursiv". Deshalb
 # prueft der erste Fall die MELDUNG, nicht bloss den Fehlschlag.
 printf '%s\n' "$K
@@ -288,7 +288,7 @@ else
   echo "FAIL @wcet an geschachtelter fn: unerwartete Meldung: $nmsg"; FAIL=$((FAIL+1))
 fi
 
-# Gegenprobe: eine ausreichende Schranke traegt — sonst waere der Fall oben
+# Gegenprobe: eine ausreichende Schranke traegt -- sonst waere der Fall oben
 # auch mit einer Meldung "immer rot" gruen.
 printf '%s\n' "$K
 fn Aussen(): int64 {

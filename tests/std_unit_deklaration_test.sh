@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# tests/std_unit_deklaration_test.sh — #1999: jede Unit nennt ihren Namen selbst.
+# tests/std_unit_deklaration_test.sh -- #1999: jede Unit nennt ihren Namen selbst.
 #
 # 17 Dateien unter std/ fuehrten keine `unit`-Zeile. Funktional fiel das nicht
 # auf: der Uebersetzer leitet den Namen aus dem PFAD ab, `import std.bpf;`
-# uebersetzte und lief. Betroffen sind Werkzeuge, die den Bestand auswerten —
+# uebersetzte und lief. Betroffen sind Werkzeuge, die den Bestand auswerten --
 # beim Erzeugen des Funktionsglossars mussten diese Dateien gesondert
 # behandelt werden, weil der Unit-Name nicht aus der Datei hervorgeht, sondern
 # nur aus ihrer Lage.
@@ -61,7 +61,7 @@ fi
 if [ "$anzahl" -gt 400 ]; then
   echo "PASS es wurden $anzahl Dateien geprueft"; PASS=$((PASS+1))
 else
-  echo "FAIL nur $anzahl Dateien gefunden — der Suchpfad stimmt nicht"; FAIL=$((FAIL+1))
+  echo "FAIL nur $anzahl Dateien gefunden -- der Suchpfad stimmt nicht"; FAIL=$((FAIL+1))
 fi
 
 echo

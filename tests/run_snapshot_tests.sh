@@ -53,7 +53,11 @@ SKIP=0
 
 # Compiler-Banner mit Versionsnummer aus einer Ausgabe entfernen.
 strip_banner() {
-  printf '%s' "$1" | grep -vE '^lyxc [0-9][^ ]* — Copyright'
+  # #2475: Der Banner traegt jetzt `--` statt `—` (ASCII-Umstellung). Beide
+  # Formen werden gefiltert, damit auch alte .expected-Dateien weiter passen —
+  # sie tragen noch `0.9.1A` und werden ohnehin nur ueber diesen Filter
+  # vergleichbar.
+  printf '%s' "$1" | grep -vE '^lyxc [0-9][^ ]* (—|--) Copyright'
 }
 
 run_test() {

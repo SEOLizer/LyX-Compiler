@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# tests/stack_limit_test.sh — #1138: `@stack_limit(N)` wird nachgewiesen.
+# tests/stack_limit_test.sh -- #1138: `@stack_limit(N)` wird nachgewiesen.
 #
 # Bis 1.0.14J war das Attribut ein blosser Vermerk: der Compiler meldete, dass
 # er die Zusicherung NICHT nachweist (#1099), und uebersetzte weiter. Jetzt
 # pruefen zwei Teile:
 #
-#   1. RAHMENGROESSE — der Codegen kennt sie, wenn er `sub rsp, imm32` patcht.
+#   1. RAHMENGROESSE -- der Codegen kennt sie, wenn er `sub rsp, imm32` patcht.
 #      Ist der Rahmen groesser als die Schranke, ist die Zusage schon fuer
 #      EINEN Aufruf verletzt, unabhaengig von jeder Aufruftiefe.
-#   2. REKURSION — eine rekursive Funktion verbraucht ohne nachweisbare Tiefe
+#   2. REKURSION -- eine rekursive Funktion verbraucht ohne nachweisbare Tiefe
 #      beliebig viel Stapel. Der vorhandene Aufrufgraph (src/ir_call_graph.lyx)
 #      erkennt auch INDIREKTE Zyklen; er wird nur gebaut, wenn das Attribut im
 #      Programm ueberhaupt vorkommt.
@@ -17,7 +17,7 @@
 # der Compiler rechnet; eine Angabe ohne Einheit waere sonst mehrdeutig.
 #
 # ACHTUNG bei den Erwartungen: ein `var puffer: int64[4096]` liegt in Lyx NICHT
-# im Rahmen — Arrays bekommen einen Heap-Block, der Slot haelt den Zeiger. Der
+# im Rahmen -- Arrays bekommen einen Heap-Block, der Slot haelt den Zeiger. Der
 # Rahmen waechst also nur um 8 Byte pro Variable. Der Repro aus dem Issue wird
 # deshalb wegen der REKURSION abgewiesen, nicht wegen des Puffers.
 
@@ -60,7 +60,7 @@ fn Tief(n: int64): int64 {
 }
 fn main(): int64 { PrintLn(Tief(3)); return 0; }" "@stack_limit ist mit Rekursion nicht nachweisbar"
 
-# Auch ein INDIREKTER Zyklus zaehlt — dafuer gibt es den Aufrufgraphen.
+# Auch ein INDIREKTER Zyklus zaehlt -- dafuer gibt es den Aufrufgraphen.
 fails "indirekte Rekursion" "$K
 @stack_limit(4096)
 fn A(n: int64): int64 { if (n <= 0) { return 0; } return B(n - 1); }
@@ -77,7 +77,7 @@ fn Viele(): int64 {
 }
 fn main(): int64 { PrintLn(Viele()); return 0; }" "verletzt"
 
-# Die Meldung nennt beide Zahlen — ohne sie waere sie nicht zu gebrauchen.
+# Die Meldung nennt beide Zahlen -- ohne sie waere sie nicht zu gebrauchen.
 fails "Meldung nennt Schranke und Rahmen" "$K
 @stack_limit(16)
 fn Viele(): int64 {
@@ -85,7 +85,7 @@ fn Viele(): int64 {
     var d: int64 := 4; var e: int64 := 5;
     return a + b + c + d + e;
 }
-fn main(): int64 { PrintLn(Viele()); return 0; }" "@stack_limit(16) verletzt — der Rahmen belegt"
+fn main(): int64 { PrintLn(Viele()); return 0; }" "@stack_limit(16) verletzt -- der Rahmen belegt"
 
 # --- Was weiterhin uebersetzen muss --------------------------------------
 out "kleiner Rahmen, keine Rekursion" "$K
@@ -98,7 +98,7 @@ out "Schranke genau eingehalten" "$K
 fn Passt(): int64 { var a: int64 := 7; return a; }
 fn main(): int64 { PrintLn(Passt()); return 0; }" '7'
 
-# Rekursion ohne das Attribut ist erlaubt — geprueft wird nur, wer zusagt.
+# Rekursion ohne das Attribut ist erlaubt -- geprueft wird nur, wer zusagt.
 out "Rekursion ohne @stack_limit unveraendert" "$K
 fn Fak(n: int64): int64 { if (n <= 1) { return 1; } return n * Fak(n - 1); }
 fn main(): int64 { PrintLn(Fak(5)); return 0; }" '120'
@@ -135,7 +135,7 @@ case "$wmsg" in
   *) echo "PASS Vermerk 'nicht nachgewiesen' ist weg"; PASS=$((PASS+1)) ;;
 esac
 
-# @integrity meldet seit 1.1.15A (#1878) NICHT mehr — es wird nachgewiesen.
+# @integrity meldet seit 1.1.15A (#1878) NICHT mehr -- es wird nachgewiesen.
 # `@dal` bleibt als Vertreter der unbewiesenen Attribute stehen, sonst pruefte
 # der Block nur noch eine leere Menge.
 printf '%s\n' "$K

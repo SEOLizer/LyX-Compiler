@@ -117,7 +117,12 @@ sed -i "s/^VERSION   := .*/VERSION   := $next/"                              "$M
 sed -i "s/^VERSION_DATE := .*/VERSION_DATE := $today/"                       "$MAKEFILE"
 grep -q '^VERSION_DATE' "$MAKEFILE" || sed -i "/^VERSION   := /a VERSION_DATE := $today" "$MAKEFILE"
 sed -i "s/version-v$cur-blue/version-v$next-blue/"                           "$README"
-sed -i "s/\"$cur\"c/\"$next\"c/g; s/lyxc $cur (bootstrap)/lyxc $next (bootstrap)/; s/lyxc $cur — Copyright/lyxc $next — Copyright/" "$LYXC"
+# #2475: Der Banner traegt seit der ASCII-Umstellung `--` statt `—`. Beide
+# Formen werden ersetzt, damit das Werkzeug auch auf einem aelteren Stand
+# greift; ohne die zweite Form blieb die Banner-Zeile stehen, waehrend alle
+# anderen Stellen weiterzaehlten — version_consistency_test hat genau das
+# gemeldet.
+sed -i "s/\"$cur\"c/\"$next\"c/g; s/lyxc $cur (bootstrap)/lyxc $next (bootstrap)/; s/lyxc $cur — Copyright/lyxc $next -- Copyright/; s/lyxc $cur -- Copyright/lyxc $next -- Copyright/" "$LYXC"
 # #1955: Das Debian-Paket traegt die Version ein siebtes Mal. Die Pruefung in
 # tests/version_consistency_test.sh kannte die Stelle schon, das SETZEN hier
 # nicht — also meldete der Bump jedes Mal einen Fehlschlag, den jemand von Hand
