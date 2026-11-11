@@ -1222,6 +1222,11 @@ pub type IRLower = class {
   // der Index der Rueckgabetypen ueber alle Module (siehe _rtBaue).
   _ekP: pchar;
   _ekL: int64;
+  // #2459: Elementgroesse (inline, sonst 0) und Kopfform eines Feld-Arrays,
+  // dessen Typ in einer ANDEREN Unit deklariert ist — gesetzt von
+  // _fremdArrInfo, gelesen von lowerIndex.
+  _fremdArrSg: int64;
+  _fremdArrKopf: int64;
   _rtStand: int64;
   _rtFnBuf: int64; _rtFnN: int64; _rtFnCap: int64;
   _rtMtBuf: int64; _rtMtN: int64; _rtMtCap: int64;
@@ -1456,6 +1461,7 @@ pub type IRLower = class {
     self._nochGelowert := 0;
     self._imNachlauf := 0;
     self._ekP := 0 as pchar; self._ekL := 0;
+    self._fremdArrSg := 0; self._fremdArrKopf := 0;   // #2459
     self._rtStand := 0 - 1;
     self._rtFnBuf := 0; self._rtFnN := 0; self._rtFnCap := 0;
     self._rtMtBuf := 0; self._rtMtN := 0; self._rtMtCap := 0;
@@ -7681,6 +7687,29 @@ pub type IRLower = class {
       if (self.seq(fname, fnlen, "rotr32", 6))  { bbId := 262; }
       self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, bbB, -1, bbId); return dest;
     }
+    // #2460: mulhi/umulhi — die oberen 64 Bit des 128-Bit-Produkts, Ids 569
+    // und 570. Ein Builtin braucht DREI Stellen: sema (`_regBuiltin`), diese
+    // Aufzaehlung und die Emission im Backend. Seit #1552 waren nur zwei
+    // besetzt — sema.lyx:9400 und der direkte x86-Weg
+    // (codegen_x86.lyx:21171 ff.); hier fehlten die Namen.
+    //
+    // Die Meldung aus #2460 nannte win64, die Luecke liegt aber nicht am
+    // Ziel: gemessen mit 1.2.35C wies `umulhi` auf arm64, riscv UND lyxos
+    // mit derselben Zeile ab ("unbekannter Name im Aufruf: umulhi"). Betroffen
+    // war jedes Ziel, das ueber das IR geht, und damit std/crypto/bignum samt
+    // der ganzen TLS-Kette darueber.
+    if (self.seq(fname, fnlen, "mulhi", 5) || self.seq(fname, fnlen, "umulhi", 6)) {
+      var mhB: int64 := self.tempCount; var mhR: int64 := 0; while mhR < 4 { self.allocTemp(); mhR := mhR + 1; }
+      var mhA: int64 := arg0; var mhN: int64 := 0;
+      while mhA >= 0 && mhN < 2 {
+        var t: int64 := self.lowerExpr(mhA);
+        self.irAddInstrDirect(IRO_STORE_LOCAL, mhB + mhN, t, -1, 0);
+        mhN := mhN + 1; mhA := self.nodeNext(mhA);
+      }
+      var mhId: int64 := 569;
+      if (self.seq(fname, fnlen, "umulhi", 6)) { mhId := 570; }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, mhB, -1, mhId); return dest;
+    }
     // #2187: CPUID / XGETBV. Zielabhaengig, und zwar hier und nicht im
     // Backend: nur ir_lower kennt das Ziel, und ein Backend, das den Opcode
     // nicht kennt, bricht laut ab (#1339) — ein Programm, das bloss fragt, ob
@@ -8186,7 +8215,22 @@ pub type IRLower = class {
     if simd == 0 {
       var ixTn: int64 := self._exprTypeNode(self.nodeC0(expr));
       var ixSg: int64 := self._arrStructElemGroesse(ixTn);
-      base := self._elemBasis(self.nodeC0(expr), base);
+      // #2459: Liegt der Typ der Basis in einer anderen Unit, hat
+      // _exprTypeNode keinen Knoten — dann beantwortet _fremdArrInfo beide
+      // Fragen im Kontext der deklarierenden Unit. Nur dann; sonst bleibt
+      // alles wie bisher.
+      if ixTn < 0 && self._fremdArrInfo(self.nodeC0(expr)) != 0 {
+        ixSg := self._fremdArrSg;
+        if self._fremdArrKopf != 0 {
+          var fkC16: int64 := self.allocTemp();
+          self.irAddInstrDirect(IRO_CONST_INT, fkC16, -1, -1, 16);
+          var fkB16: int64 := self.allocTemp();
+          self.irAddInstrDirect(IRO_ADD, fkB16, base, fkC16, 0);
+          base := fkB16;
+        }
+      } else {
+        base := self._elemBasis(self.nodeC0(expr), base);
+      }
       if ixSg > 0 {
         var sgT: int64 := self.allocTemp();
         self.irAddInstrDirect(IRO_CONST_INT, sgT, -1, -1, ixSg);
@@ -16345,6 +16389,86 @@ pub type IRLower = class {
   //   Aufruf einer freien Funktion  -> Rueckgabetyp aus dem Index (_rtFn)
   //   Methodenaufruf                -> Klasse des Empfaengers, dann _rtMt
   //   ueberladene Rechnung          -> Klasse des linken Operanden (V + V -> V)
+  // #2459: Name der Klasse, die das Feld (fp, fl) des Ausdrucks `basis` hat,
+  // nachgeschlagen im TYPVERZEICHNIS — also auch dann, wenn der Typ von
+  // `basis` in einer anderen Unit deklariert ist. alsElement = 1: nicht der
+  // Feldtyp selbst gilt, sondern sein Elementtyp (`feld[i]`).
+  //
+  // Gearbeitet wird mit NAMEN, nicht mit Knotenindizes: ein Knoten der fremden
+  // Unit darf nicht in den Aufrufer zurueck, der ihn mit seiner EIGENEN
+  // Knotentabelle lesen wuerde. Der Name zeigt in den Quelltext jener Unit,
+  // und der steht die ganze Uebersetzung ueber. Derselbe Kontextwechsel wie in
+  // _instanceFieldOffset (#2147).
+  //
+  // Setzt _ekP/_ekL wie _exprKlasse und liefert 1 oder 0.
+  fn _fremdFeldKlasse(basis: int64, fp: pchar, fl: int64, alsElement: int64): int64 {
+    self._ekL := 0;
+    if basis < 0 || fl <= 0 { return 0; }
+    if self._exprKlasse(basis) == 0 { return 0; }
+    var g: int64 := self._tregFind(self._ekP, self._ekL);
+    self._ekL := 0;
+    if g < 0 { return 0; }
+    var svS: pchar := self.src; var svN: int64 := self.nodes; var svC: int64 := self.nodeCount;
+    self.src       := peek64(self._tregSrc + g * 8) as pchar;
+    self.nodes     := peek64(self._tregNodes + g * 8);
+    self.nodeCount := peek64(self._tregCnt + g * 8);
+    var tn: int64 := self._fieldTypeNodeIn(peek64(self._tregIdx + g * 8), fp, fl);
+    if alsElement != 0 { tn := self._arrElemTyp(tn); }
+    var np: int64 := 0;
+    var nl: int64 := 0;
+    if tn >= 0 {
+      var tk: int64 := self.nodeKind(tn);
+      if tk == NK_TYPE_NAME || tk == NK_TYPE_DECL {
+        np := self.nodeSVal(tn) as int64;
+        nl := self.nodeSLen(tn);
+      }
+    }
+    self.src := svS; self.nodes := svN; self.nodeCount := svC;
+    if nl <= 0 { return 0; }
+    self._ekP := np as pchar;
+    self._ekL := nl;
+    return 1;
+  }
+
+  // #2459: Elementgroesse und Kopfform des Feld-Arrays `nd` (ein
+  // Feldzugriff), wenn dessen Typ in einer ANDEREN Unit deklariert ist.
+  // Beides MUSS im Kontext jener Unit gerechnet werden: die Elementgroesse ist
+  // die Struct-Groesse eines dort deklarierten Typs.
+  //
+  // Ohne diese Stelle uebersetzte `df.columns[c].field` nach dem Fix fuer die
+  // Typbestimmung wieder, rechnete aber falsch: _exprTypeNode liefert fuer das
+  // fremde Feld keinen Typknoten, also galt die Elementgroesse als 0 und der
+  // Kopf als nicht vorhanden — der Zugriff las ein 8-Byte-Wort ab dem
+  // Arraykopf statt der Adresse des inline liegenden Elements und faultete.
+  // „Uebersetzt wieder" ist keine Aussage ueber „rechnet richtig" (#1789).
+  //
+  // Liefert 1, wenn die Frage dort beantwortet werden konnte.
+  fn _fremdArrInfo(nd: int64): int64 {
+    self._fremdArrSg := 0;
+    self._fremdArrKopf := 0;
+    if nd < 0 { return 0; }
+    if self.nodeKind(nd) != NK_FIELD { return 0; }
+    var fp: pchar := self.nodeSVal(nd);
+    var fl: int64 := self.nodeSLen(nd);
+    if fl <= 0 { return 0; }
+    if self._exprKlasse(self.nodeC0(nd)) == 0 { return 0; }
+    var g: int64 := self._tregFind(self._ekP, self._ekL);
+    self._ekL := 0;
+    if g < 0 { return 0; }
+    var svS: pchar := self.src; var svN: int64 := self.nodes; var svC: int64 := self.nodeCount;
+    self.src       := peek64(self._tregSrc + g * 8) as pchar;
+    self.nodes     := peek64(self._tregNodes + g * 8);
+    self.nodeCount := peek64(self._tregCnt + g * 8);
+    var tn: int64 := self._fieldTypeNodeIn(peek64(self._tregIdx + g * 8), fp, fl);
+    var sg: int64 := self._arrStructElemGroesse(tn);
+    var kp: int64 := self._istKopfArray(tn);
+    self.src := svS; self.nodes := svN; self.nodeCount := svC;
+    if kp == 0 && sg == 0 { return 0; }
+    self._fremdArrSg := sg;
+    self._fremdArrKopf := kp;
+    return 1;
+  }
+
   fn _exprKlasse(nd: int64): int64 {
     self._ekL := 0;
     if nd < 0 { return 0; }
@@ -16383,6 +16507,35 @@ pub type IRLower = class {
       if self._opKlasseIdxName(bp, bl, self._opMethodenName(bo), 3) < 0 { self._ekL := 0; return 0; }
       self._ekP := bp; self._ekL := bl;
       return 1;
+    }
+    // #2459: Die Basis liegt in einer ANDEREN Unit. _exprTypeNode loest den
+    // Typ eines Feldes nur ueber Deklarationen der EIGENEN Unit auf
+    // (_typeNodeToDecl); fuer `r: Rect` mit importiertem `Rect` kam -1
+    // zurueck, und `r.min.x` galt damit als Feld eines unbekannten Typs
+    // (#2134-Abbruch). Derselbe Wert ueber eine lokale Zwischenkopie ging,
+    // weil das Local seinen Typknoten in der eigenen Unit hat — identisches
+    // Objekt, anderer Weg. Dasselbe Muster wie #1787/#1806/#1812 (eine
+    // Herkunft fehlt in einer Aufzaehlung) und wie #2139 im Zweig daneben,
+    // nur fuer ein Feld statt fuer ein Aufrufergebnis.
+    //
+    // Zwei Formen, weil im Bestand beide vorkommen:
+    //   `r.min.x`                  — Feld eines Feldes
+    //   `df.columns[c].field.name` — Feld eines INDEXZUGRIFFS auf ein Feld
+    //                                (data/csv.lyx:115, data/ops.lyx:43,
+    //                                 data/json.lyx:107, data/print.lyx:81)
+    if k == NK_FIELD {
+      if self._exprTypeNode(nd) < 0 {
+        return self._fremdFeldKlasse(self.nodeC0(nd), self.nodeSVal(nd), self.nodeSLen(nd), 0);
+      }
+    }
+    if k == NK_INDEX {
+      if self._exprTypeNode(nd) < 0 {
+        var fiB: int64 := self.nodeC0(nd);
+        if fiB >= 0 && self.nodeKind(fiB) == NK_FIELD {
+          return self._fremdFeldKlasse(self.nodeC0(fiB), self.nodeSVal(fiB), self.nodeSLen(fiB), 1);
+        }
+        return 0;
+      }
     }
     var tn: int64 := self._exprTypeNode(nd);
     if tn < 0 { return 0; }

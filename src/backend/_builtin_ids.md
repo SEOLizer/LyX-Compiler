@@ -582,6 +582,21 @@ arbeiten auf 16-Byte-Bloecken im Speicher, weil Lyx keinen 128-Bit-Werttyp hat.
 
 | 568 | ganze SHA-256-Kompression (`SHA256RNDS2`/`MSG1`/`MSG2`) | `sha256_compress(state, data, blocks)` | **nur ELF-x86** (0/1/5/6/13), NICHT lyxos (14) — dort PANIC, weil `emit_lyxos` keine SHA-NI-Fassung hat und unbehandelte IDs stumm verwirft | #2391 |
 
+## Bereich 569 … 570 — obere Produkthaelfte (#2460)
+
+| ID | Bedeutung | Lyx-Name | Ziele | Herkunft |
+|----|-----------|----------|-------|----------|
+| 569 | obere 64 Bit des VORZEICHENBEHAFTETEN 128-Bit-Produkts | `mulhi(a, b)` | x86-Familie (codegen_x86 direkt), lyxos (`imul rcx`), arm64 (`SMULH`), riscv (`MULH`, M-Erweiterung); arm-cm4/esp32 laut abgewiesen (32-Bit-Wort) | #1552, IR-Weg #2460 |
+| 570 | obere 64 Bit des VORZEICHENLOSEN Produkts | `umulhi(a, b)` | wie 569, mit `mul rcx` / `UMULH` / `MULHU` | #1552, IR-Weg #2460 |
+
+Die Namen waren seit #1552 nur an ZWEI der drei Stellen bekannt (sema
+`_regBuiltin` und `codegen_x86`); in `ir_lower` fehlten sie. Damit scheiterte
+jedes Ziel, das über das IR geht — gemessen mit 1.2.35C auf win64, arm64,
+riscv und lyxos gleichlautend mit „unbekannter Name im Aufruf: umulhi".
+`divrem128` (sema.lyx:9402, codegen_x86.lyx:21187) hat dieselbe Lücke und ist
+hier NICHT geschlossen: 128/64 ohne Hardwarebefehl ist eine eigene
+Langdivision je Architektur, siehe das zugehörige Issue.
+
 **Warum PANIC und nicht 0.** Bei `cpu_id` (253) ist 0 die *richtige* Antwort
 auf "hat diese CPU AES-NI". Bei einer Verschluesselung gibt es keinen
 plausiblen Ersatzwert — ein stiller Default waere hier eine stille

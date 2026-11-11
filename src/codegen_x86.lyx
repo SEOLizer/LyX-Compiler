@@ -22160,45 +22160,11 @@ pub type Codegen = class {
       // ueberschneiden: rcx ist Ziel von Argument 0 und zugleich Quelle von
       // Argument 3. Ein direktes Kopieren in der falschen Reihenfolge
       // zerstoert die Quelle, bevor sie gelesen ist.
-      if (self.msAbi != 0) {
-        var msN: int64 := argc;
-        if (msN > 4) {
-          EPrintStr("codegen error: extern fn '"c);
-          sys_write(2, fname as int64, fnlen);
-          EPrintStrLn("': mehr als vier Argumente sind auf win64 nicht umgesetzt (#1674)"c);
-          EPrintStrLn("  Die Microsoft-Konvention legt ab dem fuenften Argument auf den Stapel."c);
-          exit(1);
-        }
-        // Argumente sichern (Reihenfolge 0..n-1) …
-        var msI: int64 := 0;
-        while (msI < msN) {
-          self.cg_e8(0x50 + self.cg_ffiPushOp(msI));
-          msI := msI + 1;
-        }
-        // … und rueckwaerts in die Zielregister holen.
-        msI := msN - 1;
-        while (msI >= 0) {
-          self.cg_ffiPopMs(msI);
-          msI := msI - 1;
-        }
-        // Gleitkommawerte zusaetzlich nach xmm_position.
-        if (declNi >= 0) {
-          var msMask: int64 := (self.cg_nival(declNi) >> 32) & 65535;
-          var msK: int64 := 0;
-          while (msK < msN) {
-            var msCls: int64 := (msMask >> (msK * 2)) & 3;
-            if (msCls != 0) {
-              self.cg_ffiMovqXmmFromGpr(msK, self.cg_msIntReg(msK));
-              if (msCls == 2) {
-                self.cg_e8(0xF2); self.cg_e8(0x0F); self.cg_e8(0x5A);
-                self.cg_e8(0xC0 + msK * 8 + msK);   // cvtsd2ss xmm_k, xmm_k
-              }
-            }
-            msK := msK + 1;
-          }
-        }
-      }
-
+      // #2467: Die ganze Microsoft-x64-Uebergabe steht jetzt unten, beim
+      // Ausrichten des Stapels (Suche: "#2467"). Sie MUSS dort stehen: ab dem
+      // fuenften Argument gehoeren die Werte in den Argumentbereich des
+      // Aufrufers, und den gibt es erst, nachdem rsp ausgerichtet und Platz
+      // geschaffen ist. Bis 1.2.35C brach diese Stelle bei argc > 4 ab.
       var nFloat: int64 := 0;
       // #1640: 1 = alle Argumente passen in die Registerreihen, der Callee
       // bekommt also gar keine Stapelargumente — auch wenn der allgemeine
@@ -22322,8 +22288,129 @@ pub type Codegen = class {
       // Register muss der Callee erhalten), ausgerichteten Platz schaffen, die
       // Argumente dorthin KOPIEREN und danach alles zurueckdrehen.
       var stackN: int64 := 0;
-      if (argc > 6 && ffiRegOnly == 0) { stackN := argc - 6; }
-      if (stackN > 0) {
+      // #2467: msAbi hat seinen eigenen Zweig darunter — er legt die
+      // Argumente 5..n selbst in den Argumentbereich. stackN bleibt 0, sonst
+      // wuerde der SysV-Zweig denselben Stapel ein zweites Mal umbauen.
+      if (argc > 6 && ffiRegOnly == 0 && self.msAbi == 0) { stackN := argc - 6; }
+      if (self.msAbi != 0) {
+        // #2467: Microsoft-x64 vollstaendig. Bis 1.2.35C brach der Codegen ab
+        // dem fuenften Argument ab; 198 der 213 roten win64-Beispiele hingen
+        // allein daran (X11/GLX, sqlite, std/net/socket -> select).
+        //
+        // Lage beim Eintritt: die Argumente 0..5 liegen in der SysV-Reihe
+        // (rdi, rsi, rdx, rcx, r8, r9), alles ab Position 6 hat der
+        // allgemeine Aufrufpfad auf den Stapel gelegt ([rsp+0] = Argument 6).
+        //
+        // Drei Dinge unterscheiden die Microsoft-Konvention von SysV, und
+        // jedes davon steht hier:
+        //
+        //   * Die ersten vier Argumente gehen nach rcx, rdx, r8, r9 — und
+        //     Gleitkommawerte nach ihrer POSITION in xmm0..xmm3, nicht nach
+        //     einer eigenen Zaehlung.
+        //   * Ab dem fuenften liegen sie im ARGUMENTBEREICH des Aufrufers,
+        //     bei [rsp+0x20], [rsp+0x28], … Dieser Bereich und der
+        //     32-Byte-Schattenspeicher der vier Registerargumente sind EIN
+        //     zusammenhaengender Block, nicht zwei: der Callee darf seine
+        //     Registerargumente in die ersten 32 Byte schreiben.
+        //   * Abgeraeumt wird vom AUFRUFER.
+        var msN: int64 := argc;
+        var msSt: int64 := 0;
+        if (msN > 4) { msSt := msN - 4; }
+        var msArea: int64 := 32 + msSt * 8;
+        while ((msArea & 15) != 0) { msArea := msArea + 8; }
+        // #1620: dieselbe Sicherung wie im SysV-Zweig darunter — rbx haelt den
+        // alten Stapelzeiger, weil der Callee das Register erhalten muss, und
+        // die Quellen der Argumente ab Position 6 liegen danach bei
+        // [rbx + 8 + (k-6)*8] (die 8 ueberspringt das gesicherte rbx).
+        self.cg_e8(0x53);                                                        // push rbx
+        self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xE3);                    // mov rbx, rsp
+        self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xE4); self.cg_e8(0xF0);  // and rsp, -16
+        if (msArea <= 127) {
+          self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xEC); self.cg_e8(msArea);   // sub rsp, imm8
+        } else {
+          self.cg_e8(0x48); self.cg_e8(0x81); self.cg_e8(0xEC); self.cg_e32(msArea);  // sub rsp, imm32
+        }
+        // Die Stapelplaetze ZUERST: ihre Quellen sind r8 und r9, und die sind
+        // gleich die Ziele der Argumente 2 und 3. Umgekehrte Reihenfolge
+        // zerstoerte die Quelle, bevor sie gelesen ist.
+        var msJ: int64 := 4;
+        while (msJ < msN) {
+          var msZ: int64 := 32 + (msJ - 4) * 8;
+          if (msJ == 4) {
+            self.cg_e8(0x4C); self.cg_e8(0x89);
+            if (msZ <= 127) { self.cg_e8(0x44); self.cg_e8(0x24); self.cg_e8(msZ); }
+            else { self.cg_e8(0x84); self.cg_e8(0x24); self.cg_e32(msZ); }        // mov [rsp+msZ], r8
+          } else if (msJ == 5) {
+            self.cg_e8(0x4C); self.cg_e8(0x89);
+            if (msZ <= 127) { self.cg_e8(0x4C); self.cg_e8(0x24); self.cg_e8(msZ); }
+            else { self.cg_e8(0x8C); self.cg_e8(0x24); self.cg_e32(msZ); }        // mov [rsp+msZ], r9
+          } else {
+            var msQ: int64 := 8 + (msJ - 6) * 8;
+            self.cg_e8(0x48); self.cg_e8(0x8B);
+            if (msQ <= 127) { self.cg_e8(0x43); self.cg_e8(msQ); }
+            else { self.cg_e8(0x83); self.cg_e32(msQ); }                          // mov rax, [rbx+msQ]
+            self.cg_e8(0x48); self.cg_e8(0x89);
+            if (msZ <= 127) { self.cg_e8(0x44); self.cg_e8(0x24); self.cg_e8(msZ); }
+            else { self.cg_e8(0x84); self.cg_e8(0x24); self.cg_e32(msZ); }        // mov [rsp+msZ], rax
+          }
+          msJ := msJ + 1;
+        }
+        // Dann die ersten vier in ihre Zielregister, von HINTEN nach vorn:
+        // rcx ist Quelle von Argument 3 und Ziel von Argument 0, rdx Quelle
+        // von 2 und Ziel von 1. In dieser Reihenfolge ist jede Quelle gelesen,
+        // bevor sie ueberschrieben wird — die Umschichtung ueber den Stapel,
+        // die hier bis 1.2.35C stand, braucht es dafuer nicht.
+        var msM: int64 := msN;
+        if (msM > 4) { msM := 4; }
+        if (msM > 3) { self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xC9); }   // mov r9, rcx
+        if (msM > 2) { self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xD0); }   // mov r8, rdx
+        if (msM > 1) { self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xF2); }   // mov rdx, rsi
+        if (msM > 0) { self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xF9); }   // mov rcx, rdi
+        if (declNi >= 0) {
+          var msIv: int64 := self.cg_nival(declNi);
+          // #2140: Die Maske reicht ueber acht Parameter. Ein Gleitkommawert
+          // dahinter waere als Ganzzahl durchgelaufen — gemeldet, nicht
+          // geraten (Bit 53, parser._parseExternFn), dieselbe Pruefung wie im
+          // SysV-Zweig.
+          if (((msIv >> 53) & 1) != 0) {
+            EPrintStr("codegen error: extern fn '"c);
+            sys_write(2, fname as int64, fnlen);
+            EPrintStrLn("': Gleitkommaparameter ab dem neunten sind nicht umgesetzt (#2140)"c);
+            exit(1);
+          }
+          var msMask: int64 := (msIv >> 32) & 65535;
+          // Ein f32 AB POSITION 5 steht im Stapelplatz noch als double — die
+          // Umwandlung muss dort geschehen, und zwar VOR dem Laden von
+          // xmm0..xmm3, weil sie xmm0 als Zwischenablage benutzt.
+          var msF: int64 := 4;
+          while (msF < msN && msF < 8) {
+            if (((msMask >> (msF * 2)) & 3) == 2) {
+              var msFo: int64 := 32 + (msF - 4) * 8;
+              self.cg_ffiMovsdXmmFromRsp(0, msFo);                               // movsd xmm0, [rsp+off]
+              self.cg_e8(0xF2); self.cg_e8(0x0F); self.cg_e8(0x5A); self.cg_e8(0xC0);  // cvtsd2ss xmm0, xmm0
+              self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x11);              // movss [rsp+off], xmm0
+              if (msFo <= 127) { self.cg_e8(0x44); self.cg_e8(0x24); self.cg_e8(msFo); }
+              else { self.cg_e8(0x84); self.cg_e8(0x24); self.cg_e32(msFo); }
+            }
+            msF := msF + 1;
+          }
+          // Gleitkommawerte der ersten vier Positionen zusaetzlich nach
+          // xmm_position. Das Ganzzahlregister behaelt den Wert: eine
+          // variadische Windows-Funktion liest ihn von dort.
+          var msK: int64 := 0;
+          while (msK < msM) {
+            var msCls: int64 := (msMask >> (msK * 2)) & 3;
+            if (msCls != 0) {
+              self.cg_ffiMovqXmmFromGpr(msK, self.cg_msIntReg(msK));
+              if (msCls == 2) {
+                self.cg_e8(0xF2); self.cg_e8(0x0F); self.cg_e8(0x5A);
+                self.cg_e8(0xC0 + msK * 8 + msK);   // cvtsd2ss xmm_k, xmm_k
+              }
+            }
+            msK := msK + 1;
+          }
+        }
+      } else if (stackN > 0) {
         var kopieSz: int64 := stackN * 8;
         while ((kopieSz & 15) != 0) { kopieSz := kopieSz + 8; }   // auf 16 aufrunden
         self.cg_e8(0x53);                                                // push rbx
@@ -22357,13 +22444,10 @@ pub type Codegen = class {
         self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xE4); self.cg_e8(0xF0);  // and rsp, -16
         self.cg_e8(0x41); self.cg_e8(0x53);                              // push r11
         self.cg_e8(0x41); self.cg_e8(0x53);                              // push r11 (keep 16-align)
-        // #1674: Die Microsoft-Konvention verlangt vom AUFRUFER 32 Byte
-        // Schattenspeicher unterhalb der Rueckkehradresse; der Callee darf
-        // dort seine vier Registerargumente ablegen. Fehlt er, schreibt die
-        // Funktion in den Rahmen des Aufrufers.
-        if (self.msAbi != 0) {
-          self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xEC); self.cg_e8(32);  // sub rsp, 32
-        }
+        // #1674/#2467: Der 32-Byte-Schattenspeicher, den die
+        // Microsoft-Konvention vom Aufrufer verlangt, steht jetzt im
+        // msAbi-Zweig darueber — dort als untere 32 Byte des Argumentbereichs,
+        // weil Schattenspeicher und die Plaetze ab Argument 5 EIN Block sind.
       }
       // #1486: al traegt die Zahl der benutzten xmm-Register. Variadische
       // C-Funktionen (printf und Verwandte) lesen sie; mit 0 speichern sie
@@ -22373,16 +22457,20 @@ pub type Codegen = class {
       var ppx: int64 := self.codeLen;
       self.cg_e32(0);
       self.cg_addPatch(ppx, exIdx, 0, CG_PATCH_EXTERN);
-      if (stackN > 0) {
+      if (self.msAbi != 0) {
+        // #2467: Der ganze Argumentbereich wird vom AUFRUFER abgeraeumt. rbx
+        // traegt den Stapelzeiger von vor der Ausrichtung; danach noch die
+        // Werte, die der allgemeine Aufrufpfad ab Position 6 gepusht hat.
+        self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xDC);            // mov rsp, rbx
+        self.cg_e8(0x5B);                                                // pop rbx
+        self.cg_popStackArgs(argc);
+      } else if (stackN > 0) {
         self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xDC);            // mov rsp, rbx
         self.cg_e8(0x5B);                                                // pop rbx
         // Die urspruenglich gepushten Stapelargumente wieder abraeumen —
         // dieselbe Aufgabe, die cg_popStackArgs fuer Lyx-Aufrufe erledigt.
         self.cg_popStackArgs(argc);
       } else {
-        if (self.msAbi != 0) {
-          self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC4); self.cg_e8(32);  // add rsp, 32 (#1674)
-        }
         self.cg_e8(0x41); self.cg_e8(0x5B);                              // pop r11
         self.cg_e8(0x5C);                                                 // pop rsp (restore)
         // #1640: Der Callee brauchte keinen Stapel, der allgemeine Aufrufpfad
