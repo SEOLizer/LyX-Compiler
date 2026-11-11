@@ -19,6 +19,7 @@
 
 cd "$(dirname "$0")/.." || exit 1
 LYXC="${LYXC:-./lyxc}"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"   # #2439: Quelle fuer die Lueckenpruefung
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 PASS=0; FAIL=0
@@ -101,10 +102,52 @@ else
 fi
 
 echo "-- Luecken INNERHALB der Spannen muessen weiter auffallen --"
-# 204, 206-209 und 216 sind unbelegt, liegen aber mitten in einer sonst
-# belegten Spanne. Eine grobe Pruefung 0..255 wuerde sie durchlassen -- genau
-# die Grosszuegigkeit, aus der #1734 entstanden ist.
-pruefe_meldet "sys_umount (528)"      "sys_umount(1, 1, 1)"
+# 123, 192-195, 204, 208, 209 und 216 sind unbelegt, liegen aber mitten in
+# einer sonst belegten Spanne. Eine grobe Pruefung 0..255 wuerde sie
+# durchlassen -- genau die Grosszuegigkeit, aus der #1734 entstanden ist.
+#
+# #2439: Die Liste stand bis hierher als "204, 206-209 und 216" da und war
+# veraltet -- 205-207 sind inzwischen belegt (der Kernel ist gewachsen). Eine
+# von Hand fortgeschriebene Lueckenliste verrottet; sie wird deshalb beim
+# Pflegen gegen work/lyxos/syscall-ist.txt nachgerechnet, nicht geraten.
+# #2439: Hier stand `pruefe_meldet "sys_umount (528)"`. Das war aus zwei
+# Gruenden untragbar. Erstens war es das falsche Vehikel: sys_umount emittierte
+# 0x0210 = 528, und 528 ist keine der oben genannten In-Spannen-Luecken,
+# sondern lag ausserhalb jeder Spanne. Zweitens setzte der Test voraus, dass
+# die Luecke OFFEN bleibt — mit dem Fix (sys_umount auf 197, die gebaute
+# Nummer) wurde er rot, obwohl ein Defekt verschwunden war.
+#
+# Die Aussage wird deshalb direkt geprueft, an der Quelle statt an einem
+# zufaellig kaputten Aufruf: keine der Luecken darf von einem Lauf in
+# lyxosNummerBelegt() gedeckt sein. Die systematische Fassung ueber den ganzen
+# Nummernraum steht in tests/lyxos_syscall_ist_test.sh; hier bleibt die
+# punktuelle Zusicherung, weil genau diese Grosszuegigkeit #1734 ausgeloest hat.
+LUECKEN="123 192 193 194 195 204 208 209 216"
+luecke_gedeckt=""
+for n in $LUECKEN; do
+    if python3 - "$ROOT/src/backend/lyxos/emit_lyxos.lyx" "$n" <<'PY3'
+import re, sys
+quelle = open(sys.argv[1], encoding='utf-8', errors='replace').read()
+n = int(sys.argv[2])
+rumpf = quelle[quelle.index('fn lyxosNummerBelegt'):]
+rumpf = rumpf[:rumpf.index('\n    fn ', 1)]
+for lo, hi in re.findall(r'nr >= (\d+) && nr <= (\d+)', rumpf):
+    if int(lo) <= n <= int(hi):
+        sys.exit(0)      # gedeckt
+for g in re.findall(r'nr == (\d+)', rumpf):
+    if int(g) == n:
+        sys.exit(0)
+sys.exit(1)              # nicht gedeckt, richtig
+PY3
+    then luecke_gedeckt="$luecke_gedeckt $n"; fi
+done
+if [ -z "$luecke_gedeckt" ]; then
+    echo "PASS keine der neun In-Spannen-Luecken ist in lyxosNummerBelegt() gedeckt"
+    PASS=$((PASS + 1))
+else
+    echo "FAIL Luecken gedeckt:$luecke_gedeckt — eine Spanne ist zu grob gefasst"
+    FAIL=$((FAIL + 1))
+fi
 
 echo "-- echte Nummern muessen bleiben --"
 # #1742: drei Argumente, kein dir_fd — die Vierer-Form wird weiter unten geprueft.
@@ -470,6 +513,47 @@ if $LYXC "$TMP/ev.lyx" --target=lyxos -o "$TMP/ev.lbf" >/dev/null 2>&1; then
 else
     echo "FAIL Umgebung: uebersetzt nicht"; FAIL=$((FAIL + 1))
 fi
+
+echo
+echo "-- #2439: IOFS-Volumes und Partitions-Mounts (WP32-E) --"
+#
+# Sieben Nummern, die LyxOS behandelt und der Compiler nicht kannte: 189-191
+# und 196-199. Geprueft wird die Nummer am ERZEUGNIS, nicht der Rueckgabewert
+# — ein Aufruf, der uebersetzt, kann die falsche Nummer tragen, und auf
+# lyxos faellt das erst am Geraet auf.
+#
+# Die zweite Spalte ist die Aussage: die alte ENTWURFSnummer darf nicht mehr
+# drinstehen. Nur "189 kommt vor" waere auch von einem Erzeugnis erfuellt,
+# das beide Nummern traegt.
+pruefe_bytes "sys_iofs_select emittiert 189" \
+    'unit main;
+fn main(): int64 { return sys_iofs_select(0); }' "189" ""
+pruefe_bytes "sys_iofs_vol_active emittiert 190" \
+    'unit main;
+fn main(): int64 { return sys_iofs_vol_active(); }' "190" ""
+pruefe_bytes "sys_iofs_vol_count emittiert 191" \
+    'unit main;
+fn main(): int64 { return sys_iofs_vol_count(); }' "191" ""
+pruefe_bytes "sys_mount_part emittiert 196, nicht 85" \
+    'unit main;
+fn main(): int64 { return sys_mount_part(0, 1, "n"c); }' "196" "85"
+pruefe_bytes "sys_mount_list emittiert 198" \
+    'unit main;
+fn main(): int64 { return sys_mount_list(0, 0); }' "198" ""
+pruefe_bytes "sys_mount_count emittiert 199" \
+    'unit main;
+fn main(): int64 { return sys_mount_count(); }' "199" ""
+# sys_umount zeigte auf 0x0210 = 528, eine Entwurfsnummer, die es im Kernel
+# nicht gibt — jeder Aufruf scheiterte an der Nummernpruefung. Gebaut ist 197.
+pruefe_bytes "sys_umount emittiert 197, nicht 528" \
+    'unit main;
+fn main(): int64 { return sys_umount("n"c); }' "197" "528"
+# Gegenprobe, die andere Haelfte: sys_mount (85) bleibt, was es war. Waere
+# "sys_mount auf 196 nachgezogen" worden, statt einen zweiten Namen anzulegen,
+# wuerde hier 196 stehen und die IOFS-Volumes waeren gebrochen.
+pruefe_bytes "sys_mount bleibt 85, nicht 196" \
+    'unit main;
+fn main(): int64 { return sys_mount(0, 1, 2); }' "85" "196"
 
 echo "----"
 echo "$PASS PASS, $FAIL FAIL"
