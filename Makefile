@@ -21,8 +21,8 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.35C
-VERSION_DATE := 2026-11-10
+VERSION   := 1.2.36A
+VERSION_DATE := 2026-11-11
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
 UNITS_DST := $(PKG_DIR)/usr/include/lyx/units/std
@@ -337,6 +337,8 @@ test: lyxc
 	@bash tests/oop_laufzeit_test.sh
 	@echo "--- arm64: Erzeugnisse ausfuehren, nicht nur uebersetzen (#1769) ---"
 	@bash tests/arm64_laufzeit_test.sh
+	@echo "--- zielgebundene Builtins nennen die Ursache, Liste weder zu weit noch zu eng (#2427) ---"
+	@bash tests/nurlyxos_2427_test.sh
 	@echo "--- fs-Builtins wirken auf x86, arm64 und riscv; mkdir-Modus 0755 (#2463, #2465) ---"
 	@bash tests/zielmatrix_2463_test.sh
 	@echo "--- ClassName() liefert auf allen Zielen denselben Namen (#2426) ---"
