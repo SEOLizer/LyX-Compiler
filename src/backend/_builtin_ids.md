@@ -485,6 +485,43 @@ der eingesetzte Wert steht jeweils fest.
 | 550 | Linux-Syscall fstat (Nr. 80) | `sys_fstat` | #2156; nur arm64/riscv |
 | 551 | Linux-Syscall unlinkat (Nr. 35) | `rmdir` | #2450; nur arm64/riscv, dirfd AT_FDCWD, Flag AT_REMOVEDIR (0x200). Auf lyxos bleibt `rmdir` die ID 236 (sys_unlink mit UNLINK_DIR) — und die meldet dort, dass es die Nummer nicht gibt (#2011) |
 
+## Bereich 267 … 272 — IOFS-Volumes und Partitions-Mounts (#2439)
+
+WP32-E im Kernel (IOFS auch unter `/devices/<name>/`, lyx-os `bb77019`) brachte
+sieben Nummern, die LyxOS behandelt und der Compiler nicht kannte: 189–191 und
+196–199. Die Nummern sind in `kernel/ring3.lyx:3436-3471` **nachgelesen**, nicht
+aus der Entwurfs-ABI übernommen.
+
+**Warum ein eigener Block und nicht der lyxos-Bereich 20…256:** der war bis auf
+vier Nummern (199, 217, 218, 219) ausgeschöpft. Sechs verwandte Aufrufe
+hintereinander sind leichter zu prüfen als vier verstreute plus zwei woanders —
+und die Belegungsliste bleibt lesbar. Die vier bleiben für kleine Nachträge im
+alten Block frei.
+
+| ID | LyxOS-Nr | Name | Argumente | Rückgabe |
+|---:|---:|---|---:|---|
+| 267 | 189 | `sys_iofs_select` | 1 (vol) | 0 oder −1; schaltet den aktiven IOFS-Datenträger um |
+| 268 | 190 | `sys_iofs_vol_active` | 0 | Nummer des aktiven Volumes |
+| 269 | 191 | `sys_iofs_vol_count` | 0 | Anzahl der IOFS-Volumes |
+| 270 | 196 | `sys_mount_part` | 3 (disk_id, part_no, name) | 0 oder Fehlercode |
+| 271 | 198 | `sys_mount_list` | 2 (idx, out) | 0 oder −1; füllt 48 Byte je Eintrag |
+| 272 | 199 | `sys_mount_count` | 0 | Anzahl der Einträge |
+
+**`sys_mount_part` nimmt DREI Argumente, nicht vier.** Die Entwurfssignatur
+nennt `(disk_id, part_no, name, flags)`; gebaut ist
+`VfsMountPart(name, disk_id, part_no, MOUNT_TEMP)` — der Kernel setzt die Flags
+selbst, ein vierter Parameter wäre ein Wert, den niemand liest.
+
+**Der Name ist nicht `sys_mount`.** Den gibt es schon: Nummer **85**,
+`sys_mount(vol_id, disk_id, lba_start)`, hängt eine Platte als IOFS-Volume ein.
+Nummer **196** hängt eine Partition unter `/devices/<name>/` ein — gleicher
+Name, andere Bedeutung, und damit nicht entscheidbar, welcher gemeint ist. Es
+sind zwei Builtins, nicht einer mit neuer Nummer.
+
+**`sys_umount` (ID 36) zeigte auf 0x0210 = 528** — eine Entwurfsnummer, die es
+im Kernel nicht gibt; jeder Aufruf scheiterte an der Nummernprüfung aus #1734.
+Gebaut ist **197** mit **einem** Argument (`VfsUmountName`), nicht drei.
+
 ## Bereich 253 … 262 — CPU-Abfrage und Bit-Rechenwerke (#2187, #2190, #2177)
 
 Vergeben in `src/ir_lower.lyx`; der Schnellweg (`codegen_x86`) kennt dieselben
