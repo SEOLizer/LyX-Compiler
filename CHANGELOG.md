@@ -2,6 +2,53 @@
 
 ## Unveröffentlicht (develop)
 
+### BEHOBEN — win64 schrieb Linux-SO-Namen in die Import-Tabelle; dazu Sockets über Winsock (#2480)
+
+Eine mit `--target=win64` gebaute .exe startete unter Windows nicht: der Lader
+suchte `libc.so.6`, dann `libcrypto.so.3`, und brach ab, bevor eine Zeile
+eigener Code lief. Gemessen an lpm auf echter Hardware — unter Wine fällt es
+nicht auf, solange das Programm die betroffenen Funktionen nicht aufruft.
+
+Die stdlib deklariert ihre Externs mit den Namen, unter denen die Bibliotheken
+**unter Linux** liegen (`link "libc.so.6"`). `wxb_planImports` übernahm diesen
+Text unverändert als DLL-Namen. Eine Abbildung lag seit jeher in
+`src/backend/pe/dynamic_linker.lyx` — nur ruft den Pfad niemand auf.
+
+Umgeschrieben wird jetzt **einmal**, in `SetExterns`, bevor irgendeine Rechnung
+den Namen sieht; die drei Leser bleiben unberührt (dieselbe Lehre wie #1676).
+
+| `link` | DLL |
+|---|---|
+| `libc.so.*` | `msvcrt.dll`, bei Winsock-Funktionen `ws2_32.dll` |
+| `libm.so.*` | `msvcrt.dll` |
+| `libdl.so.*`, `libpthread.so.*` | `kernel32.dll` |
+| `libcrypto.so.*` / `libssl.so.*` | `libcrypto-3-x64.dll` / `libssl-3-x64.dll` |
+| sonstiges `libX.so.N` | `libX.dll` |
+| Name ohne `.so` | unverändert |
+
+Dass auch der **Funktionsname** zählt, ist kein Schönheitsfehler: `socket` und
+`connect` stehen unter Windows nicht in msvcrt, sondern in ws2_32 — dieselbe
+`link`-Angabe muss je nach Symbol in zwei verschiedenen DLLs landen.
+
+Der Name allein genügt aber nicht. Ein SOCKET ist unter Windows kein
+Dateihandle (`closesocket` statt `close`), vor dem ersten Aufruf muss
+`WSAStartup` gelaufen sein, `SOL_SOCKET` ist 0xFFFF statt 1, und `SO_RCVTIMEO`
+nimmt einen DWORD in Millisekunden statt eines `timeval`. Dafür gibt es neu:
+
+* `std/net/socket_win.lyx` — TCP über Winsock, inklusive WSAStartup.
+* `std.net.tcp` — gleiche Signaturen zweimal, in
+  `platform/linux/` und `platform/win64/`. Ausgewählt über den
+  Include-Pfad (Plattformpfad als letztes `-I`), kein Zweig zur Laufzeit:
+  `extern fn` bindet hart, und ein Programm, das ws2_32 auch nur erwähnt,
+  trägt die DLL in seiner Import-Tabelle — auch unter Linux.
+
+`std.net.socket` bleibt Linux-only (rohe Syscalls); UDP, Raw und ICMP sind
+nicht portiert. Die OpenSSL-DLLs gehören neben die .exe.
+
+Nachweis: `tests/win64_dll_namen_test.sh` — Import-Tabelle mit objdump,
+Verbindung, Senden und Empfangen unter wine gegen eine echte Gegenstelle, und
+dieselbe Fassade unter Linux.
+
 ### BEHOBEN — elf neue Capabilities; die LCBS-Lücke schrumpft von 83 auf 1 (#1865, #1870, #1871, #1872, #1875)
 
 Der Rest der Runde aus #1865. Alle Meldungen hatten dieselbe Form wie die

@@ -1,0 +1,297 @@
+// Lyx Network Library - Sockets unter Windows (Winsock 2)
+//
+// #2480: std.net.socket arbeitet mit rohen Linux-Syscalls und mit
+// `link "libc.so.6"`. Unter Windows gibt es beides nicht: Sockets kommen aus
+// ws2_32.dll, sie sind KEINE Dateihandles (close/read/write greifen daneben,
+// es heisst closesocket/recv/send), und vor dem ersten Aufruf muss WSAStartup
+// gelaufen sein. Diese Unit ist deshalb kein Umweg um std.net.socket herum,
+// sondern dessen Gegenstueck fuer das Ziel win64.
+//
+// Absicht: die Teilmenge, die ein Netzclient wie lpm braucht — verbinden,
+// lesen, schreiben, schliessen, Zeitgrenzen, dazu ein einfacher Listener.
+// Kein UDP, kein Raw, kein ICMP: was hier nicht steht, ist nicht portiert.
+//
+// Bauen:  lyxc <datei>.lyx --target=win64 --format=pe -o <datei>.exe
+// Pruefen: tests/win64_socket_test.sh (baut; ein Lauf braucht Windows)
+
+@capabilities([network.tcp.bind, network.tcp.connect])
+unit std.net.socket_win;
+
+import std.alloc;
+
+// ============================================================================
+// Konstanten (Winsock-Werte, nicht die von Linux)
+// ============================================================================
+
+pub con WSA_AF_INET: int64 := 2;
+pub con WSA_SOCK_STREAM: int64 := 1;
+pub con WSA_IPPROTO_TCP: int64 := 6;
+
+pub con WSA_INVALID_SOCKET: int64 := 0 - 1;
+pub con WSA_SOCKET_ERROR: int64 := 0 - 1;
+
+// Ebenen und Optionen. SOL_SOCKET ist unter Windows 0xFFFF, nicht 1 wie
+// unter Linux — wer die Linux-Werte uebernimmt, bekommt WSAENOPROTOOPT.
+pub con WSA_SOL_SOCKET: int64 := 65535;
+pub con WSA_SO_RCVTIMEO: int64 := 4102;
+pub con WSA_SO_SNDTIMEO: int64 := 4101;
+pub con WSA_SO_REUSEADDR: int64 := 4;
+pub con WSA_SO_ERROR: int64 := 4103;
+pub con WSA_IPPROTO_TCP_LEVEL: int64 := 6;
+pub con WSA_TCP_NODELAY: int64 := 1;
+
+pub con WSA_SD_RECEIVE: int64 := 0;
+pub con WSA_SD_SEND: int64 := 1;
+pub con WSA_SD_BOTH: int64 := 2;
+
+// sockaddr_in: 16 Byte, genau wie unter Linux.
+pub con WSA_SOCKADDR_IN_SIZE: int64 := 16;
+// WSADATA ist unter x64 400 Byte; 512 gibt Luft.
+con WSA_DATA_SIZE: int64 := 512;
+
+// ============================================================================
+// ws2_32.dll
+// ============================================================================
+
+@cap(network.tcp.connect)
+extern fn WSAStartup(versionRequested: int64, lpWSAData: int64): int64 link "ws2_32.dll";
+@cap(network.tcp.connect)
+extern fn WSACleanup(): int64 link "ws2_32.dll";
+@cap(network.tcp.connect)
+extern fn WSAGetLastError(): int64 link "ws2_32.dll";
+@cap(network.tcp.connect)
+extern fn socket(af: int64, typ: int64, protocol: int64): int64 link "ws2_32.dll";
+@cap(network.tcp.connect)
+extern fn connect(s: int64, name: int64, namelen: int64): int64 link "ws2_32.dll";
+@cap(network.tcp.bind)
+extern fn bind(s: int64, name: int64, namelen: int64): int64 link "ws2_32.dll";
+@cap(network.tcp.bind)
+extern fn listen(s: int64, backlog: int64): int64 link "ws2_32.dll";
+@cap(network.tcp.bind)
+extern fn accept(s: int64, addr: int64, addrlen: int64): int64 link "ws2_32.dll";
+@cap(network.tcp.connect)
+extern fn send(s: int64, buf: int64, len: int64, flags: int64): int64 link "ws2_32.dll";
+@cap(network.tcp.connect)
+extern fn recv(s: int64, buf: int64, len: int64, flags: int64): int64 link "ws2_32.dll";
+@cap(network.tcp.connect)
+extern fn closesocket(s: int64): int64 link "ws2_32.dll";
+@cap(network.tcp.connect)
+extern fn shutdown(s: int64, how: int64): int64 link "ws2_32.dll";
+@cap(network.tcp.connect)
+extern fn setsockopt(s: int64, level: int64, optname: int64, optval: int64, optlen: int64): int64 link "ws2_32.dll";
+@cap(network.tcp.connect)
+extern fn getsockopt(s: int64, level: int64, optname: int64, optval: int64, optlen: int64): int64 link "ws2_32.dll";
+
+// ============================================================================
+// Start und Ende
+// ============================================================================
+
+// Einmal je Prozess. Wer sie vergisst, bekommt von jedem Aufruf
+// WSANOTINITIALISED (10093) — ein Fehler, der nicht nach fehlendem Start
+// aussieht, deshalb ruft jede Funktion hier sie selbst auf.
+var wsaBereit: int64 := 0;
+var wsaStartFehler: int64 := 0;
+
+pub fn WinsockInit(): int64 {
+  if wsaBereit != 0 {
+    return 0;
+  }
+  var daten: int64 := alloc(WSA_DATA_SIZE);
+  // MAKEWORD(2,2) = 0x0202
+  var rc: int64 := WSAStartup(514, daten);
+  if rc != 0 {
+    wsaStartFehler := rc;
+    return rc;
+  }
+  wsaBereit := 1;
+  return 0;
+}
+
+pub fn WinsockBereit(): bool {
+  return wsaBereit != 0;
+}
+
+pub fn WinsockStartFehler(): int64 {
+  return wsaStartFehler;
+}
+
+pub fn WinsockEnde(): int64 {
+  if wsaBereit == 0 {
+    return 0;
+  }
+  wsaBereit := 0;
+  return WSACleanup();
+}
+
+// Letzter Fehler des Threads, z.B. 10060 WSAETIMEDOUT, 10061 WSAECONNREFUSED.
+pub fn WinsockLetzterFehler(): int64 {
+  return WSAGetLastError();
+}
+
+// ============================================================================
+// Hilfen
+// ============================================================================
+
+// Portnummer in Netzreihenfolge. Von Hand, nicht ueber htons: ein Aufruf
+// weniger in der Import-Tabelle, und das Ergebnis ist dasselbe.
+pub fn WinPortNetz(port: int64): int64 {
+  return ((port & 255) * 256) | ((port / 256) & 255);
+}
+
+// sockaddr_in aufbauen. ip liegt als 32-Bit-Wert in HOSTreihenfolge vor
+// (a*2^24 + b*2^16 + c*2^8 + d), so wie IPPack in std.net.socket ihn liefert.
+pub fn WinSockaddrIn(puffer: int64, ip: int64, port: int64) {
+  var i: int64 := 0;
+  while i < WSA_SOCKADDR_IN_SIZE {
+    poke8(puffer + i, 0);
+    i := i + 1;
+  }
+  poke16(puffer, WSA_AF_INET);
+  poke16(puffer + 2, WinPortNetz(port));
+  // in_addr steht in Netzreihenfolge: hoechstes Byte zuerst.
+  poke8(puffer + 4, (ip / 16777216) & 255);
+  poke8(puffer + 5, (ip / 65536) & 255);
+  poke8(puffer + 6, (ip / 256) & 255);
+  poke8(puffer + 7, ip & 255);
+}
+
+pub fn WinIPPack(a: int64, b: int64, c: int64, d: int64): int64 {
+  return a * 16777216 + b * 65536 + c * 256 + d;
+}
+
+fn winOptInt(s: int64, ebene: int64, opt: int64, wert: int64): int64 {
+  var puffer: int64 := alloc(8);
+  poke32(puffer, wert);
+  return setsockopt(s, ebene, opt, puffer, 4);
+}
+
+// ============================================================================
+// TCP-Client
+// ============================================================================
+
+// Gibt das Sockethandle zurueck oder WSA_INVALID_SOCKET.
+pub fn WinTCPSocket(): int64 {
+  if WinsockInit() != 0 {
+    return WSA_INVALID_SOCKET;
+  }
+  return socket(WSA_AF_INET, WSA_SOCK_STREAM, WSA_IPPROTO_TCP);
+}
+
+pub fn WinTCPConnect(ip: int64, port: int64): int64 {
+  var s: int64 := WinTCPSocket();
+  if s == WSA_INVALID_SOCKET {
+    return WSA_INVALID_SOCKET;
+  }
+  var addr: int64 := alloc(WSA_SOCKADDR_IN_SIZE);
+  WinSockaddrIn(addr, ip, port);
+  if connect(s, addr, WSA_SOCKADDR_IN_SIZE) != 0 {
+    closesocket(s);
+    return WSA_INVALID_SOCKET;
+  }
+  return s;
+}
+
+pub fn WinTCPConnectV4(a: int64, b: int64, c: int64, d: int64, port: int64): int64 {
+  return WinTCPConnect(WinIPPack(a, b, c, d), port);
+}
+
+// Gelesene Bytes, 0 bei ordentlichem Verbindungsende, negativ bei Fehler.
+pub fn WinTCPRead(s: int64, buf: int64, n: int64): int64 {
+  return recv(s, buf, n, 0);
+}
+
+pub fn WinTCPWrite(s: int64, buf: int64, n: int64): int64 {
+  return send(s, buf, n, 0);
+}
+
+// send darf weniger schreiben, als verlangt wurde. Der Aufrufer, der das
+// uebersieht, verliert stillschweigend das Ende seiner Nachricht.
+pub fn WinTCPWriteAll(s: int64, buf: int64, n: int64): int64 {
+  var geschrieben: int64 := 0;
+  while geschrieben < n {
+    var r: int64 := send(s, buf + geschrieben, n - geschrieben, 0);
+    if r <= 0 {
+      return 0 - 1;
+    }
+    geschrieben := geschrieben + r;
+  }
+  return geschrieben;
+}
+
+pub fn WinTCPClose(s: int64): int64 {
+  if s == WSA_INVALID_SOCKET {
+    return 0;
+  }
+  shutdown(s, WSA_SD_BOTH);
+  return closesocket(s);
+}
+
+// Zeitgrenzen in MILLISEKUNDEN — Windows nimmt hier einen DWORD, kein
+// timeval. Wer die Linux-Struktur uebergibt, wartet ploetzlich Stunden.
+pub fn WinTCPSetRecvTimeout(s: int64, ms: int64): int64 {
+  return winOptInt(s, WSA_SOL_SOCKET, WSA_SO_RCVTIMEO, ms);
+}
+
+pub fn WinTCPSetSendTimeout(s: int64, ms: int64): int64 {
+  return winOptInt(s, WSA_SOL_SOCKET, WSA_SO_SNDTIMEO, ms);
+}
+
+pub fn WinTCPSetNodelay(s: int64, an: bool): int64 {
+  var wert: int64 := 0;
+  if an {
+    wert := 1;
+  }
+  return winOptInt(s, WSA_IPPROTO_TCP_LEVEL, WSA_TCP_NODELAY, wert);
+}
+
+pub fn WinTCPSetReuseAddr(s: int64, an: bool): int64 {
+  var wert: int64 := 0;
+  if an {
+    wert := 1;
+  }
+  return winOptInt(s, WSA_SOL_SOCKET, WSA_SO_REUSEADDR, wert);
+}
+
+pub fn WinTCPFehler(s: int64): int64 {
+  var puffer: int64 := alloc(8);
+  var laenge: int64 := alloc(8);
+  poke32(puffer, 0);
+  poke32(laenge, 4);
+  if getsockopt(s, WSA_SOL_SOCKET, WSA_SO_ERROR, puffer, laenge) != 0 {
+    return WSAGetLastError();
+  }
+  return peek32(puffer);
+}
+
+// ============================================================================
+// TCP-Listener
+// ============================================================================
+
+// ip = 0 heisst INADDR_ANY.
+pub fn WinTCPListen(ip: int64, port: int64, backlog: int64): int64 {
+  var s: int64 := WinTCPSocket();
+  if s == WSA_INVALID_SOCKET {
+    return WSA_INVALID_SOCKET;
+  }
+  WinTCPSetReuseAddr(s, true);
+  var addr: int64 := alloc(WSA_SOCKADDR_IN_SIZE);
+  WinSockaddrIn(addr, ip, port);
+  if bind(s, addr, WSA_SOCKADDR_IN_SIZE) != 0 {
+    closesocket(s);
+    return WSA_INVALID_SOCKET;
+  }
+  if listen(s, backlog) != 0 {
+    closesocket(s);
+    return WSA_INVALID_SOCKET;
+  }
+  return s;
+}
+
+// Blockierend. Gibt das Handle der Verbindung zurueck oder
+// WSA_INVALID_SOCKET.
+pub fn WinTCPAccept(listener: int64): int64 {
+  var addr: int64 := alloc(WSA_SOCKADDR_IN_SIZE);
+  var laenge: int64 := alloc(8);
+  poke32(laenge, WSA_SOCKADDR_IN_SIZE);
+  return accept(listener, addr, laenge);
+}

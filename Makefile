@@ -281,6 +281,7 @@ test: lyxc
 	@bash tests/stille_varianten_runde16_test.sh
 	@bash tests/classname_test.sh
 	@bash tests/win64_pe_test.sh
+	@bash tests/win64_dll_namen_test.sh
 	@bash tests/doppelte_mitglieder_test.sh
 	@bash tests/schluesselwoerter_test.sh
 	@bash tests/struct_rueckgabe_test.sh
