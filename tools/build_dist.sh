@@ -13,6 +13,10 @@
 #   build/<backend>/include/lyx/units/data/**   vorkompilierte Datenunits
 #   build/<backend>/bin/lbfdump, lpm, …         Hilfswerkzeuge FUER DIESES ZIEL
 #   build/<backend>/WERKZEUGE-STATUS.txt        welche davon uebersetzt haben
+#   build/<backend>/LICENSE                     Volltext der LPCL (englisch,
+#                                               massgeblich)
+#   build/<backend>/LICENSE.es                  spanische Uebersetzung
+#   build/<backend>/LIZENZEN.txt                welche Lizenz fuer welchen Teil gilt
 #   build/<backend>/share/lyx/pci.ids           Datendateien
 #   build/<backend>/VERSION                     Version, Datum, Backend, Commit
 #   build/<backend>/INSTALL.md                  wie der Baum installiert wird
@@ -403,6 +407,79 @@ backend_bauen() {
   cp share/pci.ids "$D/share/lyx/pci.ids"
   cp share/pci.ids.LICENSE "$D/share/lyx/pci.ids.LICENSE"
 
+  # Lizenzen. Ein Paket, das Binaries und fremde Daten ausliefert, muss sagen,
+  # unter welchen Bedingungen — und zwar im Paket, nicht nur im Repo.
+  # LICENSE ist der Volltext der LPCL; LIZENZEN.txt sagt je Bestandteil,
+  # welche Lizenz gilt und wo ihr Text steht.
+  cp "$ROOT/LICENSE" "$D/LICENSE"
+  # Uebersetzungen der Lizenz. Sie sind Lesehilfen, nicht die Rechtsgrundlage:
+  # Abschnitt 10(c) des Originals erklaert die ENGLISCHE Fassung fuer
+  # massgeblich. Fehlt eine Uebersetzung im Repo, faellt sie aus dem Paket —
+  # das ist kein Fehler, nur ein Paket ohne diese Lesehilfe.
+  for sprache in es de fr; do
+    [ -f "$ROOT/LICENSE.$sprache" ] && cp "$ROOT/LICENSE.$sprache" "$D/LICENSE.$sprache"
+  done
+  local lpm_lizenz="unbekannt" lpm_version=""
+  if [ -f "$LPM_SRC/lyx.toml" ]; then
+    lpm_lizenz="$(awk -F'"' '/^license[[:space:]]*=/ {print $2; exit}' "$LPM_SRC/lyx.toml")"
+    lpm_version="$(awk -F'"' '/^version[[:space:]]*=/ {print $2; exit}' "$LPM_SRC/lyx.toml")"
+    [ -n "$lpm_lizenz" ] || lpm_lizenz="unbekannt"
+  fi
+  {
+    echo "Lizenzen der Bestandteile dieses Pakets"
+    echo "======================================="
+    echo
+    echo "lyxc $VERSION, Backend $name, gebaut am $DATUM aus Commit $COMMIT."
+    echo
+    echo "1) Compiler, Standardbibliothek, Beispiele und die Werkzeuge aus"
+    echo "   diesem Repository (lbfdump, lbfimport, lbfloader, lbfrun, lyxcpu,"
+    echo "   cpufeatures)"
+    echo
+    echo "   Lyx Proprietary & Community License (LPCL), Version 1.0 (2026)"
+    echo "   Copyright (c) 2026 Andreas Roene. All rights reserved."
+    echo "   Volltext: LICENSE in diesem Verzeichnis (englisch, massgeblich)."
+    if ls "$D"/LICENSE.?? >/dev/null 2>&1; then
+      echo "   Uebersetzungen als Lesehilfe:"
+      local uebersetzung
+      for uebersetzung in "$D"/LICENSE.??; do
+        case "${uebersetzung##*.}" in
+          es) echo "     LICENSE.es — espanol (traduccion no vinculante)" ;;
+          de) echo "     LICENSE.de — Deutsch (unverbindliche Uebersetzung)" ;;
+          fr) echo "     LICENSE.fr — francais (traduction non contraignante)" ;;
+          *)  echo "     ${uebersetzung##*/}" ;;
+        esac
+      done
+      echo "   Bei Abweichungen gilt die englische Fassung (Abschnitt 10(c))."
+    fi
+    echo
+    echo "   Kurz: kostenlos fuer Privatpersonen und Bildungseinrichtungen;"
+    echo "   die kommerzielle Verwertung bleibt dem Autor vorbehalten. Es gilt"
+    echo "   allein der Text in LICENSE, nicht diese Zusammenfassung."
+    echo
+    echo "2) lpm (Paketmanager)${lpm_version:+, Version $lpm_version}"
+    echo
+    if [ -f "$D/bin/lpm" ] || [ -f "$D/bin/lpm.exe" ]; then
+      echo "   Lizenz: $lpm_lizenz (eigenes Projekt, #2448)"
+      echo "   Copyright (c) 2026 Andreas Roene."
+      if [ -f "$LPM_SRC/LICENSE" ]; then
+        echo "   Volltext: LICENSE.lpm in diesem Verzeichnis."
+      else
+        echo "   Ein Lizenz-Volltext liegt dem lpm-Projekt nicht bei; die"
+        echo "   Angabe stammt aus seiner lyx.toml ($LPM_SRC/lyx.toml)."
+      fi
+    else
+      echo "   In diesem Paket NICHT enthalten (siehe WERKZEUGE-STATUS.txt)."
+    fi
+    echo
+    echo "3) share/lyx/pci.ids — Datendatei des PCI-ID-Projekts, NICHT vom"
+    echo "   Lyx-Autor. Eigene Lizenz und Herkunft:"
+    echo "   share/lyx/pci.ids.LICENSE in diesem Verzeichnis."
+    echo
+    echo "Erzeugnisse, die mit diesem Compiler uebersetzt werden, sind nicht"
+    echo "Gegenstand dieser Aufzaehlung; was fuer sie gilt, steht in LICENSE."
+  } > "$D/LIZENZEN.txt"
+  [ -f "$LPM_SRC/LICENSE" ] && cp "$LPM_SRC/LICENSE" "$D/LICENSE.lpm"
+
   cat > "$D/VERSION" <<EOF
 lyxc $VERSION
 Backend:  $name
@@ -511,11 +588,23 @@ Gebaut am $DATUM aus Commit $COMMIT.
     include/lyx/units/std/**.lyu    vorkompilierte Standardbibliothek
     include/lyx/units/data/**.lyu   vorkompilierte Datenunits
     share/lyx/pci.ids               Datendatei (std/hardware/pci_ids.lyx liest sie zur Laufzeit)
+    LICENSE                         Volltext der Lyx-Lizenz (LPCL 1.0, englisch)
+    LICENSE.es                      spanische Uebersetzung (unverbindlich)
+    LIZENZEN.txt                    welche Lizenz fuer welchen Bestandteil gilt
 
 Die Units sind mit dem Host-Ziel vorkompiliert (UNITS_ZIEL=host). Das ist
 gemessen, nicht angenommen: ein Erzeugnis fuer $target ist bytegleich,
 unabhaengig davon, mit welchem Ziel die .lyu gebaut wurden (40 Programme aus
 examples/, 14 uebersetzbar, 14 bytegleich, 0 abweichend).
+
+## Lizenz
+
+Compiler, Standardbibliothek, Beispiele und die Werkzeuge aus diesem
+Repository stehen unter der Lyx Proprietary & Community License (LPCL 1.0),
+Volltext in \`LICENSE\` (englisch, massgeblich); \`LICENSE.es\` ist eine
+unverbindliche spanische Uebersetzung. \`lpm\` hat eine eigene Lizenz, \`share/lyx/pci.ids\`
+stammt aus dem PCI-ID-Projekt und hat wieder eine andere —
+\`LIZENZEN.txt\` sagt je Bestandteil, welche gilt und wo ihr Text steht.
 
 ## Werkzeuge in bin/
 
