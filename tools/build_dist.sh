@@ -1,3 +1,8 @@
+  # KEIN zweiter Versuch gegen einen Quellenbaum mehr: das Paket traegt keine
+  # stdlib-Quellen. Ein Beispiel, dem die .lyu nicht reicht ("Quelle der
+  # importierten Unit nicht lesbar", "stammt aus einer .lyu ohne Objektcode"),
+  # ist damit ROT und nennt genau diese Meldung — das ist die Lage im
+  # ausgelieferten Baum, und sie soll dastehen, wie sie ist.
 #!/usr/bin/env bash
 # tools/build_dist.sh — Auslieferbaum je Backend unter build/<backend>/.
 #
@@ -6,6 +11,8 @@
 #   build/<backend>/bin/lyxc[.exe]              Compiler FUER DIESES ZIEL
 #   build/<backend>/include/lyx/units/std/**    vorkompilierte Standardbibliothek
 #   build/<backend>/include/lyx/units/data/**   vorkompilierte Datenunits
+#   build/<backend>/bin/lbfdump, lpm, …         Hilfswerkzeuge FUER DIESES ZIEL
+#   build/<backend>/WERKZEUGE-STATUS.txt        welche davon uebersetzt haben
 #   build/<backend>/share/lyx/pci.ids           Datendateien
 #   build/<backend>/VERSION                     Version, Datum, Backend, Commit
 #   build/<backend>/INSTALL.md                  wie der Baum installiert wird
@@ -119,22 +126,11 @@ if [ "${1:-}" = "--ein-beispiel" ]; then
          "$ROOT/$q" -o /dev/null ) >"$log" 2>&1; then
     rm -f "$log"; exit 0
   fi
-  # Zweiter Versuch gegen den Quellenbaum — aber NUR fuer den einen Grund, der
-  # ihn rechtfertigt. Ein zweiter Versuch "auf gut Glueck" wuerde jeden echten
-  # Fehler zweimal zeigen und die Ursachen vermischen.
-  # Zwei Meldungen, dieselbe Ursache: die .lyu reicht dem Codegen nicht. Die
-  # zweite ("stammt aus einer .lyu ohne Objektcode") kam in der ersten Fassung
-  # nicht in den zweiten Versuch und stand mit 43 Faellen als "rot" da,
-  # obwohl der Quellenbaum sie traegt.
-  if grep -qE "Quelle der importierten Unit nicht lesbar|stammt aus einer \.lyu ohne Objektcode" "$log"; then
-    if ( cd "$BSP_LOG" && timeout 120 "$LYXC" --std-path="$BSP_SRC" \
-           ${ZIEL:+--target="$ZIEL"} ${FORMAT:+--format="$FORMAT"} \
-           "$ROOT/$q" -o /dev/null ) >"$log.quelle" 2>&1; then
-      mv "$log.quelle" "$log.nurquelle"; rm -f "$log"; exit 0
-    fi
-    # Auch mit Quellen rot: dann ist der Quellenbedarf nicht die Ursache.
-    mv "$log.quelle" "$log"
-  fi
+  # KEIN zweiter Versuch gegen einen Quellenbaum: das Paket traegt keine
+  # stdlib-Quellen mehr. Ein Beispiel, dem die .lyu nicht reicht ("Quelle der
+  # importierten Unit nicht lesbar", "stammt aus einer .lyu ohne Objektcode"),
+  # ist damit ROT und nennt genau diese Meldung — das ist die Lage im
+  # ausgelieferten Baum, und sie soll dastehen, wie sie ist.
   exit 1
 fi
 
@@ -175,11 +171,41 @@ fi
 
 VERSION="$("$LYXC" --version 2>/dev/null | head -1 | awk '{print $2}')"
 [ -n "$VERSION" ] || { echo "FEHLER: $LYXC --version liefert keine Version." >&2; exit 1; }
+
+# Der Compiler muss zum Quellstand passen. Die .lyu tragen den Codegen dessen,
+# der sie erzeugt hat; ein alter ./lyxc liefert also stillschweigend Units von
+# gestern in ein Paket von heute. Die Version steckt im Binary, der Vergleich
+# gegen das Makefile ist damit eine Aussage ueber die Herkunft des Binarys.
+MAKE_VERSION="$(awk -F':=' '/^VERSION[[:space:]]*:=/ {gsub(/[[:space:]]/,"",$2); print $2; exit}' "$ROOT/Makefile")"
+if [ -n "$MAKE_VERSION" ] && [ "$VERSION" != "$MAKE_VERSION" ]; then
+  echo "FEHLER: $LYXC meldet $VERSION, der Quellstand steht auf $MAKE_VERSION." >&2
+  echo "Erst 'make bootstrap' (nie 'make clean'), dann erneut." >&2
+  echo "Wer bewusst mit einem aelteren Compiler ausliefert: DIST_VERSION_EGAL=1." >&2
+  [ "${DIST_VERSION_EGAL:-0}" = "1" ] || exit 1
+  echo "WARNUNG: DIST_VERSION_EGAL=1 — Paket entsteht mit $VERSION." >&2
+fi
 DATUM="$(date +%Y-%m-%d)"
 COMMIT="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unbekannt)"
 
 mapfile -t UNIT_QUELLEN < <( { find std -name '*.lyx'; find data -name '*.lyx'; } | sort )
 [ "${#UNIT_QUELLEN[@]}" -gt 0 ] || { echo "FEHLER: keine Unit-Quellen gefunden." >&2; exit 1; }
+
+# ── Hilfswerkzeuge ───────────────────────────────────────────────────────────
+# Je Backend werden sie FUER DIESES ZIEL uebersetzt und liegen neben dem
+# Compiler in bin/. Format: <name im Paket>|<quelle>. Eine Quelle ausserhalb
+# des Repos wird ueber eine Variable gefunden, damit das Paket nicht still
+# an einem fremden Pfad haengt: lpm lebt in einem eigenen Projekt (#2448),
+# LPM_SRC zeigt darauf. Fehlt es, faellt lpm aus dem Paket — laut, nicht still.
+LPM_SRC="${LPM_SRC:-$(cd "$ROOT/.." 2>/dev/null && pwd)/lyx-lpm}"
+WERKZEUGE=(
+  "lbfdump|$ROOT/src/tools/lbf_dump.lyx"
+  "lbfimport|$ROOT/src/tools/lbf_import.lyx"
+  "lbfloader|$ROOT/src/tools/lbf_loader.lyx"
+  "lbfrun|$ROOT/src/tools/lbf_run.lyx"
+  "lyxcpu|$ROOT/src/tools/lyx_cpu.lyx"
+  "cpufeatures|$ROOT/src/tools/cpu_features_dump.lyx"
+  "lpm|$LPM_SRC/main.lyx"
+)
 
 # ── Beispiele auswaehlen ─────────────────────────────────────────────────────
 # Ausgeliefert wird NUR, was in tools/dist_examples.txt steht. examples/ im
@@ -241,11 +267,11 @@ backend_bauen() {
 
   # 1) Compiler fuer das Ziel
   if [ "$NUR_UNITS" = "1" ]; then
-    echo "  [1/3] Compiler uebersprungen (NUR_UNITS=1)"
+    echo "  [1/5] Compiler uebersprungen (NUR_UNITS=1)"
   elif [ "$selbstbaubar" != "ja" ]; then
-    echo "  [1/3] Compiler: fuer $name nicht vorgesehen (nur Units)"
+    echo "  [1/5] Compiler: fuer $name nicht vorgesehen (nur Units)"
   else
-    echo "  [1/3] Compiler uebersetzen ($binname) — dauert Minuten"
+    echo "  [1/5] Compiler uebersetzen ($binname) — dauert Minuten"
     if "$LYXC" --std-path="$ROOT" --target="$target" --format="$format" \
          src/lyxc.lyx -o "$D/bin/$binname" >"$D/bin/.bau.log" 2>&1; then
       chmod 755 "$D/bin/$binname"
@@ -269,7 +295,8 @@ backend_bauen() {
   #    Lauf anstandslos durchkamen. Deshalb wird gefahren, BIS KEIN FORTSCHRITT
   #    mehr entsteht. Das Abbruchkriterium ist der Fortschritt, nicht eine
   #    geratene Rundenzahl; nur die Obergrenze schuetzt vor einer Endlosrunde.
-  echo "  [2/3] ${#UNIT_QUELLEN[@]} Units uebersetzen (UNITS_ZIEL=$UNITS_ZIEL, JOBS=$JOBS)"
+  echo "  [2/5] ${#UNIT_QUELLEN[@]} Units uebersetzen (UNITS_ZIEL=$UNITS_ZIEL, JOBS=$JOBS)"
+  local MARKE; MARKE="$(mktemp)"            # Zeitmarke fuer die Frischepruefung
   local LOGDIR; LOGDIR="$(mktemp -d)"
   export LYXC ROOT
   if [ "$UNITS_ZIEL" = "ziel" ]; then export ZIEL="$target"; else export ZIEL=""; fi
@@ -288,6 +315,20 @@ backend_bauen() {
     [ "$jetzt" -eq "$vorher" ] && break      # kein Fortschritt — der Rest ist echt
     vorher="$jetzt"
   done
+
+  # Zusicherung: JEDE .lyu ist in DIESEM Lauf entstanden. Der Baum wird zwar
+  # oben mit `rm -rf "$D"` geleert, aber darauf allein darf die Aussage
+  # "mit der aktuellen Compilerversion gebaut" nicht ruhen — faellt das rm
+  # einmal weg oder zeigt UNIT_DST woandershin, griffe das
+  # `[ -s "$ziel" ] && exit 0` der Unit-Funktion und liefe still auf
+  # Altbestand hinaus. Gemessen wird gegen die Marke, nicht geglaubt.
+  local n_alt
+  n_alt=$(find "$D/include/lyx/units" -name '*.lyu' ! -newer "$MARKE" | wc -l)
+  if [ "$n_alt" -gt 0 ]; then
+    echo "FEHLER: $n_alt .lyu stammen nicht aus diesem Lauf (aelter als $(date -r "$MARKE" +%T))." >&2
+    find "$D/include/lyx/units" -name '*.lyu' ! -newer "$MARKE" | head -5 >&2
+    return 1
+  fi
 
   # Die Ausnahmeliste gilt nur fuer den zielweisen Bau: im Host-Modus gibt es
   # die zielbedingten Luecken nicht, und eine fehlende Unit waere dort ein
@@ -320,8 +361,45 @@ backend_bauen() {
   [ -s "$fehlerliste" ] || rm -f "$fehlerliste"
   [ "$n_fehler" -eq 0 ] || fehler=1
 
+  # 2b) Hilfswerkzeuge fuer DIESES Ziel. Sie gehoeren zum Paket wie der
+  #     Compiler: ein lbfdump vom Host nuetzt auf einem arm64-Geraet nichts.
+  echo "  [3/5] Hilfswerkzeuge fuer $target uebersetzen"
+  local wkz_log; wkz_log="$D/bin/.werkzeuge.log"
+  local n_wkz_ok=0 n_wkz_rot=0 eintrag wname wquelle wziel
+  {
+    echo "# Hilfswerkzeuge, uebersetzt fuer $target ($name), Stand $DATUM, lyxc $VERSION"
+    echo "#"
+    echo "# Sie liegen in bin/ neben dem Compiler und sind FUER DIESES ZIEL gebaut."
+    echo
+  } > "$D/WERKZEUGE-STATUS.txt"
+  for eintrag in "${WERKZEUGE[@]}"; do
+    wname="${eintrag%%|*}"; wquelle="${eintrag#*|}"
+    wziel="$D/bin/$wname"
+    [ "$format" = "pe" ] && wziel="$wziel.exe"
+    if [ ! -f "$wquelle" ]; then
+      printf 'FEHLT  %-14s Quelle nicht gefunden: %s\n' "$wname" "$wquelle" >> "$D/WERKZEUGE-STATUS.txt"
+      n_wkz_rot=$((n_wkz_rot+1)); continue
+    fi
+    if ( cd "$(dirname "$wquelle")" && timeout 300 "$LYXC" --std-path="$ROOT" \
+           -I "$(dirname "$wquelle")" -I "$ROOT" \
+           --target="$target" --format="$format" "$wquelle" -o "$wziel" ) >"$wkz_log" 2>&1; then
+      printf 'OK     %-14s %s Bytes\n' "$wname" "$(stat -c%s "$wziel")" >> "$D/WERKZEUGE-STATUS.txt"
+      n_wkz_ok=$((n_wkz_ok+1))
+    else
+      rm -f "$wziel"                      # halbe Datei ist schlimmer als keine
+      printf 'ROT    %-14s %s\n' "$wname" \
+        "$(grep -m1 -iE '^error|^lyxc:|sema error|Parse error' "$wkz_log" | cut -c1-140)" \
+        >> "$D/WERKZEUGE-STATUS.txt"
+      n_wkz_rot=$((n_wkz_rot+1))
+    fi
+  done
+  rm -f "$wkz_log"
+  echo "        $n_wkz_ok/${#WERKZEUGE[@]} Werkzeuge gebaut, $n_wkz_rot nicht (siehe WERKZEUGE-STATUS.txt)"
+  # Ein nicht uebersetzbares Werkzeug macht den Lauf NICHT rot — der Grund
+  # steht je Werkzeug im Status, und er gehoert dem Werkzeug, nicht dem Paket.
+
   # 3) Datendateien und Begleitpapiere
-  echo "  [3/3] Datendateien und Begleitpapiere"
+  echo "  [4/5] Datendateien und Begleitpapiere"
   cp share/pci.ids "$D/share/lyx/pci.ids"
   cp share/pci.ids.LICENSE "$D/share/lyx/pci.ids.LICENSE"
 
@@ -340,7 +418,7 @@ EOF
   #    Ziel uebersetzt, und das Ergebnis steht in EXAMPLES-STATUS.txt. Ein
   #    Beispielordner, in dem die Haelfte nicht uebersetzt, ist sonst eine
   #    stille Enttaeuschung — der Nutzer haelt den Fehler fuer seinen eigenen.
-  echo "  [4/4] Beispiele pruefen und mitliefern"
+  echo "  [5/5] Beispiele pruefen und mitliefern"
   rm -rf "$D/examples"
   mkdir -p "$D/examples"
   local b
@@ -351,23 +429,19 @@ EOF
   # Datendateien, die ein Beispiel zur Laufzeit liest (ml/*.csv u. ae.).
   ( cd "$ROOT/examples" && find . -type f ! -name '*.lyx' -print0 ) \
     | ( cd "$D/examples" && xargs -0 -r -I{} sh -c 'mkdir -p "$(dirname "{}")" && cp "$0/examples/{}" "{}"' "$ROOT" )
-  # Quellenbaum neben den Vorkompilaten. Begruendung in INSTALL.md: manche
-  # .lyu beschreiben nicht alle Symbole ihrer Unit, der Codegen liest dann die
-  # .lyx. Getrennt gehalten, weil der Resolver .lyx VOR .lyu nimmt — lagen
-  # beide im selben Baum, waeren die Vorkompilate totes Gewicht.
-  # Gemessen (examples/ml/nn_auto_mpg.lyx, 3 Laeufe): mit .lyu 0,03 s, mit
-  # Quellen 0,09 s. Darum bleibt der Unit-Baum der Vorgabeweg.
+  # KEIN Quellenbaum im Paket. Die stdlib wird ausschliesslich als .lyu
+  # ausgeliefert; ihre Quelltexte kommen aus dem LPM-Paket `std` (#2448).
+  # Frueher lag hier eine Kopie unter src-std/, auf die der Beispiel-Schritt
+  # zurueckfiel — damit trug jedes Paket die stdlib zweimal, einmal als
+  # Vorkompilat und einmal als .lyx. Ein Beispiel, das die .lyu nicht reicht,
+  # ist jetzt ROT und nennt den Grund, statt still aus Quellen zu bauen.
   rm -rf "$D/src-std"
-  mkdir -p "$D/src-std"
-  cp -r "$ROOT/std"  "$D/src-std/std"
-  cp -r "$ROOT/data" "$D/src-std/data"
 
   local BSP; BSP=()
   for b in "${DIST_BSP[@]}"; do BSP+=("examples/$b"); done
   local BSP_LOG; BSP_LOG="$(mktemp -d)"
   export BSP_LOG LYXC ROOT
   export BSP_UNITS="$D/include/lyx/units"
-  export BSP_SRC="$D/src-std"
   if [ "$selbstbaubar" = "ja" ]; then export FORMAT="$format"; else export FORMAT=""; fi
   # Die Beispiele werden fuer DIESES Backend uebersetzt — unabhaengig davon,
   # mit welchem Ziel die Units gebaut wurden. Vorher erbte dieser Schritt das
@@ -385,10 +459,7 @@ EOF
     echo "# Auswahl aus tools/dist_examples.txt; Messprogramme sind nicht dabei."
     echo "#"
     echo "# OK     = uebersetzt mit diesem Baum, so wie er ist"
-    echo "# QUELLE = uebersetzt mit --std-path=<baum>/src-std statt mit dem"
-    echo "#          Unit-Baum: manche .lyu beschreiben nicht alle Symbole ihrer"
-    echo "#          Unit, der Codegen liest dann die .lyx. Kein Fehler des"
-    echo "#          Beispiels, und mit diesem Baum lauffaehig."
+    echo "# QUELLE = kommt nicht mehr vor: das Paket traegt keine stdlib-Quellen."
     echo "# ROT    = uebersetzt nicht; der Grund steht dahinter. Auf win64 sind"
     echo "#          das meist #2459, #2460 oder #1678 — dieselben Beispiele"
     echo "#          gehen fuer linux durch."
@@ -436,36 +507,37 @@ Gebaut am $DATUM aus Commit $COMMIT.
 ## Inhalt
 
     bin/$binname                    Compiler fuer dieses Ziel
+    bin/lbfdump, bin/lpm, …         Hilfswerkzeuge fuer dieses Ziel
     include/lyx/units/std/**.lyu    vorkompilierte Standardbibliothek
     include/lyx/units/data/**.lyu   vorkompilierte Datenunits
     share/lyx/pci.ids               Datendatei (std/hardware/pci_ids.lyx liest sie zur Laufzeit)
-
-Quelltexte der Standardbibliothek liegen bewusst nicht im Baum — sie kommen
-aus dem LPM-Paket \`std\` (#2448). Der Import-Resolver bevorzugt .lyx vor .lyu;
-mitgelieferte Quellen wuerden die Vorkompilate aushebeln.
 
 Die Units sind mit dem Host-Ziel vorkompiliert (UNITS_ZIEL=host). Das ist
 gemessen, nicht angenommen: ein Erzeugnis fuer $target ist bytegleich,
 unabhaengig davon, mit welchem Ziel die .lyu gebaut wurden (40 Programme aus
 examples/, 14 uebersetzbar, 14 bytegleich, 0 abweichend).
 
-## Zwei Baeume, und wann welcher
+## Werkzeuge in bin/
 
-    include/lyx/units/   Vorkompilate (.lyu) -- der Vorgabeweg, schneller
-    src-std/             Quelltexte der stdlib (.lyx) -- fuer den Rest
+Neben dem Compiler liegen die Hilfswerkzeuge, ebenfalls fuer $target gebaut:
+\`lbfdump\` (LBF/LYX!-Container lesen und pruefen), \`lbfimport\`,
+\`lbfloader\`, \`lbfrun\`, \`lyxcpu\`, \`cpufeatures\` und der Paketmanager
+\`lpm\`. Welche davon fuer dieses Ziel uebersetzt haben, steht mit Groesse
+bzw. Fehlergrund in \`WERKZEUGE-STATUS.txt\`.
 
-Manche .lyu beschreiben nicht alle Symbole ihrer Unit; der Codegen liest dann
-die .lyx und bricht sonst ab mit "Quelle der importierten Unit nicht lesbar".
-Das betrifft vor allem Units mit FFI-Externs (std.net.socket, std.db.sqlite,
-die Qt-Units). Fuer solche Programme:
+## Nur Vorkompilate, keine stdlib-Quellen
 
-    lyxc --std-path=<baum>/src-std prog.lyx -o prog
+Das Paket traegt die Standardbibliothek ausschliesslich als \`.lyu\` unter
+\`include/lyx/units/\`. Quelltexte liegen bewusst nicht bei — sie kommen aus
+dem LPM-Paket \`std\` (#2448), und der Import-Resolver bevorzugt .lyx vor
+.lyu, mitgelieferte Quellen wuerden die Vorkompilate aushebeln.
 
-Beide Baeume stammen aus demselben Commit, koennen also nicht auseinander
-laufen. Getrennt gehalten sind sie, weil der Import-Resolver .lyx VOR .lyu
-nimmt: lagen sie im selben Verzeichnis, waeren die Vorkompilate nie benutzt.
-Gemessen an examples/ml/nn_auto_mpg.lyx, je drei Laeufe: mit .lyu 0,03 s, mit
-Quellen 0,09 s.
+Manche .lyu beschreiben nicht alle Symbole ihrer Unit; ein Programm, das so
+eine Unit braucht, bricht ab mit "Quelle der importierten Unit nicht lesbar"
+oder "stammt aus einer .lyu ohne Objektcode". Das betrifft vor allem Units mit
+FFI-Externs (std.net.socket, std.db.sqlite, die Qt-Units). Solche Programme
+brauchen die stdlib-Quellen aus dem LPM-Paket; \`EXAMPLES-STATUS.txt\` nennt
+sie mit genau dieser Meldung.
 
 ## Beispiele
 
