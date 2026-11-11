@@ -141,6 +141,48 @@ else
   pruefe "#2480 Gegenstelle sah die Bytes"      "$(cat "$TMP/srv_sah" 2>/dev/null)" "frage"
 fi
 
+# ------------------------------------------------------- Namensaufloesung
+# getaddrinfo statt std.net.dns: unter Windows gibt es weder die UDP-Syscalls
+# noch /etc/resolv.conf. Braucht echtes Netz — ohne wird uebersprungen, statt
+# gruen zu melden.
+cat > "$TMP/res.lyx" <<'EOF'
+unit Main;
+import std.io;
+import std.net.tcp;
+fn main(): int64 {
+  TcpInit();
+  var ip: int64 := TcpResolve("example.com");
+  if (ip != 0) { PrintLn("aufgeloest=1"); } else { PrintLn("aufgeloest=0"); }
+  var s: int64 := TcpConnectHost("example.com", 80);
+  if (s != TCP_UNGUELTIG) { PrintLn("verbunden=1"); TcpClose(s); } else { PrintLn("verbunden=0"); }
+  TcpEnde();
+  return 0;
+}
+EOF
+if ! "$LYXC" --std-path=. -I "$PWD/platform/win64" "$TMP/res.lyx" --target=win64 --format=pe -o "$TMP/res.exe" > "$TMP/res.log" 2>&1; then
+  bad "#2480 TcpResolve (win64) uebersetzt"; grep -E "error" "$TMP/res.log" | head -3
+else
+  ok "#2480 TcpResolve (win64) uebersetzt"
+  if objdump -p "$TMP/res.exe" 2>/dev/null | grep -q "getaddrinfo"; then
+    ok "#2480 getaddrinfo statt eigener DNS-Pakete"
+  else
+    bad "#2480 getaddrinfo statt eigener DNS-Pakete"
+  fi
+  if "$LYXC" --std-path=. -I "$PWD/platform/linux" "$TMP/res.lyx" -o "$TMP/res_linux" > "$TMP/res_linux.log" 2>&1; then
+    ok "#2480 TcpResolve (linux) uebersetzt"
+    if timeout 30 "$TMP/res_linux" > "$TMP/res_linux.out" 2>&1 && grep -q "^aufgeloest=1" "$TMP/res_linux.out"; then
+      ( cd "$TMP" && timeout 90 wine ./res.exe ) > "$TMP/res.out" 2>/dev/null
+      r() { grep "^$1=" "$TMP/res.out" 2>/dev/null | head -1 | cut -d= -f2 | tr -d '\r'; }
+      pruefe "#2480 win64: Name aufgeloest" "$(r aufgeloest)" "1"
+      pruefe "#2480 win64: ueber den Namen verbunden" "$(r verbunden)" "1"
+    else
+      echo "HINWEIS: kein Netz (auch unter Linux loest example.com nicht auf) — Laufpruefung uebersprungen"
+    fi
+  else
+    bad "#2480 TcpResolve (linux) uebersetzt"; grep -E "error" "$TMP/res_linux.log" | head -3
+  fi
+fi
+
 # ------------------------------------------------- dieselbe Unit unter Linux
 # Die Fassade taugt nur, wenn BEIDE Seiten sie erfuellen: gleiche Namen,
 # gleiches Verhalten. Ohne diese Gegenprobe faellt erst beim naechsten

@@ -81,6 +81,10 @@ extern fn shutdown(s: int64, how: int64): int64 link "ws2_32.dll";
 extern fn setsockopt(s: int64, level: int64, optname: int64, optval: int64, optlen: int64): int64 link "ws2_32.dll";
 @cap(network.tcp.connect)
 extern fn getsockopt(s: int64, level: int64, optname: int64, optval: int64, optlen: int64): int64 link "ws2_32.dll";
+@cap(network.udp.connect)
+extern fn getaddrinfo(knoten: pchar, dienst: pchar, hinweise: int64, ergebnis: int64): int64 link "ws2_32.dll";
+@cap(network.udp.connect)
+extern fn freeaddrinfo(adr: int64): int64 link "ws2_32.dll";
 
 // ============================================================================
 // Start und Ende
@@ -294,4 +298,54 @@ pub fn WinTCPAccept(listener: int64): int64 {
   var laenge: int64 := alloc(8);
   poke32(laenge, WSA_SOCKADDR_IN_SIZE);
   return accept(listener, addr, laenge);
+}
+
+// ============================================================================
+// Namensaufloesung
+// ============================================================================
+
+// std.net.dns baut DNS-Pakete selbst und verschickt sie ueber UDP-Syscalls —
+// unter Windows gibt es weder die Syscalls noch /etc/resolv.conf. Hier fragt
+// stattdessen der Loeser des Systems, ueber getaddrinfo.
+//
+// Rueckgabe: IPv4 in HOSTreihenfolge (a*2^24 + b*2^16 + c*2^8 + d), wie
+// WinIPPack sie liefert, oder 0.
+//
+// Aufbau von addrinfo unter Windows x64 (NICHT derselbe wie unter Linux):
+//   0 ai_flags(4)  4 ai_family(4)  8 ai_socktype(4)  12 ai_protocol(4)
+//   16 ai_addrlen(8)  24 ai_canonname(8)  32 ai_addr(8)  40 ai_next(8)
+pub fn WinResolve(host: pchar): int64 {
+  if WinsockInit() != 0 {
+    return 0;
+  }
+  var ergebnis: int64 := alloc(8);
+  poke64(ergebnis, 0);
+  if getaddrinfo(host, 0 as pchar, 0, ergebnis) != 0 {
+    return 0;
+  }
+  var eintrag: int64 := peek64(ergebnis);
+  var ip: int64 := 0;
+  // Die Kette durchgehen, bis ein AF_INET dabei ist: der erste Eintrag kann
+  // IPv6 sein, und dessen sockaddr traegt an Stelle 4 etwas ganz anderes.
+  while eintrag != 0 && ip == 0 {
+    if peek32(eintrag + 4) == WSA_AF_INET {
+      var adr: int64 := peek64(eintrag + 32);
+      if adr != 0 {
+        ip := peek8(adr + 4) * 16777216 + peek8(adr + 5) * 65536
+            + peek8(adr + 6) * 256 + peek8(adr + 7);
+      }
+    }
+    eintrag := peek64(eintrag + 40);
+  }
+  freeaddrinfo(peek64(ergebnis));
+  return ip;
+}
+
+// Verbinden ueber den Namen statt ueber die Zahl.
+pub fn WinTCPConnectHost(host: pchar, port: int64): int64 {
+  var ip: int64 := WinResolve(host);
+  if ip == 0 {
+    return WSA_INVALID_SOCKET;
+  }
+  return WinTCPConnect(ip, port);
 }

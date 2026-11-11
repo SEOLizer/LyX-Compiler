@@ -413,8 +413,14 @@ lyxc prog.lyx --std-path=<aurum> -I <aurum>/platform/win64 \
   --target=win64 --format=pe -o prog.exe
 ```
 
-`std.net.socket` selbst bleibt Linux-only: es arbeitet ueber rohe Syscalls.
-UDP, Raw-Sockets und ICMP sind nicht nach Windows portiert.
+`std.net.tcp` loest auch Namen auf: `TcpResolve(host)` und
+`TcpConnectHost(host, port)`. Unter Linux spricht `std.net.dns` selbst DNS,
+unter Windows fragt `getaddrinfo` den Loeser des Systems — dort gibt es weder
+die UDP-Syscalls noch `/etc/resolv.conf`.
+
+`std.net.socket`, `std.net.dns` und `std.net.https` bleiben Linux-only: sie
+arbeiten ueber rohe Syscalls. UDP, Raw-Sockets und ICMP sind nicht nach
+Windows portiert.
 
 ---
 

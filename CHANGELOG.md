@@ -42,8 +42,13 @@ nimmt einen DWORD in Millisekunden statt eines `timeval`. Dafür gibt es neu:
   `extern fn` bindet hart, und ein Programm, das ws2_32 auch nur erwähnt,
   trägt die DLL in seiner Import-Tabelle — auch unter Linux.
 
-`std.net.socket` bleibt Linux-only (rohe Syscalls); UDP, Raw und ICMP sind
-nicht portiert. Die OpenSSL-DLLs gehören neben die .exe.
+Dazu löst `std.net.tcp` auch Namen auf (`TcpResolve`, `TcpConnectHost`):
+unter Linux über `std.net.dns`, unter Windows über `getaddrinfo` — dort gibt
+es weder die UDP-Syscalls noch `/etc/resolv.conf`.
+
+`std.net.socket`, `std.net.dns` und `std.net.https` bleiben Linux-only (rohe
+Syscalls); UDP, Raw und ICMP sind nicht portiert. Die OpenSSL-DLLs gehören
+neben die .exe.
 
 Nachweis: `tests/win64_dll_namen_test.sh` — Import-Tabelle mit objdump,
 Verbindung, Senden und Empfangen unter wine gegen eine echte Gegenstelle, und
