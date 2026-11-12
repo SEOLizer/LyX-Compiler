@@ -30,7 +30,8 @@
 //
 //   u32  Anzahl Eintraege
 //   je Eintrag:
-//     u8   Art   (2 = Funktion, 3 = Struct, 4 = Klasse, 7 = Import)
+//     u8   Art   (2 = Funktion, 3 = Struct, 4 = Klasse, 5 = Typalias,
+//                 6 = f64-Konstante, 7 = Import)
 //     u32  Laenge des Rests in Byte — ein Leser UEBERSPRINGT unbekannte Arten
 //     str  Name  (Bindung ueber den NAMEN, nicht ueber den Symbolindex)
 //     ...  artabhaengiger Rumpf:
@@ -43,6 +44,17 @@
 //                   gefalteten Werts, z. B. "5", "(0 - 6 - 1)", "true", "2.5")
 //     u8   Flags (heute 0 — extern, generisch und variadisch werden nicht
 //               beschrieben, sondern fehlen; siehe LywSammleDeklarationen)
+//
+//   Art 5 (Typalias, #2488):
+//     str  Zieltyp als Text ("int64", "pchar", "Foo[]" ...)
+//
+//   Art 6 (f64-Konstante, #2488):
+//     str  Literal als QUELLTEXT ("3.141592653589793")
+//     Der Text und nicht das Bitmuster: der lesende Compiler parst ihn mit
+//     SEINEM Parser, also genau so wie die Quelle selbst. Damit ist der Wert
+//     bitgleich, ohne dass hier ein Gleitkommawert formatiert werden muss —
+//     und ohne eine dritte Kopie des Float-Parsers neben
+//     ir_lower._parseFloatBits und codegen_x86.cg_parseFloat.
 //
 //   Art 3 (Struct):
 //     u32  Gesamtgroesse in Byte, u8 Flags (0)
@@ -132,6 +144,19 @@ con LYU_DK_FN:     int64 := 2;
 con LYU_DK_STRUCT: int64 := 3;
 con LYU_DK_KLASSE: int64 := 4;
 con LYU_DK_IMPORT: int64 := 7;
+// #2488: Zwei Symbolarten standen in der Symboltabelle, ohne von einer
+// Deklaration beschrieben zu werden — der Codegen zaehlte sie als verloren
+// und verlangte die Quelle ("Nicht beschrieben: ListInt64"). 23 von 500
+// Vorkompilaten waren dadurch GANZ unbenutzbar.
+//
+// Additiv OHNE Fassungssprung: der Abschnitt traegt je Eintrag ein
+// u32-Laengenfeld, und ein Leser, der die Art nicht kennt, UEBERSPRINGT sie
+// (lyu_reader._dkGeheZu). Ein aelterer Compiler verhaelt sich damit wie
+// bisher — er verlangt die Quelle, laut und mit derselben Meldung. Eine neue
+// Formatfassung haette neue .lyu fuer ihn GANZ unlesbar gemacht, und zwar
+// fuer alle 500 Units statt der 23 betroffenen.
+con LYU_DK_ALIAS:  int64 := 5;   // pub type X = <Typ>
+con LYU_DK_CONF64: int64 := 6;   // pub con X: f64 := <Literal>
 
 // Magic 'LYU\0'
 con LYU_W_M0: int64 := 76;
@@ -807,7 +832,7 @@ pub type LyuWriter = class {
       } else if (k == NK_TYPE_DECL && self._npub(cur) != 0) {
         var iv: int64 := self._niv(cur);
         var tauglich: int64 := 1;
-        if ((iv & 2) != 0)  { tauglich := 0; }   // Alias
+        if ((iv & 2) != 0)  { tauglich := 0; }   // Alias: eigene Art, siehe unten
         if ((iv & 32) != 0) { tauglich := 0; }   // Interface
         if (self._istGenerisch(cur) != 0)   { tauglich := 0; }
         if (self._nameHatSpitze(cur) != 0)  { tauglich := 0; }
@@ -821,6 +846,19 @@ pub type LyuWriter = class {
             self._dkAdd(LYU_DK_KLASSE, cur);
           }
         }
+        // #2488: der reine Typalias. Oben als "nicht tauglich" fuer Struct und
+        // Klasse ausgeschlossen, hier mit eigener Art beschrieben. Generische
+        // und Instanzen generischer Typen bleiben draussen, wie dort.
+        if ((iv & 2) != 0 && (iv & 32) == 0
+            && self._istGenerisch(cur) == 0 && self._nameHatSpitze(cur) == 0) {
+          self._dkAdd(LYU_DK_ALIAS, cur);
+        }
+      } else if (k == NK_CON_DECL && self._npub(cur) != 0) {
+        // #2488: f64-Konstante. Der Konstantenabschnitt kennt nur int64 und
+        // pchar; eine Gleitkommakonstante fiel deshalb durch und machte die
+        // ganze Unit unbenutzbar (std/math/constants: "Nicht beschrieben: PI").
+        var ci: int64 := self._nc(cur, 1);
+        if (ci >= 0) { if (self._nk(ci) == NK_LIT_FLOAT) { self._dkAdd(LYU_DK_CONF64, cur); } }
       } else if (k == NK_STRUCT_DECL && self._npub(cur) != 0) {
         if ((self._niv(cur) & 1) == 0 && self._feldMitAt(cur) == 0) {
           self._dkAdd(LYU_DK_STRUCT, cur);
@@ -1021,6 +1059,16 @@ pub type LyuWriter = class {
       self._e8(self._niv(n) & 1);
       var al: int64 := self._nc(n, 0);
       if (al >= 0) { self._eStr(self._nsp(al), self._nsl(al)); } else { self._eStr(""c, 0); }
+    } else if (art == LYU_DK_ALIAS) {
+      // #2488: Zieltyp als Text. Nicht beschreibbare Ziele (generische
+      // Instanz u. a.) geben 0 — der Aufrufer dreht den Eintrag zurueck,
+      // und es bleibt beim bisherigen Verhalten fuer DIESE Unit.
+      if (self._eTyp(self._nc(n, 0)) == 0) { return 0; }
+    } else if (art == LYU_DK_CONF64) {
+      // #2488: das Literal, wie es im Quelltext steht.
+      var li: int64 := self._nc(n, 1);
+      if (li < 0) { return 0; }
+      self._eStr(self._nsp(li), self._nsl(li));
     } else if (art == LYU_DK_FN) {
       if (self._eSignatur(n) == 0) { return 0; }
     } else if (art == LYU_DK_STRUCT) {
