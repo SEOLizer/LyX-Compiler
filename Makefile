@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.37C
+VERSION   := 1.2.37D
 VERSION_DATE := 2026-11-12
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -771,6 +771,8 @@ test: lyxc
 	@bash tests/std_unit_deklaration_test.sh
 	@echo "--- std.list: ListStr* und ListInt64Exchange (14 Pruefungen) (#2485) ---"
 	@bash tests/liststr_2485_test.sh
+	@echo "--- .lyu: Typalias und f64-Konstante werden beschrieben (#2488) ---"
+	@bash tests/lyu_dekl_2488_test.sh
 	@bash tests/embed_test.sh
 	@bash tests/lyu_import_test.sh
 	@bash tests/lyu_arch_test.sh
