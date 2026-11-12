@@ -160,7 +160,7 @@ Annotations modify the compiler's behavior for the decorated declaration. They a
 | `@capabilities([...])` | `fn` | ✅ | LCBS: declare required runtime capabilities |
 | `@uses_caller_cap([...])` | `fn` | ✅ | LCBS: inherit capabilities from caller |
 | `@cap(path)` | `extern fn` | ✅ | LCBS: map FFI call to capability path |
-| `@energy(N)` | `fn` | ✅ | Energy level override for this function (1–5) |
+| `@energy(N)` | `fn` | ✅ | Energy level override for this function (1–5); sets the loop unroll factor |
 
 #### `@export`
 
@@ -245,6 +245,8 @@ fn criticalCounter(): int64 {
 
 These annotations are part of the Lyx Capability-Based Security (LCBS) system. See `doc/capabilities.md` for the full reference.
 
+An `extern fn` whose symbol the compiler cannot classify needs a capability annotation (FFI sandbox, fail-closed). The standard library is exempt as the binding layer — but only units that were actually read from the authoritative library tree: `--std-path` / `LYX_STD_PATH` if set, otherwise the installation (`/usr/include/lyx/units`). The unit name alone (`std.*`, `src.*`) or a directory called `std/` next to the program does not grant this trust (since 1.2.20D, #2202). When compiling from a checkout of the library itself, name it: `--std-path=.`.
+
 ```lyx
 @capabilities([fs.read, net.connect])
 fn fetchConfig(path: pchar): void { ... }
@@ -258,7 +260,19 @@ extern fn open(path: pchar, flags: int64, mode: int64): int64 link "libc.so.6";
 
 #### `@energy(N)` (fn)
 
-Overrides the energy level (1 = minimal, 5 = extreme) for the annotated function, independently of the global `--target-energy` flag. Affects loop unrolling and SIMD strategy.
+Overrides the energy level (1 = minimal, 5 = extreme) for the annotated function, independently of the global `--target-energy` flag (default level: 3).
+
+The level has exactly one effect: the loop unroll factor of the x86-64 code generator.
+
+| Level | Unroll factor |
+|-------|---------------|
+| 1 | 1× (no unrolling) |
+| 2 | 2× |
+| 3 (default) | 4× |
+| 4 | 4× |
+| 5 | 8× |
+
+It does **not** select instruction sets, SIMD/FPU/AVX-512 use or a battery profile, and the IR backends (arm64, riscv, esp32, arm-cm4, lyxos) ignore it. Instruction set selection goes through `--target-cpu` / `@cpu`.
 
 ```lyx
 @energy(5)
@@ -280,6 +294,9 @@ fn hotLoop(data: pchar, len: int64): void { ... }
 ./lyxc program.lyx -o program.exe --target=win64
 ./lyxc program.lyx -o program --target=arm64
 ./lyxc program.lyx -o program --target=riscv
+
+# Or keep it all in a project file (see 3.3)
+./lyxc project.lpf
 ```
 
 ### 3.2 Command-Line Options
@@ -288,11 +305,13 @@ fn hotLoop(data: pchar, len: int64): void { ... }
 |--------|-------------|
 | `-o <file>` | Output file (default: a.out / a.exe) |
 | `-I <path>` | Add include path for modules (repeatable) |
-| `--std-path=PATH` | Override standard library path |
+| `--std-path=PATH` | Override standard library path; also the tree whose units count as the trusted FFI binding layer (#2202) |
 | `--target=TARGET` | Target platform (linux, win64, arm64, macosx64, macos-arm64, esp32, riscv) |
 | `--arch=ARCH` | Architecture (x86_64, arm64, xtensa, riscv) |
-| `--target-energy=<1-5>` | Energy level (1=minimal, 5=extreme) |
-| `--emit-asm` | Output IR as pseudo-assembler |
+| `--target-energy=<1-5>` | Energy level (1=minimal, 5=extreme); sets only the x86-64 loop unroll factor 1/2/4/4/8, see `@energy(N)` |
+| `--emit-asm` | Write x86-64 disassembly of the generated code to `<output>.asm` |
+| `--dump-asm` | Same disassembly, to standard output |
+| `--asm-listing` | Disassembly annotated with source line numbers at function entries |
 | `--dump-relocs` | Show relocations and external symbols |
 | `--trace-imports` | Debug import resolution |
 | `--lint` | Enable linter warnings |
@@ -306,7 +325,50 @@ fn hotLoop(data: pchar, len: int64): void { ... }
 | `--build-info` | Show build identification (TOR-002) |
 | `--config` | Show configuration (TOR-003) |
 
-### 3.3 Target Platforms
+### 3.3 Project Files (`*.lpf`)
+
+A project file replaces a long command line. `lyxc project.lpf` reads the source
+to compile, the switches, the include paths and the required LPM packages from
+one place — reproducible and reviewable in Git.
+
+```toml
+[projekt]                            # or [project]
+quelle  = "apps/vcldemo.lyx"         # required — the .lyx to compile
+ziel    = "lyxos"                    # like --target=
+ausgabe = "build/vcldemo.lbf"        # like -o
+
+[include]
+pfade = [".", "platform/lyxos"]      # like -I, in order
+
+[schalter]                           # or [flags]
+liste = ["--emit=lbf", "-O2"]        # exactly as they would appear on the command line
+
+[pakete]                             # or [packages]
+vega = "0.3.1"                       # resolved through `lpm resolve`
+```
+
+German and English key names are both accepted (`quelle`/`source`,
+`ziel`/`target`, `ausgabe`/`output`, `pfade`/`paths`, `liste`/`flags`).
+Comments start with `#` or `//`.
+
+**Rules that matter in practice:**
+
+| Rule | Why |
+|---|---|
+| A switch on the command line **overrides** the project file | `lyxc demo.lpf --target=linux` gives a quick counter-check without editing the file |
+| Relative paths count from the **directory of the `.lpf`**, not the working directory | otherwise the same file would compile differently depending on where it is invoked |
+| Include paths and switches from the file are **added**, not replaced | `-I` on the command line stays in effect |
+| Unknown sections and keys are **reported**, not skipped | a typo in `[incldue]` would otherwise swallow every path in it and surface later as "Modul nicht gefunden" |
+| A package that cannot be resolved **fails the build** | with the package name and version, instead of a missing-module error further downstream |
+
+**Packages.** Each entry under `[pakete]` is resolved by running
+`lpm resolve <name> <version>`; the cache path it prints becomes a *package
+root*. A package is stored flat in the cache
+(`~/.lpm/cache/vega/0.3.1/types.lyx`) while its unit is called `vega.types`, so
+the mapping is by package name — a plain include path would not find it. If
+`lpm` is not installed, list the directory under `[include]` instead.
+
+### 3.4 Target Platforms
 
 | Target | Architecture | Format | ABI | Status |
 |--------|-------------|--------|-----|--------|

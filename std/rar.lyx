@@ -16,6 +16,7 @@
 //   1=ARC  2=FILE  3=SERVICE  4=ENCRYPT  5=ENDARC
 // FILE-Flags: 0x0001=Verzeichnis  0x0002=mtime  0x0004=CRC32
 // Compression info bits 7-9: method (0=store, 1-5=compress)
+@capabilities([fs.create, fs.delete, fs.meta, fs.perm, fs.read, fs.write, system.time])
 
 unit std.rar;
 
@@ -94,13 +95,13 @@ fn rarCopy(dst: int64, src: int64, n: int64): void {
 // Gibt alloc'd Handle zurück oder 0 bei Fehler (nicht RAR5 oder I/O-Fehler).
 // Aufrufer muss RarClose() aufrufen.
 // Nur stored-Einträge (method=0) werden gespeichert; komprimierte übersprungen.
-pub fn RarOpen(path: int64): int64 {
+pub fn RarOpen(path: pchar): int64 {   // #1264: Pfad ist eine Zeichenkette
     var fsize: int64 := FileSize(path);
     if (fsize < 8) { return 0; }
 
     var raw: int64 := alloc(fsize + 1);
-    var n:   int64 := ReadFile(path, raw, fsize);
-    if (n < 8) { free(raw); return 0; }
+    var n:   int64 := ReadFile(path, raw as pchar, fsize);   // #1264: Puffer als Zeiger
+    if (n < 8) { free(raw, fsize + 1); return 0; }
     poke8(raw + n, 0);
 
     // RAR5-Signatur prüfen: 52 61 72 21 1A 07 01 00
@@ -112,15 +113,19 @@ pub fn RarOpen(path: int64): int64 {
         (peek8(raw + 5) != 0x07) |
         (peek8(raw + 6) != 0x01) |
         (peek8(raw + 7) != 0x00)) {
-        free(raw); return 0;
+        free(raw, fsize + 1); return 0;
     }
 
-    var handle:  int64 := alloc(32);
+    // #1402: 40 statt 32 Byte — Platz fuer die Zahl der uebersprungenen
+    // Eintraege (Offset 32). Ohne sie sah ein Archiv aus lauter komprimierten
+    // Dateien genauso aus wie ein leeres.
+    var handle:  int64 := alloc(40);
     var entries: int64 := alloc(RAR_MAX_ENTRIES * 32);
     poke64(handle,      raw);
     poke64(handle + 8,  n);
     poke64(handle + 16, entries);
     poke64(handle + 24, 0);
+    poke64(handle + 32, 0);   // #1402: uebersprungene Eintraege
 
     // Cursor (heap-allokiert, da kein Adress-Operator in Lyx)
     var cur: int64 := alloc(8);
@@ -191,6 +196,15 @@ pub fn RarOpen(path: int64): int64 {
                     // Verzeichnisse (FHD_DIRECTORY, bit 0) überspringen
                     var isDir: int64 := fileFlags & 0x0001;
 
+                    // #1402: Ein komprimierter Eintrag wird weiterhin
+                    // uebersprungen — der RAR-Algorithmus ist proprietaer und
+                    // nicht umgesetzt. Gezaehlt wird er jetzt aber. Handelsuebliche
+                    // Packer komprimieren standardmaessig, das ist also der
+                    // Regelfall und nicht die Ausnahme.
+                    if ((isDir == 0) & (method != 0)) {
+                        poke64(handle + 32, peek64(handle + 32) + 1);
+                    }
+
                     // Nur stored reguläre Dateien mit vernünftigem Namen speichern
                     if ((isDir == 0) & (method == 0) & (nameLen > 0) & (nameLen < 512)) {
                         var dataOff: int64 := hdrDataEnd;
@@ -199,7 +213,7 @@ pub fn RarOpen(path: int64): int64 {
                             var ni: int64 := 0;
                             while (ni < nameLen) {
                                 poke8(name + ni, peek8(raw + namePos + ni));
-                                ni := ni + 1;
+                                ni += 1;
                             }
                             poke8(name + nameLen, 0);
 
@@ -207,8 +221,8 @@ pub fn RarOpen(path: int64): int64 {
                             poke64(entry,      name);
                             poke64(entry + 8,  dataOff);
                             poke64(entry + 16, dataSize);
-                            poke64(entry + 24, 0);
-                            count := count + 1;
+                            poke64(entry + 24, nameLen);   // fuer RarClose: Laenge des Namens
+                            count += 1;
                         }
                     }
                 }
@@ -219,7 +233,7 @@ pub fn RarOpen(path: int64): int64 {
         }
     }
 
-    free(cur);
+    free(cur, 8);
     poke64(handle + 24, count);
     return handle;
 }
@@ -232,12 +246,14 @@ pub fn RarClose(handle: int64): void {
     var i: int64 := 0;
     while (i < count) {
         var name: int64 := peek64(entries + i * 32);
-        if (name != 0) { free(name); }
-        i := i + 1;
+        if (name != 0) { free(name, peek64(entries + i * 32 + 24) + 1); }
+        i += 1;
     }
-    free(entries);
-    free(peek64(handle));
-    free(handle);
+    free(entries, RAR_MAX_ENTRIES * 32);
+    // raw wurde als alloc(fsize + 1) belegt; handle+8 haelt die gelesene Laenge n,
+    // die hoechstens fsize ist -- munmap gibt damit nie mehr frei als belegt wurde.
+    free(peek64(handle), peek64(handle + 8) + 1);
+    free(handle, 40);   // #1402
 }
 
 // Gibt die Anzahl der stored Einträge zurück.
@@ -283,11 +299,29 @@ pub fn RarRead(handle: int64, idx: int64, outBuf: int64, maxLen: int64): int64 {
 }
 
 // Sucht Eintrag nach exaktem Namen (UTF-8). Gibt Index zurück oder -1.
-pub fn RarFind(handle: int64, name: int64): int64 {
+// #1402: Zahl der Eintraege, die beim Oeffnen uebersprungen wurden, weil sie
+// komprimiert sind. Damit kann eine Anwendung sagen "Archiv enthaelt 5
+// Dateien, alle komprimiert — kann ich nicht lesen" statt ein leeres Archiv
+// zu melden.
+pub fn RarSkippedCount(handle: int64): int64 {
+    if (handle == 0) { return 0; }
+    return peek64(handle + 32);
+}
+
+// #1402: RAR_ERR_COMPRESSED, wenn mindestens ein Eintrag ausgelassen wurde,
+// sonst RAR_ERR_OK. Die Konstante war deklariert und wurde nirgends vergeben.
+pub fn RarLastError(handle: int64): int64 {
+    if (handle == 0) { return RAR_ERR_IO; }
+    if (peek64(handle + 32) > 0) { return RAR_ERR_COMPRESSED; }
+    return RAR_ERR_OK;
+}
+
+pub fn RarFind(handle: int64, name: pchar): int64 {
+  var nameAdr: int64 := name as int64;   // #1613
     if (handle == 0) { return 0 - 1; }
     var count:   int64 := peek64(handle + 24);
     var entries: int64 := peek64(handle + 16);
-    var nlen:    int64 := StrLen(name);
+    var nlen:    int64 := StrLen(nameAdr);
     var i: int64 := 0;
     while (i < count) {
         var ename: int64 := peek64(entries + i * 32);
@@ -297,13 +331,13 @@ pub fn RarFind(handle: int64, name: int64): int64 {
                 var isMatch: int64 := 1;
                 var k: int64 := 0;
                 while (k < nlen) {
-                    if (peek8(ename + k) != peek8(name + k)) { isMatch := 0; }
-                    k := k + 1;
+                    if (peek8(ename + k) != peek8(nameAdr + k)) { isMatch := 0; }
+                    k += 1;
                 }
                 if (isMatch == 1) { return i; }
             }
         }
-        i := i + 1;
+        i += 1;
     }
     return 0 - 1;
 }

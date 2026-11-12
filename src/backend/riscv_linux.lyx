@@ -24,6 +24,8 @@
 // ============================================================================
 
 
+import src.emit_write;
+import src.backend.linux_syscalls;   // #2021
 import src.std.alloc;
 con RV_ZERO: int64 := 0;
 con RV_RA:   int64 := 1;
@@ -40,20 +42,54 @@ con RV_A7:   int64 := 17;
 con RV_T0:   int64 := 5;
 con RV_T1:   int64 := 6;
 con RV_T2:   int64 := 7;
+// #2061: Hilfsregister fuer Adressen, deren Versatz nicht in zwoelf Bit passt
+// (s11). Sonst benutzt dieses Backend es nirgends, und es lebt nie ueber einen
+// einzelnen Zugriff hinaus — es kann also mit nichts kollidieren, auch nicht
+// mit t3 … t6, die die Builtin-Folgen als Laufvariablen nehmen.
+//
+// #2140: s11 ist nach dem psABI callee-saved. Bis 1.2.16A wurde es benutzt,
+// ohne es zu retten — unter Lyx-Aufrufern faellt das nicht auf (keiner haelt
+// darin etwas), ein C-Aufrufer (Rueckruf, .so) verliert aber seinen Wert.
+// Ein caller-saved Register gibt es dafuer nicht: t0..t2 tragen die Operanden
+// eines Zugriffs, t3..t6 und a0..a7 die Laufvariablen der Builtin-Folgen
+// (deren Slotzugriffe selbst ueber RV_WEIT gehen koennen). Deshalb rettet
+// emitPrologue s11 in JEDER Funktion; welche es braucht, steht beim Prolog
+// noch nicht fest (Feldversaetze grosser Strukturen kommen erst im Rumpf).
+con RV_WEIT: int64 := 27;
 
 // Linux RISC-V syscall numbers
 con RV_SYS_EXIT:   int64 := 93;
 con RV_SYS_WRITE:  int64 := 64;
+con RV_SYS_READ:   int64 := 63;   // #1740: riscv64 zaehlt anders als x86-64 (dort 0)
 con RV_SYS_MMAP:   int64 := 222;
 con RV_SYS_MUNMAP: int64 := 215;
-con RV_SYS_OPEN:   int64 := 56;
+con RV_SYS_OPEN:   int64 := 56;   // #1764: das ist openat(dirfd,path,flags,mode)
 con RV_SYS_CLOSE:  int64 := 57;
+
+// #1740: Laenge des _start-Rumpfs (RiscvLinuxBackend.rlb_emitStart). Der Rumpf
+// wird VOR den Code kopiert; der Datenbereich muss deshalb um genau diese
+// Laenge versetzt auf eine Seitengrenze fallen.
+// #2035: wird ausserhalb dieser Unit gebraucht.
+// #2110: 16 seit dem ersten Befehl, der argv fuer GetArgC/GetArgV sichert.
+// #2271: 28 — argc/argv in a0/a1 und der Aufruf von main als AUIPC+JALR.
+pub con RV_START_STUB_LEN: int64 := 28;
 
 // Branch patch types
 con RV_PATCH_J:   int64 := 0;   // JAL x0, label  (unconditional)
-con RV_PATCH_BL:  int64 := 1;   // JAL ra, funcId  (call)
+con RV_PATCH_BL:  int64 := 1;   // AUIPC ra + JALR ra, funcId  (call, #2112)
 con RV_PATCH_BEQ: int64 := 2;   // BEQ t0, x0, label  (branch if == 0)
 con RV_PATCH_BNE: int64 := 3;   // BNE t0, x0, label  (branch if != 0)
+// #2112: Reichweiten der Befehlsfelder. B-Typ (BEQ/BNE) traegt 13 Bit, also
+// +/-4 KiB; JAL 21 Bit, +/-1 MiB; AUIPC+ADDI/JALR 32 Bit, +/-2 GiB. Vorher
+// wurde jeder Abstand still auf die Feldbreite maskiert: ein while-Rumpf ueber
+// 4 KiB (rund 16 poke8) sprang beim Verlassen irgendwohin, ein Aufruf ueber
+// 1 MiB Code hinweg ebenso.
+con RV_REACH_B:   int64 := 0x1000;
+con RV_REACH_JAL: int64 := 0x100000;
+con RV_REACH_PC:  int64 := 0x80000000;
+// #1806: Adresse einer Funktion als WERT (fn-Zeiger). AUIPC+ADDI, beide
+// Haelften werden nachgetragen — dasselbe Paar wie bei den globalen Variablen.
+con RV_PATCH_FADDR: int64 := 4;
 
 // ============================================================================
 // EmitRISCV64  —  IR → RV64GC machine code
@@ -65,23 +101,99 @@ pub type EmitRISCV64 = class {
   codeCap:    int64;
   ir:         int64;
   stackSize:  int64;
-  labelAddrs: int64;   // labelId → code offset  (1024 × 8 bytes)
+  labelAddrs: int64;   // labelId → code offset  (labelCap × 8 bytes)
   labelCount: int64;
-  patchBuf:   int64;   // {codeOff,labelId,type,reg} × 1024  (1024 × 32 bytes)
+  labelCap:   int64;   // #2112: waechst, war fest 1024
+  patchBuf:   int64;   // {codeOff,labelId,type,reg} je 32 Bytes, waechst (#1740)
   patchCount: int64;
-  funcAddrs:  int64;   // funcId → start offset  (256 × 8 bytes)
+  patchCap:   int64;   // #1740: Kapazitaet in Eintraegen
+  funcAddrs:  int64;   // funcId → start offset  (funcCap × 8 bytes)
   funcCount:  int64;
+  funcCap:    int64;   // #2112: Funktionszahl des Moduls, war fest 256
+  // #1740: globale Variablen. Der Zugriff entsteht PC-relativ (AUIPC+ADDI) und
+  // wird aufgeloest, sobald der Datenbereich hinter dem Code steht.
+  globRelocBuf:   int64;   // {codeOff, globalIdx} je 16 Bytes
+  globRelocCount: int64;
+  globRelocCap:   int64;
+  globalsOff:     int64;   // Code-Offset des Datenbereichs (-1 = noch nicht gesetzt)
+  mainOff:        int64;   // #1740: Code-Offset von main (-1 = nicht gefunden)
+  // #2162: FFI. Je Symbol {namePtr, nameLen, libPtr, libLen} (32 Byte,
+  // absolute Zeiger); je Aufruf {codeOff, extIdx} (16 Byte) fuer den
+  // GOT-Platz hinter den Modulvariablen.
+  extBuf:        int64;
+  extCount:      int64;
+  extCap:        int64;
+  gotRelocBuf:   int64;
+  gotRelocCount: int64;
+  gotRelocCap:   int64;
+  gotOff:        int64;   // Code-Offset des ersten GOT-Platzes (-1 = keiner)
+  dynStartOff:   int64;   // Code-Offset des libc-Startwegs (-1 = keiner)
+  noLibcInit:    int64;   // --no-libc-init: main direkt, ohne __libc_start_main
+  lebendBuf:     int64;   // #2451: 1 Byte je Funktion, 0 = nichts weglassen
+  // #2162: --shared. Je Export mit Gleitkomma {funcId, sig, huellenOff}
+  // (24 Byte); sig wie lyxc._armSoSignaturen: n | arten << 8 | rueck << 32.
+  isShared:      int64;
+  soHuTab:       int64;
+  soHuCount:     int64;
+  soHuCap:       int64;
+  bumpGIdx:      int64;   // #2227: erstes der zwei Bump-Globals (Zeiger, Ende), -1 = noch keins
+  slotRecCur:    int64;   // #2270: Slot-Satz der Funktion, die gerade entsteht (0 = keiner)
 
   // --------------------------------------------------------------------------
   // Code emission primitives
   // --------------------------------------------------------------------------
 
   fn rv_e32(v: int64) {
+    self.growCode(4);
     poke8(self.codeBuf + self.codeLen,     v & 0xFF);
     poke8(self.codeBuf + self.codeLen + 1, (v >> 8) & 0xFF);
     poke8(self.codeBuf + self.codeLen + 2, (v >> 16) & 0xFF);
     poke8(self.codeBuf + self.codeLen + 3, (v >> 24) & 0xFF);
     self.codeLen := self.codeLen + 4;
+  }
+
+  // #1339: einzelnes Byte — fuer Zeichenketten, die inline im Codestrom liegen.
+  fn rv_e8(v: int64) {
+    self.growCode(1);
+    poke8(self.codeBuf + self.codeLen, v & 0xFF);
+    self.codeLen := self.codeLen + 1;
+  }
+
+  // #1339: JAL x0, off — unbedingter Sprung ohne Ruecksprungadresse. Das
+  // Sprungziel steckt in RISC-V verstreut im Befehlswort (imm[20|10:1|11|19:12]);
+  // von Hand zusammengesetzt ist das die haeufigste Fehlerquelle, deshalb hier
+  // an einer Stelle.
+  // #1388: BEQ rs, x0, +off  (B-Type, funct3=0). Nur vorwaerts, Offset gerade.
+  fn rv_BEQZ_fwd(rs: int64, off: int64) {
+    var b11: int64 := (off >> 11) & 1;
+    var b4_1: int64 := (off >> 1) & 0xF;
+    var b10_5: int64 := (off >> 5) & 0x3F;
+    var b12: int64 := (off >> 12) & 1;
+    self.rv_e32(0x63 | (b11 << 7) | (b4_1 << 8) | (0 << 12) | (rs << 15) | (0 << 20)
+                     | (b10_5 << 25) | (b12 << 31));
+  }
+
+  // #2103: B-Type mit beliebiger Bedingung (funct3: 0 BEQ, 1 BNE, 6 BLTU,
+  // 7 BGEU), vor- und rueckwaerts; Offset gerade, +-4 KiB.
+  fn rv_Bcond(f3: int64, rs1: int64, rs2: int64, off: int64) {
+    if off < (0 - 4096) || off > 4094 {
+      EPrintStrLn("error: riscv: rv_Bcond-Offset ausserhalb +-4 KiB (#2103)."c);
+      exit(1);
+    }
+    var b11: int64 := (off >> 11) & 1;
+    var b4_1: int64 := (off >> 1) & 0xF;
+    var b10_5: int64 := (off >> 5) & 0x3F;
+    var b12: int64 := (off >> 12) & 1;
+    self.rv_e32(0x63 | (b11 << 7) | (b4_1 << 8) | (f3 << 12) | (rs1 << 15) | (rs2 << 20)
+                     | (b10_5 << 25) | (b12 << 31));
+  }
+
+  fn rv_JAL_x0(off: int64) {
+    var b20:    int64 := (off >> 20) & 0x1;
+    var b10_1:  int64 := (off >> 1)  & 0x3FF;
+    var b11:    int64 := (off >> 11) & 0x1;
+    var b19_12: int64 := (off >> 12) & 0xFF;
+    self.rv_e32(0x6F | (b19_12 << 12) | (b11 << 20) | (b10_1 << 21) | (b20 << 31));
   }
 
   fn rv_poke32at(off: int64, val: int64) {
@@ -95,20 +207,95 @@ pub type EmitRISCV64 = class {
   // RISC-V instruction encoders
   // --------------------------------------------------------------------------
 
+  // #2061: Alle Speicherbefehle unten tragen ihren Versatz in ZWOELF Bit,
+  // vorzeichenbehaftet (-2048 … 2047). Bis 1.2.11E wurde ein groesserer Wert
+  // mit `& 0xFFF` passend gemacht — still. Ein Slot jenseits von -2048 landete
+  // an einer anderen Adresse, und die Rahmenanlage im Prolog lief in die
+  // falsche Richtung: 2672 Byte Rahmen wurden zu `addi sp, sp, +1424`.
+  //
+  // Passt der Versatz nicht, wird die Adresse jetzt im Hilfsregister
+  // aufgebaut (_rvWeit) und mit Versatz 0 zugegriffen. Der Normalfall bleibt
+  // ein einzelner Befehl; nur der weite Zugriff wird laenger. Das ist
+  // unbedenklich fuer die handkodierten Vorwaertsspruenge dieses Backends
+  // (rv_BEQZ_fwd mit fester Bytezahl): keiner von ihnen ueberspringt einen
+  // Slot-Zugriff — nachgezaehlt fuer alle 26 Stellen. Wer einen neuen
+  // schreibt, muss das mit bedenken.
+
   // LD rd, off(rs1)  — 64-bit load, I-type, funct3=3, opcode=3
   fn rv_LD(rd: int64, rs1: int64, off: int64) {
+    if self._rvPasst12(off) == 0 { self._rvWeit(rs1, off); self.rv_LD(rd, RV_WEIT, 0); return; }   // #2061
     self.rv_e32(0x3 | (rd<<7) | (3<<12) | (rs1<<15) | ((off & 0xFFF)<<20));
   }
 
   // SD rs2, off(rs1)  — 64-bit store, S-type, funct3=3, opcode=0x23
   fn rv_SD(rs2: int64, rs1: int64, off: int64) {
+    if self._rvPasst12(off) == 0 { self._rvWeit(rs1, off); self.rv_SD(rs2, RV_WEIT, 0); return; }   // #2061
     var imm5: int64 := off & 0x1F;
     var imm7: int64 := ((off & 0xFFF) >> 5) & 0x7F;
     self.rv_e32(0x23 | (imm5<<7) | (3<<12) | (rs1<<15) | (rs2<<20) | (imm7<<25));
   }
 
+  // #1388: schmale Zugriffe. Die Speicher-Builtins (peek8/16/32, poke8/16/32)
+  // brauchen sie; bis 1.1.0A fehlten sie, und weil emitBuiltinCall keinen
+  // Default-Zweig hatte, erzeugte `peek8(p)` GAR NICHTS und lieferte, was
+  // zufaellig in a0 stand.
+  // LBU rd, off(rs1) — funct3=4, opcode=3
+  fn rv_LBU(rd: int64, rs1: int64, off: int64) {
+    if self._rvPasst12(off) == 0 { self._rvWeit(rs1, off); self.rv_LBU(rd, RV_WEIT, 0); return; }   // #2061
+    self.rv_e32(0x3 | (rd<<7) | (4<<12) | (rs1<<15) | ((off & 0xFFF)<<20));
+  }
+  // LHU rd, off(rs1) — funct3=5
+  fn rv_LHU(rd: int64, rs1: int64, off: int64) {
+    if self._rvPasst12(off) == 0 { self._rvWeit(rs1, off); self.rv_LHU(rd, RV_WEIT, 0); return; }   // #2061
+    self.rv_e32(0x3 | (rd<<7) | (5<<12) | (rs1<<15) | ((off & 0xFFF)<<20));
+  }
+  // LWU rd, off(rs1) — funct3=6
+  fn rv_LWU(rd: int64, rs1: int64, off: int64) {
+    if self._rvPasst12(off) == 0 { self._rvWeit(rs1, off); self.rv_LWU(rd, RV_WEIT, 0); return; }   // #2061
+    self.rv_e32(0x3 | (rd<<7) | (6<<12) | (rs1<<15) | ((off & 0xFFF)<<20));
+  }
+  // LW rd, off(rs1) — funct3=2. Auf RV64 VORZEICHENERWEITERND, im Unterschied
+  // zu LWU daneben. #2300: peek32 lud mit LWU und lieferte damit auf riscv
+  // einen anderen Wert als auf x86 (4294967295 statt -1).
+  fn rv_LW(rd: int64, rs1: int64, off: int64) {
+    if self._rvPasst12(off) == 0 { self._rvWeit(rs1, off); self.rv_LW(rd, RV_WEIT, 0); return; }
+    self.rv_e32(0x3 | (rd<<7) | (2<<12) | (rs1<<15) | ((off & 0xFFF)<<20));
+  }
+  // SB rs2, off(rs1) — funct3=0, opcode=0x23
+  fn rv_SB(rs2: int64, rs1: int64, off: int64) {
+    if self._rvPasst12(off) == 0 { self._rvWeit(rs1, off); self.rv_SB(rs2, RV_WEIT, 0); return; }   // #2061
+    var sbI5: int64 := off & 0x1F;
+    var sbI7: int64 := ((off & 0xFFF) >> 5) & 0x7F;
+    self.rv_e32(0x23 | (sbI5<<7) | (0<<12) | (rs1<<15) | (rs2<<20) | (sbI7<<25));
+  }
+  // SH rs2, off(rs1) — funct3=1
+  fn rv_SH(rs2: int64, rs1: int64, off: int64) {
+    if self._rvPasst12(off) == 0 { self._rvWeit(rs1, off); self.rv_SH(rs2, RV_WEIT, 0); return; }   // #2061
+    var shI5: int64 := off & 0x1F;
+    var shI7: int64 := ((off & 0xFFF) >> 5) & 0x7F;
+    self.rv_e32(0x23 | (shI5<<7) | (1<<12) | (rs1<<15) | (rs2<<20) | (shI7<<25));
+  }
+  // SW rs2, off(rs1) — funct3=2
+  fn rv_SW(rs2: int64, rs1: int64, off: int64) {
+    if self._rvPasst12(off) == 0 { self._rvWeit(rs1, off); self.rv_SW(rs2, RV_WEIT, 0); return; }   // #2061
+    var swI5: int64 := off & 0x1F;
+    var swI7: int64 := ((off & 0xFFF) >> 5) & 0x7F;
+    self.rv_e32(0x23 | (swI5<<7) | (2<<12) | (rs1<<15) | (rs2<<20) | (swI7<<25));
+  }
+
   // ADDI rd, rs1, imm  — I-type, funct3=0, opcode=0x13
+  //
+  // #2061: Ein Direktwert ausserhalb von zwoelf Bit scheitert hier LAUT. Es
+  // gibt keinen Aufrufer, der das braucht — die Rahmenanlage geht seit #2061
+  // ueber rv_LI64 —, und ein stilles Abschneiden hat genau den Fehler
+  // verursacht, den das Issue beschreibt.
   fn rv_ADDI(rd: int64, rs1: int64, imm: int64) {
+    if self._rvPasst12(imm) == 0 {
+      EPrintStr("error: riscv: ADDI-Direktwert "c);
+      EPrintInt(imm);
+      EPrintStrLn(" passt nicht in zwoelf Bit (#2061) -- rv_LI64 benutzen."c);
+      exit(1);
+    }
     self.rv_e32(0x13 | (rd<<7) | (0<<12) | (rs1<<15) | ((imm & 0xFFF)<<20));
   }
 
@@ -125,6 +312,16 @@ pub type EmitRISCV64 = class {
   // MUL rd, rs1, rs2  — M-ext, funct3=0, funct7=1
   fn rv_MUL(rd: int64, rs1: int64, rs2: int64) {
     self.rv_e32(0x33 | (rd<<7) | (0<<12) | (rs1<<15) | (rs2<<20) | (1<<25));
+  }
+
+  // #2460: MULH/MULHU rd, rs1, rs2 — M-ext, funct3=1 bzw. 3, funct7=1.
+  // Die oberen 64 Bit des Produkts; MUL daneben liefert die unteren.
+  fn rv_MULH(rd: int64, rs1: int64, rs2: int64) {
+    self.rv_e32(0x33 | (rd<<7) | (1<<12) | (rs1<<15) | (rs2<<20) | (1<<25));
+  }
+
+  fn rv_MULHU(rd: int64, rs1: int64, rs2: int64) {
+    self.rv_e32(0x33 | (rd<<7) | (3<<12) | (rs1<<15) | (rs2<<20) | (1<<25));
   }
 
   // DIV rd, rs1, rs2  — M-ext, funct3=4 (signed), funct7=1
@@ -162,6 +359,11 @@ pub type EmitRISCV64 = class {
     self.rv_e32(0x33 | (rd<<7) | (5<<12) | (rs1<<15) | (rs2<<20) | (0<<25));
   }
 
+  // SRA rd, rs1, rs2 — arithmetisch rechts, funct3=5, funct7=0x20 (#2236)
+  fn rv_SRA(rd: int64, rs1: int64, rs2: int64) {
+    self.rv_e32(0x33 | (rd<<7) | (5<<12) | (rs1<<15) | (rs2<<20) | (0x20<<25));
+  }
+
   // SLT rd, rs1, rs2  — signed less-than, funct3=2
   fn rv_SLT(rd: int64, rs1: int64, rs2: int64) {
     self.rv_e32(0x33 | (rd<<7) | (2<<12) | (rs1<<15) | (rs2<<20) | (0<<25));
@@ -183,17 +385,76 @@ pub type EmitRISCV64 = class {
   }
 
   // Load full immediate: LUI+ADDI for values outside [-2048..2047]
+  // #1764: Trotz des Namens deckte diese Routine nur den 32-Bit-Bereich ab:
+  // LUI traegt 20 Bit, ADDI zwoelf. Alles darueber fiel still weg — und weil
+  // ein f64-Literal als IEEE-Bitmuster durch dieselbe Routine geht, wurde aus
+  // 1.5 (0x3FF8000000000000) ein `lui t0, 0`, also die Null. Gerechnet wurde
+  // danach richtig, nur eben mit falschen Zahlen.
+  //
+  // Der weite Weg setzt den Wert aus Stuecken zu je elf Bit zusammen: erst das
+  // oberste Stueck laden, dann fuenfmal um elf schieben und das naechste
+  // hineinodern. Elf Bit deshalb, weil ADDI und ORI ihr Immediate
+  // vorzeichenbehaftet lesen — bis 2047 bleibt es positiv, ein Vorzeichenfall
+  // kann also gar nicht erst entstehen. Sechs Stuecke decken 66 Bit ab, das
+  // oberste traegt die restlichen neun.
   fn rv_LI64(rd: int64, imm: int64) {
     if imm >= -2048 && imm <= 2047 {
       self.rv_ADDI(rd, RV_ZERO, imm);
-    } else {
+      return;
+    }
+    // #2292: Der Schnellweg LUI+ADDI gilt nur, wenn er den Wert WIRKLICH
+    // trifft. LUI schreibt auf RV64 das 20-Bit-Feld um zwoelf verschoben und
+    // VORZEICHENERWEITERT; ADDI liest sein Immediate ebenfalls
+    // vorzeichenbehaftet. Fuer die obersten 2048 Werte des positiven
+    // 32-Bit-Bereichs geht das schief:
+    //
+    //   imm  = 0x7FFFFFFF
+    //   lo12 = 0xFFF -> vorzeichenbehaftet -1
+    //   hi20 = (0x7FFFFFFF + 1) >> 12 = 0x80000
+    //   LUI  rd, 0x80000  ->  0xFFFFFFFF80000000   (Bit 19 gesetzt!)
+    //   ADDI rd, rd, -1   ->  0xFFFFFFFF7FFFFFFF   statt 0x7FFFFFFF
+    //
+    // Gemessen: `2147483647` war auf riscv -2147483649, und damit war
+    // `1073741824 <= 2147483647` FALSCH. Im Compiler selbst ist das genau die
+    // Grenzkonstante von cg_emitBinOpImm — der riscv-gebaute lyxc hat deshalb
+    // keinen Konstantenvergleich mehr ins Immediate gefaltet und ein 53 KiB
+    // groesseres Abbild erzeugt (#2276 Rest). Bei NEGATIVEN Werten ist die
+    // Vorzeichenerweiterung gerade richtig, deshalb stimmte `0 - 2147483648`.
+    //
+    // Gepruefft wird deshalb nicht der Bereich, sondern das ERGEBNIS: hi20 als
+    // vorzeichenbehaftete 20 Bit gelesen, zusammengesetzt, verglichen. Trifft
+    // es nicht, geht der Wert den sechsteiligen Weg unten — der traegt jeden
+    // 64-Bit-Wert und kostet hier nur fuer 2048 Werte etwas mehr Code.
+    if imm >= 0 - 2147483648 && imm <= 2147483647 {
       var lo12: int64 := imm & 0xFFF;
       if (lo12 & 0x800) != 0 { lo12 := lo12 - 0x1000; }
       var hi20: int64 := (imm - lo12) >> 12;
-      // LUI rd, hi20
-      self.rv_e32(0x37 | (rd<<7) | ((hi20 & 0xFFFFF)<<12));
-      if lo12 != 0 { self.rv_ADDI(rd, rd, lo12); }
+      var hiS: int64 := hi20 & 0xFFFFF;
+      if (hiS & 0x80000) != 0 { hiS := hiS - 0x100000; }   // 20-Bit-Zweierkomplement
+      if ((hiS * 4096) + lo12) == imm {
+        // LUI rd, hi20
+        self.rv_e32(0x37 | (rd<<7) | ((hi20 & 0xFFFFF)<<12));
+        if lo12 != 0 { self.rv_ADDI(rd, rd, lo12); }
+        return;
+      }
     }
+    self.rv_ADDI(rd, RV_ZERO, (imm >> 55) & 0x1FF);
+    var sh: int64 := 44;
+    while sh >= 0 {
+      self.rv_SLLI(rd, rd, 11);
+      self.rv_ORI(rd, rd, (imm >> sh) & 0x7FF);
+      sh := sh - 11;
+    }
+  }
+
+  // SLLI rd, rs1, shamt — I-Type, funct3=1, opcode=0x13 (RV64: shamt bis 63)
+  fn rv_SLLI(rd: int64, rs1: int64, shamt: int64) {
+    self.rv_e32(0x13 | (rd<<7) | (1<<12) | (rs1<<15) | ((shamt & 0x3F)<<20));
+  }
+
+  // ORI rd, rs1, imm — I-Type, funct3=6, opcode=0x13
+  fn rv_ORI(rd: int64, rs1: int64, imm: int64) {
+    self.rv_e32(0x13 | (rd<<7) | (6<<12) | (rs1<<15) | ((imm & 0xFFF)<<20));
   }
 
   // ECALL
@@ -201,6 +462,31 @@ pub type EmitRISCV64 = class {
 
   // RET = JALR x0, ra, 0
   fn rv_RET() { self.rv_e32(0x00008067); }
+
+  // #2144: Rueckgabewert von mmap pruefen — dieselbe Pruefung wie
+  // cg_emitMmapGeprueft (x86, #1947) und emitMmapGeprueft (emit_arm64.lyx);
+  // die drei muessen uebereinstimmen. Erwartet a0 direkt nach dem ECALL.
+  // Im Gutfall wird nur a7 ueberschrieben (die Syscallnummer, die jede Stelle
+  // vor dem naechsten ECALL neu setzt) — kein Register, das ein Builtin ueber
+  // den Aufruf hinweg haelt. Die Meldung liegt im Code (wie bei #1339).
+  fn rv_mmapGeprueft() {
+    self.rv_ADDI(RV_A7, RV_ZERO, -2048);
+    self.rv_ADDI(RV_A7, RV_A7, -2047);         // a7 = -4095
+    self.rv_Bcond(6, RV_A0, RV_A7, 84);        // BLTU a0, a7 → hinter die Meldung
+    self.rv_e32(0x17 | (RV_A1 << 7));          // AUIPC a1, 0
+    self.rv_ADDI(RV_A1, RV_A1, 36);            // a1 = Meldung (9 Befehle weiter)
+    self.rv_ADDI(RV_A0, RV_ZERO, 2);           // stderr
+    self.rv_ADDI(RV_A2, RV_ZERO, 42);
+    self.rv_ADDI(RV_A7, RV_ZERO, 64);          // write
+    self.rv_ECALL();
+    self.rv_ADDI(RV_A0, RV_ZERO, 1);
+    self.rv_ADDI(RV_A7, RV_ZERO, 94);          // exit_group
+    self.rv_ECALL();
+    var m: pchar := "Speicheranforderung fehlgeschlagen (mmap)\n";
+    var i: int64 := 0;
+    while i < 42 { self.rv_e8(StrCharAt(m, i)); i := i + 1; }
+    self.rv_e8(0); self.rv_e8(0);
+  }
 
   // Build J-type JAL word: rd=0→jump, rd=1→call
   fn rv_buildJAL(rd: int64, offset: int64): int64 {
@@ -224,7 +510,41 @@ pub type EmitRISCV64 = class {
   // Stack slot helper: slot i → [s0, -(i+1)*8]
   // --------------------------------------------------------------------------
 
-  fn slotOff(slot: int64): int64 { return -(slot + 1) * 8; }
+  fn slotOff(slot: int64): int64 { return -(self._physSlot(slot) + 1) * 8; }   // #2270
+
+  // #2270: virtueller Slot -> physischer Slot ueber den Satz aus ir_lower
+  // (_slotRecNeu). Temps, deren Anweisung vorbei ist, teilen sich Slots; der
+  // Rahmen schrumpft damit auf die groesste gleichzeitig lebende Menge. Ohne
+  // Satz (Funktion aus einer .lyu, Code ausserhalb einer Funktion) bleibt
+  // jeder Slot er selbst. Ein Slot jenseits der Tabelle kommt HINTER den
+  // physischen Bereich, nicht auf seine eigene Nummer — dort laege ein
+  // wiederverwendeter. Dieselbe Abbildung in riscv_linux.lyx und
+  // emit_arm64.lyx — die beiden muessen uebereinstimmen.
+  fn _physSlot(slot: int64): int64 {
+    var r: int64 := self.slotRecCur;
+    if r == 0 || slot < 0 { return slot; }
+    var n: int64 := peek64(r + IR_SLOT_OFF_VIRT);
+    if slot < n { return peek64(peek64(r + IR_SLOT_OFF_MAP) + slot * 8); }
+    return peek64(r + IR_SLOT_OFF_ANZ) + (slot - n);
+  }
+
+  // Satz der Funktion funcId (0 = keiner).
+  fn _slotRecVon(funcId: int64): int64 {
+    var pc: int64 := peek64(self.ir + IR_MOD_OFF_PHYSCAP);
+    if funcId < 0 || funcId >= pc { return 0; }
+    return peek64(peek64(self.ir + IR_MOD_OFF_PHYSBUF) + funcId * 8);
+  }
+
+  // Slots des Rahmens: physisch belegte plus die jenseits der Tabelle.
+  fn _rahmenSlots(funcId: int64): int64 {
+    var locals: int64 := self.getFuncLocalCount(funcId);
+    var r: int64 := self.slotRecCur;
+    if r == 0 { return locals; }
+    var n: int64 := peek64(r + IR_SLOT_OFF_VIRT);
+    var mehr: int64 := 0;
+    if locals > n { mehr := locals - n; }
+    return peek64(r + IR_SLOT_OFF_ANZ) + mehr;
+  }
 
   fn rv_loadSlot(slot: int64) {
     self.rv_LD(RV_T0, RV_FP, self.slotOff(slot));
@@ -243,7 +563,7 @@ pub type EmitRISCV64 = class {
   // --------------------------------------------------------------------------
 
   fn calcStackFrame(funcId: int64) {
-    var locals: int64 := self.getFuncLocalCount(funcId);
+    var locals: int64 := self._rahmenSlots(funcId);   // #2270
     var sz: int64 := locals * 8;
     if (sz & 15) != 0 { sz := (sz + 16) & -16; }
     if sz < 16 { sz := 16; }
@@ -253,16 +573,27 @@ pub type EmitRISCV64 = class {
   // Prologue layout (after execution):
   //   [s0+0]  = saved old s0
   //   [s0+8]  = saved ra
+  //   [s0+16] = saved s11 (RV_WEIT, #2140); [s0+24] frei (16-Ausrichtung)
+  //   [s0+32] = erstes Stapelargument des Aufrufers (#2132)
   //   s0      = sp (frame pointer; saved regs above it)
   //   sp      = s0 - stackSize  (locals area below s0)
   // slotOff(i) = -(i+1)*8  → within [sp .. s0-1] ✓
   fn emitPrologue() {
-    self.rv_ADDI(RV_SP, RV_SP, -16);  // alloc saved-regs area
+    self.rv_ADDI(RV_SP, RV_SP, -32);  // alloc saved-regs area
     self.rv_SD(RV_FP, RV_SP, 0);      // save old s0
     self.rv_SD(RV_RA, RV_SP, 8);      // save ra
+    self.rv_SD(RV_WEIT, RV_SP, 16);   // #2140: s11 ist callee-saved
     self.rv_MV(RV_FP, RV_SP);         // s0 = sp (frame pointer)
     if self.stackSize > 0 {
-      self.rv_ADDI(RV_SP, RV_SP, -self.stackSize);  // alloc locals
+      // #2061: ein Rahmen ueber 2048 Byte passt nicht in den Direktwert von
+      // ADDI. Vorher wurde er abgeschnitten und der Stapelzeiger wanderte
+      // nach OBEN.
+      if self._rvPasst12(0 - self.stackSize) != 0 {
+        self.rv_ADDI(RV_SP, RV_SP, -self.stackSize);  // alloc locals
+      } else {
+        self.rv_LI64(RV_WEIT, self.stackSize);
+        self.rv_SUB(RV_SP, RV_SP, RV_WEIT);
+      }
     }
   }
 
@@ -272,7 +603,8 @@ pub type EmitRISCV64 = class {
     self.rv_MV(RV_SP, RV_FP);                    // restore sp = s0
     self.rv_LD(RV_FP, RV_SP, 0);                 // restore old s0
     self.rv_LD(RV_RA, RV_SP, 8);                 // restore ra
-    self.rv_ADDI(RV_SP, RV_SP, 16);              // pop saved area
+    self.rv_LD(RV_WEIT, RV_SP, 16);              // #2140: s11 zurueck
+    self.rv_ADDI(RV_SP, RV_SP, 32);              // pop saved area
     self.rv_RET();                                // JALR x0, ra, 0
   }
 
@@ -280,14 +612,65 @@ pub type EmitRISCV64 = class {
   // Patch management
   // --------------------------------------------------------------------------
 
+  // #1740: Die Liste wuchs frueher nicht — jenseits von 1024 Eintraegen fiel
+  // jeder weitere Patch still weg und der zugehoerige Sprung blieb auf seinem
+  // Platzhalter stehen. Seit die Aufruf-Patches ueber alle Funktionen hinweg
+  // stehenbleiben (siehe emitFunc), ist die Grenze schnell erreicht.
   fn addPatch(codeOff: int64, labelId: int64, ptype: int64, reg: int64) {
-    if self.patchCount < 1024 {
-      var base: int64 := self.patchBuf + self.patchCount * 32;
-      poke64(base,      codeOff);
-      poke64(base + 8,  labelId);
-      poke64(base + 16, ptype);
-      poke64(base + 24, reg);
-      self.patchCount := self.patchCount + 1;
+    if self.patchCount >= self.patchCap {
+      var nc: int64 := self.patchCap * 2;
+      var nb: int64 := alloc(nc * 32);
+      var ci: int64 := 0;
+      while ci < self.patchCount * 4 {
+        poke64(nb + ci * 8, peek64(self.patchBuf + ci * 8));
+        ci := ci + 1;
+      }
+      self.patchBuf := nb;
+      self.patchCap := nc;
+    }
+    var base: int64 := self.patchBuf + self.patchCount * 32;
+    poke64(base,      codeOff);
+    poke64(base + 8,  labelId);
+    poke64(base + 16, ptype);
+    poke64(base + 24, reg);
+    self.patchCount := self.patchCount + 1;
+  }
+
+  // #2112: Abstand passt nicht ins Befehlsfeld → laut, statt zu maskieren.
+  fn rv_checkReach(what: pchar, dist: int64, reach: int64) {
+    if dist >= (0 - reach) && dist < reach { return; }
+    EPrintStr("error: riscv: "c); EPrintStr(what);
+    EPrintStr(": Abstand "c); EPrintInt(dist);
+    EPrintStr(" Byte ueberschreitet die Reichweite von +/-"c); EPrintInt(reach);
+    EPrintStrLn(" Byte (#2112)."c);
+    exit(1);
+  }
+
+  // #2112: mode 1 = Ende einer Funktion (offene Marken-Patches sind ein
+  // Fehler — sonst loeste sie die gleichnamige Marke der naechsten Funktion
+  // auf), mode 0 = Ende von emit() (auch offene Aufrufe/Adressen). Dasselbe
+  // wie _checkNoOpenPatches in emit_arm64.lyx — die beiden muessen
+  // uebereinstimmen.
+  fn rv_checkNoOpenPatches(mode: int64) {
+    var i: int64 := 0;
+    while i < self.patchCount {
+      var base:  int64 := self.patchBuf + i * 32;
+      var lid:   int64 := peek64(base + 8);
+      var ptype: int64 := peek64(base + 16);
+      if lid != -2 {
+        var isFn: int64 := 0;
+        if ptype == RV_PATCH_BL || ptype == RV_PATCH_FADDR { isFn := 1; }
+        if mode == 0 || isFn == 0 {
+          EPrintStr("error: riscv: Sprungziel nie aufgeloest -- "c);
+          if isFn != 0 { EPrintStr("Funktion "c); } else { EPrintStr("Marke "c); }
+          EPrintInt(lid);
+          EPrintStr(" (Patchtyp "c); EPrintInt(ptype);
+          EPrintStr(", Code-Offset "c); EPrintInt(peek64(base));
+          EPrintStrLn(") (#2112)."c);
+          exit(1);
+        }
+      }
+      i := i + 1;
     }
   }
 
@@ -298,22 +681,75 @@ pub type EmitRISCV64 = class {
       var codeOff: int64 := peek64(base);
       var labelId: int64 := peek64(base + 8);
       var ptype:   int64 := peek64(base + 16);
+      // #1740: -2 heisst „schon gepatcht" — der Durchlauf am Ende von emit()
+      // sieht dieselbe Liste noch einmal.
+      if labelId != -2 {
       var target:  int64 := -1;
-      if ptype == RV_PATCH_BL {
-        if labelId < 256 { target := peek64(self.funcAddrs + labelId * 8); }
+      if ptype == RV_PATCH_BL || ptype == RV_PATCH_FADDR {
+        // #1740 verlangte, ein Ziel 0 nur fuer die ZUERST erzeugte Funktion
+        // als echt zu nehmen -- sonst sprang jeder Vorwaertsaufruf auf
+        // Code-Offset 0 und damit in die erste Funktion (Selbstaufruf von main
+        // bis zum Stapelueberlauf). Die Regel hing daran, dass Funktion 0
+        // zuerst erzeugt wird.
+        // #2451: Mit dem Schnitt gilt das nicht mehr -- wird Funktion 0
+        // weggelassen, liegt eine andere bei Offset 0. Deshalb ist funcAddrs
+        // jetzt auf -1 VORBELEGT, und ein Offset 0 ist eine echte Adresse.
+        if labelId >= 0 && labelId < self.funcCap {
+          target := peek64(self.funcAddrs + labelId * 8);
+        }
       } else {
-        if labelId < 1024 { target := peek64(self.labelAddrs + labelId * 8); }
+        if labelId >= 0 && labelId < self.labelCap { target := peek64(self.labelAddrs + labelId * 8); }
       }
       if target >= 0 {
         var delta: int64 := target - codeOff;
-        if ptype == RV_PATCH_J || ptype == RV_PATCH_BL {
-          // rd = ptype (0 = x0 for jump, 1 = ra for call)
-          self.rv_poke32at(codeOff, self.rv_buildJAL(ptype, delta));
+        if ptype == RV_PATCH_J {
+          // #2271: Die Stelle hat Platz fuer zwei Befehle. In JAL-Reichweite
+          // bleibt es beim JAL, dahinter ein NOP, das nie laeuft (JAL x0 kehrt
+          // nicht zurueck). Darueber AUIPC t1 + JALR x0 — der Selbstbau fuer
+          // riscv hat eine Funktion ueber 1 MiB und scheiterte daran. Hoch/tief
+          // geteilt wie bei RV_PATCH_BL darunter; die beiden muessen
+          // uebereinstimmen.
+          if delta >= (0 - RV_REACH_JAL) && delta < RV_REACH_JAL {
+            self.rv_poke32at(codeOff, self.rv_buildJAL(0, delta));
+            self.rv_poke32at(codeOff + 4, 0x13);   // ADDI x0, x0, 0
+          } else {
+            self.rv_checkReach("AUIPC+JALR (Sprung innerhalb der Funktion)"c, delta, RV_REACH_PC);
+            var jHi: int64 := (delta + 0x800) >> 12;
+            var jLo: int64 := delta - (jHi << 12);
+            self.rv_poke32at(codeOff, 0x17 | (RV_T1 << 7) | ((jHi & 0xFFFFF) << 12));
+            self.rv_poke32at(codeOff + 4, 0x67 | (RV_ZERO << 7) | (0 << 12) | (RV_T1 << 15) | ((jLo & 0xFFF) << 20));
+          }
+        } else if ptype == RV_PATCH_BL {
+          // #2112: Aufruf als AUIPC ra + JALR ra — JAL reichte nur +/-1 MiB,
+          // und ein Programm mit mehr Code ist kein Sonderfall. Hoch/tief
+          // geteilt wie bei RV_PATCH_FADDR darunter.
+          self.rv_checkReach("AUIPC+JALR (Aufruf)"c, delta, RV_REACH_PC);
+          var blHi: int64 := (delta + 0x800) >> 12;
+          var blLo: int64 := delta - (blHi << 12);
+          self.rv_poke32at(codeOff, 0x17 | (RV_RA << 7) | ((blHi & 0xFFFFF) << 12));
+          self.rv_poke32at(codeOff + 4, 0x67 | (RV_RA << 7) | (0 << 12) | (RV_RA << 15) | ((blLo & 0xFFF) << 20));
+        } else if ptype == RV_PATCH_FADDR {
+          self.rv_checkReach("AUIPC+ADDI (Funktionsadresse)"c, delta, RV_REACH_PC);
+          // #1806: AUIPC traegt die oberen 20 Bit, ADDI die unteren 12. Weil
+          // ADDI sein Immediate VORZEICHENBEHAFTET addiert, muss der obere Teil
+          // aufgerundet werden, sobald Bit 11 gesetzt ist — dieselbe Rechnung
+          // wie bei applyGlobalRelocs.
+          var faHi: int64 := (delta + 0x800) >> 12;
+          var faLo: int64 := delta - (faHi << 12);
+          self.rv_poke32at(codeOff, 0x17 | (RV_T0 << 7) | ((faHi & 0xFFFFF) << 12));
+          self.rv_poke32at(codeOff + 4, 0x13 | (RV_T0 << 7) | (0 << 12) | (RV_T0 << 15) | ((faLo & 0xFFF) << 20));
         } else if ptype == RV_PATCH_BEQ {
+          self.rv_checkReach("BEQ"c, delta, RV_REACH_B);
           self.rv_poke32at(codeOff, self.rv_buildBtype(0, RV_T0, RV_ZERO, delta));
         } else if ptype == RV_PATCH_BNE {
+          self.rv_checkReach("BNE"c, delta, RV_REACH_B);
           self.rv_poke32at(codeOff, self.rv_buildBtype(1, RV_T0, RV_ZERO, delta));
+        } else {
+          EPrintStr("error: riscv: unbekannter Patchtyp "c); EPrintInt(ptype); EPrintStrLn(" (#2112)."c);
+          exit(1);
         }
+        poke64(base + 8, -2);
+      }
       }
       i := i + 1;
     }
@@ -323,7 +759,63 @@ pub type EmitRISCV64 = class {
   // Instruction dispatch
   // --------------------------------------------------------------------------
 
+    // #1339: Der Dispatcher unten ist eine flache Liste aus `if op == X`
+  // ohne else und ohne Default. Ein Opcode, den keine Zeile trifft, erzeugte
+  // damit GAR NICHTS und verschwand lautlos aus dem Programm — bei
+  // IRO_PANIC hiess das: nach einer erkannten Verletzung laeuft es weiter.
+  //
+  // Diese Liste nennt die Opcodes, die riscv tatsaechlich behandelt. Sie ist
+  // aus dem Dispatcher erhoben und wird gegen ihn geprueft. Weicht sie ab,
+  // scheitert der Lauf LAUT — die Abweichung faellt damit beim Uebersetzen
+  // auf und nicht erst im erzeugten Programm.
+  fn rv_opBehandelt(op: int64): int64 {
+    // #1339: die vier Zusicherungen — ir_lower erzeugt sie (ASSERT_NOT_ZERO
+    // steht vor jeder Division), und bis 1.0.18B behandelte sie ausser lyxos
+    // kein Backend.
+    if (op == IRO_ASSERT_NOT_NULL || op == IRO_ASSERT_NOT_ZERO) { return 1; }
+    if (op == IRO_ASSERT_TRUE || op == IRO_ASSERT_BOUNDS) { return 1; }
+    if (op == IRO_CONST_STR) { return 1; }   // #1339
+    if (op == IRO_LOAD_LOCAL_ADDR || op == IRO_LOAD_GLOBAL_ADDR) { return 1; }   // #2116
+    if (op == 167 || op == IRO_ADD || op == IRO_ALLOC || op == IRO_AND) { return 1; }
+    if (op == IRO_BITAND || op == IRO_BITNOT || op == IRO_BITOR || op == IRO_BITXOR) { return 1; }
+    if (op == IRO_BR_FALSE || op == IRO_BR_TRUE || op == IRO_CALL || op == IRO_CALL_BUILTIN) { return 1; }
+    if (op == IRO_CAST || op == IRO_CMP_EQ || op == IRO_CMP_GE || op == IRO_CMP_GT) { return 1; }
+    if (op == IRO_CMP_LE || op == IRO_CMP_LT || op == IRO_CMP_NEQ || op == IRO_CONST_FLOAT) { return 1; }
+    if (op == IRO_CONST_INT || op == IRO_DIV || op == IRO_FREE || op == IRO_FTOI) { return 1; }
+    if (op == IRO_CALL_INDIRECT || op == IRO_FUNC_ADDR) { return 1; }   // #1806
+    if (op == IRO_CALL_EXTERN) { return 1; }   // #2162
+    if (op == IRO_FUNC_EXIT || op == IRO_ITOF || op == IRO_JMP || op == IRO_LABEL) { return 1; }
+    // #1764: die Gleitkomma-Rechnung. Sie fehlte komplett — behandelt waren nur
+    // ITOF/FTOI, und die kopierten den Slot bloss. `PrintLn` scheiterte damit
+    // an IRO_FSUB (Opcode 21), weil die Zahlformatierung in std/io darueber
+    // laeuft. RV64GC hat die D-Erweiterung, die Befehle gibt es also.
+    if (op == IRO_FADD || op == IRO_FSUB || op == IRO_FMUL || op == IRO_FDIV) { return 1; }
+    if (op == IRO_FNEG || op == IRO_FSQRT) { return 1; }
+    if (op == IRO_F64_ZU_F32 || op == IRO_F32_ZU_F64) { return 1; }   // #2160
+    // #1764: Feldzugriff ueber einen Index. Ohne ihn scheitert `PrintLn`
+    // ebenfalls — die Zahlformatierung in std/io greift auf Ziffernfelder zu.
+    if (op == IRO_LOAD_IDX || op == IRO_STORE_IDX) { return 1; }
+    if (op == IRO_FCMP_EQ || op == IRO_FCMP_NEQ || op == IRO_FCMP_LT) { return 1; }
+    if (op == IRO_FCMP_LE || op == IRO_FCMP_GT || op == IRO_FCMP_GE) { return 1; }
+    if (op == IRO_LOAD_FIELD || op == IRO_LOAD_FIELD_HEAP || op == IRO_LOAD_GLOBAL || op == IRO_LOAD_LOCAL) { return 1; }
+    if (op == IRO_MOD || op == IRO_MUL || op == IRO_NEG || op == IRO_NOT) { return 1; }
+    if (op == IRO_OR || op == IRO_PANIC || op == IRO_SEXT || op == IRO_SHL) { return 1; }
+    if (op == IRO_SHR || op == IRO_SAR || op == IRO_STORE_FIELD || op == IRO_STORE_FIELD_HEAP || op == IRO_STORE_GLOBAL) { return 1; }
+    if (op == IRO_STORE_LOCAL || op == IRO_SUB || op == IRO_THROW || op == IRO_TRUNC) { return 1; }
+    if (op == IRO_XOR || op == IRO_ZEXT) { return 1; }
+    return 0;
+  }
+
   fn emitInstr(funcId: int64, idx: int64) {
+    var opRoh: int64 := self.getInstrOp(idx);
+    if (self.rv_opBehandelt(opRoh) == 0) {
+      EPrintStr("error: riscv-Backend kennt Opcode "c);
+      EPrintInt(opRoh);
+      EPrintStrLn(" nicht -- er wuerde stillschweigend verschwinden (#1339)."c);
+      EPrintStrLn("  Entweder den Opcode hier umsetzen oder ihn in ir_lower fuer dieses Ziel abweisen."c);
+      exit(1);
+    }
+
     var op:   int64 := self.getInstrOp(idx);
     var dest: int64 := self.getInstrDest(idx);
     var src1: int64 := self.getInstrSrc1(idx);
@@ -388,6 +880,10 @@ pub type EmitRISCV64 = class {
       self.rv_loadSlot(src1); self.rv_loadSlot2(src2);
       self.rv_SRL(RV_T0, RV_T0, RV_T1); self.rv_storeSlot(dest);
     }
+    if op == IRO_SAR {                       // #2236: arithmetisch
+      self.rv_loadSlot(src1); self.rv_loadSlot2(src2);
+      self.rv_SRA(RV_T0, RV_T0, RV_T1); self.rv_storeSlot(dest);
+    }
 
     // --- Comparisons ---
     if op == IRO_CMP_EQ {
@@ -431,71 +927,206 @@ pub type EmitRISCV64 = class {
     if op == IRO_LOAD_LOCAL || op == IRO_STORE_LOCAL {
       self.rv_loadSlot(src1); self.rv_storeSlot(dest);
     }
+    // #1740: src1 bzw. src2 tragen einen globalIdx, KEINE Adresse. riscv lud
+    // ihn bis hierher als Zahl in ein Register und griff darauf zu — der
+    // Zugriff auf die erste globale Variable landete also auf Adresse 0, der
+    // auf die zweite auf 8. Genau daran starb `alloc`, dessen Zustand in
+    // globalen Variablen steht. Jetzt zeigt AUIPC+ADDI PC-relativ in den
+    // Datenbereich hinter dem Code; die Distanz traegt applyGlobalRelocs nach.
     if op == IRO_LOAD_GLOBAL {
-      self.rv_LI64(RV_T2, src1);
+      self.emitGlobalAddr(src1);
       self.rv_LD(RV_T0, RV_T2, 0); self.rv_storeSlot(dest);
     }
+    // #2116: `@x` — Adresse des Slots (fp + slotOff), weit wie _rvWeit (#2061).
+    if op == IRO_LOAD_LOCAL_ADDR {
+      var laOff: int64 := self.slotOff(src1);
+      if self._rvPasst12(laOff) != 0 { self.rv_ADDI(RV_T0, RV_FP, laOff); }
+      else { self.rv_LI64(RV_T0, laOff); self.rv_ADD(RV_T0, RV_FP, RV_T0); }
+      self.rv_storeSlot(dest);
+    }
+    // #2116: `@g` — dieselbe AUIPC/ADDI-Folge wie IRO_LOAD_GLOBAL, ohne LD.
+    if op == IRO_LOAD_GLOBAL_ADDR {
+      self.emitGlobalAddr(src1);
+      self.rv_MV(RV_T0, RV_T2); self.rv_storeSlot(dest);
+    }
+    // ir_lower legt bei STORE_GLOBAL den globalIdx ins DEST-Feld und den Slot
+    // mit dem Wert nach src1 (irAddInstrDirect(op, gIdx, valTemp, -1, 0)).
+    // riscv las den Index aus src2 — dort steht -1, geschrieben wurde also
+    // acht Byte VOR den Datenbereich, mitten in den Code (#1740).
     if op == IRO_STORE_GLOBAL {
-      self.rv_LI64(RV_T2, src2);
+      self.emitGlobalAddr(dest);
       self.rv_loadSlot(src1);
       self.rv_SD(RV_T0, RV_T2, 0);
     }
 
+    // #1764: dest = base[idx] bzw. base[idx] = src, Elementbreite acht Byte —
+    // dieselbe Rechnung wie im arm64-Backend (LDR x0,[x0,x1,LSL #3]).
+    if op == IRO_LOAD_IDX {
+      self.rv_loadSlot(src1);                 // t0 = Basis
+      self.rv_loadSlot2(src2);                // t1 = Index
+      self.rv_SLLI(RV_T1, RV_T1, 3);          // t1 = Index * 8
+      self.rv_ADD(RV_T0, RV_T0, RV_T1);
+      self.rv_LD(RV_T0, RV_T0, 0);
+      self.rv_storeSlot(dest);
+    }
+    if op == IRO_STORE_IDX {
+      self.rv_loadSlot(src2);                 // t0 = Basis
+      self.rv_loadSlot2(dest);                // t1 = Index
+      self.rv_SLLI(RV_T1, RV_T1, 3);
+      self.rv_ADD(RV_T2, RV_T0, RV_T1);       // t2 = Ziel-Adresse
+      self.rv_loadSlot(src1);                 // t0 = Wert
+      self.rv_SD(RV_T0, RV_T2, 0);
+    }
+
     // --- Struct field access ---
+    // #1767: Beim Schreiben steht der Feld-Offset im DEST-Feld, nicht in imm —
+    // ir_lower erzeugt STORE_FIELD als (dest = Offset, src1 = Wert,
+    // src2 = Basis), so wie lyxos und arm64 es lesen. riscv nahm imm, und das
+    // ist dort immer 0: JEDES Feld landete auf Offset 0, das zweite
+    // ueberschrieb also das erste. `self.a + self.b` ergab damit 7 statt 49.
+    // #2147: imm = Breite | (vorzeichenbehaftet << 8), 0 = acht Byte — wie
+    // emitLoadFieldArt in emit_arm64.lyx (die beiden muessen uebereinstimmen).
+    // Bis 1.2.16C las/schrieb jeder Feldzugriff acht Byte.
     if op == IRO_LOAD_FIELD || op == IRO_LOAD_FIELD_HEAP {
       self.rv_loadSlot(src1);
-      self.rv_LD(RV_T0, RV_T0, src2); self.rv_storeSlot(dest);
+      var lfW: int64 := imm & 255;
+      var lfVz: int64 := (imm >> 8) & 1;
+      if lfW == 1 && lfVz == 0 { self.rv_LBU(RV_T0, RV_T0, src2); }
+      else if lfW == 2 && lfVz == 0 { self.rv_LHU(RV_T0, RV_T0, src2); }
+      else if lfW == 4 && lfVz == 0 { self.rv_LWU(RV_T0, RV_T0, src2); }
+      else if lfW == 1 || lfW == 2 || lfW == 4 {
+        // LB/LH/LW (funct3 0/1/2) — vorzeichenrichtig erweitert.
+        var lfAdr: int64 := RV_T0;
+        var lfOff: int64 := src2;
+        if self._rvPasst12(src2) == 0 { self._rvWeit(RV_T0, src2); lfAdr := RV_WEIT; lfOff := 0; }
+        var lfF3: int64 := 0;
+        if lfW == 2 { lfF3 := 1; }
+        if lfW == 4 { lfF3 := 2; }
+        self.rv_e32(0x3 | (RV_T0<<7) | (lfF3<<12) | (lfAdr<<15) | ((lfOff & 0xFFF)<<20));
+      }
+      else { self.rv_LD(RV_T0, RV_T0, src2); }
+      self.rv_storeSlot(dest);
     }
     if op == IRO_STORE_FIELD || op == IRO_STORE_FIELD_HEAP {
       self.rv_loadSlot(src2);            // t0 = base pointer
       self.rv_MV(RV_T2, RV_T0);         // t2 = base
       self.rv_loadSlot(src1);            // t0 = value
-      self.rv_SD(RV_T0, RV_T2, imm);
+      var sfW: int64 := imm & 255;
+      if sfW == 1 { self.rv_SB(RV_T0, RV_T2, dest); }
+      else if sfW == 2 { self.rv_SH(RV_T0, RV_T2, dest); }
+      else if sfW == 4 { self.rv_SW(RV_T0, RV_T2, dest); }
+      else { self.rv_SD(RV_T0, RV_T2, dest); }
     }
 
     // --- Function calls ---
     if op == IRO_CALL {
+      // #1740: Die Argumente liegen im reservierten Block ab src2 (argBase),
+      // nicht in den Slots 0..N-1 — die gehoeren den Locals des Aufrufers.
+      // riscv las sie bis hierher aus Slot 0 und uebergab damit irgendeinen
+      // fremden Wert; arm64 und lyxos rechnen laengst ab argBase.
       var argCount: int64 := imm;
-      var ai: int64 := 0;
-      while ai < argCount && ai < 8 {
-        self.rv_loadSlot(ai);
-        self.rv_MV(RV_A0 + ai, RV_T0);
-        ai := ai + 1;
-      }
+      // #2132: ab dem neunten Argument ueber den Stapel (rv_StapelArgs).
+      var stBytes: int64 := self.rv_StapelArgs(src2, argCount);
+      self.rv_RegArgs(src2, argCount);
       var patchOff: int64 := self.codeLen;
-      self.rv_e32(0x000000EF);   // JAL ra, 0 placeholder (0x6F | 1<<7 = 0xEF)
+      // #2112: AUIPC ra + JALR ra statt JAL ra (+/-1 MiB) — beide Platzhalter,
+      // applyPatches traegt hoch/tief ein.
+      self.rv_e32(0x17 | (RV_RA << 7));                       // AUIPC ra, 0
+      self.rv_e32(0x67 | (RV_RA << 7) | (RV_RA << 15));       // JALR ra, 0(ra)
       self.addPatch(patchOff, src1, RV_PATCH_BL, 0);
+      if stBytes > 0 { self.rv_ADDI(RV_SP, RV_SP, stBytes); }   // #2132: Stapelargumente abraeumen
       self.rv_MV(RV_T0, RV_A0);
       self.rv_storeSlot(dest);
     }
     if op == IRO_CALL_BUILTIN {
-      self.emitBuiltinCall(imm, dest);
+      self.emitBuiltinCall(imm, src1, dest);
+    }
+    // #2162: FFI-Aufruf nach LP64D. src1 = Argumentzahl, src2/imm = Bibliothek
+    // und Symbol (Offsets in den IR-Strings), src3 = Argumentblock, immFloat =
+    // Signatur der Deklaration (parser._parseExternFn).
+    if op == IRO_CALL_EXTERN {
+      self.rv_callExtern(src1, src2, imm, dest, self.getInstrField(idx, IR_INSTR_OFF_SRC3),
+                         self.getInstrField(idx, IR_INSTR_OFF_IMMFLOAT));
+    }
+    // #1806: Aufruf ueber einen Funktionszeiger. Die Argumente liegen wie beim
+    // gewoehnlichen Aufruf, die Zieladresse steht in einem Slot.
+    //
+    // Bis 1.1.10G fehlte der Opcode hier ganz; der Aufruf kam nur deshalb nie
+    // so weit, weil die Namensaufloesung in ir_lower vorher scheiterte. Der
+    // laute Opcode-Waechter hat ihn beim Beheben von #1806 sofort gemeldet —
+    // so soll es sein.
+    // #2132: src2 = argBase des Argumentblocks, wie beim direkten Aufruf.
+    if op == IRO_CALL_INDIRECT {
+      var ciCount: int64 := imm;
+      var ciSt: int64 := self.rv_StapelArgs(src2, ciCount);
+      self.rv_RegArgs(src2, ciCount);
+      self.rv_loadSlot(src1);                    // t0 = Zieladresse
+      // JALR ra, t0, 0
+      self.rv_e32(0x67 | (RV_RA << 7) | (0 << 12) | (RV_T0 << 15));
+      if ciSt > 0 { self.rv_ADDI(RV_SP, RV_SP, ciSt); }   // #2132
+      self.rv_MV(RV_T0, RV_A0);
+      self.rv_storeSlot(dest);
+    }
+    // #1806: Adresse einer Funktion als Wert. Erst muss `add` als ZAHL
+    // entstehen, bevor `f(a, b)` sie indirekt rufen kann.
+    if op == IRO_FUNC_ADDR {
+      var faOff: int64 := self.codeLen;
+      self.rv_e32(0x17 | (RV_T0 << 7));          // AUIPC t0, 0 — nachgetragen
+      self.rv_ADDI(RV_T0, RV_T0, 0);             // ADDI  t0, t0, 0 — nachgetragen
+      self.addPatch(faOff, src1, RV_PATCH_FADDR, 0);
+      self.rv_storeSlot(dest);
     }
 
     // --- Control flow ---
+    // #2271: Jeder Sprung innerhalb der Funktion belegt zwei Befehle —
+    // applyPatches setzt JAL+NOP oder, ueber +/-1 MiB, AUIPC+JALR ein.
     if op == IRO_JMP {
       var patchOff: int64 := self.codeLen;
       self.rv_e32(0x0000006F);   // JAL x0, 0 placeholder
+      self.rv_e32(0x00000013);   // NOP / JALR — nachgetragen
       self.addPatch(patchOff, imm, RV_PATCH_J, 0);
     }
+    // #2112: Bedingte Spruenge als umgekehrter Kurzsprung ueber den Sprung.
+    // BEQ/BNE reichen nur +/-4 KiB — ein while-Rumpf mit rund 16 poke8 lag
+    // schon darueber, und der Abstand wurde still maskiert. Der Kurzsprung
+    // ueberspringt beide Befehle der Sprungstelle (#2271: +12 statt +8).
     if op == IRO_BR_TRUE {
       self.rv_loadSlot(src1);
+      self.rv_e32(self.rv_buildBtype(0, RV_T0, RV_ZERO, 12)); // BEQ t0, x0, +12
       var patchOff: int64 := self.codeLen;
-      // BNE t0, x0, 0 placeholder: 0x63 | (1<<12) | (RV_T0<<15) = 0x00029063
-      self.rv_e32(0x00029063);
-      self.addPatch(patchOff, imm, RV_PATCH_BNE, 0);
+      self.rv_e32(0x0000006F);                                 // JAL x0, label
+      self.rv_e32(0x00000013);                                 // NOP / JALR
+      self.addPatch(patchOff, imm, RV_PATCH_J, 0);
     }
     if op == IRO_BR_FALSE {
       self.rv_loadSlot(src1);
+      self.rv_e32(self.rv_buildBtype(1, RV_T0, RV_ZERO, 12)); // BNE t0, x0, +12
       var patchOff: int64 := self.codeLen;
-      // BEQ t0, x0, 0 placeholder: 0x63 | (0<<12) | (RV_T0<<15) = 0x00028063
-      self.rv_e32(0x00028063);
-      self.addPatch(patchOff, imm, RV_PATCH_BEQ, 0);
+      self.rv_e32(0x0000006F);                                 // JAL x0, label
+      self.rv_e32(0x00000013);                                 // NOP / JALR
+      self.addPatch(patchOff, imm, RV_PATCH_J, 0);
     }
     if op == IRO_LABEL {
-      if imm < 1024 {
-        poke64(self.labelAddrs + imm * 8, self.codeLen);
+      // #2112: Die Tabelle war fest bei 1024; eine Marke dahinter wurde
+      // still verworfen und ihr Sprung nie nachgetragen.
+      if imm < 0 {
+        EPrintStr("error: riscv: negative Marke "c); EPrintInt(imm); EPrintStrLn(" (#2112)."c);
+        exit(1);
       }
+      if imm >= self.labelCap {
+        var lnc: int64 := self.labelCap * 2;
+        while imm >= lnc { lnc := lnc * 2; }
+        var lnb: int64 := alloc(lnc * 8);
+        var lci: int64 := 0;
+        while lci < lnc {
+          if lci < self.labelCap { poke64(lnb + lci * 8, peek64(self.labelAddrs + lci * 8)); }
+          else                   { poke64(lnb + lci * 8, -1); }
+          lci := lci + 1;
+        }
+        self.labelAddrs := lnb;
+        self.labelCap   := lnc;
+      }
+      poke64(self.labelAddrs + imm * 8, self.codeLen);
     }
     if op == IRO_FUNC_EXIT {
       self.emitEpilogue();
@@ -511,37 +1142,1001 @@ pub type EmitRISCV64 = class {
       self.rv_LI(RV_A5, 0);
       self.rv_LI(RV_A7, RV_SYS_MMAP);
       self.rv_ECALL();
+      self.rv_mmapGeprueft();   // #2144
       self.rv_MV(RV_T0, RV_A0); self.rv_storeSlot(dest);
     }
     if op == IRO_FREE {
-      self.rv_loadSlot(src1); self.rv_MV(RV_A0, RV_T0);
-      self.rv_LI(RV_A1, 0);
-      self.rv_LI(RV_A7, RV_SYS_MUNMAP);
-      self.rv_ECALL();
+      // #2052: munmap(ptr, len) — src2 ist die Laenge, dest der Rueckgabewert.
+      // Hier stand `a1 = 0`, und das ist unter Linux immer EINVAL. Ohne
+      // bekannte Laenge (src2 == -1, aus `dispose`) wird nichts erzeugt.
+      // Dieselbe Entscheidung wie emitFree in emit_arm64.lyx — die beiden
+      // muessen uebereinstimmen.
+      if src2 >= 0 {
+        self.rv_loadSlot(src2); self.rv_MV(RV_A1, RV_T0);
+        self.rv_loadSlot(src1); self.rv_MV(RV_A0, RV_T0);
+        self.rv_LI(RV_A7, RV_SYS_MUNMAP);
+        self.rv_ECALL();
+        if dest >= 0 { self.rv_MV(RV_T0, RV_A0); self.rv_storeSlot(dest); }
+      }
     }
 
     // --- Type conversions: copy only (no FP support in this backend) ---
-    if op == IRO_ITOF || op == IRO_FTOI || op == IRO_CAST || op == IRO_SEXT || op == IRO_ZEXT || op == IRO_TRUNC {
+    if op == IRO_CAST || op == IRO_SEXT || op == IRO_ZEXT || op == IRO_TRUNC {
       self.rv_loadSlot(src1); self.rv_storeSlot(dest);
+    }
+    // #1764: ITOF und FTOI standen bis hierher in derselben Zeile wie CAST und
+    // kopierten den Slot nur. Aus `1 as f64` wurde damit das Bitmuster der
+    // ganzen Zahl 1 — eine Zahl nahe null statt 1.0, still und falsch.
+    if op == IRO_ITOF {
+      self.rv_loadSlot(src1);                 // t0 = ganze Zahl
+      self.rv_FCVT_D_L(0, RV_T0);             // f0 = (double) t0
+      self.rv_FSD(0, RV_FP, self.slotOff(dest));
+    }
+    if op == IRO_FTOI {
+      self.rv_FLD(0, RV_FP, self.slotOff(src1));
+      self.rv_FCVT_L_D(RV_T0, 0);             // t0 = (int64) f0, abgeschnitten
+      self.rv_storeSlot(dest);
+    }
+    // #1764: Gleitkomma-Rechnung ueber f0/f1. Zwischen Laden und Speichern
+    // steht kein Aufruf, die beiden Register brauchen also nicht gerettet zu
+    // werden.
+    if op == IRO_FADD || op == IRO_FSUB || op == IRO_FMUL || op == IRO_FDIV {
+      self.rv_FLD(0, RV_FP, self.slotOff(src1));
+      self.rv_FLD(1, RV_FP, self.slotOff(src2));
+      if op == IRO_FADD { self.rv_FOP_D(0x01, 0, 0, 1); }
+      if op == IRO_FSUB { self.rv_FOP_D(0x05, 0, 0, 1); }
+      if op == IRO_FMUL { self.rv_FOP_D(0x09, 0, 0, 1); }
+      if op == IRO_FDIV { self.rv_FOP_D(0x0D, 0, 0, 1); }
+      self.rv_FSD(0, RV_FP, self.slotOff(dest));
+    }
+    if op == IRO_FNEG {
+      self.rv_FLD(0, RV_FP, self.slotOff(src1));
+      // FSGNJN.D f0, f0, f0 — Vorzeichen des zweiten Operanden negiert
+      // uebernehmen, also genau das Vorzeichen umdrehen.
+      self.rv_e32(0x53 | (0 << 7) | (1 << 12) | (0 << 15) | (0 << 20) | (0x11 << 25));
+      self.rv_FSD(0, RV_FP, self.slotOff(dest));
+    }
+    // #2160: f32-Feld <-> double im Slot.
+    if op == IRO_F64_ZU_F32 {
+      self.rv_FLD(0, RV_FP, self.slotOff(src1));
+      self.rv_e32(0x53 | (1 << 20) | (0x20 << 25));            // FCVT.S.D f0, f0 (RNE)
+      self.rv_e32(0x53 | (RV_T0 << 7) | (0x70 << 25));        // FMV.X.W t0, f0 (vorzeichenerweitert)
+      self.rv_e32(0x13 | (RV_T0 << 7) | (1 << 12) | (RV_T0 << 15) | (32 << 20));   // SLLI t0, t0, 32
+      self.rv_e32(0x13 | (RV_T0 << 7) | (5 << 12) | (RV_T0 << 15) | (32 << 20));   // SRLI t0, t0, 32
+      self.rv_storeSlot(dest);
+    }
+    if op == IRO_F32_ZU_F64 {
+      self.rv_loadSlot(src1);
+      self.rv_e32(0x53 | (RV_T0 << 15) | (0x78 << 25));       // FMV.W.X f0, t0
+      self.rv_e32(0x53 | (0x21 << 25));                        // FCVT.D.S f0, f0
+      self.rv_FSD(0, RV_FP, self.slotOff(dest));
+    }
+    if op == IRO_FSQRT {
+      self.rv_FLD(0, RV_FP, self.slotOff(src1));
+      // FSQRT.D f0, f0 (rs2 = 0, rm = 0 = RNE)
+      self.rv_e32(0x53 | (0 << 7) | (0 << 12) | (0 << 15) | (0 << 20) | (0x2D << 25));
+      self.rv_FSD(0, RV_FP, self.slotOff(dest));
+    }
+    // #1764: Vergleiche. FEQ/FLT/FLE schreiben 0 oder 1 in ein GANZZAHL-Register.
+    // Fuer NEQ wird das Ergebnis von FEQ gekippt, fuer GT und GE werden die
+    // Operanden getauscht — mehr Befehle hat die D-Erweiterung nicht.
+    if op == IRO_FCMP_EQ || op == IRO_FCMP_NEQ || op == IRO_FCMP_LT ||
+       op == IRO_FCMP_LE || op == IRO_FCMP_GT || op == IRO_FCMP_GE {
+      self.rv_FLD(0, RV_FP, self.slotOff(src1));
+      self.rv_FLD(1, RV_FP, self.slotOff(src2));
+      if op == IRO_FCMP_EQ  { self.rv_FCMP_D(2, RV_T0, 0, 1); }
+      if op == IRO_FCMP_NEQ { self.rv_FCMP_D(2, RV_T0, 0, 1); self.rv_e32(0x13 | (RV_T0<<7) | (4<<12) | (RV_T0<<15) | (1<<20)); }
+      if op == IRO_FCMP_LT  { self.rv_FCMP_D(1, RV_T0, 0, 1); }
+      if op == IRO_FCMP_LE  { self.rv_FCMP_D(0, RV_T0, 0, 1); }
+      if op == IRO_FCMP_GT  { self.rv_FCMP_D(1, RV_T0, 1, 0); }
+      if op == IRO_FCMP_GE  { self.rv_FCMP_D(0, RV_T0, 1, 0); }
+      self.rv_storeSlot(dest);
+    }
+
+    // --- WSP-05: Inline-Assembly (imm = arch-Mnemonic-Id aus ir_lower RISC-V-Tabelle) ---
+    // #1281: IRO_THROW → exit(1). try/catch weist ir_lower fuer dieses Ziel ab,
+    // ein throw ist hier also immer unbehandelt; bis 1.0.16G erzeugte er nichts.
+    if op == IRO_THROW {
+      self.rv_LI(RV_A0, 1);
+      self.rv_LI(RV_A7, RV_SYS_EXIT);
+      self.rv_e32(0x00000073);   // ecall
+    }
+
+    // #1339: IRO_CONST_STR — Zeichenkettenliteral. Es fehlte, und deshalb
+    // scheiterte auf diesem Ziel schon `PrintLn("hallo")`; vor der
+    // Opcode-Pruefung verschwand der Opcode sogar spurlos, und das Programm
+    // bekam einen Zeiger auf nichts.
+    //
+    // Verfahren wie im arm64-Backend: die Bytes stehen INLINE im Codestrom,
+    // die Adresse entsteht PC-relativ, und ein Sprung fuehrt darum herum. Das
+    // spart eine eigene Datensektion und funktioniert auf jedem Ladeort.
+    if op == IRO_CONST_STR {
+      var strBufR: int64 := peek64(self.ir + 32);
+      var spR: int64 := strBufR + imm;
+    // #1968: Die Laenge steht im VORSPANN vor der Zeichenkette (acht Byte bei
+    // off-8, von irAddString gelegt), nicht in der Nullterminierung. `StrLen`
+    // schnitt hier alles ab dem ersten Nullbyte im INHALT ab — bei einer
+    // eingebetteten Datei (#1961) blieb davon ein Bruchstueck plus Fremdbytes
+    // aus dem anschliessenden Speicher. Die Null wird weiterhin MITgeschrieben,
+    // die Laufzeit erwartet sie bei pchar; sie ist nur nicht mehr das Mass.
+      var lenR: int64 := _irStrLenVorspann(strBufR, imm);
+      var totalR: int64 := lenR + 1;                     // mit der abschliessenden 0
+      var padR: int64 := (4 - (totalR & 3)) & 3;         // auf 4 Byte auffuellen
+      var paddedR: int64 := totalR + padR;
+      // AUIPC t0, 0 → t0 = Adresse DIESES Befehls
+      self.rv_e32(0x00000297);
+      // ADDI t0, t0, 12 → hinter AUIPC + ADDI + JAL, also an den Anfang der Bytes
+      self.rv_ADDI(RV_T0, RV_T0, 12);
+      // JAL x0, 4 + paddedR → ueber die Zeichenkette hinweg
+      self.rv_JAL_x0(4 + paddedR);
+      var iR: int64 := 0;
+      while (iR < lenR) { self.rv_e8(peek8(spR + iR)); iR := iR + 1; }
+      self.rv_e8(0);
+      var pR: int64 := 0;
+      while (pR < padR) { self.rv_e8(0); pR := pR + 1; }
+      self.rv_storeSlot(dest);
+    }
+
+    // #1339: Die Zusicherungen. Sie entstehen in ir_lower — ASSERT_NOT_ZERO
+    // steht seit WP-OPCODE-REST vor JEDER Division, damit eine Null zu einem
+    // kontrollierten Abbruch fuehrt statt zu SIGFPE. Kein Backend ausser
+    // lyxos hat sie behandelt: der Opcode verschwand, und die Division lief
+    // ungeprueft. Seit der Opcode-Pruefung aus #1339 faellt das beim
+    // Uebersetzen auf — hier ist die Umsetzung.
+    //
+    // Aufbau wie im lyxos-Backend: Wert laden, gegen 0 pruefen, im guten Fall
+    // ueber den Abbruch springen.
+    // #2105: Die Sprungweite stand hier FEST auf +12 — der Kommentar sagte
+    // "ueberspringt die drei Abbruchbefehle", dafuer braucht es aber +16
+    // (Sprung, li, li, ecall). Das Ziel war also das ecall SELBST: im guten
+    // Fall lief ein Systemaufruf mit dem a7 und a0, die gerade in den
+    // Registern standen — nach einer Ausgabe ein write(<Wert>, ...). JEDE
+    // Division auf riscv tat das. Fiel nur auf, wenn der Wert zufaellig ein
+    // offener Deskriptor war: im vollen `make test` eine geerbte Pipe, und
+    // das Programm starb mit SIGPIPE (rc 141) mitten in examples/test_zlib.
+    // Jetzt wird die Weite wie bei xtensa NACHGETRAGEN, nicht gezaehlt.
+    // arm64 (CBNZ +16) und arm_cm (BNE +0 ueber ein BKPT) waren richtig.
+    if op == IRO_ASSERT_NOT_NULL || op == IRO_ASSERT_NOT_ZERO || op == IRO_ASSERT_TRUE {
+      self.rv_loadSlot(src1);
+      var anPos: int64 := self.codeLen;
+      self.rv_e32(0x00000013);   // Platzhalter, unten durch BNE t0, x0 ersetzt
+      self.rv_LI(RV_A0, 1);
+      self.rv_LI(RV_A7, RV_SYS_EXIT);
+      self.rv_e32(0x00000073);   // ecall
+      self.rv_poke32at(anPos, self.rv_buildBtype(1, RV_T0, RV_ZERO, self.codeLen - anPos));
+    }
+
+    // ASSERT_BOUNDS: src1 = Index, src2 = Laenge. Verglichen wird VORZEICHENLOS
+    // (bltu), damit ein negativer Index als sehr grosse Zahl erkannt wird und
+    // nicht durchrutscht.
+    // #2105: dieselbe feste Weite +12 wie oben — Ziel war das ecall.
+    if op == IRO_ASSERT_BOUNDS {
+      self.rv_loadSlot(src1);
+      self.rv_loadSlot2(src2);
+      var abPos: int64 := self.codeLen;
+      self.rv_e32(0x00000013);   // Platzhalter, unten durch BLTU t0, t1 ersetzt
+      self.rv_LI(RV_A0, 1);
+      self.rv_LI(RV_A7, RV_SYS_EXIT);
+      self.rv_e32(0x00000073);   // ecall
+      self.rv_poke32at(abPos, self.rv_buildBtype(6, RV_T0, RV_T1, self.codeLen - abPos));   // funct3 6 = BLTU
+    }
+
+    // #1339: IRO_PANIC (121) war hier gar nicht behandelt — ein `panic("...")`
+    // erzeugte NICHTS und das Programm lief an genau der Stelle weiter, an der
+    // es abbrechen sollte. Bei einer erkannten Verletzung ist das die
+    // gefaehrlichste Form des stillen Defaults. Verhalten wie IRO_THROW: exit(1).
+    //
+    // #2141: und zwar MIT Meldung — bis 1.2.16A endete panic stumm mit rc 1.
+    // Wie cg_emitPanicBody auf x86 und der arm64-Zweig (die drei muessen
+    // uebereinstimmen): Text bis zum Nullbyte nach stderr, ohne Zeilenende;
+    // ein Nullzeiger schreibt nichts.
+    if op == IRO_PANIC && src1 >= 0 {
+      self.rv_LD(RV_A1, RV_FP, self.slotOff(src1));   // a1 = Text
+      var pnNull: int64 := self.codeLen;
+      self.rv_e32(0x00000013);                     // Platzhalter, unten BEQ a1, x0
+      self.rv_LI(RV_A2, 0);                        // a2 = Laenge
+      var pnLoop: int64 := self.codeLen;
+      self.rv_ADD(RV_T1, RV_A1, RV_A2);
+      self.rv_LBU(RV_T2, RV_T1, 0);
+      self.rv_BEQZ_fwd(RV_T2, 12);   // Nullbyte -> hinter den Ruecksprung
+      self.rv_ADDI(RV_A2, RV_A2, 1);
+      var pnBack: int64 := pnLoop - self.codeLen;
+      self.rv_JAL_x0(pnBack);
+      self.rv_LI(RV_A0, 2);                        // fd = stderr
+      self.rv_LI(RV_A7, RV_SYS_WRITE);
+      self.rv_ECALL();
+      self.rv_poke32at(pnNull, self.rv_buildBtype(0, RV_A1, RV_ZERO, self.codeLen - pnNull));   // BEQ
+    }
+    if op == IRO_PANIC {
+      self.rv_LI(RV_A0, 1);
+      self.rv_LI(RV_A7, RV_SYS_EXIT);
+      self.rv_e32(0x00000073);   // ecall
+    }
+
+    if op == 167 {
+      if      imm == 0 { self.rv_e32(0x00000013); }  // nop     (addi x0,x0,0)
+      else if imm == 1 { self.rv_e32(0x10500073); }  // wfi
+      else if imm == 2 { self.rv_e32(0x0FF0000F); }  // fence   (iorw,iorw)
+      else if imm == 3 { self.rv_e32(0x0000100F); }  // fence.i
+      else if imm == 4 { self.rv_e32(0x00000073); }  // ecall
+      else if imm == 5 { self.rv_e32(0x00100073); }  // ebreak
+      else if imm == 6 { self.rv_e32(0x30200073); }  // mret
+      else if imm == 7 { self.rv_e32(0x10200073); }  // sret
+      else {
+        EPrintStrLn("error: asm: unbekannte Mnemonic (riscv)"c);
+        exit(1);
+      }
     }
   }
 
-  fn emitBuiltinCall(id: int64, dest: int64) {
+  // #2132: Argumente ab dem neunten nach dem RISC-V-psABI (LP64) auf den
+  // Stapel — 8-Byte-Plaetze ab sp, sp bleibt 16-ausgerichtet. Der Platz wird
+  // am Stueck angelegt und nach dem Aufruf wieder freigegeben; die Slots
+  // liest dieser Weg s0-relativ. Liefert die Byte-Zahl fuer das ADDI danach.
+  // Bis 1.2.15A wurde alles ab dem neunten Argument still verworfen.
+  // Dieselbe Rechnung wie _a64StapelArgs in emit_arm64.lyx — die beiden
+  // muessen uebereinstimmen.
+  fn rv_StapelArgs(argBase: int64, argCount: int64): int64 {
+    if argCount <= 8 { return 0; }
+    if argBase < 0 {
+      // Alte Konvention (Argumente im Kratzstreifen 0..7): dort ist fuer ein
+      // neuntes kein Platz. Erzeugt ir_lower seit #2132 nicht mehr.
+      EPrintStr("error: riscv: Aufruf mit "c); EPrintInt(argCount);
+      EPrintStrLn(" Argumenten ohne Argumentblock -- mehr als acht gehen so nicht (#2132)."c);
+      exit(1);
+    }
+    var stBytes: int64 := (argCount - 8) * 8;
+    if (stBytes & 15) != 0 { stBytes := stBytes + 8; }
+    if stBytes > 2032 {
+      EPrintStr("error: riscv: Aufruf mit "c); EPrintInt(argCount);
+      EPrintStrLn(" Argumenten -- mehr als 2 KB Stapelargumente werden nicht erzeugt (#2132)."c);
+      exit(1);
+    }
+    self.rv_ADDI(RV_SP, RV_SP, 0 - stBytes);
+    var si: int64 := 8;
+    while si < argCount {
+      self.rv_loadSlot(argBase + si);
+      self.rv_SD(RV_T0, RV_SP, (si - 8) * 8);
+      si := si + 1;
+    }
+    return stBytes;
+  }
+
+  // #2132: die ersten acht Argumente in a0..a7. argBase < 0 ist die alte
+  // Konvention mit den Argumenten im Kratzstreifen ab Slot 0.
+  fn rv_RegArgs(argBase: int64, argCount: int64) {
+    var rb: int64 := argBase;
+    if rb < 0 { rb := 0; }
+    var ai: int64 := 0;
+    while ai < argCount && ai < 8 {
+      self.rv_loadSlot(rb + ai);
+      self.rv_MV(RV_A0 + ai, RV_T0);
+      ai := ai + 1;
+    }
+  }
+
+  fn emitBuiltinCall(id: int64, argBase: int64, dest: int64) {
+    // #1388: Die Adresse steht NICHT in Slot 0, sondern in einem hohen Block,
+    // dessen erster Slot als src1 mitkommt (argBase). ir_lower spillt seit dem
+    // Misdispatch-Fix (#839) absichtlich dorthin, weil die festen Slots 0..2
+    // die Locals des Aufrufers ueberschreiben. Bis 1.1.5C lasen die drei
+    // IR-Backends trotzdem Slot 0 und 1 — sie bekamen also irgendeinen Wert
+    // des Aufrufers als Adresse. Auf arm64 war das ein Segfault bei jedem
+    // peek8; gemessen wurde damals nur, ob die BYTES entstehen, nicht, ob das
+    // Programm laeuft.
+    var sBase: int64 := argBase;
+    if (sBase < 0) { sBase := 0; }
     if id == 1 {
       // write(stdout, buf, len)
+      //
+      // #1764: Eine NEGATIVE Laenge ist ein Sentinel und heisst „bis zum
+      // Nullbyte zaehlen". ir_lower setzt ihn fuer `PrintLn(pchar-Variable)`
+      // (dort steht -1 im Laengen-Slot), weil die Laenge erst zur Laufzeit
+      // feststeht. riscv reichte den Wert roh an write weiter — der Aufruf
+      // scheiterte, und die Ausgabe blieb leer: `PrintLn("literal")` schrieb,
+      // `PrintLn(s)` schwieg. Das lyxos-Backend kennt denselben Sentinel.
+      self.rv_LD(RV_A1, RV_FP, self.slotOff(sBase));
+      self.rv_LD(RV_A2, RV_FP, self.slotOff(sBase + 1));
+      self.rv_SLT(RV_T0, RV_A2, RV_ZERO);   // t0 = (Laenge < 0)
+      self.rv_BEQZ_fwd(RV_T0, 28);          // Laenge steht fest → ueber den Zaehlblock
+      self.rv_LI(RV_A2, 0);
+      var w1Loop: int64 := self.codeLen;
+      self.rv_ADD(RV_T1, RV_A1, RV_A2);
+      self.rv_LBU(RV_T2, RV_T1, 0);
+      self.rv_BEQZ_fwd(RV_T2, 12);          // Nullbyte → hinter den Ruecksprung
+      self.rv_ADDI(RV_A2, RV_A2, 1);
+      self.rv_JAL_x0(w1Loop - self.codeLen);
       self.rv_LI(RV_A0, 1);
-      self.rv_LD(RV_A1, RV_FP, self.slotOff(0));
-      self.rv_LD(RV_A2, RV_FP, self.slotOff(1));
       self.rv_LI(RV_A7, RV_SYS_WRITE);
       self.rv_ECALL();
-    } else if id == 2 || id == 3 {
-      // exit(code)
-      self.rv_LD(RV_A0, RV_FP, self.slotOff(0));
+    } else if id == 2 {
+      // #2031: Ganzzahl nach stdout.
+      //
+      // Bis 1.2.5F stand hier `id == 2 || id == 3` — BEIDE endeten im
+      // exit-Zweig. `PrintLn(7)` gab damit nichts aus und beendete das
+      // Programm mit dem Exit-Code 7; `return 0` wurde nie erreicht. Das sah
+      // aus wie ein Programm, das vorzeitig fertig ist, und fiel deshalb nie
+      // auf — Zeichenketten (ID 1) waren nicht betroffen, riscv wirkte
+      // oberflaechlich funktionsfaehig.
+      //
+      // Laut src/backend/_builtin_ids.md ist ID 2 "Ganzzahl nach stdout" und
+      // ID 3 das Prozessende. arm64 hat den Fall im Linux-Zweig laengst
+      // richtig (inline itoa + write); riscv hat ihn nie bekommen.
+      //
+      // Dieselbe Ziffernrechnung wie IntToStr (ID 16) weiter unten — von
+      // hinten nach vorn, weil die niedrigste Stelle zuerst herausfaellt, und
+      // die Schleife laeuft MINDESTENS EINMAL, damit aus 0 eine "0" wird.
+      // Register: t3 = Restwert, t4 = Pufferanfang, t5 = Schreibmarke,
+      // t6 = Vorzeichenmerker.
+      self.rv_LD(RV_A1, RV_FP, self.slotOff(sBase));
+      self.rv_MV(28, RV_A1);                       // t3 = n
+      self.rv_LI(RV_A1, 64);
+      self.rv_bumpAlloc();                         // #2227: a0 = Puffer
+      self.rv_MV(29, RV_A0);                       // t4 = Puffer
+      self.rv_ADDI(30, 29, 63);                    // t5 = t4 + 63 (Ende)
+      // #2148: NICHT negieren. `t3 = -t3` liess den kleinsten int64 negativ
+      // (0 - n ist keine Betragsfunktion), DIV/REM lieferten dann negative
+      // Ziffern, und PrintInt(INT64_MIN) gab Satzzeichen aus. Stattdessen
+      // bleibt n negativ — DIV rundet gegen null, REM traegt das Vorzeichen
+      // von n —, und jede Ziffer wird ueber die Maske a7 = -t6 einzeln zum
+      // Betrag: (r ^ a7) - a7. Dieselbe Rechnung wie IntToStr (ID 16) unten —
+      // die beiden muessen uebereinstimmen.
+      self.rv_SLT(31, 28, 0);                      // t6 = (n < 0)
+      self.rv_SUB(RV_A7, 0, 31);                   // a7 = 0 oder -1
+      self.rv_LI(RV_A6, 10);
+      var piL: int64 := self.codeLen;
+      self.rv_DIV(RV_A1, 28, RV_A6);
+      self.rv_REM(RV_A2, 28, RV_A6);
+      self.rv_XOR(RV_A2, RV_A2, RV_A7);
+      self.rv_SUB(RV_A2, RV_A2, RV_A7);            // Betrag der Ziffer
+      self.rv_ADDI(RV_A2, RV_A2, 48);
+      self.rv_ADDI(30, 30, 0 - 1);
+      self.rv_SB(RV_A2, 30, 0);
+      self.rv_MV(28, RV_A1);
+      self.rv_BEQZ_fwd(28, 8);
+      self.rv_JAL_x0(piL - self.codeLen);
+      self.rv_BEQZ_fwd(31, 16);                    // Minuszeichen, falls noetig
+      self.rv_ADDI(30, 30, 0 - 1);
+      self.rv_LI(RV_A2, 45);
+      self.rv_SB(RV_A2, 30, 0);
+      // write(1, t5, (t4 + 63) - t5) — OHNE Zeilenumbruch; den haengt PrintLn
+      // als eigenen ID-1-Aufruf an.
+      self.rv_ADDI(RV_A3, 29, 63);
+      self.rv_SUB(RV_A2, RV_A3, 30);               // Laenge
+      self.rv_MV(RV_A1, 30);                       // Zeiger auf die erste Ziffer
+      self.rv_LI(RV_A0, 1);                        // fd = stdout
+      self.rv_LI(RV_A7, RV_SYS_WRITE);
+      self.rv_ECALL();
+    } else if id == 3 {
+      // exit(code)  — #1740: Code steht im Argumentblock, nicht in Slot 0.
+      self.rv_LD(RV_A0, RV_FP, self.slotOff(sBase));
       self.rv_LI(RV_A7, RV_SYS_EXIT);
       self.rv_ECALL();
+    } else if id == 13 {
+      // #1388: EPrintStr — write(2, buf, strlen(buf)); die Laenge rechnet der
+      // Code selbst aus (die Konvention reicht nur einen Sentinel durch).
+      self.rv_LD(RV_A1, RV_FP, self.slotOff(sBase));   // a1 = buf (#1740)
+      self.rv_LI(RV_A2, 0);                        // a2 = Laenge
+      var epLoop: int64 := self.codeLen;
+      self.rv_ADD(RV_T1, RV_A1, RV_A2);
+      self.rv_LBU(RV_T2, RV_T1, 0);
+      self.rv_BEQZ_fwd(RV_T2, 12);   // Nullbyte -> hinter den Ruecksprung
+      self.rv_ADDI(RV_A2, RV_A2, 1);
+      var epBack: int64 := epLoop - self.codeLen;
+      self.rv_JAL_x0(epBack);
+      self.rv_LI(RV_A0, 2);                        // fd = stderr
+      self.rv_LI(RV_A7, RV_SYS_WRITE);
+      self.rv_ECALL();
+    } else if id == 407 {
+      // #2103: StrTrim — an Ort und Stelle, wie emitStrTrim (lyxos) und der
+      // arm64-Zweig (die drei muessen uebereinstimmen). Geschrieben wird nur,
+      // wenn hinten Leerraum stand (Literale sind nicht beschreibbar).
+      self.rv_LD(RV_A1, RV_FP, self.slotOff(sBase));   // a1 = s
+      var trA: int64 := self.codeLen;                  // r0
+      self.rv_LBU(RV_T2, RV_A1, 0);
+      self.rv_ADDI(RV_T0, RV_ZERO, 32); self.rv_Bcond(0, RV_T2, RV_T0, 7 * 4);    // -> r9
+      self.rv_ADDI(RV_T0, RV_ZERO, 9);  self.rv_Bcond(0, RV_T2, RV_T0, 5 * 4);
+      self.rv_ADDI(RV_T0, RV_ZERO, 13); self.rv_Bcond(0, RV_T2, RV_T0, 3 * 4);
+      self.rv_ADDI(RV_T0, RV_ZERO, 10); self.rv_Bcond(1, RV_T2, RV_T0, 3 * 4);    // BNE -> r11
+      self.rv_ADDI(RV_A1, RV_A1, 1);                   // r9
+      self.rv_JAL_x0(trA - self.codeLen);              // r10
+      self.rv_ADDI(RV_A2, RV_A1, 0);                   // r11
+      var trE: int64 := self.codeLen;                  // r12
+      self.rv_LBU(RV_T2, RV_A2, 0);
+      self.rv_BEQZ_fwd(RV_T2, 12);                     // -> r16
+      self.rv_ADDI(RV_A2, RV_A2, 1);
+      self.rv_JAL_x0(trE - self.codeLen);
+      self.rv_ADDI(RV_A3, RV_A2, 0);                   // r16
+      var trH: int64 := self.codeLen;                  // r17
+      self.rv_Bcond(7, RV_A1, RV_A2, 12 * 4);          // BGEU a1,a2 -> r29
+      self.rv_LBU(RV_T2, RV_A2, 0 - 1);
+      self.rv_ADDI(RV_T0, RV_ZERO, 32); self.rv_Bcond(0, RV_T2, RV_T0, 7 * 4);    // -> r27
+      self.rv_ADDI(RV_T0, RV_ZERO, 9);  self.rv_Bcond(0, RV_T2, RV_T0, 5 * 4);
+      self.rv_ADDI(RV_T0, RV_ZERO, 13); self.rv_Bcond(0, RV_T2, RV_T0, 3 * 4);
+      self.rv_ADDI(RV_T0, RV_ZERO, 10); self.rv_Bcond(1, RV_T2, RV_T0, 3 * 4);    // BNE -> r29
+      self.rv_ADDI(RV_A2, RV_A2, 0 - 1);               // r27
+      self.rv_JAL_x0(trH - self.codeLen);              // r28
+      self.rv_Bcond(0, RV_A2, RV_A3, 2 * 4);           // r29 BEQ a2,a3 -> r31
+      self.rv_SB(RV_ZERO, RV_A2, 0);                   // r30
+      self.rv_ADDI(RV_A0, RV_A1, 0);                   // r31
+    } else if id == 15 {
+      // #1388: StrLen — Zeichen bis zur Null zaehlen, Ergebnis nach a0.
+      self.rv_LD(RV_A1, RV_FP, self.slotOff(sBase));   // a1 = buf (#1740)
+      self.rv_LI(RV_A0, 0);
+      var slLoop: int64 := self.codeLen;
+      self.rv_ADD(RV_T1, RV_A1, RV_A0);
+      self.rv_LBU(RV_T2, RV_T1, 0);
+      self.rv_BEQZ_fwd(RV_T2, 12);
+      self.rv_ADDI(RV_A0, RV_A0, 1);
+      self.rv_JAL_x0(slLoop - self.codeLen);
+    } else if id == 200 || id == 208 || id == 201 || id == 202 {
+      // #1388: peek8/16/32/64 — Adresse aus Slot 0, Wert nach a0.
+      self.rv_LD(RV_A1, RV_FP, self.slotOff(sBase));
+      if (id == 200) { self.rv_LBU(RV_A0, RV_A1, 0); }
+      if (id == 208) { self.rv_LHU(RV_A0, RV_A1, 0); }
+      if (id == 201) { self.rv_LW(RV_A0, RV_A1, 0); }   // #2300: vorzeichenerweiternd wie x86
+      if (id == 202) { self.rv_LD(RV_A0, RV_A1, 0); }
+    } else if id == 6 {
+      // #1388: StrSub(s, start, len) — Teilkette in frischen Speicher kopieren.
+      // Puffer aus dem Bump-Block (#2227). Kopiert wird hoechstens bis zum
+      // Ende der Kette: ein zu grosses `len` liest sonst darueber hinaus.
+      self.rv_LD(RV_A1, RV_FP, self.slotOff(sBase));
+      self.rv_MV(28, RV_A1);                       // t3 = s
+      self.rv_LD(RV_A1, RV_FP, self.slotOff(sBase + 1));
+      self.rv_ADD(28, 28, RV_A1);                  // t3 = s + start
+      self.rv_LD(RV_A1, RV_FP, self.slotOff(sBase + 2));
+      self.rv_MV(31, RV_A1);                       // t6 = len
+      self.rv_ADD(RV_A1, 31, 31);
+      self.rv_ADDI(RV_A1, RV_A1, 16);              // Groesse = 2*len + 16
+      self.rv_bumpAlloc();                         // #2227: a0 = Puffer
+      self.rv_MV(29, RV_A0);                       // t4 = Puffer
+      self.rv_LI(30, 0);                           // t5 = Zaehler
+      var subL: int64 := self.codeLen;
+      self.rv_SLT(RV_T2, 30, 31);                  // t2 = (i < len)
+      self.rv_BEQZ_fwd(RV_T2, 32);                 // fertig (acht Befehle weiter)
+      self.rv_ADD(RV_A2, 28, 30);
+      self.rv_LBU(RV_A3, RV_A2, 0);
+      self.rv_BEQZ_fwd(RV_A3, 20);                 // Kette zu Ende
+      self.rv_ADD(RV_A2, 29, 30);
+      self.rv_SB(RV_A3, RV_A2, 0);
+      self.rv_ADDI(30, 30, 1);
+      self.rv_JAL_x0(subL - self.codeLen);
+      self.rv_ADD(RV_A2, 29, 30);
+      self.rv_SB(0, RV_A2, 0);                     // Nullbyte
+      self.rv_MV(RV_A0, 29);
+    } else if id == 7 {
+      // #2028: StrConcat(a, b) — beide Ketten in frischen Speicher kopieren.
+      //
+      // Fehlte ganz; jedes Programm mit Zeichenkettenverkettung war fuer riscv
+      // unbaubar — nach PrintLn das meistbenutzte Builtin. Puffer aus dem
+      // Bump-Block (rv_bumpAlloc, #2227): der Zeiger muss den Aufruf
+      // ueberleben.
+      //
+      // Register: t3 = a, t4 = b, t5 = Laenge a, t6 = Laenge b, a6 = Puffer,
+      // t0 = Zaehler. a0..a5 und a7 sind nach dem Systemaufruf wieder frei.
+      self.rv_LD(RV_A1, RV_FP, self.slotOff(sBase));
+      self.rv_MV(28, RV_A1);                       // t3 = a
+      self.rv_LD(RV_A1, RV_FP, self.slotOff(sBase + 1));
+      self.rv_MV(29, RV_A1);                       // t4 = b
+      // Laenge von a → t5
+      self.rv_LI(30, 0);
+      var cnAL: int64 := self.codeLen;
+      self.rv_ADD(RV_A2, 28, 30);
+      self.rv_LBU(RV_A3, RV_A2, 0);
+      self.rv_BEQZ_fwd(RV_A3, 12);                 // fertig (drei Befehle weiter)
+      self.rv_ADDI(30, 30, 1);
+      self.rv_JAL_x0(cnAL - self.codeLen);
+      // Laenge von b → t6
+      self.rv_LI(31, 0);
+      var cnBL: int64 := self.codeLen;
+      self.rv_ADD(RV_A2, 29, 31);
+      self.rv_LBU(RV_A3, RV_A2, 0);
+      self.rv_BEQZ_fwd(RV_A3, 12);
+      self.rv_ADDI(31, 31, 1);
+      self.rv_JAL_x0(cnBL - self.codeLen);
+      // Groesse = la + lb + 16 (Reserve wie bei StrSub)
+      self.rv_ADD(RV_A1, 30, 31);
+      self.rv_ADDI(RV_A1, RV_A1, 16);
+      self.rv_bumpAlloc();                         // #2227: a0 = Puffer
+      self.rv_MV(RV_A6, RV_A0);                    // a6 = Puffer
+      // a kopieren: bis zum Nullbyte, Ziel = Puffer + i
+      self.rv_LI(RV_T0, 0);
+      var cnCA: int64 := self.codeLen;
+      self.rv_ADD(RV_A2, 28, RV_T0);
+      self.rv_LBU(RV_A3, RV_A2, 0);
+      self.rv_BEQZ_fwd(RV_A3, 20);                 // fertig (fuenf Befehle weiter)
+      self.rv_ADD(RV_A2, RV_A6, RV_T0);
+      self.rv_SB(RV_A3, RV_A2, 0);
+      self.rv_ADDI(RV_T0, RV_T0, 1);
+      self.rv_JAL_x0(cnCA - self.codeLen);
+      // b kopieren: Ziel = Puffer + la + j
+      self.rv_LI(RV_T0, 0);
+      var cnCB: int64 := self.codeLen;
+      self.rv_ADD(RV_A2, 29, RV_T0);
+      self.rv_LBU(RV_A3, RV_A2, 0);
+      self.rv_BEQZ_fwd(RV_A3, 24);                 // fertig (sechs Befehle weiter)
+      self.rv_ADD(RV_A2, RV_A6, 30);
+      self.rv_ADD(RV_A2, RV_A2, RV_T0);
+      self.rv_SB(RV_A3, RV_A2, 0);
+      self.rv_ADDI(RV_T0, RV_T0, 1);
+      self.rv_JAL_x0(cnCB - self.codeLen);
+      // Nullbyte hinter das Ergebnis
+      self.rv_ADD(RV_A2, RV_A6, 30);
+      self.rv_ADD(RV_A2, RV_A2, 31);
+      self.rv_SB(0, RV_A2, 0);
+      self.rv_MV(RV_A0, RV_A6);
+    } else if id == 16 {
+      // #1388: IntToStr(n) — Dezimaltext, Zeiger nach a0.
+      //
+      // Puffer aus dem Bump-Block (#2227, vorher ein mmap je Aufruf): der
+      // Zeiger muss den Aufruf ueberleben. Gerechnet wird von hinten nach vorn,
+      // weil die niedrigste Stelle zuerst herausfaellt.
+      //
+      // Register: t3 = Restwert, t4 = Pufferanfang, t5 = Schreibmarke,
+      // t6 = Vorzeichenmerker. a0..a7 sind nach dem Systemaufruf wieder frei.
+      self.rv_LD(RV_A1, RV_FP, self.slotOff(sBase));
+      self.rv_MV(28, RV_A1);                       // t3 = n
+      self.rv_LI(RV_A1, 64);
+      self.rv_bumpAlloc();                         // #2227: a0 = Puffer
+      self.rv_MV(29, RV_A0);                       // t4 = Puffer
+      self.rv_ADDI(30, 29, 63);                    // t5 = t4 + 63
+      self.rv_SB(0, 30, 0);                        // Nullbyte ans Ende
+      // #2148: n bleibt negativ, jede Ziffer wird einzeln zum Betrag —
+      // dieselbe Rechnung wie PrintInt (ID 2) oben, die beiden muessen
+      // uebereinstimmen. `t3 = -t3` liess INT64_MIN negativ.
+      self.rv_SLT(31, 28, 0);                      // t6 = (n < 0)
+      self.rv_SUB(RV_A7, 0, 31);                   // a7 = 0 oder -1
+      self.rv_LI(RV_A6, 10);                       // Teiler
+      // Ziffernschleife, laeuft mindestens einmal (damit aus 0 eine "0" wird).
+      var itsL: int64 := self.codeLen;
+      self.rv_DIV(RV_A1, 28, RV_A6);
+      self.rv_REM(RV_A2, 28, RV_A6);
+      self.rv_XOR(RV_A2, RV_A2, RV_A7);
+      self.rv_SUB(RV_A2, RV_A2, RV_A7);            // Betrag der Ziffer
+      self.rv_ADDI(RV_A2, RV_A2, 48);
+      self.rv_ADDI(30, 30, 0 - 1);
+      self.rv_SB(RV_A2, 30, 0);
+      self.rv_MV(28, RV_A1);
+      self.rv_BEQZ_fwd(28, 8);                     // fertig? dann ueber den Ruecksprung
+      self.rv_JAL_x0(itsL - self.codeLen);
+      // Minuszeichen, falls noetig.
+      self.rv_BEQZ_fwd(31, 16);
+      self.rv_ADDI(30, 30, 0 - 1);
+      self.rv_LI(RV_A2, 45);
+      self.rv_SB(RV_A2, 30, 0);
+      self.rv_MV(RV_A0, 30);                       // Ergebnis: Zeiger auf die erste Ziffer
+    } else if id >= 255 && id <= 262 {
+      // #2190: Bit-Rechenwerke. RV64I kennt KEINEN davon — Zaehlen, Rotieren
+      // und Bytetauschen stehen in der Erweiterung Zbb, und die ist nicht
+      // zugesichert. Also werden sie aus Grundbefehlen gerechnet. Die Werte
+      // muessen denen der anderen Backends entsprechen: clz(0) == 64,
+      // ctz(0) == 64, Rotationsweite modulo 64.
+      //
+      // Alle Spruenge werden NACHGETRAGEN, nie gezaehlt: rv_LI64 erzeugt je
+      // nach Wert zwei oder elf Befehle (siehe emitZiffern).
+      self.rv_LD(RV_A1, RV_FP, self.slotOff(sBase));        // a1 = x
+      if id == 255 {                                        // popcount(x)
+        self.rv_LI(RV_A0, 0);
+        var pcL: int64 := self.codeLen;
+        self.rv_BEQZ_fwd(RV_A1, 0);                         // Ziel wird nachgetragen
+        var pcRaus: int64 := self.codeLen - 4;
+        self.rv_LI(RV_T0, 1);
+        self.rv_AND(RV_T1, RV_A1, RV_T0);                   // t1 = x & 1
+        self.rv_ADD(RV_A0, RV_A0, RV_T1);
+        self.rv_SRL(RV_A1, RV_A1, RV_T0);                   // x >>= 1 (logisch)
+        self.rv_JAL_x0(pcL - self.codeLen);
+        self.rv_poke32at(pcRaus, self.rv_buildBtype(0, RV_A1, RV_ZERO, self.codeLen - pcRaus));
+      } else if id == 256 {                                 // clz(x)
+        self.rv_LI(RV_A0, 0);
+        self.rv_LI(RV_T2, 63);
+        var clL: int64 := self.codeLen;
+        self.rv_LI(RV_T0, 64);
+        self.rv_Bcond(0, RV_A0, RV_T0, 0);                  // a0 == 64 → fertig
+        var clRaus1: int64 := self.codeLen - 4;
+        self.rv_SRL(RV_T1, RV_A1, RV_T2);                   // t1 = x >> 63
+        self.rv_BEQZ_fwd(RV_T1, 0);                         // oberstes Bit 0 → weiter
+        var clWeiter: int64 := self.codeLen - 4;
+        self.rv_JAL_x0(0);                                  // sonst fertig
+        var clRaus2: int64 := self.codeLen - 4;
+        self.rv_poke32at(clWeiter, self.rv_buildBtype(0, RV_T1, RV_ZERO, self.codeLen - clWeiter));
+        self.rv_LI(RV_T0, 1);
+        self.rv_SLL(RV_A1, RV_A1, RV_T0);                   // x <<= 1
+        self.rv_ADDI(RV_A0, RV_A0, 1);
+        self.rv_JAL_x0(clL - self.codeLen);
+        var clEnde: int64 := self.codeLen;
+        self.rv_poke32at(clRaus1, self.rv_buildBtype(0, RV_A0, RV_T0, clEnde - clRaus1));
+        self.rv_poke32at(clRaus2, self.rv_buildJAL(0, clEnde - clRaus2));
+      } else if id == 257 {                                 // ctz(x)
+        self.rv_LI(RV_A0, 0);
+        var ctL: int64 := self.codeLen;
+        self.rv_LI(RV_T0, 64);
+        self.rv_Bcond(0, RV_A0, RV_T0, 0);                  // a0 == 64 → fertig
+        var ctRaus1: int64 := self.codeLen - 4;
+        self.rv_LI(RV_T0, 1);
+        self.rv_AND(RV_T1, RV_A1, RV_T0);                   // t1 = x & 1
+        self.rv_BEQZ_fwd(RV_T1, 0);                         // unterstes Bit 0 → weiter
+        var ctWeiter: int64 := self.codeLen - 4;
+        self.rv_JAL_x0(0);                                  // sonst fertig
+        var ctRaus2: int64 := self.codeLen - 4;
+        self.rv_poke32at(ctWeiter, self.rv_buildBtype(0, RV_T1, RV_ZERO, self.codeLen - ctWeiter));
+        self.rv_SRL(RV_A1, RV_A1, RV_T0);                   // x >>= 1
+        self.rv_ADDI(RV_A0, RV_A0, 1);
+        self.rv_JAL_x0(ctL - self.codeLen);
+        var ctEnde: int64 := self.codeLen;
+        self.rv_poke32at(ctRaus1, self.rv_buildBtype(0, RV_A0, RV_T0, ctEnde - ctRaus1));
+        self.rv_poke32at(ctRaus2, self.rv_buildJAL(0, ctEnde - ctRaus2));
+      } else if id == 258 {                                 // bswap64(x)
+        self.rv_LI(RV_A0, 0);
+        self.rv_LI(RV_A2, 8);                               // Zaehler
+        self.rv_LI(RV_T2, 8);                               // Schiebeweite
+        var bsL: int64 := self.codeLen;
+        self.rv_BEQZ_fwd(RV_A2, 0);
+        var bsRaus: int64 := self.codeLen - 4;
+        self.rv_SLL(RV_A0, RV_A0, RV_T2);                   // res <<= 8
+        self.rv_LI(RV_T0, 255);
+        self.rv_AND(RV_T1, RV_A1, RV_T0);                   // t1 = x & 0xFF
+        self.rv_OR(RV_A0, RV_A0, RV_T1);
+        self.rv_SRL(RV_A1, RV_A1, RV_T2);                   // x >>= 8
+        self.rv_ADDI(RV_A2, RV_A2, 0 - 1);
+        self.rv_JAL_x0(bsL - self.codeLen);
+        self.rv_poke32at(bsRaus, self.rv_buildBtype(0, RV_A2, RV_ZERO, self.codeLen - bsRaus));
+      } else if id == 259 || id == 260 {                    // rotl/rotr(x, n)
+        self.rv_LD(RV_A2, RV_FP, self.slotOff(sBase + 1));  // a2 = n
+        self.rv_LI(RV_T0, 63);
+        self.rv_AND(RV_A2, RV_A2, RV_T0);                   // n &= 63
+        self.rv_MV(RV_A0, RV_A1);                           // Vorgabe: unveraendert
+        self.rv_BEQZ_fwd(RV_A2, 0);                         // n == 0 → fertig
+        var roRaus: int64 := self.codeLen - 4;
+        self.rv_LI(RV_T0, 64);
+        self.rv_SUB(RV_T2, RV_T0, RV_A2);                   // t2 = 64 - n
+        if id == 259 {
+          self.rv_SLL(RV_T0, RV_A1, RV_A2);                 // x << n
+          self.rv_SRL(RV_T1, RV_A1, RV_T2);                 // x >>> (64-n)
+        } else {
+          self.rv_SRL(RV_T0, RV_A1, RV_A2);                 // x >>> n
+          self.rv_SLL(RV_T1, RV_A1, RV_T2);                 // x << (64-n)
+        }
+        self.rv_OR(RV_A0, RV_T0, RV_T1);
+        self.rv_poke32at(roRaus, self.rv_buildBtype(0, RV_A2, RV_ZERO, self.codeLen - roRaus));
+      } else if id == 261 || id == 262 {                    // rotl32/rotr32(x, n), #2177
+        // Wie 259/260, nur auf den unteren 32 Bit: x wird null-erweitert,
+        // die Weite modulo 32, und das Ergebnis wieder auf 32 Bit gekuerzt —
+        // dieselben Werte wie rol/ror eax auf x86.
+        self.rv_LI(RV_T0, 32);
+        self.rv_SLL(RV_A1, RV_A1, RV_T0);
+        self.rv_SRL(RV_A1, RV_A1, RV_T0);                   // x &= 0xFFFFFFFF
+        self.rv_LD(RV_A2, RV_FP, self.slotOff(sBase + 1));  // a2 = n
+        self.rv_LI(RV_T0, 31);
+        self.rv_AND(RV_A2, RV_A2, RV_T0);                   // n &= 31
+        self.rv_MV(RV_A0, RV_A1);                           // Vorgabe: unveraendert
+        self.rv_BEQZ_fwd(RV_A2, 0);                         // n == 0 → fertig
+        var r3Raus: int64 := self.codeLen - 4;
+        self.rv_LI(RV_T0, 32);
+        self.rv_SUB(RV_T2, RV_T0, RV_A2);                   // t2 = 32 - n
+        if id == 261 {
+          self.rv_SLL(RV_T0, RV_A1, RV_A2);                 // x << n
+          self.rv_SRL(RV_T1, RV_A1, RV_T2);                 // x >>> (32-n)
+        } else {
+          self.rv_SRL(RV_T0, RV_A1, RV_A2);                 // x >>> n
+          self.rv_SLL(RV_T1, RV_A1, RV_T2);                 // x << (32-n)
+        }
+        self.rv_OR(RV_A0, RV_T0, RV_T1);
+        self.rv_LI(RV_T0, 32);
+        self.rv_SLL(RV_A0, RV_A0, RV_T0);
+        self.rv_SRL(RV_A0, RV_A0, RV_T0);                   // auf 32 Bit kuerzen
+        self.rv_poke32at(r3Raus, self.rv_buildBtype(0, RV_A2, RV_ZERO, self.codeLen - r3Raus));
+      }
+    // #2460: mulhi/umulhi. Anders als die Bit-Rechenwerke darueber steht das
+    // hier NICHT in einer Erweiterung, auf die man verzichten koennte: MULH
+    // und MULHU gehoeren zu M, und M wird in diesem Backend ohnehin
+    // vorausgesetzt (rv_MUL/rv_DIV/rv_REM daneben). Dieselbe Bedeutung wie
+    // `imul rsi`/`mul rsi` auf x86 (codegen_x86.lyx:21171 ff.).
+    } else if id == 569 || id == 570 {
+      self.rv_LD(RV_A1, RV_FP, self.slotOff(sBase));
+      self.rv_LD(RV_A2, RV_FP, self.slotOff(sBase + 1));
+      if id == 569 { self.rv_MULH(RV_A0, RV_A1, RV_A2); }
+      else         { self.rv_MULHU(RV_A0, RV_A1, RV_A2); }
+    } else if id == 206 {
+      // #1388: StrCharAt(s, i) — Byte an Position i, ohne Vorzeichen.
+      self.rv_LD(RV_A1, RV_FP, self.slotOff(sBase));
+      self.rv_LD(RV_A2, RV_FP, self.slotOff(sBase + 1));
+      self.rv_ADD(RV_A1, RV_A1, RV_A2);
+      self.rv_LBU(RV_A0, RV_A1, 0);
+    } else if id == 207 {
+      // #1388: StrSetChar(s, i, c) — Byte an Position i setzen.
+      self.rv_LD(RV_A1, RV_FP, self.slotOff(sBase));
+      self.rv_LD(RV_A2, RV_FP, self.slotOff(sBase + 1));
+      self.rv_LD(RV_T1, RV_FP, self.slotOff(sBase + 2));
+      self.rv_ADD(RV_A1, RV_A1, RV_A2);
+      self.rv_SB(RV_T1, RV_A1, 0);
+      self.rv_LI(RV_A0, 0);
+    } else if id == 8 {
+      // #2037: StrCopy(s) — Kette in frischen Speicher kopieren.
+      //
+      // Das arm64-Backend hat sie laengst; hier fehlte sie. Puffer aus dem
+      // Bump-Block wie bei StrSub (6) und StrConcat (7), #2227.
+      self.rv_LD(RV_A1, RV_FP, self.slotOff(sBase));
+      self.rv_MV(28, RV_A1);                       // t3 = s
+      // Laenge zaehlen
+      self.rv_LI(30, 0);                           // t5 = Laenge
+      var scpL: int64 := self.codeLen;
+      self.rv_ADD(RV_A2, 28, 30);
+      self.rv_LBU(RV_A3, RV_A2, 0);
+      self.rv_BEQZ_fwd(RV_A3, 12);
+      self.rv_ADDI(30, 30, 1);
+      self.rv_JAL_x0(scpL - self.codeLen);
+      // Puffer: Laenge + 16 Reserve
+      self.rv_ADDI(RV_A1, 30, 16);
+      self.rv_bumpAlloc();                         // #2227: a0 = Puffer
+      self.rv_MV(29, RV_A0);                       // t4 = Puffer
+      // Kopieren, Nullbyte eingeschlossen
+      self.rv_LI(31, 0);
+      var scpK: int64 := self.codeLen;
+      self.rv_ADD(RV_A2, 28, 31);
+      self.rv_LBU(RV_A3, RV_A2, 0);
+      self.rv_ADD(RV_A2, 29, 31);
+      self.rv_SB(RV_A3, RV_A2, 0);
+      self.rv_BEQZ_fwd(RV_A3, 12);
+      self.rv_ADDI(31, 31, 1);
+      self.rv_JAL_x0(scpK - self.codeLen);
+      self.rv_MV(RV_A0, 29);
+    } else if id == 10 || id == 11 {
+      // #2037: mem_barrier() / inst_barrier(). riscv hat FENCE; die
+      // Befehlsbarriere ist FENCE.I. arm64 emittiert dafuer DMB SY bzw. ISB SY
+      // — dieselbe Absicht, anderer Befehlssatz.
+      //
+      //   FENCE iorw,iorw = 0x0FF0000F   (alle Zugriffe vor/nach)
+      //   FENCE.I         = 0x0000100F
+      if (id == 10) { self.rv_e32(0x0FF0000F); }
+      if (id == 11) { self.rv_e32(0x0000100F); }
+    } else if id == 14 {
+      // #2037: Zeilenumbruch auf stderr (EPrintStrLn/EPrintLn/panic).
+      //
+      // Ohne sie liess sich KEINE Unit uebersetzen, die `panic` aufruft — das
+      // arm64-Backend hat den Fall seit #1388.
+      //
+      // Das Byte steht im Puffer, den mmap liefert: ein Stapelplatz waere
+      // billiger, aber der Rahmen hier ist nicht dafuer eingerichtet.
+      self.rv_LI(RV_A0, 0);
+      self.rv_LI(RV_A1, 16);
+      self.rv_LI(RV_A2, 3);
+      self.rv_LI(RV_A3, 34);
+      self.rv_LI(RV_A4, 0 - 1);
+      self.rv_LI(RV_A5, 0);
+      self.rv_LI(RV_A7, RV_SYS_MMAP);
+      self.rv_ECALL();
+      self.rv_mmapGeprueft();   // #2144
+      self.rv_MV(28, RV_A0);                       // t3 = Puffer
+      self.rv_LI(RV_A3, 10);                       // '\n'
+      self.rv_SB(RV_A3, 28, 0);
+      self.rv_LI(RV_A0, 2);                        // fd = stderr
+      self.rv_MV(RV_A1, 28);
+      self.rv_LI(RV_A2, 1);
+      self.rv_LI(RV_A7, RV_SYS_WRITE);
+      self.rv_ECALL();
+    } else if (IstLinuxSys(id) != 0) {   // #2122
+      // #2021: Linux-Syscall aus der gemeinsamen Tabelle — dieselbe, die das
+      // arm64-Backend liest. Beide gehen nach der generischen Linux-ABI und
+      // zaehlen gleich; eine zweite Abschrift waere eine Stelle zu viel.
+      var lscN: int64 := LinuxSysArgc(id);
+      var lscB: int64 := sBase;
+      var lscI: int64 := 0;
+      while (lscI < lscN && lscI < 6) {
+        self.rv_LD(RV_A0 + lscI, RV_FP, self.slotOff(lscB + lscI));
+        lscI := lscI + 1;
+      }
+      self.rv_LI(RV_A7, LinuxSysNr(id));
+      self.rv_ECALL();
+    } else if id == 400 || id == 401 || id == 402 {
+      // #1770: fFloor / fCeil / fRound.
+      var rmR: int64 := 0;
+      if (id == 400) { rmR := 2; }
+      if (id == 401) { rmR := 3; }
+      self.emitRundeRV(sBase, rmR);
+    } else if id == 403 {
+      // #1770: FloatToStr(v) — Zeiger auf den Text.
+      self.emitF64ToStrRV(sBase);
+    } else if id == 9 || id == 545 {
+      // #1770: PrintFloat(v) — derselbe Formatierer, danach write(fd, ptr, len).
+      // Die Laenge zaehlt der Code selbst bis zum Nullbyte.
+      //
+      // #2042: EPrintFloat (545) ist derselbe Rumpf mit fd = 2 — eine Kopie,
+      // die sich nur in dieser einen Zahl unterschiede, waere die zweite
+      // Stelle, die man beim naechsten Mal vergisst nachzuziehen.
+      self.emitF64ToStrRV(sBase);
+      self.rv_MV(RV_A1, RV_A0);
+      self.rv_LI(RV_A2, 0);
+      var pfLoop: int64 := self.codeLen;
+      self.rv_ADD(RV_T1, RV_A1, RV_A2);
+      self.rv_LBU(RV_T2, RV_T1, 0);
+      self.rv_BEQZ_fwd(RV_T2, 12);
+      self.rv_ADDI(RV_A2, RV_A2, 1);
+      self.rv_JAL_x0(pfLoop - self.codeLen);
+      var pfFd: int64 := 1;                 // stdout
+      if id == 545 { pfFd := 2; }           // #2042: EPrintFloat -> stderr
+      self.rv_LI(RV_A0, pfFd);
+      self.rv_LI(RV_A7, RV_SYS_WRITE);
+      self.rv_ECALL();
+    } else if id == 210 {
+      // #1764: memcpy(dst, src, len) — byteweise, Rueckgabe ist dst. std/io
+      // baut damit seine Ausgabepuffer zusammen; ohne die ID scheitert schon
+      // `PrintLn`. Ein wortweiser Weg braeuchte eine Ausrichtungspruefung und
+      // brächte hier nichts: die Puffer sind kurz.
+      self.rv_LD(RV_A0, RV_FP, self.slotOff(sBase));         // a0 = dst
+      self.rv_LD(RV_A1, RV_FP, self.slotOff(sBase + 1));     // a1 = src
+      self.rv_LD(RV_A2, RV_FP, self.slotOff(sBase + 2));     // a2 = len
+      self.rv_ADDI(28, RV_ZERO, 0);                          // t3 = 0 (Zaehler)
+      var mcLoop: int64 := self.codeLen;
+      self.rv_SUB(RV_T1, RV_A2, 28);                         // t1 = len - Zaehler
+      // #1842: 28, nicht 24. Der Abstand ist PC-relativ zum BEQZ, und nach ihm
+      // stehen SECHS Befehle (ADD/LBU/ADD/SB/ADDI/JAL) — 24 landete auf dem
+      // JAL, also im Ruecksprung: die Schleife lief endlos. Aufgefallen erst
+      // durch eine AUSFUEHRUNG unter qemu (#1789: "behandelt" ist keine
+      // Aussage ueber "richtig behandelt"); seit #1764 war die ID da, aber
+      // ungemessen.
+      self.rv_BEQZ_fwd(RV_T1, 28);                           // fertig -> hinter den Ruecksprung
+      self.rv_ADD(RV_T1, RV_A1, 28);
+      self.rv_LBU(RV_T2, RV_T1, 0);                          // t2 = src[Zaehler]
+      self.rv_ADD(RV_T1, RV_A0, 28);
+      self.rv_SB(RV_T2, RV_T1, 0);                           // dst[Zaehler] = t2
+      self.rv_ADDI(28, 28, 1);
+      self.rv_JAL_x0(mcLoop - self.codeLen);
+    } else if id == 216 {
+      // #1842: memset(ptr, byte, len) — byteweise, Rueckgabe ist ptr. Dieselbe
+      // Rechnung wie 210 darueber, die beiden muessen uebereinstimmen.
+      self.rv_LD(RV_A0, RV_FP, self.slotOff(sBase));         // a0 = ptr
+      self.rv_LD(RV_A1, RV_FP, self.slotOff(sBase + 1));     // a1 = Bytewert
+      self.rv_LD(RV_A2, RV_FP, self.slotOff(sBase + 2));     // a2 = len
+      self.rv_ADDI(28, RV_ZERO, 0);                          // t3 = 0 (Zaehler)
+      var msLoop: int64 := self.codeLen;
+      self.rv_SUB(RV_T1, RV_A2, 28);                         // t1 = len - Zaehler
+      self.rv_BEQZ_fwd(RV_T1, 20);                           // fertig -> hinter den Ruecksprung (vier Befehle danach)
+      self.rv_ADD(RV_T1, RV_A0, 28);
+      self.rv_SB(RV_A1, RV_T1, 0);                           // ptr[Zaehler] = Bytewert
+      self.rv_ADDI(28, 28, 1);
+      self.rv_JAL_x0(msLoop - self.codeLen);
+    } else if id == 220 {
+      // #1764: open(path, flags, mode). riscv64 kennt kein open — die Nummer
+      // 56 ist dort openat(dirfd, path, flags, mode). Beim #1740-Fix blieb die
+      // ID deshalb bewusst offen statt geraten; hier ist die Umsetzung:
+      // dirfd = AT_FDCWD (-100), damit relative Pfade wie bei open wirken.
+      self.rv_LI(RV_A0, 0 - 100);                            // AT_FDCWD
+      self.rv_LD(RV_A1, RV_FP, self.slotOff(sBase));         // path
+      self.rv_LD(RV_A2, RV_FP, self.slotOff(sBase + 1));     // flags
+      self.rv_LD(RV_A3, RV_FP, self.slotOff(sBase + 2));     // mode
+      self.rv_LI(RV_A7, RV_SYS_OPEN);                        // 56 = openat
+      self.rv_ECALL();
+    } else if id == 17 {
+      // #2110: GetArgC — die argv-Zeiger ab s10 bis zum abschliessenden NULL
+      // zaehlen (argv[argc] ist nach der Linux-ABI NULL). Dieselbe Rechnung
+      // wie im Linux-Zweig von emit_arm64.lyx, die beiden muessen
+      // uebereinstimmen.
+      self.rv_MV(RV_T0, 26);                                 // t0 = argv (s10)
+      self.rv_LI(RV_A0, 0);
+      var gaLoop: int64 := self.codeLen;
+      self.rv_LD(RV_T1, RV_T0, 0);
+      self.rv_BEQZ_fwd(RV_T1, 16);                           // NULL → hinter die Schleife
+      self.rv_ADDI(RV_A0, RV_A0, 1);
+      self.rv_ADDI(RV_T0, RV_T0, 8);
+      self.rv_JAL_x0(gaLoop - self.codeLen);
+    } else if id == 18 {
+      self.rv_MV(RV_A0, 26);                                 // #2110: GetArgV = s10
+    } else if id == 19 {
+      // #2264: GetEnvBlock — 0, wie im Linux-Zweig von emit_arm64.lyx und in
+      // emitNullArg (emit_lyxos.lyx). Unter Linux steht envp als
+      // Zeigervektor hinter argv; bei 0 nehmen std.env und lyx_getEnvVar
+      // genau diesen SysV-Weg. Die drei Stellen muessen uebereinstimmen.
+      self.rv_LI(RV_A0, 0);
+    } else if id == 235 {
+      // #2110: ArgvGet(argv, i) — dieselbe Rechnung wie im Linux-Zweig von
+      // emit_arm64.lyx: argv[i], ein NULL vor dem Index liefert 0.
+      self.rv_LD(RV_T0, RV_FP, self.slotOff(sBase));         // argv
+      self.rv_LD(RV_T1, RV_FP, self.slotOff(sBase + 1));     // i
+      var avLoop: int64 := self.codeLen;
+      self.rv_BEQZ_fwd(RV_T1, 24);                           // i == 0 → nehmen
+      self.rv_LD(RV_T2, RV_T0, 0);
+      self.rv_BEQZ_fwd(RV_T2, 24);                           // NULL → 0
+      self.rv_ADDI(RV_T0, RV_T0, 8);
+      self.rv_ADDI(RV_T1, RV_T1, 0 - 1);
+      self.rv_JAL_x0(avLoop - self.codeLen);
+      self.rv_LD(RV_A0, RV_T0, 0);                           // nehmen
+      self.rv_JAL_x0(8);
+      self.rv_LI(RV_A0, 0);
+    } else if id == 65 {
+      // #2343: getpid -- kein Argument, Ergebnis in a0 (getpid 172).
+      // Dieselbe Rechnung wie im Linux-Zweig von emit_arm64.lyx, die beiden
+      // muessen uebereinstimmen.
+      self.rv_LI(RV_A7, 172);
+      self.rv_ECALL();
+    } else if id == 221 || id == 224 || id == 225 || id == 226 || id == 227 {
+      // #2104: close / rename / unlink / mkdir / exit — dieselbe Rechnung wie
+      // im Linux-Zweig von emit_arm64.lyx, die beiden muessen uebereinstimmen
+      // (generische Linux-ABI: close 57, unlinkat 35, mkdirat 34, renameat2
+      // 276 — riscv64 hat kein renameat —, exit_group 94).
+      if (id == 221 || id == 227) {
+        self.rv_LD(RV_A0, RV_FP, self.slotOff(sBase));       // fd / Code
+        if (id == 221) { self.rv_LI(RV_A7, RV_SYS_CLOSE); }
+        else           { self.rv_LI(RV_A7, 94); }            // exit_group
+      } else if (id == 224) {
+        self.rv_LI(RV_A0, 0 - 100);                          // AT_FDCWD
+        self.rv_LD(RV_A1, RV_FP, self.slotOff(sBase));       // alt
+        self.rv_LI(RV_A2, 0 - 100);                          // AT_FDCWD
+        self.rv_LD(RV_A3, RV_FP, self.slotOff(sBase + 1));   // neu
+        self.rv_LI(RV_A4, 0);                                // flags
+        self.rv_LI(RV_A7, 276);                              // renameat2
+      } else {
+        self.rv_LI(RV_A0, 0 - 100);                          // AT_FDCWD
+        self.rv_LD(RV_A1, RV_FP, self.slotOff(sBase));       // path
+        if (id == 225) {
+          self.rv_LI(RV_A2, 0);                              // flags
+          self.rv_LI(RV_A7, 35);                             // unlinkat
+        } else {
+          self.rv_LD(RV_A2, RV_FP, self.slotOff(sBase + 1)); // mode
+          self.rv_LI(RV_A7, 34);                             // mkdirat
+        }
+      }
+      self.rv_ECALL();
+    } else if id == 222 || id == 223 {
+      // #1740: read(fd, buf, len) / write(fd, buf, len). Ohne sie scheiterte
+      // schon `PrintLn` — laut immerhin, aber eben ohne Ausgabe. Die drei
+      // Argumente stehen ab argBase (ir_lower legt sie dort ab), das Ergebnis
+      // kommt wie ueberall ueber a0 zurueck. `open` bleibt bewusst offen: auf
+      // riscv64 gibt es nur openat(56) mit vier Argumenten, das braucht eine
+      // eigene Umsetzung statt einer geratenen Nummer.
+      self.rv_LD(RV_A0, RV_FP, self.slotOff(sBase));
+      self.rv_LD(RV_A1, RV_FP, self.slotOff(sBase + 1));
+      self.rv_LD(RV_A2, RV_FP, self.slotOff(sBase + 2));
+      if (id == 222) { self.rv_LI(RV_A7, RV_SYS_READ); }
+      if (id == 223) { self.rv_LI(RV_A7, RV_SYS_WRITE); }
+      self.rv_ECALL();
+    } else if id == 228 || id == 231 || id == 232 {
+      // #2260: lseek / pipe / truncate — dieselbe Umsetzung wie im
+      // arm64-Backend (generische Linux-Nummern: lseek 62, truncate 45,
+      // pipe2 59 mit Flags 0); die beiden muessen uebereinstimmen.
+      self.rv_LD(RV_A0, RV_FP, self.slotOff(sBase));
+      if (id == 228) {
+        self.rv_LD(RV_A1, RV_FP, self.slotOff(sBase + 1));
+        self.rv_LD(RV_A2, RV_FP, self.slotOff(sBase + 2));
+        self.rv_LI(RV_A7, 62);
+      } else if (id == 232) {
+        self.rv_LD(RV_A1, RV_FP, self.slotOff(sBase + 1));
+        self.rv_LI(RV_A7, 45);
+      } else {
+        self.rv_LI(RV_A1, 0);
+        self.rv_LI(RV_A7, 59);
+      }
+      self.rv_ECALL();
+    } else if id == 203 || id == 209 || id == 204 || id == 205 {
+      // #1388: poke8/16/32/64 — Adresse und Wert stehen im Argumentblock.
+      // #1740: Hier standen weiterhin die festen Slots 0 und 1, obwohl der
+      // Kommentar am Kopf dieser Methode genau davor warnt und der peek-Zweig
+      // daneben laengst ab argBase liest. poke64 schrieb damit auf die Adresse
+      // aus einem fremden Slot — bei `poke64(alloc(64), x)` auf die 0.
+      self.rv_LD(RV_A1, RV_FP, self.slotOff(sBase));
+      self.rv_LD(RV_A2, RV_FP, self.slotOff(sBase + 1));
+      if (id == 203) { self.rv_SB(RV_A2, RV_A1, 0); }
+      if (id == 209) { self.rv_SH(RV_A2, RV_A1, 0); }
+      if (id == 204) { self.rv_SW(RV_A2, RV_A1, 0); }
+      if (id == 205) { self.rv_SD(RV_A2, RV_A1, 0); }
+      self.rv_LI(RV_A0, 0);
+    } else {
+      // #1388: Bis 1.1.0A gab es hier KEINEN Default. Eine unbekannte
+      // Builtin-ID erzeugte gar nichts, und der Aufruf lieferte, was zufaellig
+      // in a0 stand — derselbe stille Default wie bei den Opcodes in #1339,
+      // nur eine Ebene tiefer und ohne Meldung.
+      self._builtinUnsupportedRV(id);
     }
     self.rv_MV(RV_T0, RV_A0);
     self.rv_storeSlot(dest);
+  }
+
+  fn _builtinUnsupportedRV(id: int64) {
+    EPrintStr("error: riscv: Builtin-ID "c);
+    EPrintInt(id);
+    EPrintStrLn(" wird nicht behandelt"c);
+    EPrintStrLn("  Die IDs sind ein globaler Namensraum ueber alle Backends."c);
+    EPrintStrLn("  Vergabe und Belegung stehen in src/backend/_builtin_ids.md."c);
+    exit(1);
   }
 
   // --------------------------------------------------------------------------
@@ -549,23 +2144,55 @@ pub type EmitRISCV64 = class {
   // --------------------------------------------------------------------------
 
   fn emitFunc(funcId: int64) {
-    if funcId < 256 {
-      poke64(self.funcAddrs + funcId * 8, self.codeLen);
-      self.funcCount := self.funcCount + 1;
+    if funcId >= self.funcCap {
+      EPrintStr("error: riscv: Funktion "c); EPrintInt(funcId);
+      EPrintStrLn(" liegt jenseits der Funktionstabelle (#2112)."c);
+      exit(1);
     }
+    poke64(self.funcAddrs + funcId * 8, self.codeLen);
+    self.funcCount := self.funcCount + 1;
+    // #1740: Anfang von main merken. Der _start-Rumpf sprang fest auf die
+    // ZUERST erzeugte Funktion; stand main nicht an erster Stelle, lief das
+    // Programm in eine fremde Funktion und lieferte deren Wert.
+    if self.isMainFunc(funcId) != 0 { self.mainOff := self.codeLen; }
     self.stackSize  := 0;
     self.labelCount := 0;
-    self.patchCount := 0;
+    // #1740: patchCount wird NICHT zurueckgesetzt. Aufruf-Patches muessen die
+    // Funktion ueberleben, sonst kann der Durchlauf am Ende von emit() die
+    // Vorwaertsaufrufe nicht mehr aufloesen. Aufgeloeste Eintraege sind mit
+    // labelId = -2 markiert und werden uebersprungen.
     var li: int64 := 0;
-    while li < 1024 { poke64(self.labelAddrs + li * 8, -1); li := li + 1; }
+    while li < self.labelCap { poke64(self.labelAddrs + li * 8, -1); li := li + 1; }
+    self.slotRecCur := self._slotRecVon(funcId);   // #2270
     self.calcStackFrame(funcId);
     self.emitPrologue();
+    // #1740: eingehende Argumentregister a0..a7 in die Param-Slots spillen.
+    // Ohne das las ein LOAD_LOCAL eines Parameters uninitialisierten Stapel —
+    // `alloc(size)` bekam seine Groesse also nie zu sehen. Die Parameter
+    // liegen hinter dem Kratzstreifen (IR_BARG_SLOTS), wie bei arm64 (#1388).
+    var pSpillCount: int64 := peek64(peek64(self.ir + 80) + funcId * 80 + 40);
+    var pSpillI: int64 := 0;
+    while pSpillI < pSpillCount {
+      if pSpillI < 8 {
+        self.rv_SD(RV_A0 + pSpillI, RV_FP, self.slotOff(IR_BARG_SLOTS + pSpillI));
+      } else {
+        // #2132: Parameter ab dem neunten liegen nach dem RISC-V-psABI beim
+        // Aufrufer auf dem Stapel, 8-Byte-Plaetze ab dessen sp — hier
+        // [s0+32], ueber dem geretteten s0/ra/s11 (#2140). Bis 1.2.15A
+        // blieben diese Slots unbeschrieben.
+        self.rv_LD(RV_T0, RV_FP, 32 + (pSpillI - 8) * 8);
+        self.rv_SD(RV_T0, RV_FP, self.slotOff(IR_BARG_SLOTS + pSpillI));
+      }
+      pSpillI := pSpillI + 1;
+    }
     var instrStart: int64 := self.getFuncInstrStart(funcId);
     var instrCount: int64 := self.getFuncInstrCount(funcId);
     var i: int64 := 0;
     while i < instrCount { self.emitInstr(funcId, instrStart + i); i := i + 1; }
     self.emitEpilogue();
     self.applyPatches();
+    self.rv_checkNoOpenPatches(1);   // #2112
+    self.slotRecCur := 0;   // #2270: ausserhalb einer Funktion keine Abbildung
   }
 
   // --------------------------------------------------------------------------
@@ -574,22 +2201,80 @@ pub type EmitRISCV64 = class {
 
   pub fn init(irMod: int64) {
     self.ir         := irMod;
+    self.bumpGIdx   := -1;
     self.codeBuf    := alloc(131072);
     self.codeCap    := 131072;
     self.codeLen    := 0;
     self.stackSize  := 0;
-    self.labelAddrs := alloc(1024 * 8);
+    self.labelCap   := 1024;
+    self.labelAddrs := alloc(self.labelCap * 8);
     self.labelCount := 0;
     self.patchBuf   := alloc(1024 * 32);
+    self.patchCap   := 1024;
     self.patchCount := 0;
-    self.funcAddrs  := alloc(256 * 8);
+    // #2112: war fest 256 — die 257. Funktion bekam keine Adresse, jeder
+    // Aufruf dorthin blieb auf dem Platzhalter (Selbstaufruf).
+    self.funcCap    := self.getFuncCount() + 1;
+    if self.funcCap < 256 { self.funcCap := 256; }
+    self.funcAddrs  := alloc(self.funcCap * 8);
+    var rvFa: int64 := 0;
+    while rvFa < self.funcCap { poke64(self.funcAddrs + rvFa * 8, 0 - 1); rvFa := rvFa + 1; }   // #2451
     self.funcCount  := 0;
+    self.globRelocBuf   := alloc(256 * 16);
+    self.globRelocCap   := 256;
+    self.globRelocCount := 0;
+    self.globalsOff     := -1;
+    self.mainOff        := -1;
+    self.extCap        := 16;
+    self.extBuf        := alloc(self.extCap * 32);
+    self.extCount      := 0;
+    self.gotRelocCap   := 64;
+    self.gotRelocBuf   := alloc(self.gotRelocCap * 16);
+    self.gotRelocCount := 0;
+    self.gotOff        := -1;
+    self.dynStartOff   := -1;
+    self.noLibcInit    := 0;
+    self.lebendBuf     := 0;   // #2451
+    self.isShared      := 0;
+    self.soHuCap       := 8;
+    self.soHuTab       := alloc(self.soHuCap * 24);
+    self.soHuCount     := 0;
   }
 
   pub fn emit(): int64 {
     var n: int64 := self.getFuncCount();
     var i: int64 := 0;
-    while i < n { self.emitFunc(i); i := i + 1; }
+    // #2451: Unerreichbares nicht emittieren -- dieselbe Rechnung wie im
+    // arm64-Zweig (IrErreichbare in src/ir.lyx), damit beide IR-Ziele dasselbe
+    // Erzeugnis tragen. Uebersprungen wird die EMISSION, nicht der Platz in
+    // der Tabelle: Indizes und Relokationen bleiben, und ein uebersehener
+    // Aufruf bleibt als offener Patch stehen und scheitert laut.
+    while i < n {
+      var tot: int64 := 0;
+      if (self.lebendBuf != 0 && peek8(self.lebendBuf + i) == 0) { tot := 1; }
+      if tot == 0 { self.emitFunc(i); }
+      i := i + 1;
+    }
+    // #1740: jetzt steht jede Funktionsadresse fest — offene Vorwaertsaufrufe
+    // aufloesen.
+    // #2162: mit FFI startet main ueber __libc_start_main (wie arm64, WP-A5),
+    // damit libc initialisiert ist und exit() die stdio-Puffer leert. Der
+    // Startweg steht hinter den Funktionen; sein Aufruf von main wird mit
+    // den anderen aufgeloest.
+    if self.extCount > 0 && self.noLibcInit == 0 && self.isShared == 0 { self.rv_emitLibcStart(); }
+    // #2162: Huellen der .so-Exporte mit Gleitkomma — hinter dem Code, vor
+    // den Daten; ihr Aufruf der Lyx-Funktion wird mit den anderen aufgeloest.
+    var hu: int64 := 0;
+    while hu < self.soHuCount {
+      var hr: int64 := self.soHuTab + hu * 24;
+      var hs: int64 := peek64(hr + 8);
+      poke64(hr + 16, self.rv_emitSoHuelle(peek64(hr), hs & 255, (hs >> 8) & 65535, (hs >> 32) & 3));
+      hu := hu + 1;
+    }
+    self.applyPatches();
+    self.rv_checkNoOpenPatches(0);   // #2112
+    self.emitGlobalsPool();
+    self.applyGlobalRelocs();
     return self.codeLen;
   }
 
@@ -635,6 +2320,707 @@ pub type EmitRISCV64 = class {
   fn getInstrSrc1(absIdx: int64): int64  { return self.getInstrField(absIdx, 16); }
   fn getInstrSrc2(absIdx: int64): int64  { return self.getInstrField(absIdx, 24); }
   fn getInstrImmInt(absIdx: int64): int64 { return self.getInstrField(absIdx, 40); }
+
+  // --------------------------------------------------------------------------
+  // #1740: globale Variablen
+  //
+  // Die Methoden stehen am ENDE der Klasse: neue Eintraege weiter oben wuerden
+  // die VMT verschieben und den Seed brechen (dieselbe Falle wie im
+  // lyxos-Backend).
+  // --------------------------------------------------------------------------
+
+  // t2 := Adresse von global[gIdx]  —  AUIPC t2, 0 / ADDI t2, t2, 0, beide
+  // Haelften spaeter von applyGlobalRelocs nachgetragen.
+  fn emitGlobalAddr(gIdx: int64) {
+    self.recordGlobalReloc(self.codeLen, gIdx);
+    self.rv_e32(0x17 | (RV_T2 << 7));                 // AUIPC t2, 0
+    self.rv_ADDI(RV_T2, RV_T2, 0);                     // ADDI  t2, t2, 0
+  }
+
+  fn recordGlobalReloc(codeOff: int64, gIdx: int64) {
+    if self.globRelocCount >= self.globRelocCap {
+      var nc: int64 := self.globRelocCap * 2;
+      var nb: int64 := alloc(nc * 16);
+      var ci: int64 := 0;
+      while ci < self.globRelocCount * 2 {
+        poke64(nb + ci * 8, peek64(self.globRelocBuf + ci * 8));
+        ci := ci + 1;
+      }
+      self.globRelocBuf := nb;
+      self.globRelocCap := nc;
+    }
+    var rec: int64 := self.globRelocBuf + self.globRelocCount * 16;
+    poke64(rec + 0, codeOff);
+    poke64(rec + 8, gIdx);
+    self.globRelocCount := self.globRelocCount + 1;
+  }
+
+  // Haengt den Datenbereich hinter den Code: acht Byte je globaler Variable,
+  // vorbelegt mit ihrem Initialwert. Davor wird so weit aufgefuellt, dass der
+  // Bereich im fertigen Abbild auf einer Seitengrenze beginnt — nur dann
+  // koennen Code (r-x) und Daten (rw-) getrennte Segmente werden.
+  fn emitGlobalsPool() {
+    while ((self.codeLen + RV_START_STUB_LEN) % 4096) != 0 { self.rv_e8(0); }
+    self.globalsOff := self.codeLen;
+    var gCount: int64 := peek64(self.ir + IR_MOD_OFF_GLOBALLEN);
+    var gBuf:   int64 := peek64(self.ir + IR_MOD_OFF_GLOBALBUF);
+    var gi: int64 := 0;
+    while gi < gCount {
+      var v: int64 := 0;
+      if gBuf != 0 { v := peek64(gBuf + gi * 8); }
+      self.rv_e32(v & 0xFFFFFFFF);
+      self.rv_e32((v >> 32) & 0xFFFFFFFF);
+      gi := gi + 1;
+    }
+    // #2162: GOT — je FFI-Symbol acht Byte, die der Lader ueber R_RISCV_64
+    // fuellt. Im beschreibbaren Segment, nicht im Code.
+    if self.extCount > 0 {
+      self.gotOff := self.codeLen;
+      var ge: int64 := 0;
+      while ge < self.extCount { self.rv_e32(0); self.rv_e32(0); ge := ge + 1; }
+    }
+  }
+
+  // AUIPC traegt die oberen 20 Bit, ADDI die unteren 12 — und weil ADDI sein
+  // Immediate vorzeichenbehaftet addiert, muss der obere Teil aufgerundet
+  // werden, sobald Bit 11 gesetzt ist.
+  fn applyGlobalRelocs() {
+    var i: int64 := 0;
+    while i < self.globRelocCount {
+      var rec:     int64 := self.globRelocBuf + i * 16;
+      var codeOff: int64 := peek64(rec + 0);
+      var gIdx:    int64 := peek64(rec + 8);
+      var target:  int64 := self.globalsOff + gIdx * 8;
+      var delta:   int64 := target - codeOff;
+      var hi:      int64 := (delta + 0x800) >> 12;
+      var lo:      int64 := delta - (hi << 12);
+      self.rv_poke32at(codeOff, 0x17 | (RV_T2 << 7) | ((hi & 0xFFFFF) << 12));
+      self.rv_poke32at(codeOff + 4, 0x13 | (RV_T2 << 7) | (RV_T2 << 15) | ((lo & 0xFFF) << 20));
+      i := i + 1;
+    }
+    // #2162: GOT-Ladebefehle — AUIPC t1 / LD t1, dieselbe Teilung.
+    var gk: int64 := 0;
+    while gk < self.gotRelocCount {
+      var grec:  int64 := self.gotRelocBuf + gk * 16;
+      var gcOff: int64 := peek64(grec + 0);
+      var gDelta: int64 := self.gotOff + peek64(grec + 8) * 8 - gcOff;
+      var gHi: int64 := (gDelta + 0x800) >> 12;
+      var gLo: int64 := gDelta - (gHi << 12);
+      self.rv_poke32at(gcOff, 0x17 | (RV_T1 << 7) | ((gHi & 0xFFFFF) << 12));
+      self.rv_poke32at(gcOff + 4, 0x03 | (RV_T1 << 7) | (3 << 12) | (RV_T1 << 15) | ((gLo & 0xFFF) << 20));
+      gk := gk + 1;
+    }
+  }
+
+  // #2227: a0 := Puffer mit a1 Byte aus dem Bump-Block. Dieselbe Rechnung wie
+  // cg_emitBumpAtomarIn (src/codegen_x86.lyx) und emitBumpAlloc im
+  // arm64-Backend — die drei muessen uebereinstimmen: Zeiger/Ende als zwei
+  // Modulvariablen, Bloecke von 64 KiB oder der Anforderung auf Seiten
+  // aufgerundet, mmap geprueft (#2144). Vorher ein mmap je StrConcat/StrSub/
+  // IntToStr — eine Seite, ein Mapping, nie freigegeben.
+  //
+  // NICHT atomar: das Backend kennt keine Threads. Kommen sie dazu, braucht
+  // der schnelle Weg LR/SC und der langsame eine Sperre.
+  //
+  // Register: nur a0-a7, t0, t1, t2. StrConcat und StrSub halten t3-t6 ueber
+  // die Anforderung hinweg. a1 ist danach die auf 16 aufgerundete Groesse.
+  fn rv_bumpAlloc() {
+    if self.bumpGIdx < 0 { self.bumpGIdx := _irGlobalsAnhaengen(self.ir, 2); }
+    self.rv_ADDI(RV_A1, RV_A1, 15);
+    self.rv_e32(0x13 | (RV_A1 << 7) | (7 << 12) | (RV_A1 << 15) | ((0 - 16) & 0xFFF) << 20);   // ANDI a1, a1, -16
+    self.emitGlobalAddr(self.bumpGIdx);           // t2 = &Zeiger, t2+8 = &Ende
+    self.rv_LD(RV_A0, RV_T2, 0);
+    self.rv_LD(RV_A2, RV_T2, 8);
+    self.rv_ADD(RV_A3, RV_A0, RV_A1);
+    self.rv_Bcond(6, RV_A2, RV_A3, 12);           // BLTU Ende, neu -> langsam
+    self.rv_SD(RV_A3, RV_T2, 0);
+    var pFertig: int64 := self.codeLen;
+    self.rv_JAL_x0(0);                            // -> fertig (nachgetragen)
+    // langsam: t1 = max(64 KiB, Groesse auf Seiten aufgerundet)
+    self.rv_LI64(RV_T0, 4095);
+    self.rv_ADD(RV_T1, RV_A1, RV_T0);
+    self.rv_e32(0x13 | (RV_T1 << 7) | (5 << 12) | (RV_T1 << 15) | (12 << 20));   // SRLI t1, t1, 12
+    self.rv_SLLI(RV_T1, RV_T1, 12);
+    self.rv_LI64(RV_T0, 65536);
+    self.rv_Bcond(7, RV_T1, RV_T0, 8);            // BGEU t1, t0 -> behalten
+    self.rv_MV(RV_T1, RV_T0);
+    self.rv_MV(RV_A6, RV_A1);                     // Groesse; ECALL laesst a1..a7, t* stehen
+    self.rv_LI(RV_A0, 0);
+    self.rv_MV(RV_A1, RV_T1);
+    self.rv_LI(RV_A2, 3);
+    self.rv_LI(RV_A3, 34);
+    self.rv_LI(RV_A4, 0 - 1);
+    self.rv_LI(RV_A5, 0);
+    self.rv_LI(RV_A7, RV_SYS_MMAP);
+    self.rv_ECALL();
+    self.rv_mmapGeprueft();
+    self.rv_ADD(RV_A2, RV_A0, RV_T1);
+    self.rv_SD(RV_A2, RV_T2, 8);                  // Ende
+    self.rv_ADD(RV_A3, RV_A0, RV_A6);
+    self.rv_SD(RV_A3, RV_T2, 0);                  // Zeiger
+    var rel: int64 := self.codeLen - pFertig;
+    var b20:    int64 := (rel >> 20) & 0x1;
+    var b10_1:  int64 := (rel >> 1)  & 0x3FF;
+    var b11:    int64 := (rel >> 11) & 0x1;
+    var b19_12: int64 := (rel >> 12) & 0xFF;
+    self.rv_poke32at(pFertig, 0x6F | (b19_12 << 12) | (b11 << 20) | (b10_1 << 21) | (b20 << 31));
+  }
+
+  // Code-Offset des Datenbereichs — der ELF-Schreiber trennt daran die
+  // Segmente. -1, solange emit() nicht gelaufen ist.
+  pub fn getGlobalsOff(): int64 { return self.globalsOff; }
+
+  // #1740: heisst die Funktion "main"? Der Name steht als Offset in den
+  // String-Pool des IR-Moduls (Feldpaar nameOff/nameLen im Funktionssatz).
+  fn isMainFunc(funcId: int64): int64 {
+    var funcBuf: int64 := peek64(self.ir + 80);
+    var rec:     int64 := funcBuf + funcId * IR_FUNC_SIZE;
+    var nameLen: int64 := peek64(rec + IR_FUNC_OFF_NAMELEN);
+    if nameLen != 4 { return 0; }
+    var strBufR: int64 := peek64(self.ir + 32);
+    var p:       int64 := strBufR + peek64(rec + 0);
+    if peek8(p + 0) != 109 { return 0; }   // 'm'
+    if peek8(p + 1) != 97  { return 0; }   // 'a'
+    if peek8(p + 2) != 105 { return 0; }   // 'i'
+    if peek8(p + 3) != 110 { return 0; }   // 'n'
+    return 1;
+  }
+
+  // Code-Offset von main; -1, wenn das Modul keines hat.
+  pub fn getMainOff(): int64 {
+    if self.dynStartOff >= 0 { return self.dynStartOff; }   // #2162: _start springt in den libc-Startweg
+    return self.mainOff;
+  }
+
+  // --------------------------------------------------------------------------
+  // #1764: Gleitkomma (D-Erweiterung). Auch diese Methoden stehen am ENDE der
+  // Klasse, damit die VMT sich nicht verschiebt.
+  // --------------------------------------------------------------------------
+
+  // FLD frd, off(rs1)  — 64-Bit-Ladebefehl, I-Type, funct3=3, opcode=0x07
+  fn rv_FLD(frd: int64, rs1: int64, off: int64) {
+    if self._rvPasst12(off) == 0 { self._rvWeit(rs1, off); self.rv_FLD(frd, RV_WEIT, 0); return; }   // #2061
+    self.rv_e32(0x07 | (frd<<7) | (3<<12) | (rs1<<15) | ((off & 0xFFF)<<20));
+  }
+
+  // FSD frs2, off(rs1) — 64-Bit-Speicherbefehl, S-Type, funct3=3, opcode=0x27
+  fn rv_FSD(frs2: int64, rs1: int64, off: int64) {
+    if self._rvPasst12(off) == 0 { self._rvWeit(rs1, off); self.rv_FSD(frs2, RV_WEIT, 0); return; }   // #2061
+    var imm5: int64 := off & 0x1F;
+    var imm7: int64 := ((off & 0xFFF) >> 5) & 0x7F;
+    self.rv_e32(0x27 | (imm5<<7) | (3<<12) | (rs1<<15) | (frs2<<20) | (imm7<<25));
+  }
+
+  // Zweistellige Gleitkomma-Rechnung: FADD.D/FSUB.D/FMUL.D/FDIV.D.
+  // Rundungsart 0 (RNE) steht fest im Befehl — die dynamische Art (7) haengt am
+  // fcsr, und den setzt hier niemand.
+  fn rv_FOP_D(funct7: int64, frd: int64, frs1: int64, frs2: int64) {
+    self.rv_e32(0x53 | (frd<<7) | (0<<12) | (frs1<<15) | (frs2<<20) | (funct7<<25));
+  }
+
+  // Vergleich: funct3 wählt FLE(0) / FLT(1) / FEQ(2); das Ergebnis (0 oder 1)
+  // geht in ein Ganzzahl-Register.
+  fn rv_FCMP_D(funct3: int64, rd: int64, frs1: int64, frs2: int64) {
+    self.rv_e32(0x53 | (rd<<7) | (funct3<<12) | (frs1<<15) | (frs2<<20) | (0x51<<25));
+  }
+
+  // FCVT.D.L frd, rs1 — vorzeichenbehaftete 64-Bit-Zahl nach double (rs2=2).
+  fn rv_FCVT_D_L(frd: int64, rs1: int64) {
+    self.rv_e32(0x53 | (frd<<7) | (0<<12) | (rs1<<15) | (2<<20) | (0x69<<25));
+  }
+
+  // FCVT.L.D rd, frs1 — double nach 64-Bit-Zahl, Rundungsart 1 (RTZ), also
+  // abschneiden wie in C und wie auf x86-64 (cvttsd2si).
+  fn rv_FCVT_L_D(rd: int64, frs1: int64) {
+    self.rv_e32(0x53 | (rd<<7) | (1<<12) | (frs1<<15) | (2<<20) | (0x61<<25));
+  }
+
+  // #1764: Der Codepuffer war fest 128 KB gross und wurde nie geprueft. Ein
+  // groesseres Programm schrieb einfach darueber hinaus — Heap-Korruption, und
+  // der Uebersetzer starb an einer Stelle, die mit der Ursache nichts zu tun
+  // hatte. Aufgefallen ist es, als `PrintLn` samt std/io endlich uebersetzte
+  // und das Erzeugnis die Grenze riss.
+  // #1770: FMV.D.X frd, rs1 — Bitmuster aus einem Ganzzahlregister in ein
+  // Gleitkommaregister, ohne Umrechnung (funct7 = 0x79, rs2 = 0).
+  fn rv_FMV_D_X(frd: int64, rs1: int64) {
+    self.rv_e32(0x53 | (frd<<7) | (0<<12) | (rs1<<15) | (0<<20) | (0x79<<25));
+  }
+
+  // #1770: FMV.X.D rd, frs1 — Bitmuster aus einem Gleitkommaregister zurueck
+  // in ein Ganzzahlregister (funct7 = 0x71, rs2 = 0).
+  fn rv_FMV_X_D(rd: int64, frs1: int64) {
+    self.rv_e32(0x53 | (rd<<7) | (0<<12) | (frs1<<15) | (0<<20) | (0x71<<25));
+  }
+
+  // #1770: FCVT.L.D mit waehlbarer Rundungsart (0 = zur naechsten geraden,
+  // 1 = abschneiden, 2 = abwaerts, 3 = aufwaerts).
+  fn rv_FCVT_L_D_rm(rd: int64, frs1: int64, rm: int64) {
+    self.rv_e32(0x53 | (rd<<7) | (rm<<12) | (frs1<<15) | (2<<20) | (0x61<<25));
+  }
+
+  // #1770: fFloor / fCeil / fRound. x86 hat dafuer `roundsd`; RV64GC hat
+  // keinen Befehl, der einen double auf einen ganzen double rundet, also geht
+  // der Weg ueber die Ganzzahl: FCVT.L.D mit der passenden Rundungsart und
+  // zurueck mit FCVT.D.L.
+  //
+  // Werte jenseits von 2^63 passen in keine Ganzzahl — FCVT.L.D liefert dann
+  // 0x8000000000000000. Solche Werte sind ohnehin ganzzahlig, also kommt das
+  // Bitmuster unveraendert zurueck. Ohne diese Abfrage waere aus einer sehr
+  // grossen Zahl still die kleinste negative geworden.
+  //
+  // rm: 2 = abwaerts (fFloor), 3 = aufwaerts (fCeil), 0 = zur naechsten
+  // geraden Zahl (fRound — dasselbe wie roundsd-Modus 0 auf dem x86-Weg,
+  // 2.5 wird dort zu 2.0 und -2.5 zu -2.0).
+  fn emitRundeRV(bitsSlot: int64, rm: int64) {
+    self.rv_LD(28, RV_FP, self.slotOff(bitsSlot));   // t3 = Bitmuster
+    self.rv_FMV_D_X(0, 28);
+    self.rv_FCVT_L_D_rm(30, 0, rm);                  // t5 = gerundete Ganzzahl
+    self.rv_LI64(31, 0 - 9223372036854775807 - 1);   // 0x8000000000000000
+    self.rv_XOR(RV_T2, 30, 31);
+    var bPasst: int64 := self.codeLen; self.rv_e32(0);
+    self.rv_MV(RV_A0, 28);                           // passt nicht → unveraendert
+    var jEnde: int64 := self.codeLen; self.rv_e32(0);
+    var lPasst: int64 := self.codeLen;
+    self.rv_FCVT_D_L(1, 30);
+    self.rv_FMV_X_D(RV_A0, 1);
+    var lEnde: int64 := self.codeLen;
+    self.rv_poke32at(bPasst, self.rv_buildBtype(1, RV_T2, RV_ZERO, lPasst - bPasst));
+    self.rv_poke32at(jEnde,  self.rv_buildJAL(0, lEnde - jEnde));
+  }
+
+  // #1770: Ziffern einer nichtnegativen Zahl in den Puffer schreiben.
+  // reg = Wert, ptrReg = Schreibmarke (wird weitergezaehlt), stellen = feste
+  // Stellenzahl mit fuehrenden Nullen, oder 0 fuer „so viele wie noetig".
+  // Gerechnet wird ueber einen absteigenden Teiler; das kommt ohne zweiten
+  // Puffer aus, in den man rueckwaerts schreiben muesste.
+  fn emitZiffern(reg: int64, ptrReg: int64, stellen: int64) {
+    // t1 = Teiler
+    if stellen > 0 {
+      var teiler: int64 := 1;
+      var si: int64 := 1;
+      while si < stellen { teiler := teiler * 10; si := si + 1; }
+      self.rv_LI64(RV_T1, teiler);
+    } else {
+      self.rv_ADDI(RV_T1, RV_ZERO, 1);
+      // solange Wert / Teiler >= 10: Teiler mal zehn
+      var gLoop: int64 := self.codeLen;
+      self.rv_DIV(RV_T2, reg, RV_T1);
+      self.rv_ADDI(RV_T0, RV_ZERO, 10);
+      self.rv_SLT(RV_T2, RV_T2, RV_T0);      // t2 = (Wert/Teiler < 10)
+      self.rv_BEQZ_fwd(RV_T2, 8);            // noch zu gross → weiter vergroessern
+      // Ausstieg: das Ziel wird NACHGETRAGEN. Von Hand gezaehlt stand hier 12,
+      // also der Ruecksprung selbst statt der Befehl dahinter — die Schleife
+      // lief endlos. Gezaehlte Sprungweiten sind in diesem Backend generell
+      // die falsche Technik (rv_LI64 allein erzeugt zwei oder elf Befehle).
+      var gRaus: int64 := self.codeLen; self.rv_e32(0);
+      self.rv_ADDI(RV_T0, RV_ZERO, 10);
+      self.rv_MUL(RV_T1, RV_T1, RV_T0);
+      self.rv_JAL_x0(gLoop - self.codeLen);
+      self.rv_poke32at(gRaus, self.rv_buildJAL(0, self.codeLen - gRaus));
+    }
+    // Ausgabeschleife: Ziffer = (Wert / Teiler) % 10
+    var zLoop: int64 := self.codeLen;
+    self.rv_DIV(RV_T2, reg, RV_T1);
+    self.rv_ADDI(RV_T0, RV_ZERO, 10);
+    self.rv_REM(RV_T2, RV_T2, RV_T0);
+    self.rv_ADDI(RV_T2, RV_T2, 48);          // '0'
+    self.rv_SB(RV_T2, ptrReg, 0);
+    self.rv_ADDI(ptrReg, ptrReg, 1);
+    self.rv_ADDI(RV_T0, RV_ZERO, 10);
+    self.rv_DIV(RV_T1, RV_T1, RV_T0);        // Teiler /= 10
+    self.rv_BEQZ_fwd(RV_T1, 8);              // Teiler 0 → fertig
+    self.rv_JAL_x0(zLoop - self.codeLen);
+  }
+
+  // #1770: f64 als Text in einen frischen Puffer; Zeiger nach a0.
+  //
+  // Format wie auf dem x86-Weg: Vorzeichen, ganzer Teil, Punkt, GENAU sechs
+  // Nachkommastellen, abgeschnitten statt gerundet (2.675 wird dort zu
+  // 2.674999, weil die Zahl selbst schon darunter liegt). nan und inf werden
+  // an den Bits erkannt, ein zu grosser Wert meldet sich als "overflow" statt
+  // eine Zahl zu erfinden — dieselbe Entscheidung wie im lyxos-Backend.
+  //
+  // Alle Spruenge werden NACHGETRAGEN statt mit gezaehlten Weiten emittiert:
+  // rv_LI64 erzeugt je nach Wert zwei oder elf Befehle, eine von Hand
+  // gezaehlte Weite ist also von vornherein falsch.
+  //
+  // Register: a0 = Puffer, t3 = Bits, t4 = Schreibmarke, t5/t6 = Rechenwerte.
+  fn emitF64ToStrRV(bitsSlot: int64) {
+    // Puffer: 48 Byte aus dem Bump-Block (#2227, vorher ein mmap je Aufruf)
+    self.rv_LI(RV_A1, 48);
+    self.rv_bumpAlloc();
+    self.rv_MV(29, RV_A0);                       // t4 = Schreibmarke
+    self.rv_LD(28, RV_FP, self.slotOff(bitsSlot));   // t3 = Bitmuster
+
+    // Sonderfaelle: nach dem Verdoppeln faellt das Vorzeichen heraus.
+    // 0xFFE0000000000000 ist unendlich, alles darueber ist NaN.
+    self.rv_ADD(30, 28, 28);                     // t5 = Bits * 2
+    self.rv_LI64(31, 0 - 9007199254740992);      // t6 = 0xFFE0000000000000
+    self.rv_SLTU(RV_T2, 31, 30);                 // t2 = (t6 < t5) → NaN
+    var bKeinNan: int64 := self.codeLen; self.rv_e32(0);
+    self.rv_LI64(RV_T0, 7233902);                // 'n','a','n',0
+    self.rv_SW(RV_T0, 29, 0);
+    self.rv_ADDI(29, 29, 3);
+    var jNanEnde: int64 := self.codeLen; self.rv_e32(0);
+
+    var lKeinNan: int64 := self.codeLen;
+    self.rv_XOR(RV_T2, 30, 31);                  // gleich → unendlich
+    var bKeinInf: int64 := self.codeLen; self.rv_e32(0);   // BNE waere umgekehrt: hier BEQ auf t2
+    self.rv_LI64(RV_T0, 6712937);                // 'i','n','f',0
+    self.rv_SW(RV_T0, 29, 0);
+    self.rv_ADDI(29, 29, 3);
+    var jInfEnde: int64 := self.codeLen; self.rv_e32(0);
+
+    // Endlicher Wert. f0 = Zahl, f1 = 0.0
+    var lZahl: int64 := self.codeLen;
+    self.rv_FMV_D_X(0, 28);
+    self.rv_FMV_D_X(1, RV_ZERO);
+    self.rv_FCMP_D(1, RV_T2, 0, 1);              // t2 = (f0 < 0.0)
+    var bNichtNeg: int64 := self.codeLen; self.rv_e32(0);
+    self.rv_ADDI(RV_T0, RV_ZERO, 45);            // '-'
+    self.rv_SB(RV_T0, 29, 0);
+    self.rv_ADDI(29, 29, 1);
+    self.rv_e32(0x53 | (0 << 7) | (1 << 12) | (0 << 15) | (0 << 20) | (0x11 << 25));  // FSGNJN.D f0,f0,f0
+
+    // Traegt eine 64-Bit-Zahl den ganzen Teil? 0x8000000000000000 heisst nein.
+    var lPositiv: int64 := self.codeLen;
+    self.rv_FCVT_L_D(30, 0);                     // t5 = (int64) f0, abgeschnitten
+    self.rv_LI64(31, 0 - 9223372036854775807 - 1);
+    self.rv_XOR(RV_T2, 30, 31);
+    var bPasst: int64 := self.codeLen; self.rv_e32(0);   // t2 == 0 → passt NICHT
+    self.rv_LI64(RV_T0, 1919252079);             // 'o','v','e','r'
+    self.rv_SW(RV_T0, 29, 0);
+    self.rv_LI64(RV_T0, 2003790950);             // 'f','l','o','w'
+    self.rv_SW(RV_T0, 29, 4);
+    self.rv_ADDI(29, 29, 8);
+    var jBigEnde: int64 := self.codeLen; self.rv_e32(0);
+
+    // Ganzer Teil, Punkt, sechs Nachkommastellen.
+    var lZiffern: int64 := self.codeLen;
+    self.emitZiffern(30, 29, 0);
+    self.rv_ADDI(RV_T0, RV_ZERO, 46);            // '.'
+    self.rv_SB(RV_T0, 29, 0);
+    self.rv_ADDI(29, 29, 1);
+    self.rv_FCVT_D_L(1, 30);                     // f1 = (double) ganzer Teil
+    self.rv_FOP_D(0x05, 0, 0, 1);                // f0 = f0 - f1
+    self.rv_LI64(RV_T0, 4696837146684686336);    // 1e6 als IEEE-754
+    self.rv_FMV_D_X(1, RV_T0);
+    self.rv_FOP_D(0x09, 0, 0, 1);                // f0 = f0 * 1e6
+    self.rv_FCVT_L_D(30, 0);                     // t5 = Nachkommastellen
+    self.emitZiffern(30, 29, 6);
+
+    // ende: Nullbyte. a0 zeigt noch auf den Pufferanfang.
+    var lEnde: int64 := self.codeLen;
+    self.rv_SB(RV_ZERO, 29, 0);
+
+    // Spruenge nachtragen. BEQ t2, x0 springt, wenn die Bedingung NICHT gilt.
+    self.rv_poke32at(bKeinNan,  self.rv_buildBtype(0, RV_T2, RV_ZERO, lKeinNan - bKeinNan));
+    self.rv_poke32at(bKeinInf,  self.rv_buildBtype(1, RV_T2, RV_ZERO, lZahl - bKeinInf));
+    self.rv_poke32at(bNichtNeg, self.rv_buildBtype(0, RV_T2, RV_ZERO, lPositiv - bNichtNeg));
+    self.rv_poke32at(bPasst,    self.rv_buildBtype(1, RV_T2, RV_ZERO, lZiffern - bPasst));
+    self.rv_poke32at(jNanEnde,  self.rv_buildJAL(0, lEnde - jNanEnde));
+    self.rv_poke32at(jInfEnde,  self.rv_buildJAL(0, lEnde - jInfEnde));
+    self.rv_poke32at(jBigEnde,  self.rv_buildJAL(0, lEnde - jBigEnde));
+  }
+
+  // #2151: rv_SLTU stand hier ein zweites Mal (gleicher Befehl wie oben).
+
+  fn growCode(need: int64) {
+    if (self.codeLen + need) <= self.codeCap { return; }
+    var nc: int64 := self.codeCap * 2;
+    while (self.codeLen + need) > nc { nc := nc * 2; }
+    var nb: int64 := alloc(nc);
+    var i: int64 := 0;
+    while i < self.codeLen { poke8(nb + i, peek8(self.codeBuf + i)); i := i + 1; }
+    self.codeBuf := nb;
+    self.codeCap := nc;
+  }
+
+  // #2061: 1, wenn v in einen vorzeichenbehafteten Zwoelf-Bit-Direktwert passt.
+  fn _rvPasst12(v: int64): int64 {
+    if v >= 0 - 2048 && v <= 2047 { return 1; }
+    return 0;
+  }
+
+  // #2061: RV_WEIT := rs1 + off, fuer Versaetze ausserhalb von zwoelf Bit.
+  // Danach wird mit `…, 0(RV_WEIT)` zugegriffen. Das Gegenstueck auf arm64 ist
+  // _emitFarAddr (#1388) — dort endet die Reichweite bei 4095, hier nicht:
+  // rv_LI64 baut jeden 64-Bit-Wert.
+  fn _rvWeit(rs1: int64, off: int64) {
+    self.rv_LI64(RV_WEIT, off);
+    self.rv_ADD(RV_WEIT, rs1, RV_WEIT);
+  }
+
+  // --------------------------------------------------------------------------
+  // #2162: FFI nach LP64D. Am Klassenende (VMT, siehe oben).
+  //
+  // Lyx fuehrt jeden Wert in einem Ganzzahlslot, f64 als Bitmuster, f32 als
+  // double (#1127). C erwartet nach LP64D Ganzzahlen/Zeiger in a0..a7 und
+  // Gleitkomma in fa0..fa7, GETRENNT gezaehlt; ist die Gleitkommareihe voll,
+  // geht der Wert nach der Ganzzahlregel weiter (Register, dann Stapel), ein
+  // f32 dann als single in den unteren 32 Bit. Variadische Argumente hinter
+  // der Deklaration haben keine Klasse (Maske 0) und gehen in die
+  // Ganzzahlreihe — das ist auf riscv auch fuer Gleitkomma richtig.
+  // Dieselbe Klasseneinteilung wie _a64FfiArgs (arm64) und der SysV-Weg in
+  // codegen_x86.lyx; die drei muessen uebereinstimmen.
+  // --------------------------------------------------------------------------
+
+  pub fn setNoLibcInit(v: int64) { self.noLibcInit := v; }
+  pub fn setShared(v: int64) { self.isShared := v; }
+  // #2451: siehe IrErreichbare in src/ir.lyx.
+  pub fn setLebend(buf: int64) { self.lebendBuf := buf; }
+  pub fn getFuncAddrs(): int64 { return self.funcAddrs; }
+
+  // Huelle vormerken (vor emit); liefert ihren Index fuer getSoHuelleOff.
+  pub fn addSoHuelle(funcId: int64, sig: int64): int64 {
+    if self.soHuCount >= self.soHuCap {
+      var nc: int64 := self.soHuCap * 2;
+      var nb: int64 := alloc(nc * 24);
+      memcpy(nb, self.soHuTab, self.soHuCount * 24);
+      self.soHuTab := nb; self.soHuCap := nc;
+    }
+    var r: int64 := self.soHuTab + self.soHuCount * 24;
+    poke64(r, funcId); poke64(r + 8, sig); poke64(r + 16, 0 - 1);
+    self.soHuCount := self.soHuCount + 1;
+    return self.soHuCount - 1;
+  }
+  pub fn getSoHuelleOff(i: int64): int64 { return peek64(self.soHuTab + i * 24 + 16); }
+
+  // C ruft einen Lyx-Export: Ganzzahlen in a0..a7, Gleitkomma in fa0..fa7
+  // (getrennt gezaehlt, f32 als single). Lyx erwartet alles der Reihe nach
+  // in a0..a7, f64 als Bitmuster, f32 als double (#1127). Die Huelle legt um
+  // — von hinten nach vorn, denn Parameter i kommt aus a_q mit q <= i und
+  // ein spaeteres Ziel ueberschreibt so keine noch gebrauchte Quelle —, ruft
+  // die Funktion und legt ein Gleitkommaergebnis nach fa0. Dieselbe Aufgabe
+  // wie emitSoHuelle (arm64) und cg_soEmitHuellen (x86); die drei muessen
+  // uebereinstimmen.
+  fn rv_emitSoHuelle(funcId: int64, n: int64, arten: int64, rueck: int64): int64 {
+    if n > 8 {
+      EPrintStrLn("error: riscv --shared: Export mit Gleitkomma und mehr als acht Parametern ist nicht umgesetzt (#2162)."c);
+      exit(1);
+    }
+    var start: int64 := self.codeLen;
+    self.rv_ADDI(RV_SP, RV_SP, 0 - 16);
+    self.rv_SD(RV_RA, RV_SP, 0);
+    var i: int64 := n - 1;
+    while i >= 0 {
+      var c: int64 := (arten >> (i * 2)) & 3;
+      var q: int64 := 0;
+      var j: int64 := 0;
+      while j < i {
+        var cj: int64 := (arten >> (j * 2)) & 3;
+        if (cj == 0) == (c == 0) { q := q + 1; }
+        j := j + 1;
+      }
+      if c == 0 {
+        if q != i { self.rv_MV(RV_A0 + i, RV_A0 + q); }
+      } else if c == 1 {
+        self.rv_FMV_X_D(RV_A0 + i, 10 + q);                              // a_i := fa_q
+      } else {
+        self.rv_e32(0x53 | ((10 + q) << 15) | (0x21 << 25));             // FCVT.D.S ft0, fa_q
+        self.rv_FMV_X_D(RV_A0 + i, 0);
+      }
+      i := i - 1;
+    }
+    var callOff: int64 := self.codeLen;
+    self.rv_e32(0x17 | (RV_RA << 7));                                     // AUIPC ra, 0
+    self.rv_e32(0x67 | (RV_RA << 7) | (RV_RA << 15));                     // JALR ra, 0(ra)
+    self.addPatch(callOff, funcId, RV_PATCH_BL, 0);
+    if rueck == 1 { self.rv_FMV_D_X(10, RV_A0); }                         // fa0 := a0
+    if rueck == 2 {
+      self.rv_FMV_D_X(0, RV_A0);
+      self.rv_e32(0x53 | (10 << 7) | (1 << 20) | (0x20 << 25));           // FCVT.S.D fa0, ft0
+    }
+    self.rv_LD(RV_RA, RV_SP, 0);
+    self.rv_ADDI(RV_SP, RV_SP, 16);
+    self.rv_RET();
+    return start;
+  }
+  pub fn getExternBuf(): int64 { return self.extBuf; }
+  pub fn getExternCount(): int64 { return self.extCount; }
+  pub fn getGotOff(): int64 { return self.gotOff; }
+
+  // Symbol eintragen (gleicher Name = gleicher GOT-Platz); liefert den Index.
+  fn rv_externIdx(np: int64, nl: int64, lp: int64, ll: int64): int64 {
+    var i: int64 := 0;
+    while i < self.extCount {
+      var b: int64 := self.extBuf + i * 32;
+      if peek64(b + 8) == nl {
+        var g: int64 := 1;
+        var j: int64 := 0;
+        while j < nl && g != 0 { if peek8(peek64(b) + j) != peek8(np + j) { g := 0; } j := j + 1; }
+        if g != 0 { return i; }
+      }
+      i := i + 1;
+    }
+    if self.extCount >= self.extCap {
+      var nc: int64 := self.extCap * 2;
+      var nb: int64 := alloc(nc * 32);
+      memcpy(nb, self.extBuf, self.extCount * 32);
+      self.extBuf := nb; self.extCap := nc;
+    }
+    var e: int64 := self.extBuf + self.extCount * 32;
+    poke64(e, np); poke64(e + 8, nl); poke64(e + 16, lp); poke64(e + 24, ll);
+    self.extCount := self.extCount + 1;
+    return self.extCount - 1;
+  }
+
+  // t1 := GOT[extIdx]  (AUIPC/LD, von applyGlobalRelocs nachgetragen)
+  fn rv_ladeGot(extIdx: int64) {
+    if self.gotRelocCount >= self.gotRelocCap {
+      var nc: int64 := self.gotRelocCap * 2;
+      var nb: int64 := alloc(nc * 16);
+      memcpy(nb, self.gotRelocBuf, self.gotRelocCount * 16);
+      self.gotRelocBuf := nb; self.gotRelocCap := nc;
+    }
+    var r: int64 := self.gotRelocBuf + self.gotRelocCount * 16;
+    poke64(r, self.codeLen); poke64(r + 8, extIdx);
+    self.gotRelocCount := self.gotRelocCount + 1;
+    self.rv_e32(0x17 | (RV_T1 << 7));                          // AUIPC t1, 0
+    self.rv_e32(0x03 | (RV_T1 << 7) | (3 << 12) | (RV_T1 << 15));   // LD t1, 0(t1)
+  }
+
+  // t0 (double-Bitmuster) -> t0 (single-Bitmuster in den unteren 32 Bit)
+  fn rv_t0ZuSingle() {
+    self.rv_FMV_D_X(0, RV_T0);
+    self.rv_e32(0x53 | (1 << 20) | (0x20 << 25));            // FCVT.S.D ft0, ft0
+    self.rv_e32(0x53 | (RV_T0 << 7) | (0x70 << 25));         // FMV.X.W t0, ft0
+  }
+
+  fn rv_callExtern(argCount: int64, libStrOff: int64, nameStrOff: int64, dest: int64, argBase: int64, sig: int64) {
+    var strBuf: int64 := peek64(self.ir + 32);
+    var np: int64 := strBuf + nameStrOff;
+    var nl: int64 := StrLen(np as pchar);
+    if ((sig >> 53) & 1) != 0 {
+      EPrintStr("error: riscv: extern fn '"c); sys_write(2, np, nl);
+      EPrintStrLn("': Gleitkommaparameter ab dem neunten sind nicht umgesetzt (#2162)."c);
+      EPrintStrLn("  Die Signaturmaske der Deklaration reicht ueber acht Parameter; dahinter ist die Klasse unbekannt."c);
+      exit(1);
+    }
+    var fmask: int64 := (sig >> 32) & 0xFFFF;
+    var rb: int64 := argBase;
+    if rb < 0 { rb := 0; }
+    // Erster Durchgang: wie viele Werte landen auf dem Stapel?
+    var nI: int64 := 0;
+    var nF: int64 := 0;
+    var nSt: int64 := 0;
+    var i: int64 := 0;
+    while i < argCount {
+      var c0: int64 := 0;
+      if i < 8 { c0 := (fmask >> (i * 2)) & 3; }
+      if c0 != 0 && nF < 8 { nF := nF + 1; }
+      else if nI < 8 { nI := nI + 1; }
+      else { nSt := nSt + 1; }
+      i := i + 1;
+    }
+    var stBytes: int64 := nSt * 8;
+    if (stBytes & 15) != 0 { stBytes := stBytes + 8; }
+    if stBytes > 2032 {
+      EPrintStr("error: riscv: extern fn '"c); sys_write(2, np, nl);
+      EPrintStrLn("': mehr als 2 KB Stapelargumente werden nicht erzeugt (#2162)."c);
+      exit(1);
+    }
+    if stBytes > 0 {
+      if argBase < 0 {
+        EPrintStrLn("error: riscv: FFI-Aufruf mit Stapelargumenten ohne Argumentblock (#2132, #2162)."c);
+        exit(1);
+      }
+      self.rv_ADDI(RV_SP, RV_SP, 0 - stBytes);
+    }
+    // Zweiter Durchgang: dieselbe Einteilung, jetzt mit Befehlen.
+    nI := 0; nF := 0;
+    var si: int64 := 0;
+    i := 0;
+    while i < argCount {
+      var c: int64 := 0;
+      if i < 8 { c := (fmask >> (i * 2)) & 3; }
+      if c != 0 && nF < 8 {
+        self.rv_FLD(10 + nF, RV_FP, self.slotOff(rb + i));        // fa_nF
+        if c == 2 { self.rv_e32(0x53 | ((10 + nF) << 7) | ((10 + nF) << 15) | (1 << 20) | (0x20 << 25)); }   // FCVT.S.D
+        nF := nF + 1;
+      } else {
+        self.rv_loadSlot(rb + i);
+        if c == 2 { self.rv_t0ZuSingle(); }
+        if nI < 8 {
+          self.rv_MV(RV_A0 + nI, RV_T0);
+          nI := nI + 1;
+        } else {
+          self.rv_SD(RV_T0, RV_SP, si * 8);
+          si := si + 1;
+        }
+      }
+      i := i + 1;
+    }
+    var lp: int64 := strBuf + libStrOff;
+    self.rv_ladeGot(self.rv_externIdx(np, nl, lp, StrLen(lp as pchar)));
+    self.rv_e32(0x67 | (RV_RA << 7) | (RV_T1 << 15));          // JALR ra, 0(t1)
+    if stBytes > 0 { self.rv_ADDI(RV_SP, RV_SP, stBytes); }
+    // Rueckgabe: fa0 (f64/f32) oder a0, schmale Ganzzahlen auf 64 Bit.
+    var fret: int64 := (sig >> 48) & 3;
+    if fret == 1 {
+      self.rv_FMV_X_D(RV_T0, 10);
+    } else if fret == 2 {
+      self.rv_e32(0x53 | (10 << 15) | (0x21 << 25));          // FCVT.D.S ft0, fa0
+      self.rv_FMV_X_D(RV_T0, 0);
+    } else {
+      self.rv_MV(RV_T0, RV_A0);
+      var iw: int64 := (sig >> 50) & 7;
+      if iw == 1 { self.rv_SLLI(RV_T0, RV_T0, 56); self.rv_e32(0x13 | (RV_T0 << 7) | (5 << 12) | (RV_T0 << 15) | ((0x400 | 56) << 20)); }   // SRAI 56
+      if iw == 2 { self.rv_SLLI(RV_T0, RV_T0, 48); self.rv_e32(0x13 | (RV_T0 << 7) | (5 << 12) | (RV_T0 << 15) | ((0x400 | 48) << 20)); }   // SRAI 48
+      if iw == 3 { self.rv_e32(0x1B | (RV_T0 << 7) | (RV_T0 << 15)); }                                                                   // ADDIW t0, t0, 0
+      if iw == 4 { self.rv_e32(0x13 | (RV_T0 << 7) | (7 << 12) | (RV_T0 << 15) | (255 << 20)); }                                         // ANDI 255
+      if iw == 5 { self.rv_SLLI(RV_T0, RV_T0, 48); self.rv_e32(0x13 | (RV_T0 << 7) | (5 << 12) | (RV_T0 << 15) | (48 << 20)); }          // SRLI 48
+      if iw == 6 { self.rv_SLLI(RV_T0, RV_T0, 32); self.rv_e32(0x13 | (RV_T0 << 7) | (5 << 12) | (RV_T0 << 15) | (32 << 20)); }          // SRLI 32
+    }
+    self.rv_storeSlot(dest);
+  }
+
+  // Startweg mit libc (wie der 56-Byte-Rumpf auf arm64, WP-A5):
+  //   _start (RiscvLinuxBackend) setzt s10 und springt hierher statt nach main.
+  //   lstart: a5 := a0 (rtld_fini vom Lader), a1 := argc, a2 := argv,
+  //           a0 := &mtramp, a3 = a4 = 0, a6 := sp, __libc_start_main(...)
+  //   mtramp: von libc mit (argc, argv, envp) gerufen — s10 ist callee-saved
+  //           und deshalb hier NEU zu setzen (libc hat es zwischendurch
+  //           benutzt); gesichert und zurueckgeschrieben, dann main.
+  fn rv_emitLibcStart() {
+    var mainId: int64 := -1;
+    var fi: int64 := 0;
+    while fi < self.getFuncCount() {
+      if self.isMainFunc(fi) != 0 { mainId := fi; }
+      fi := fi + 1;
+    }
+    if mainId < 0 { return; }   // kein Programm (Bibliothek ohne main)
+    var lsm: int64 := self.rv_externIdx("__libc_start_main"c as int64, 17, "libc.so.6"c as int64, 9);
+    var mtramp: int64 := self.codeLen;
+    self.rv_ADDI(RV_SP, RV_SP, 0 - 16);
+    self.rv_SD(RV_RA, RV_SP, 0);
+    self.rv_SD(26, RV_SP, 8);                                   // s10
+    self.rv_MV(26, RV_A1);                                      // s10 := argv
+    var callOff: int64 := self.codeLen;
+    self.rv_e32(0x17 | (RV_RA << 7));                           // AUIPC ra, 0
+    self.rv_e32(0x67 | (RV_RA << 7) | (RV_RA << 15));           // JALR ra, 0(ra)
+    self.addPatch(callOff, mainId, RV_PATCH_BL, 0);
+    self.rv_LD(RV_RA, RV_SP, 0);
+    self.rv_LD(26, RV_SP, 8);
+    self.rv_ADDI(RV_SP, RV_SP, 16);
+    self.rv_RET();
+    self.dynStartOff := self.codeLen;
+    self.rv_MV(RV_A5, RV_A0);                                   // rtld_fini
+    self.rv_LD(RV_A1, RV_SP, 0);                                // argc
+    self.rv_ADDI(RV_A2, RV_SP, 8);                              // argv
+    var d: int64 := mtramp - self.codeLen;
+    var dHi: int64 := (d + 0x800) >> 12;
+    var dLo: int64 := d - (dHi << 12);
+    self.rv_e32(0x17 | (RV_A0 << 7) | ((dHi & 0xFFFFF) << 12));                       // AUIPC a0
+    self.rv_e32(0x13 | (RV_A0 << 7) | (RV_A0 << 15) | ((dLo & 0xFFF) << 20));         // ADDI a0
+    self.rv_MV(RV_A3, RV_ZERO);
+    self.rv_MV(RV_A4, RV_ZERO);
+    self.rv_MV(RV_A6, RV_SP);
+    self.rv_ladeGot(lsm);
+    self.rv_e32(0x67 | (RV_RA << 7) | (RV_T1 << 15));           // JALR ra, 0(t1) — kehrt nicht zurueck
+    self.rv_RET();                                              // sonst zurueck in _start (exit)
+  }
+
 };
 
 // ============================================================================
@@ -645,8 +3031,25 @@ pub type RiscvLinuxBackend = class {
   code:    int64;
   codeLen: int64;
   codeCap: int64;
+  dataOff: int64;   // #1740: Offset des Datenbereichs in self.code (0 = keiner)
+  mainOff: int64;   // #1740: Code-Offset von main (0 = erste Funktion)
+  // #2162: FFI-Symbole des Emitters ({namePtr,nameLen,libPtr,libLen}) und
+  // der Offset (ab self.code) ihres ersten GOT-Platzes.
+  extBuf:   int64;
+  extCount: int64;
+  gotOff:   int64;
 
   fn rlb_ce8(v: int64) {
+    // #1764: auch dieser Puffer war fest (64 KB) und ungeprueft.
+    if (self.codeLen + 1) > self.codeCap {
+      var nc: int64 := self.codeCap * 2;
+      while (self.codeLen + 1) > nc { nc := nc * 2; }
+      var nb: int64 := alloc(nc);
+      var i: int64 := 0;
+      while i < self.codeLen { poke8(nb + i, peek8(self.code + i)); i := i + 1; }
+      self.code    := nb;
+      self.codeCap := nc;
+    }
     poke8(self.code + self.codeLen, v & 0xFF);
     self.codeLen := self.codeLen + 1;
   }
@@ -658,12 +3061,36 @@ pub type RiscvLinuxBackend = class {
     self.rlb_ce8(v >> 24);
   }
 
-  // _start stub (12 bytes):
-  //   JAL ra, 12          = 0x00C000EF  (call main at offset 12)
+  // _start stub (28 bytes):
+  //   ADDI s10, sp, 8                       (#2110: argv sichern)
+  //   LD   a0, 0(sp)                        (#2271: argc an main)
+  //   ADDI a1, sp, 8                        (#2271: argv an main)
+  //   AUIPC ra, hi / JALR ra, lo(ra)        (#2271: call main, +/-2 GiB)
   //   ADDI a7, x0, 93     = 0x05D00893  (exit syscall)
   //   ECALL               = 0x00000073
-  fn rlb_emitStart() {
-    self.rlb_ce32(0x00C000EF);  // JAL ra, 12
+  //
+  // #1740: Der Sprung ging fest auf Offset 12, also auf die zuerst erzeugte
+  // Funktion. Das ist nur dann main, wenn main auch als erste dasteht.
+  fn rlb_emitStart(mainOff: int64) {
+    // #2110: argv = sp + 8 nach s10 (x26). Beim Eintritt zeigt sp auf argc,
+    // dahinter die argv-Zeiger und ein NULL (Linux-ABI). s10 ist callee-saved
+    // und wird vom erzeugten Code nie benutzt (s11 ist seit #2061 das
+    // Hilfsregister); C-Code erhaelt es nach der ABI. GetArgC zaehlt bis zum
+    // NULL, GetArgV liefert s10 — dieselbe Auskunft wie emitArgcArgv auf lyxos.
+    self.rlb_ce32(0x00810D13);  // ADDI s10, sp, 8
+    // #2271: `main(argc, argv)` bekam auf riscv nichts in a0/a1 — der
+    // riscv-Selbstbau las argc 0 und zeigte nur die Hilfe. Der Weg ueber
+    // __libc_start_main (lstart) setzt a0/a1 selbst; dort schadet es nicht.
+    self.rlb_ce32(0x00013503);  // LD a0, 0(sp)
+    self.rlb_ce32(0x00810593);  // ADDI a1, sp, 8
+    // #2271: main per AUIPC+JALR statt JAL — der riscv-Selbstbau hat mehr als
+    // 1 MiB Code, main liegt dahinter. Hoch/tief geteilt wie RV_PATCH_BL in
+    // applyPatches; die beiden muessen uebereinstimmen.
+    var off: int64 := RV_START_STUB_LEN + mainOff - 12;   // AUIPC steht bei Offset 12
+    var hi: int64 := (off + 0x800) >> 12;
+    var lo: int64 := off - (hi << 12);
+    self.rlb_ce32(0x17 | (RV_RA << 7) | ((hi & 0xFFFFF) << 12));                          // AUIPC ra, hi
+    self.rlb_ce32(0x67 | (RV_RA << 7) | (0 << 12) | (RV_RA << 15) | ((lo & 0xFFF) << 20)); // JALR ra, lo(ra)
     self.rlb_ce32(0x05D00893);  // ADDI a7, x0, 93
     self.rlb_ce32(0x00000073);  // ECALL
   }
@@ -672,10 +3099,15 @@ pub type RiscvLinuxBackend = class {
     self.codeCap := 65536;
     self.code    := alloc(self.codeCap);
     self.codeLen := 0;
+    self.dataOff := 0;
+    self.mainOff := 0;
+    self.extBuf   := 0;
+    self.extCount := 0;
+    self.gotOff   := 0;
   }
 
   pub fn Build(irBuf: int64, irLen: int64) {
-    self.rlb_emitStart();
+    self.rlb_emitStart(self.mainOff);
     var i: int64 := 0;
     while i < irLen { self.rlb_ce8(peek8(irBuf + i)); i := i + 1; }
   }
@@ -683,9 +3115,18 @@ pub type RiscvLinuxBackend = class {
   pub fn GetCodeSize(): int64 { return self.codeLen; }
 
   pub fn WriteELF64(path: pchar) {
+    if self.extCount > 0 { self.WriteELF64Dyn(path); return; }   // #2162
     var codeFileOffset: int64 := 4096;
     var codeSize:       int64 := self.codeLen;
     var elfSize:        int64 := codeFileOffset + codeSize;
+    // #1740: Grenze zwischen Code (r-x) und Daten (rw-). dataOff zaehlt ab
+    // self.code, also einschliesslich _start-Rumpf; der Emitter hat davor so
+    // weit aufgefuellt, dass die Grenze auf einer Seite liegt.
+    var dataStart: int64 := self.dataOff;
+    var dataSize:  int64 := 0;
+    if dataStart > 0 { dataSize := codeSize - dataStart; }
+    var phnum: int64 := 1;
+    if dataSize > 0 { phnum := 2; }
 
     var elfBuf: int64 := alloc(elfSize);
     if elfBuf == -1 { return; }
@@ -716,30 +3157,365 @@ pub type RiscvLinuxBackend = class {
     poke32(elfBuf + 48, 0x05);       // e_flags: EF_RISCV_RVC | EF_RISCV_FLOAT_ABI_DOUBLE
     poke16(elfBuf + 52, 64);         // e_ehsize
     poke16(elfBuf + 54, 56);         // e_phentsize
-    poke16(elfBuf + 56, 1);          // e_phnum
+    poke16(elfBuf + 56, phnum);      // e_phnum (#1740: 2 mit Datensegment)
     poke16(elfBuf + 58, 64);         // e_shentsize
     poke16(elfBuf + 60, 0);          // e_shnum
     poke16(elfBuf + 62, 0);          // e_shstrndx
 
     // PT_LOAD segment header (56 bytes at offset 64)
+    // #1740: Ohne Datenbereich laedt wie bisher ein einziges r-x-Segment die
+    // ganze Datei. Mit Datenbereich wird bei dataStart getrennt, damit die
+    // globalen Variablen beschreibbar sind, ohne dass der Code es wird.
+    var codeSegSize: int64 := elfSize;
+    if dataSize > 0 { codeSegSize := codeFileOffset + dataStart; }
     poke32(elfBuf + 64, 1);              // p_type: PT_LOAD
     poke32(elfBuf + 68, 5);             // p_flags: PF_R | PF_X
     poke64(elfBuf + 72, 0);             // p_offset: 0 (load whole file)
     poke64(elfBuf + 80, 0x400000);      // p_vaddr
     poke64(elfBuf + 88, 0x400000);      // p_paddr
-    poke64(elfBuf + 96, elfSize);       // p_filesz
-    poke64(elfBuf + 104, elfSize);      // p_memsz
+    poke64(elfBuf + 96, codeSegSize);   // p_filesz
+    poke64(elfBuf + 104, codeSegSize);  // p_memsz
     poke64(elfBuf + 112, 0x1000);       // p_align: 4096
 
-    var fd: int64 := open(path, 577, 493);
-    if fd < 0 {
-      EPrintStr("error: cannot write output: "c);
-      EPrintStrLn(path);
-      free(elfBuf, elfSize);
-      return;
+    if dataSize > 0 {
+      var dOff: int64 := codeFileOffset + dataStart;
+      poke32(elfBuf + 120, 1);                    // p_type: PT_LOAD
+      poke32(elfBuf + 124, 6);                    // p_flags: PF_R | PF_W
+      poke64(elfBuf + 128, dOff);                 // p_offset
+      poke64(elfBuf + 136, 0x400000 + dOff);      // p_vaddr
+      poke64(elfBuf + 144, 0x400000 + dOff);      // p_paddr
+      poke64(elfBuf + 152, dataSize);             // p_filesz
+      poke64(elfBuf + 160, dataSize);             // p_memsz
+      poke64(elfBuf + 168, 0x1000);               // p_align
     }
-    write(fd, elfBuf as pchar, elfSize);
-    close(fd);
+
+    EmitWriteFile(path, elfBuf, elfSize);   // #1682
     free(elfBuf, elfSize);
+  }
+
+  // #1740: Offset des Datenbereichs (ab self.code, also mit _start-Rumpf).
+  // Steht am Klassenende, damit die VMT sich nicht verschiebt.
+  pub fn SetDataOff(off: int64) { self.dataOff := off; }
+
+  // #1740: Code-Offset von main. Muss VOR Build gesetzt werden — der
+  // _start-Rumpf entsteht dort.
+  pub fn SetMainOff(off: int64) { self.mainOff := off; }
+
+  // #2162: --shared. ET_DYN mit Ladebasis 0, sonst dasselbe Speicherbild
+  // (Code r-x ab Dateioffset 4096, Daten rw- ab der Seitengrenze dataOff) —
+  // der Code ist durchgehend PC-relativ (AUIPC), Modulvariablen und GOT
+  // liegen im Datensegment. dynsym: [0] null, [1..] die FFI-Symbole (UNDEF,
+  // R_RISCV_64 auf ihren GOT-Platz), danach die Exporte (GLOBAL FUNC,
+  // st_value = Adresse relativ zur Basis). Ein echter SysV-Hash, denn dlsym
+  // sucht darueber. Der _start-Rumpf (RV_START_STUB_LEN) bleibt als toter Code stehen:
+  // an seiner Laenge haengt die Seitenausrichtung des Emitters.
+  // exportBuf: je Export {namePtr, nameLen, codeOff (ab self.code)} — dieselbe
+  // Liste wie lyxc.buildExportList.
+  pub fn WriteSharedLib(path: pchar, expBuf: int64, expCount: int64) {
+    var codeFileOffset: int64 := 4096;
+    var codeSize: int64 := self.codeLen;
+    var dataStart: int64 := self.dataOff;
+    if dataStart <= 0 {
+      EPrintStrLn("error: riscv --shared: kein Datensegment (#2162)."c);
+      exit(1);
+    }
+    var nE: int64 := self.extCount;
+    var nX: int64 := expCount;
+    var nSym: int64 := 1 + nE + nX;
+    var dsCap: int64 := 64;
+    var k: int64 := 0;
+    while k < nE { dsCap := dsCap + peek64(self.extBuf + k * 32 + 8) + peek64(self.extBuf + k * 32 + 24) + 2; k := k + 1; }
+    k := 0;
+    while k < nX { dsCap := dsCap + peek64(expBuf + k * 24 + 8) + 1; k := k + 1; }
+    var dynstr: int64 := alloc(dsCap);
+    var dsLen: int64 := 1;
+    poke8(dynstr, 0);
+    var nameOff: int64 := alloc(nSym * 8);       // dynstr-Offset je Symbol
+    var namePtr: int64 := alloc(nSym * 8);
+    var nameLen: int64 := alloc(nSym * 8);
+    var needOff: int64 := alloc(nE * 8 + 8);
+    var nNeed: int64 := 0;
+    k := 0;
+    while k < nE {
+      var lp: int64 := peek64(self.extBuf + k * 32 + 16);
+      var ll: int64 := peek64(self.extBuf + k * 32 + 24);
+      var neu: int64 := 1;
+      var j: int64 := 0;
+      while j < k && neu != 0 {
+        if peek64(self.extBuf + j * 32 + 24) == ll {
+          var gl: int64 := 1;
+          var q: int64 := 0;
+          while q < ll && gl != 0 { if peek8(peek64(self.extBuf + j * 32 + 16) + q) != peek8(lp + q) { gl := 0; } q := q + 1; }
+          if gl != 0 { neu := 0; }
+        }
+        j := j + 1;
+      }
+      if neu != 0 {
+        poke64(needOff + nNeed * 8, dsLen); nNeed := nNeed + 1;
+        memcpy(dynstr + dsLen, lp, ll); dsLen := dsLen + ll; poke8(dynstr + dsLen, 0); dsLen := dsLen + 1;
+      }
+      k := k + 1;
+    }
+    k := 1;
+    while k < nSym {
+      var p: int64 := 0; var l: int64 := 0;
+      if k <= nE { p := peek64(self.extBuf + (k - 1) * 32); l := peek64(self.extBuf + (k - 1) * 32 + 8); }
+      else { p := peek64(expBuf + (k - 1 - nE) * 24); l := peek64(expBuf + (k - 1 - nE) * 24 + 8); }
+      poke64(namePtr + k * 8, p); poke64(nameLen + k * 8, l); poke64(nameOff + k * 8, dsLen);
+      memcpy(dynstr + dsLen, p, l); dsLen := dsLen + l; poke8(dynstr + dsLen, 0); dsLen := dsLen + 1;
+      k := k + 1;
+    }
+    var nBucket: int64 := nSym;
+    var dynstrOff: int64 := ((codeFileOffset + codeSize + 7) >> 3) << 3;
+    var dynsymOff: int64 := ((dynstrOff + dsLen + 7) >> 3) << 3;
+    var hashOff: int64 := dynsymOff + nSym * 24;
+    var hashSize: int64 := (2 + nBucket + nSym) * 4;
+    var relaOff: int64 := ((hashOff + hashSize + 7) >> 3) << 3;
+    var relaSize: int64 := nE * 24;
+    var dynOff: int64 := relaOff + relaSize;
+    var dynCnt: int64 := nNeed + 9;
+    if nE > 0 { dynCnt := dynCnt + 3; }
+    var dynSize: int64 := dynCnt * 16;
+    var fileSize: int64 := dynOff + dynSize;
+
+    var buf: int64 := alloc(fileSize);
+    var z: int64 := 0;
+    while z < fileSize { poke8(buf + z, 0); z := z + 1; }
+    memcpy(buf + codeFileOffset, self.code, codeSize);
+    poke8(buf + 0, 127); poke8(buf + 1, 69); poke8(buf + 2, 76); poke8(buf + 3, 70);
+    poke8(buf + 4, 2);   poke8(buf + 5, 1);  poke8(buf + 6, 1);  poke8(buf + 7, 0);
+    poke16(buf + 16, 3);          // ET_DYN
+    poke16(buf + 18, 0xF3);       // EM_RISCV
+    poke32(buf + 20, 1);
+    poke64(buf + 24, 0);          // kein Einsprung
+    poke64(buf + 32, 64);
+    poke32(buf + 48, 0x05);       // RVC | lp64d
+    poke16(buf + 52, 64); poke16(buf + 54, 56); poke16(buf + 56, 3);
+    poke16(buf + 58, 64);
+    var dOff: int64 := codeFileOffset + dataStart;
+    var ph: int64 := buf + 64;
+    poke32(ph, 1); poke32(ph + 4, 5);
+    poke64(ph + 8, 0); poke64(ph + 16, 0); poke64(ph + 24, 0);
+    poke64(ph + 32, dOff); poke64(ph + 40, dOff); poke64(ph + 48, 0x1000);
+    ph := ph + 56;
+    poke32(ph, 1); poke32(ph + 4, 6);
+    poke64(ph + 8, dOff); poke64(ph + 16, dOff); poke64(ph + 24, dOff);
+    poke64(ph + 32, fileSize - dOff); poke64(ph + 40, fileSize - dOff); poke64(ph + 48, 0x1000);
+    ph := ph + 56;
+    poke32(ph, 2); poke32(ph + 4, 6);
+    poke64(ph + 8, dynOff); poke64(ph + 16, dynOff); poke64(ph + 24, dynOff);
+    poke64(ph + 32, dynSize); poke64(ph + 40, dynSize); poke64(ph + 48, 8);
+
+    memcpy(buf + dynstrOff, dynstr, dsLen);
+    k := 1;
+    while k < nSym {
+      var sy: int64 := buf + dynsymOff + k * 24;
+      poke32(sy, peek64(nameOff + k * 8));
+      poke8(sy + 4, 0x12);                                   // STB_GLOBAL | STT_FUNC
+      if k > nE {
+        poke16(sy + 6, 1);                                   // definiert (kein SHN_UNDEF/SHN_ABS)
+        poke64(sy + 8, codeFileOffset + peek64(expBuf + (k - 1 - nE) * 24 + 16));
+      }
+      k := k + 1;
+    }
+    // SysV-Hash: h = (h << 4) + c; g = h & 0xF0000000; h ^= g >> 24; h &= ~g
+    poke32(buf + hashOff, nBucket);
+    poke32(buf + hashOff + 4, nSym);
+    var bucket: int64 := buf + hashOff + 8;
+    var chain: int64 := bucket + nBucket * 4;
+    k := 1;
+    while k < nSym {
+      var h: int64 := 0;
+      var p2: int64 := peek64(namePtr + k * 8);
+      var q2: int64 := 0;
+      while q2 < peek64(nameLen + k * 8) {
+        h := ((h << 4) + peek8(p2 + q2)) & 0xFFFFFFFF;
+        var g: int64 := h & 0xF0000000;
+        if g != 0 { h := h ^ (g >> 24); }
+        h := h & (0xFFFFFFFF ^ g);
+        q2 := q2 + 1;
+      }
+      var bi: int64 := h % nBucket;
+      poke32(chain + k * 4, peek32(bucket + bi * 4));
+      poke32(bucket + bi * 4, k);
+      k := k + 1;
+    }
+    k := 0;
+    while k < nE {
+      var ra: int64 := buf + relaOff + k * 24;
+      poke64(ra, codeFileOffset + self.gotOff + k * 8);
+      poke64(ra + 8, ((k + 1) << 32) | 2);                   // R_RISCV_64
+      k := k + 1;
+    }
+    var dp: int64 := buf + dynOff;
+    k := 0;
+    while k < nNeed { poke64(dp, 1); poke64(dp + 8, peek64(needOff + k * 8)); dp := dp + 16; k := k + 1; }
+    poke64(dp, 4);  poke64(dp + 8, hashOff);   dp := dp + 16;   // DT_HASH
+    poke64(dp, 5);  poke64(dp + 8, dynstrOff); dp := dp + 16;   // DT_STRTAB
+    poke64(dp, 6);  poke64(dp + 8, dynsymOff); dp := dp + 16;   // DT_SYMTAB
+    poke64(dp, 10); poke64(dp + 8, dsLen);     dp := dp + 16;   // DT_STRSZ
+    poke64(dp, 11); poke64(dp + 8, 24);        dp := dp + 16;   // DT_SYMENT
+    if nE > 0 {
+      poke64(dp, 7); poke64(dp + 8, relaOff);  dp := dp + 16;   // DT_RELA
+      poke64(dp, 8); poke64(dp + 8, relaSize); dp := dp + 16;   // DT_RELASZ
+      poke64(dp, 9); poke64(dp + 8, 24);       dp := dp + 16;   // DT_RELAENT
+    }
+    poke64(dp, 30); poke64(dp + 8, 8);         dp := dp + 16;   // DT_FLAGS = DF_BIND_NOW
+    poke64(dp, 0);  poke64(dp + 8, 0);                          // DT_NULL
+    EmitWriteFile(path, buf, fileSize);
+    free(buf, fileSize);
+  }
+
+  // #2162: FFI-Symbole und GOT-Offset (ab self.code, mit _start-Rumpf).
+  pub fn SetFfi(extBuf: int64, extCount: int64, gotOff: int64) {
+    self.extBuf := extBuf; self.extCount := extCount; self.gotOff := gotOff;
+  }
+
+  // #2162: dynamisch gelinktes Erzeugnis. Dasselbe Speicherbild wie
+  // WriteELF64 (Code r-x ab 0x401000, Daten rw- ab der Seitengrenze dataOff),
+  // dazu:
+  //   - PT_INTERP /lib/ld-linux-riscv64-lp64d.so.1 (im Kopfbereich),
+  //   - hinter den Daten (im rw-Segment) .dynstr, .dynsym, .hash, .rela.dyn
+  //     und .dynamic, PT_DYNAMIC zeigt darauf,
+  //   - je Symbol eine R_RISCV_64-Relocation auf seinen GOT-Platz (der
+  //     Emitter legt die Plaetze hinter die Modulvariablen und laedt sie
+  //     PC-relativ). DF_BIND_NOW: alles beim Start, keine PLT.
+  // Dieselbe Tabellenfolge wie writeELFExecDynamic (arm64) in lyxc.lyx.
+  pub fn WriteELF64Dyn(path: pchar) {
+    var baseVA: int64 := 0x400000;
+    var codeFileOffset: int64 := 4096;
+    var codeSize: int64 := self.codeLen;
+    var dataStart: int64 := self.dataOff;
+    if dataStart <= 0 {
+      EPrintStrLn("error: riscv: FFI ohne Datensegment -- der GOT haette keinen Platz (#2162)."c);
+      exit(1);
+    }
+    var interpStr: pchar := "/lib/ld-linux-riscv64-lp64d.so.1"c;
+    var interpLen: int64 := StrLen(interpStr) + 1;
+    var phnum: int64 := 4;
+    var interpOff: int64 := 64 + phnum * 56;
+    // .dynstr: \0, Bibliotheken (je einmal), Symbolnamen
+    var n: int64 := self.extCount;
+    var dsCap: int64 := 64;
+    var k: int64 := 0;
+    while k < n { dsCap := dsCap + peek64(self.extBuf + k * 32 + 8) + peek64(self.extBuf + k * 32 + 24) + 2; k := k + 1; }
+    var dynstr: int64 := alloc(dsCap);
+    var dsLen: int64 := 1;
+    poke8(dynstr, 0);
+    var libStr: int64 := alloc(n * 8 + 8);    // dynstr-Offset der Bibliothek von Symbol k (DT_NEEDED nur fuer den ersten)
+    var libNeu: int64 := alloc(n * 8 + 8);    // 1 = erste Nennung dieser Bibliothek
+    var symStr: int64 := alloc(n * 8 + 8);
+    k := 0;
+    while k < n {
+      var lp: int64 := peek64(self.extBuf + k * 32 + 16);
+      var ll: int64 := peek64(self.extBuf + k * 32 + 24);
+      var gef: int64 := -1;
+      var j: int64 := 0;
+      while j < k && gef < 0 {
+        if peek64(self.extBuf + j * 32 + 24) == ll {
+          var gl: int64 := 1;
+          var q: int64 := 0;
+          while q < ll && gl != 0 { if peek8(peek64(self.extBuf + j * 32 + 16) + q) != peek8(lp + q) { gl := 0; } q := q + 1; }
+          if gl != 0 { gef := j; }
+        }
+        j := j + 1;
+      }
+      if gef >= 0 {
+        poke64(libStr + k * 8, peek64(libStr + gef * 8)); poke64(libNeu + k * 8, 0);
+      } else {
+        poke64(libStr + k * 8, dsLen); poke64(libNeu + k * 8, 1);
+        memcpy(dynstr + dsLen, lp, ll); dsLen := dsLen + ll; poke8(dynstr + dsLen, 0); dsLen := dsLen + 1;
+      }
+      var np: int64 := peek64(self.extBuf + k * 32);
+      var nl: int64 := peek64(self.extBuf + k * 32 + 8);
+      poke64(symStr + k * 8, dsLen);
+      memcpy(dynstr + dsLen, np, nl); dsLen := dsLen + nl; poke8(dynstr + dsLen, 0); dsLen := dsLen + 1;
+      k := k + 1;
+    }
+    var nNeeded: int64 := 0;
+    k := 0;
+    while k < n { nNeeded := nNeeded + peek64(libNeu + k * 8); k := k + 1; }
+    // Lage der Tabellen hinter dem Code-/Datenpuffer (alles 8-ausgerichtet)
+    var tabOff: int64 := ((codeFileOffset + codeSize + 7) >> 3) << 3;
+    var dynstrOff: int64 := tabOff;
+    var dynsymOff: int64 := ((dynstrOff + dsLen + 7) >> 3) << 3;
+    var dynsymSize: int64 := (n + 1) * 24;
+    var hashOff: int64 := dynsymOff + dynsymSize;
+    var hashSize: int64 := (3 + n + 1) * 4;
+    var relaOff: int64 := ((hashOff + hashSize + 7) >> 3) << 3;
+    var relaSize: int64 := n * 24;
+    var dynOff: int64 := relaOff + relaSize;
+    var dynSize: int64 := (nNeeded + 11) * 16;
+    var fileSize: int64 := dynOff + dynSize;
+
+    var buf: int64 := alloc(fileSize);
+    var z: int64 := 0;
+    while z < fileSize { poke8(buf + z, 0); z := z + 1; }
+    memcpy(buf + codeFileOffset, self.code, codeSize);
+
+    poke8(buf + 0, 127); poke8(buf + 1, 69); poke8(buf + 2, 76); poke8(buf + 3, 70);
+    poke8(buf + 4, 2);   poke8(buf + 5, 1);  poke8(buf + 6, 1);  poke8(buf + 7, 0);
+    poke16(buf + 16, 2);          // ET_EXEC
+    poke16(buf + 18, 0xF3);       // EM_RISCV
+    poke32(buf + 20, 1);
+    poke64(buf + 24, 0x401000);   // e_entry: _start
+    poke64(buf + 32, 64);
+    poke64(buf + 40, 0);
+    poke32(buf + 48, 0x05);       // EF_RISCV_RVC | EF_RISCV_FLOAT_ABI_DOUBLE (lp64d)
+    poke16(buf + 52, 64); poke16(buf + 54, 56); poke16(buf + 56, phnum);
+    poke16(buf + 58, 64); poke16(buf + 60, 0); poke16(buf + 62, 0);
+
+    var dOff: int64 := codeFileOffset + dataStart;
+    var ph: int64 := buf + 64;
+    poke32(ph, 1); poke32(ph + 4, 5);                                       // PT_LOAD r-x
+    poke64(ph + 8, 0); poke64(ph + 16, baseVA); poke64(ph + 24, baseVA);
+    poke64(ph + 32, dOff); poke64(ph + 40, dOff); poke64(ph + 48, 0x1000);
+    ph := ph + 56;
+    poke32(ph, 1); poke32(ph + 4, 6);                                       // PT_LOAD rw- (Daten, GOT, Tabellen)
+    poke64(ph + 8, dOff); poke64(ph + 16, baseVA + dOff); poke64(ph + 24, baseVA + dOff);
+    poke64(ph + 32, fileSize - dOff); poke64(ph + 40, fileSize - dOff); poke64(ph + 48, 0x1000);
+    ph := ph + 56;
+    poke32(ph, 3); poke32(ph + 4, 4);                                       // PT_INTERP
+    poke64(ph + 8, interpOff); poke64(ph + 16, baseVA + interpOff); poke64(ph + 24, baseVA + interpOff);
+    poke64(ph + 32, interpLen); poke64(ph + 40, interpLen); poke64(ph + 48, 1);
+    ph := ph + 56;
+    poke32(ph, 2); poke32(ph + 4, 6);                                       // PT_DYNAMIC
+    poke64(ph + 8, dynOff); poke64(ph + 16, baseVA + dynOff); poke64(ph + 24, baseVA + dynOff);
+    poke64(ph + 32, dynSize); poke64(ph + 40, dynSize); poke64(ph + 48, 8);
+
+    memcpy(buf + interpOff, interpStr as int64, interpLen);
+    memcpy(buf + dynstrOff, dynstr, dsLen);
+    k := 0;
+    while k < n {
+      var sy: int64 := buf + dynsymOff + (k + 1) * 24;
+      poke32(sy, peek64(symStr + k * 8));
+      poke8(sy + 4, 0x12);                     // STB_GLOBAL | STT_FUNC, SHN_UNDEF
+      var ra: int64 := buf + relaOff + k * 24;
+      poke64(ra, baseVA + codeFileOffset + self.gotOff + k * 8);   // r_offset: GOT-Platz
+      poke64(ra + 8, ((k + 1) << 32) | 2);     // R_RISCV_64
+      poke64(ra + 16, 0);
+      k := k + 1;
+    }
+    poke32(buf + hashOff, 1);                  // nbucket = 1 (alle Symbole UNDEF)
+    poke32(buf + hashOff + 4, n + 1);          // nchain
+    var dp: int64 := buf + dynOff;
+    k := 0;
+    while k < n {
+      if peek64(libNeu + k * 8) != 0 { poke64(dp, 1); poke64(dp + 8, peek64(libStr + k * 8)); dp := dp + 16; }   // DT_NEEDED
+      k := k + 1;
+    }
+    poke64(dp, 4);  poke64(dp + 8, baseVA + hashOff);   dp := dp + 16;   // DT_HASH
+    poke64(dp, 5);  poke64(dp + 8, baseVA + dynstrOff); dp := dp + 16;   // DT_STRTAB
+    poke64(dp, 6);  poke64(dp + 8, baseVA + dynsymOff); dp := dp + 16;   // DT_SYMTAB
+    poke64(dp, 10); poke64(dp + 8, dsLen);              dp := dp + 16;   // DT_STRSZ
+    poke64(dp, 11); poke64(dp + 8, 24);                 dp := dp + 16;   // DT_SYMENT
+    poke64(dp, 7);  poke64(dp + 8, baseVA + relaOff);   dp := dp + 16;   // DT_RELA
+    poke64(dp, 8);  poke64(dp + 8, relaSize);           dp := dp + 16;   // DT_RELASZ
+    poke64(dp, 9);  poke64(dp + 8, 24);                 dp := dp + 16;   // DT_RELAENT
+    poke64(dp, 30); poke64(dp + 8, 8);                  dp := dp + 16;   // DT_FLAGS = DF_BIND_NOW
+    poke64(dp, 0);  poke64(dp + 8, 0);                                    // DT_NULL
+
+    EmitWriteFile(path, buf, fileSize);
+    free(buf, fileSize);
   }
 };

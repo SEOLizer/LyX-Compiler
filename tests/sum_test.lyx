@@ -1,0 +1,422 @@
+// tests/sum_test.lyx
+// Selbstpruefende Testbatterie fuer std.sum.
+//
+// Der Kern ist ein Vergleich der Verfahren untereinander an Faellen, bei denen
+// die exakte Antwort bekannt ist. Wichtig dabei: die Pruefungen muessen die
+// UNTERSCHIEDE festhalten, nicht bloss die Uebereinstimmung — sonst belegen
+// sie nicht, dass die Kompensation etwas tut.
+//
+//   * 1e6 mal 0,1: naiv liegt um 1,3e-6 daneben, kompensiert exakt
+//   * [1, 1e100, 1, -1e100]: naiv UND Kahan liefern 0, Neumaier liefert 2
+//   * Welford gegen die Schulformel bei Werten um 1e9: dort wird die
+//     Schulformel negativ, Welford nicht
+//
+// Sollwerte aus Python (math.fsum und statistics), Fehlerschranken aus der
+// Theorie: die kompensierte Summe darf hoechstens ein oder zwei Einheiten der
+// letzten Stelle danebenliegen.
+
+unit main;
+
+import std.sum;
+import std.math;
+import std.alloc;
+
+var _fails: int64 := 0;
+var _checks: int64 := 0;
+
+fn CheckB(name: pchar, got: bool, want: bool): void {
+  _checks := _checks + 1;
+  if (got != want) {
+    _fails := _fails + 1;
+    PrintStr("FAIL "c);
+    PrintStr(name);
+    PrintStr("\n"c);
+  }
+}
+
+fn CheckI(name: pchar, got: int64, want: int64): void {
+  _checks := _checks + 1;
+  if (got != want) {
+    _fails := _fails + 1;
+    PrintStr("FAIL "c);
+    PrintStr(name);
+    PrintStr(" got="c);
+    PrintInt(got);
+    PrintStr(" want="c);
+    PrintInt(want);
+    PrintStr("\n"c);
+  }
+}
+
+// Genauer Vergleich: die Abweichung wird skaliert ausgegeben, weil PrintFloat
+// nur sechs Nachkommastellen zeigt.
+fn CheckNear(name: pchar, got: f64, want: f64, tol: f64): void {
+  _checks := _checks + 1;
+  var d: f64 := got - want;
+  if (d < 0.0) { d := 0.0 - d; }
+  if (d > tol) {
+    _fails := _fails + 1;
+    PrintStr("FAIL "c);
+    PrintStr(name);
+    PrintStr(" got="c);
+    PrintFloat(got);
+    PrintStr(" want="c);
+    PrintFloat(want);
+    PrintStr(" diff*1e9="c);
+    PrintFloat(d * 1000000000.0);
+    PrintStr("\n"c);
+  }
+}
+
+fn CheckExact(name: pchar, got: f64, want: f64): void {
+  _checks := _checks + 1;
+  if (got != want) {
+    _fails := _fails + 1;
+    PrintStr("FAIL "c);
+    PrintStr(name);
+    PrintStr(" nicht exakt: got="c);
+    PrintFloat(got);
+    PrintStr(" want="c);
+    PrintFloat(want);
+    PrintStr("\n"c);
+  }
+}
+
+var _s: int64 := 88172645463325252;
+
+fn Rnd(m: int64): int64 {
+  _s := (_s * 6364136223846793005 + 1442695040888963407) & 4611686018427387903;
+  return (_s / 65536) % m;
+}
+
+fn main(): int64 {
+  // ── Die exakte Zweiersumme ─────────────────────────────────────────────────
+  var err: int64 := alloc(8);
+
+  // 1 + 1e16: die Eins geht in der Summe unter, muss aber im Fehler auftauchen
+  var big: f64 := 1.0e16;
+  var s: f64 := SumTwoSum(big, 1.0, err);
+  var e: f64 := peekf64(err);
+  CheckExact("twoSum.sum"c, s, 1.0e16);
+  CheckExact("twoSum.errCarriesTheOne"c, e, 1.0);
+  // s + err ist exakt a + b — das ist die Aussage des Verfahrens
+  CheckExact("twoSum.reconstructs"c, s + e, 1.0e16 + 1.0);
+
+  // ohne Rundung ist der Fehler null
+  s := SumTwoSum(1.0, 2.0, err);
+  CheckExact("twoSum.exactCase"c, s, 3.0);
+  CheckExact("twoSum.noError"c, peekf64(err), 0.0);
+
+  // Reihenfolge egal
+  var s2: f64 := SumTwoSum(1.0, big, err);
+  CheckExact("twoSum.commutative"c, s2, 1.0e16);
+  CheckExact("twoSum.commutativeErr"c, peekf64(err), 1.0);
+
+  // FastTwoSum bei erfuellter Voraussetzung
+  s := SumFastTwoSum(big, 1.0, err);
+  CheckExact("fastTwoSum.sum"c, s, 1.0e16);
+  CheckExact("fastTwoSum.err"c, peekf64(err), 1.0);
+  free(err, 8);
+
+  // ── Der Fall, an dem Kahan scheitert ───────────────────────────────────────
+  var a: int64 := alloc(4 * 8);
+  pokef64(a, 1.0);
+  pokef64(a + 8, 1.0e100);
+  pokef64(a + 16, 1.0);
+  pokef64(a + 24, 0.0 - 1.0e100);
+
+  CheckExact("big.naiveIsZero"c, SumNaive(a, 4), 0.0);
+  CheckExact("big.kahanAlsoZero"c, SumKahan(a, 4), 0.0);
+  CheckExact("big.neumaierIsTwo"c, SumNeumaier(a, 4), 2.0);
+
+  var work: int64 := alloc(256 * 8);
+  CheckExact("big.exactIsTwo"c, SumExact(a, 4, work, 256), 2.0);
+
+  // Das ist der Grund fuer die Empfehlung — als Aussage festgehalten
+  CheckB("big.kahanDiffersFromNeumaier"c,
+         SumKahan(a, 4) == SumNeumaier(a, 4), false);
+  free(a, 4 * 8);
+
+  // ── Eine Million mal ein Zehntel ───────────────────────────────────────────
+  var n: int64 := 1000000;
+  var arr: int64 := alloc(n * 8);
+  var i: int64 := 0;
+  while (i < n) {
+    pokef64(arr + i * 8, 0.1);
+    i := i + 1;
+  }
+
+  var exact: f64 := 100000.0;
+  var naive: f64 := SumNaive(arr, n);
+  var kah: f64 := SumKahan(arr, n);
+  var neu: f64 := SumNeumaier(arr, n);
+  var pw: f64 := SumPairwise(arr, n);
+  var ex: f64 := SumExact(arr, n, work, 256);
+
+  // naiv liegt messbar daneben — Sollwert aus Python: 1.3328826753e-6
+  var naiveErr: f64 := naive - exact;
+  CheckB("million.naiveIsWrong"c, naive == exact, false);
+  CheckNear("million.naiveErrorSize"c, naiveErr, 0.0000013328826753, 0.0000000001);
+
+  // die kompensierten Verfahren treffen exakt
+  CheckExact("million.kahanExact"c, kah, exact);
+  CheckExact("million.neumaierExact"c, neu, exact);
+  CheckExact("million.exactExact"c, ex, exact);
+
+  // paarweise ist besser als naiv, ohne Zusatzkosten
+  var pwErr: f64 := pw - exact;
+  if (pwErr < 0.0) { pwErr := 0.0 - pwErr; }
+  var nvErr: f64 := naiveErr;
+  if (nvErr < 0.0) { nvErr := 0.0 - nvErr; }
+  var pwBetter: bool := pwErr < nvErr;
+  CheckB("million.pairwiseBeatsNaive"c, pwBetter, true);
+
+  // ── Laufende Summierer liefern dasselbe wie die Feldfassungen ──────────────
+  var accK: int64 := alloc(SUM_ACC_BYTES);
+  var accN: int64 := alloc(SUM_ACC_BYTES);
+  SumKahanInit(accK);
+  SumNeumaierInit(accN);
+  i := 0;
+  while (i < n) {
+    var v: f64 := peekf64(arr + i * 8);
+    SumKahanAdd(accK, v);
+    SumNeumaierAdd(accN, v);
+    i := i + 1;
+  }
+  CheckExact("acc.kahanMatchesArray"c, SumKahanValue(accK), kah);
+  CheckExact("acc.neumaierMatchesArray"c, SumNeumaierValue(accN), neu);
+
+  // frisch begonnen ist die Summe null
+  SumNeumaierInit(accN);
+  CheckExact("acc.initZero"c, SumNeumaierValue(accN), 0.0);
+  SumNeumaierAdd(accN, 1.0);
+  SumNeumaierAdd(accN, 2.0);
+  CheckExact("acc.simple"c, SumNeumaierValue(accN), 3.0);
+  free(accK, SUM_ACC_BYTES);
+  free(accN, SUM_ACC_BYTES);
+
+  free(arr, n * 8);
+
+  // ── Randfaelle ─────────────────────────────────────────────────────────────
+  var one: int64 := alloc(8);
+  pokef64(one, 42.5);
+  CheckExact("single.naive"c, SumNaive(one, 1), 42.5);
+  CheckExact("single.neumaier"c, SumNeumaier(one, 1), 42.5);
+  CheckExact("single.pairwise"c, SumPairwise(one, 1), 42.5);
+  CheckExact("single.exact"c, SumExact(one, 1, work, 256), 42.5);
+  CheckExact("empty.naive"c, SumNaive(one, 0), 0.0);
+  CheckExact("empty.neumaier"c, SumNeumaier(one, 0), 0.0);
+  CheckExact("empty.pairwise"c, SumPairwise(one, 0), 0.0);
+  CheckExact("empty.mean"c, SumMean(one, 0), 0.0);
+  free(one, 8);
+
+  // ── Auslöschung ────────────────────────────────────────────────────────────
+  //
+  // 1e16, 1, -1e16: die Eins geht bei naiver Summierung verloren.
+  var c3: int64 := alloc(3 * 8);
+  pokef64(c3, 1.0e16);
+  pokef64(c3 + 8, 1.0);
+  pokef64(c3 + 16, 0.0 - 1.0e16);
+  CheckExact("cancel.naiveLosesOne"c, SumNaive(c3, 3), 0.0);
+  CheckExact("cancel.neumaierKeepsIt"c, SumNeumaier(c3, 3), 1.0);
+  CheckExact("cancel.exactKeepsIt"c, SumExact(c3, 3, work, 256), 1.0);
+  free(c3, 3 * 8);
+
+  // ── Skalarprodukt ──────────────────────────────────────────────────────────
+  var da: int64 := alloc(4 * 8);
+  var db: int64 := alloc(4 * 8);
+  pokef64(da, 1.0);       pokef64(db, 2.0);
+  pokef64(da + 8, 3.0);   pokef64(db + 8, 4.0);
+  pokef64(da + 16, 5.0);  pokef64(db + 16, 6.0);
+  pokef64(da + 24, 7.0);  pokef64(db + 24, 8.0);
+  CheckExact("dot.simple"c, SumDot(da, db, 4), 100.0);
+  CheckExact("dot.empty"c, SumDot(da, db, 0), 0.0);
+  free(da, 4 * 8);  free(db, 4 * 8);
+
+  // ── Mittelwert ─────────────────────────────────────────────────────────────
+  var m5: int64 := alloc(5 * 8);
+  i := 0;
+  while (i < 5) {
+    pokef64(m5 + i * 8, (i + 1) as f64);
+    i := i + 1;
+  }
+  CheckExact("mean.simple"c, SumMean(m5, 5), 3.0);
+  free(m5, 5 * 8);
+
+  // ── Welford ────────────────────────────────────────────────────────────────
+  var st: int64 := alloc(SUM_STAT_BYTES);
+  SumStatInit(st);
+  CheckI("stat.emptyCount"c, SumStatCount(st), 0);
+  CheckExact("stat.emptyMean"c, SumStatMean(st), 0.0);
+  CheckExact("stat.emptyVar"c, SumStatVarianceS(st), 0.0);
+
+  // 2, 4, 4, 4, 5, 5, 7, 9 — Lehrbuchbeispiel:
+  // Mittel 5, Varianz (Grundgesamtheit) 4, Standardabweichung 2
+  var vals: int64 := alloc(8 * 8);
+  pokef64(vals, 2.0);      pokef64(vals + 8, 4.0);
+  pokef64(vals + 16, 4.0); pokef64(vals + 24, 4.0);
+  pokef64(vals + 32, 5.0); pokef64(vals + 40, 5.0);
+  pokef64(vals + 48, 7.0); pokef64(vals + 56, 9.0);
+  SumStatInit(st);
+  i := 0;
+  while (i < 8) {
+    SumStatAdd(st, peekf64(vals + i * 8));
+    i := i + 1;
+  }
+  CheckI("stat.count"c, SumStatCount(st), 8);
+  CheckExact("stat.mean"c, SumStatMean(st), 5.0);
+  CheckExact("stat.varP"c, SumStatVarianceP(st), 4.0);
+  CheckExact("stat.stdP"c, SumStatStdDevP(st), 2.0);
+  // Stichprobenvarianz: 32/7
+  CheckNear("stat.varS"c, SumStatVarianceS(st), 4.571428571428571, 0.000000000001);
+
+  // Ein einzelner Wert hat keine Stichprobenstreuung
+  SumStatInit(st);
+  SumStatAdd(st, 42.0);
+  CheckExact("stat.oneMean"c, SumStatMean(st), 42.0);
+  CheckExact("stat.oneVarS"c, SumStatVarianceS(st), 0.0);
+  CheckExact("stat.oneVarP"c, SumStatVarianceP(st), 0.0);
+
+  // ── Der Grund fuer Welford ─────────────────────────────────────────────────
+  //
+  // Werte um 1e9 mit Streuung 1. Die Schulformel E[x^2] - E[x]^2 loescht sich
+  // dabei aus und liefert etwas Falsches — hier nachgerechnet, damit der
+  // Unterschied belegt ist und nicht bloss behauptet.
+  var bigv: int64 := alloc(5 * 8);
+  i := 0;
+  while (i < 5) {
+    pokef64(bigv + i * 8, 1000000000.0 + (i as f64));
+    i := i + 1;
+  }
+  SumStatInit(st);
+  i := 0;
+  while (i < 5) {
+    SumStatAdd(st, peekf64(bigv + i * 8));
+    i := i + 1;
+  }
+  CheckExact("welford.bigMean"c, SumStatMean(st), 1000000002.0);
+  CheckExact("welford.bigVarS"c, SumStatVarianceS(st), 2.5);
+
+  // die Schulformel zum Vergleich
+  var sx: f64 := 0.0;
+  var sxx: f64 := 0.0;
+  i := 0;
+  while (i < 5) {
+    var v2: f64 := peekf64(bigv + i * 8);
+    sx := sx + v2;
+    sxx := sxx + v2 * v2;
+    i := i + 1;
+  }
+  var meanNaive: f64 := sx / 5.0;
+  var varNaive: f64 := sxx / 5.0 - meanNaive * meanNaive;
+  // exakt waeren 2,0 (Grundgesamtheit) — die Schulformel trifft das nicht
+  CheckB("welford.textbookFormulaFails"c,
+         AbsF64(varNaive - 2.0) < 0.001, false);
+  free(bigv, 5 * 8);
+
+  // ── Zaehler zusammenfassen ─────────────────────────────────────────────────
+  var s1: int64 := alloc(SUM_STAT_BYTES);
+  var s2b: int64 := alloc(SUM_STAT_BYTES);
+  var sm: int64 := alloc(SUM_STAT_BYTES);
+  SumStatInit(s1);
+  SumStatInit(s2b);
+  i := 0;
+  while (i < 4) {
+    SumStatAdd(s1, peekf64(vals + i * 8));
+    i := i + 1;
+  }
+  while (i < 8) {
+    SumStatAdd(s2b, peekf64(vals + i * 8));
+    i := i + 1;
+  }
+  SumStatMerge(s1, s2b, sm);
+  CheckI("merge.count"c, SumStatCount(sm), 8);
+  CheckNear("merge.mean"c, SumStatMean(sm), 5.0, 0.000000000001);
+  CheckNear("merge.varP"c, SumStatVarianceP(sm), 4.0, 0.000000000001);
+  // mit einem leeren Zaehler bleibt alles wie es war
+  SumStatInit(s2b);
+  SumStatMerge(s1, s2b, sm);
+  CheckI("merge.withEmpty"c, SumStatCount(sm), 4);
+  CheckNear("merge.emptyMean"c, SumStatMean(sm), SumStatMean(s1), 0.000000000001);
+  free(s1, SUM_STAT_BYTES);  free(s2b, SUM_STAT_BYTES);  free(sm, SUM_STAT_BYTES);
+  free(st, SUM_STAT_BYTES);
+  free(vals, 8 * 8);
+
+  // ── Zufallsproben: die Verfahren gegeneinander ─────────────────────────────
+  //
+  // Fuer jede Probe muss gelten: die exakte Summe ist die Wahrheit, und
+  // Neumaier liegt naeher an ihr als die naive Summe (oder gleichauf).
+  var badOrder: int64 := 0;
+  var badExact: int64 := 0;
+  var N: int64 := 2000;
+  var rnd: int64 := alloc(N * 8);
+  var trial: int64 := 0;
+  while (trial < 40) {
+    // Werte sehr unterschiedlicher Groesse — dort tut sich der Unterschied auf
+    i := 0;
+    while (i < N) {
+      var mag: int64 := Rnd(14) - 7;
+      var base: f64 := (Rnd(2000001) - 1000000) as f64;
+      var v3: f64 := base;
+      var k: int64 := 0;
+      while (k < mag) { v3 := v3 * 10.0; k := k + 1; }
+      k := 0;
+      while (k > mag) { v3 := v3 / 10.0; k := k - 1; }
+      pokef64(rnd + i * 8, v3);
+      i := i + 1;
+    }
+
+    var ref: f64 := SumExact(rnd, N, work, 256);
+    var nv: f64 := SumNaive(rnd, N);
+    var nu: f64 := SumNeumaier(rnd, N);
+
+    var eN: f64 := AbsF64(nu - ref);
+    var eV: f64 := AbsF64(nv - ref);
+    if (eN > eV) { badOrder := badOrder + 1; }
+
+    // die exakte Summe muss auch mit umgekehrter Reihenfolge herauskommen
+    var rev: int64 := alloc(N * 8);
+    i := 0;
+    while (i < N) {
+      pokef64(rev + i * 8, peekf64(rnd + (N - 1 - i) * 8));
+      i := i + 1;
+    }
+    var ref2: f64 := SumExact(rev, N, work, 256);
+    if (ref != ref2) { badExact := badExact + 1; }
+    free(rev, N * 8);
+
+    trial := trial + 1;
+  }
+  CheckI("fuzzNeumaierNeverWorse"c, badOrder, 0);
+  CheckI("fuzzExactOrderIndependent"c, badExact, 0);
+  free(rnd, N * 8);
+
+  // ── Negativkontrollen ──────────────────────────────────────────────────────
+  //
+  // Erstens: die naive Summe MUSS bei den Proben oben tatsaechlich abweichen,
+  // sonst pruefen die Vergleiche nichts.
+  var probe: int64 := alloc(1000 * 8);
+  i := 0;
+  while (i < 1000) {
+    pokef64(probe + i * 8, 0.1);
+    i := i + 1;
+  }
+  CheckB("negCtrl.naiveDrifts"c, SumNaive(probe, 1000) == 100.0, false);
+  CheckExact("negCtrl.neumaierDoesNot"c, SumNeumaier(probe, 1000), 100.0);
+
+  // Zweitens: SumTwoSum muss den Fehler wirklich liefern — mit einem
+  // Fehlerterm von immer null waere das ganze Verfahren wertlos.
+  var e2: int64 := alloc(8);
+  SumTwoSum(1.0e16, 1.0, e2);
+  CheckB("negCtrl.errorIsNonZero"c, peekf64(e2) == 0.0, false);
+  free(e2, 8);
+  free(probe, 1000 * 8);
+  free(work, 256 * 8);
+
+  PrintStr("checks="c);
+  PrintInt(_checks);
+  PrintStr(" fails="c);
+  PrintInt(_fails);
+  PrintStr("\n"c);
+  return _fails;
+}

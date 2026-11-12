@@ -1,0 +1,257 @@
+// tests/fat_test.lyx — std.fs.fat gegen ECHTE Abbilder
+//
+// Die Vorlagen erzeugt tests/fat_test.sh mit `mkfs.vfat` und `mtools`, nicht
+// dieser Test. Das ist die wichtigste Entscheidung an dieser Batterie: ein
+// selbst gebautes Abbild wuerde nur belegen, dass Leser und Schreiber
+// dieselbe Vorstellung haben — auch eine falsche. Gegen `mkfs.vfat` gemessen
+// steht auf der anderen Seite eine unabhaengige Umsetzung.
+//
+// Geprueft werden alle drei Fassungen (FAT12, FAT16, FAT32) mit denselben
+// Faellen. FAT12 ist dabei nicht der Nebenschauplatz, sondern der schwerste:
+// dort belegt ein Tabelleneintrag zwoelf Bit, zwei Eintraege teilen sich drei
+// Bytes, und ein Eintrag kann ueber die Sektorgrenze reichen.
+//
+// Der 200-000-Byte-Fall traegt den Test: er belegt je nach Fassung dutzende
+// bis hunderte Cluster. Wer die Datei als zusammenhaengenden Bereich liest,
+// bekommt hier fremden Inhalt — und weil das Muster berechenbar ist, faellt
+// schon ein einziges verschobenes Byte auf.
+
+unit main;
+
+import std.io;
+import std.env;
+import std.alloc;
+import std.string;
+import std.fs.fat;
+
+var _fails: int64 := 0;
+var _checks: int64 := 0;
+
+fn Check(name: pchar, got: int64, want: int64): void {
+  _checks := _checks + 1;
+  if (got == want) { PrintStr("PASS "c); PrintStrLn(name); }
+  else {
+    PrintStr("FAIL "c); PrintStr(name);
+    PrintStr(": erhalten "c); PrintInt(got);
+    PrintStr(" erwartet "c); PrintInt(want); PrintLn(""c);
+    _fails := _fails + 1;
+  }
+}
+
+fn CheckWahr(name: pchar, got: bool): void {
+  _checks := _checks + 1;
+  if (got) { PrintStr("PASS "c); PrintStrLn(name); }
+  else { PrintStr("FAIL "c); PrintStr(name); PrintStrLn(" (erwartet: wahr)"c); _fails := _fails + 1; }
+}
+
+fn CheckFalsch(name: pchar, got: bool): void {
+  _checks := _checks + 1;
+  if (!got) { PrintStr("PASS "c); PrintStrLn(name); }
+  else { PrintStr("FAIL "c); PrintStr(name); PrintStrLn(" (erwartet: falsch)"c); _fails := _fails + 1; }
+}
+
+// Pfad "<dir>/fat<typ>.img" zusammensetzen.
+fn BaueP(dir: pchar, typ: pchar, out: int64): void {
+  var n: int64 := 0;
+  var i: int64 := 0;
+  var dl: int64 := StrLen(dir);
+  while (i < dl) { poke8(out + n, StrCharAt(dir, i)); n := n + 1; i := i + 1; }
+  poke8(out + n, 47); n := n + 1;
+  poke8(out + n, 102); n := n + 1;   // f
+  poke8(out + n, 97);  n := n + 1;   // a
+  poke8(out + n, 116); n := n + 1;   // t
+  i := 0;
+  var tl: int64 := StrLen(typ);
+  while (i < tl) { poke8(out + n, StrCharAt(typ, i)); n := n + 1; i := i + 1; }
+  poke8(out + n, 46);  n := n + 1;   // .
+  poke8(out + n, 105); n := n + 1;   // i
+  poke8(out + n, 109); n := n + 1;   // m
+  poke8(out + n, 103); n := n + 1;   // g
+  poke8(out + n, 0);
+}
+
+fn NameGleich(buf: int64, s: pchar): bool {
+  var i: int64 := 0;
+  while (i < 300) {
+    var a: int64 := peek8(buf + i) & 255;
+    var b: int64 := StrCharAt(s, i) & 255;
+    if (a != b) { return false; }
+    if (a == 0) { return true; }
+    i := i + 1;
+  }
+  return false;
+}
+
+fn PruefeAbbild(pfad: pchar, erwarteterTyp: int64, marke: pchar): void {
+  PrintStr("\n--- "c); PrintStrLn(marke);
+
+  var fd: int64 := open(pfad, 0, 0);
+  _checks := _checks + 1;
+  if (fd < 0) {
+    PrintStr("FAIL "c); PrintStr(marke); PrintStrLn(": Abbild nicht zu oeffnen"c);
+    _fails := _fails + 1;
+    return;
+  }
+  PrintStr("PASS "c); PrintStr(marke); PrintStrLn(": Abbild geoeffnet"c);
+
+  var vol: FatVolume := FatMount(fd, 0);
+  CheckWahr("Volume ist gueltig"c, FatVolumeValid(vol));
+  // DIE Bestimmung: der Typ faellt aus der Clusterzahl, nicht aus dem
+  // Textfeld im Bootsektor. Ein Leser, der den Text liest, trifft hier
+  // zufaellig richtig — und bei einem anderen Formatierer falsch.
+  Check("Fassung erkannt"c, vol.fatType, erwarteterTyp);
+  Check("Sektorgroesse"c, vol.bytesPerSector, 512);
+  CheckWahr("Cluster hat wenigstens einen Sektor"c, vol.sectorsPerClus >= 1);
+  CheckWahr("Datenbereich liegt hinter den FAT-Kopien"c,
+            vol.firstDataSector > vol.reservedSectors);
+
+  // ── Wurzelverzeichnis durchlaufen ────────────────────────────────────
+  var d: FatDir := FatDirOpen(vol, 0);
+  var e: FatEntry;
+  var nb: int64 := alloc(320);
+  var zHallo: int64 := 0;
+  var zGross: int64 := 0;
+  var zOrdner: int64 := 0;
+  var zLang: int64 := 0;
+  var zAll: int64 := 0;
+  var grossSize: int64 := 0;
+  var laufend: bool := true;
+  while (laufend) {
+    var r: int64 := FatDirNext(vol, d, e, nb, 320);
+    if (r != 1) { laufend := false; }
+    else {
+      zAll := zAll + 1;
+      if (NameGleich(nb, "HALLO.TXT"c)) { zHallo := zHallo + 1; }
+      if (NameGleich(nb, "GROSS.BIN"c)) { zGross := zGross + 1; grossSize := e.size; }
+      if (NameGleich(nb, "ORDNER"c)) { zOrdner := zOrdner + 1; CheckWahr("ORDNER ist ein Verzeichnis"c, e.isDir); }
+      if (NameGleich(nb, "Ein langer Dateiname.txt"c)) { zLang := zLang + 1; }
+    }
+  }
+  FatDirClose(vol, d);
+
+  Check("HALLO.TXT im Wurzelverzeichnis"c, zHallo, 1);
+  Check("GROSS.BIN im Wurzelverzeichnis"c, zGross, 1);
+  Check("ORDNER im Wurzelverzeichnis"c, zOrdner, 1);
+  // Der lange Name ist der Nachweis fuer die LFN-Auswertung. Ohne sie hiesse
+  // der Eintrag "EINLAN~1.TXT" — auch ein gueltiger Name, nur eben nicht der,
+  // den der Nutzer vergeben hat.
+  Check("langer Dateiname zusammengesetzt"c, zLang, 1);
+  CheckWahr("der Durchlauf endet (kein Dauerlauf)"c, zAll < 1000);
+  Check("GROSS.BIN Groesse"c, grossSize, 200000);
+
+  // ── Kleine Datei lesen ───────────────────────────────────────────────
+  var e2: FatEntry;
+  Check("HALLO.TXT gefunden"c, FatFindInDir(vol, 0, "HALLO.TXT"c, e2), 1);
+  var buf: int64 := alloc(64);
+  Check("HALLO.TXT gelesen"c, FatReadFile(vol, e2, buf, 64), 10);
+  poke8(buf + 10, 0);
+  CheckWahr("HALLO.TXT Inhalt"c, NameGleich(buf, "Hallo FAT\n"c));
+  free(buf, 64);
+
+  // ── Grosse Datei ueber viele Cluster ─────────────────────────────────
+  var e3: FatEntry;
+  Check("GROSS.BIN gefunden"c, FatFindInDir(vol, 0, "GROSS.BIN"c, e3), 1);
+  var gb: int64 := alloc(200000);
+  Check("GROSS.BIN vollstaendig gelesen"c, FatReadFile(vol, e3, gb, 200000), 200000);
+  // Jedes Byte gegen die Bildungsregel. Ein verschobener Cluster faellt hier
+  // auf, auch wenn die Laenge stimmt.
+  var falsch: int64 := 0;
+  var i2: int64 := 0;
+  var ersterFehler: int64 := 0 - 1;
+  while (i2 < 200000) {
+    var soll: int64 := (i2 * 7 + 3) & 255;
+    if ((peek8(gb + i2) & 255) != soll) {
+      falsch := falsch + 1;
+      if (ersterFehler < 0) { ersterFehler := i2; }
+    }
+    i2 := i2 + 1;
+  }
+  _checks := _checks + 1;
+  if (falsch == 0) { PrintStrLn("PASS GROSS.BIN Inhalt Byte fuer Byte"c); }
+  else {
+    PrintStr("FAIL GROSS.BIN Inhalt: "c); PrintInt(falsch);
+    PrintStr(" Abweichungen, erste bei "c); PrintInt(ersterFehler); PrintLn(""c);
+    _fails := _fails + 1;
+  }
+  free(gb, 200000);
+
+  // Die Kette muss genau so viele Cluster haben, wie die Groesse verlangt.
+  var proCl: int64 := FatBytesPerCluster(vol);
+  var sollCl: int64 := (200000 + proCl - 1) / proCl;
+  Check("Kettenlaenge von GROSS.BIN"c, FatChainLength(vol, e3.cluster), sollCl);
+
+  // ── Pfad ueber zwei Ebenen ───────────────────────────────────────────
+  var e4: FatEntry;
+  Check("ORDNER/TIEF/UNTEN.TXT gefunden"c,
+        FatFindPath(vol, "ORDNER/TIEF/UNTEN.TXT"c, e4), 1);
+  var buf2: int64 := alloc(64);
+  Check("UNTEN.TXT gelesen"c, FatReadFile(vol, e4, buf2, 64), 10);
+  free(buf2, 64);
+  // Fuehrende und doppelte Trennzeichen duerfen nichts aendern.
+  var e5: FatEntry;
+  Check("derselbe Pfad mit Schraegstrichen davor"c,
+        FatFindPath(vol, "/ORDNER//TIEF/UNTEN.TXT"c, e5), 1);
+  Check("und mit Rueckstrichen"c,
+        FatFindPath(vol, "ORDNER\\TIEF\\UNTEN.TXT"c, e5), 1);
+
+  // ── Was es nicht gibt ────────────────────────────────────────────────
+  var e6: FatEntry;
+  Check("fehlende Datei wird nicht gefunden"c,
+        FatFindInDir(vol, 0, "GIBTESNICHT.XYZ"c, e6), 0);
+  Check("fehlender Pfad wird nicht gefunden"c,
+        FatFindPath(vol, "ORDNER/TIEF/NICHTDA.TXT"c, e6), 0);
+
+  // Ein Verzeichnis ist keine Datei — das wird gemeldet, nicht mit dem
+  // Rohinhalt des Clusters beantwortet.
+  var e7: FatEntry;
+  Check("ORDNER gefunden"c, FatFindInDir(vol, 0, "ORDNER"c, e7), 1);
+  var b3: int64 := alloc(64);
+  Check("Verzeichnis lesen wird abgewiesen"c, FatReadFile(vol, e7, b3, 64), FAT_ERR);
+  free(b3, 64);
+
+  // Clusternummern ausserhalb des Datentraegers.
+  Check("Cluster 0 gibt es nicht"c, FatNextCluster(vol, 0), FAT_ERR);
+  Check("Cluster 1 gibt es nicht"c, FatNextCluster(vol, 1), FAT_ERR);
+  Check("Cluster hinter dem Ende"c,
+        FatNextCluster(vol, vol.countOfClusters + 5), FAT_ERR);
+
+  free(nb, 320);
+  close(fd);
+}
+
+fn main(): int64 {
+  var argc: int64 := GetArgC();
+  if (argc < 2) {
+    PrintStrLn("FAIL: Abbildverzeichnis fehlt (Aufruf: fat_test <verzeichnis>)"c);
+    return 1;
+  }
+  var dir: pchar := ArgvGet(GetArgV(), 1);
+
+  var p: int64 := alloc(600);
+
+  BaueP(dir, "12"c, p);
+  PruefeAbbild(p as pchar, FAT_TYPE_12, "FAT12"c);
+  BaueP(dir, "16"c, p);
+  PruefeAbbild(p as pchar, FAT_TYPE_16, "FAT16"c);
+  BaueP(dir, "32"c, p);
+  PruefeAbbild(p as pchar, FAT_TYPE_32, "FAT32"c);
+
+  // Gegenprobe: etwas, das kein FAT ist, wird als solches erkannt. Ohne
+  // diesen Fall waere jede Pruefung oben auch von einem Mount erfuellt, der
+  // wahllos "gueltig" sagt.
+  PrintStrLn("\n--- kein FAT"c);
+  var selbst: int64 := open("/proc/self/exe"c, 0, 0);
+  if (selbst >= 0) {
+    var v2: FatVolume := FatMount(selbst, 0);
+    CheckFalsch("ein ELF ist kein FAT-Volume"c, FatVolumeValid(v2));
+    close(selbst);
+  }
+
+  free(p, 600);
+
+  PrintStr("\n"c);
+  PrintInt(_checks); PrintStr(" Pruefungen, "c);
+  PrintInt(_fails); PrintStrLn(" FAIL"c);
+  if (_fails == 0) { PrintStrLn("OK: std.fs.fat"c); return 0; }
+  return 1;
+}

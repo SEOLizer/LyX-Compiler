@@ -1,0 +1,420 @@
+// src/backend/linux_syscalls.lyx — #2021: Linux-Syscalls fuer die IR-Backends.
+//
+// Eine Stelle fuer arm64 UND riscv. Beide gehen nach der GENERISCHEN
+// Linux-ABI (asm-generic/unistd.h) und zaehlen damit gleich — write ist auf
+// beiden 64, read 63, exit 93. Nur x86-64 zaehlt anders (dort 1/0/60), und
+// genau deshalb steht diese Tabelle NICHT im x86-Codegen: der emittiert seine
+// Nummern selbst und braucht sie nicht.
+//
+// WARUM EINE GEMEINSAME TABELLE. Bis 1.2.6A schrieb jedes Backend jeden
+// Syscall als eigenen Block. Bei achtzehn neuen Aufrufen waeren das
+// sechsunddreissig handgeschriebene Assembler-Bloecke geworden, die
+// uebereinstimmen muessen — die Klasse "zwei Stellen, die auseinanderlaufen",
+// nur in gross. Die Nummern stehen deshalb hier, und beide Backends holen sie
+// von hier.
+//
+// DIE NUMMERN SIND GEMESSEN, NICHT ABGESCHRIEBEN: nachgeschlagen in
+// /usr/include/asm-generic/unistd.h. Die Stichprobe gegen die bereits im
+// Compiler hinterlegten Werte stimmte (write 64, read 63, exit 93,
+// munmap 215).
+//
+// NICHT ENTHALTEN: `select`. Die generische ABI kennt es nicht — arm64 und
+// riscv haben nur `pselect6` (72), das ein sechstes Argument (Signalmaske)
+// nimmt. Ein Aufruf mit fuenf Argumenten darauf abzubilden hiesse, den
+// sechsten Wert zu erfinden; das waere eine stille Fehlfunktion statt einer
+// fehlenden Funktion. sys_select bleibt auf diesen Zielen offen und wird von
+// ir_lower benannt abgewiesen.
+
+unit src.backend.linux_syscalls;
+
+// ── IDs (siehe src/backend/_builtin_ids.md) ─────────────────────────────────
+pub con LSC_MIN: int64 := 440;
+pub con LSC_MAX: int64 := 544;
+
+pub con LSC_GETUID:         int64 := 440;
+pub con LSC_CHROOT:         int64 := 441;
+pub con LSC_CLONE:          int64 := 442;
+pub con LSC_EPOLL_CREATE1:  int64 := 443;
+pub con LSC_INOTIFY_INIT1:  int64 := 444;
+pub con LSC_IO_URING_SETUP: int64 := 445;
+pub con LSC_MQ_OPEN:        int64 := 446;
+pub con LSC_MREMAP:         int64 := 447;
+pub con LSC_PIDFD_OPEN:     int64 := 448;
+pub con LSC_PRCTL:          int64 := 449;
+pub con LSC_PREAD64:        int64 := 450;
+pub con LSC_PTRACE:         int64 := 451;
+pub con LSC_RT_SIGACTION:   int64 := 452;
+pub con LSC_SCHED_YIELD:    int64 := 453;
+pub con LSC_SHMGET:         int64 := 454;
+pub con LSC_SETXATTR:       int64 := 455;
+pub con LSC_BPF:            int64 := 456;
+
+// #2021 (zweite Runde): erst sichtbar, nachdem die davorliegenden Namen
+// behoben waren — je Unit meldet der Lowerer nur den ERSTEN fehlenden.
+pub con LSC_EPOLL_CTL:         int64 := 457;
+pub con LSC_EVENTFD2:          int64 := 458;
+pub con LSC_GETGID:            int64 := 459;
+pub con LSC_GETPPID:           int64 := 460;
+pub con LSC_GETXATTR:          int64 := 461;
+pub con LSC_INOTIFY_ADD_WATCH: int64 := 462;
+pub con LSC_IO_URING_ENTER:    int64 := 463;
+pub con LSC_MADVISE:           int64 := 464;
+pub con LSC_MQ_UNLINK:         int64 := 465;
+pub con LSC_PERF_EVENT_OPEN:   int64 := 466;
+pub con LSC_PIDFD_SEND_SIGNAL: int64 := 467;
+pub con LSC_PWRITE64:          int64 := 468;
+pub con LSC_RT_SIGPROCMASK:    int64 := 469;
+pub con LSC_SETHOSTNAME:       int64 := 470;
+pub con LSC_SHMAT:             int64 := 471;
+
+// #2024: die Linux-Formen der IDs 172...198. Sie bekommen EIGENE IDs, weil
+// dieselbe ID nicht zwei Stelligkeiten tragen kann: `sendto` nimmt unter
+// LyxOS vier Argumente, unter Linux sechs. ir_lower waehlt nach Ziel.
+pub con LSC_FCNTL:             int64 := 472;
+pub con LSC_DUP3:              int64 := 473;
+pub con LSC_FTRUNCATE:         int64 := 474;
+pub con LSC_FSYNC:             int64 := 475;
+pub con LSC_FDATASYNC:         int64 := 476;
+pub con LSC_UNAME:             int64 := 477;
+pub con LSC_GETCPU:            int64 := 478;
+pub con LSC_READV:             int64 := 479;
+pub con LSC_WRITEV:            int64 := 480;
+pub con LSC_STATFS:            int64 := 481;
+pub con LSC_SCHED_GETAFFINITY: int64 := 482;
+pub con LSC_SCHED_SETAFFINITY: int64 := 483;
+pub con LSC_GETPRIORITY:       int64 := 484;
+pub con LSC_SETPRIORITY:       int64 := 485;
+pub con LSC_KILL:              int64 := 486;
+pub con LSC_PIPE2:             int64 := 487;
+pub con LSC_SENDTO:            int64 := 488;
+pub con LSC_RECVFROM:          int64 := 489;
+pub con LSC_GETSOCKNAME:       int64 := 490;
+pub con LSC_GETPEERNAME:       int64 := 491;
+pub con LSC_FACCESSAT:         int64 := 492;
+pub con LSC_FUTEX:             int64 := 493;
+
+// #2021 (dritte Runde): der gemessene Rest. Nummern aus asm-generic/unistd.h;
+// `sendfile` und `mmap` liegen dort hinter __NR3264_*, `epoll_wait` und
+// `getpgrp` gibt es gar nicht — sie werden umgeschrieben (siehe ir_lower).
+pub con LSC_ACCEPT4:           int64 := 494;
+pub con LSC_CAPGET:            int64 := 495;
+pub con LSC_CAPSET:            int64 := 496;
+pub con LSC_FALLOCATE:         int64 := 497;
+pub con LSC_FGETXATTR:         int64 := 498;
+pub con LSC_FLISTXATTR:        int64 := 499;
+pub con LSC_FREMOVEXATTR:      int64 := 500;
+pub con LSC_FSETXATTR:         int64 := 501;
+pub con LSC_FUTEX_WAITV:       int64 := 502;
+pub con LSC_GETEGID:           int64 := 503;
+pub con LSC_GETEUID:           int64 := 504;
+pub con LSC_INOTIFY_RM_WATCH:  int64 := 505;
+pub con LSC_IO_URING_REGISTER: int64 := 506;
+pub con LSC_LISTXATTR:         int64 := 507;
+pub con LSC_MEMFD_CREATE:      int64 := 508;
+pub con LSC_MINCORE:           int64 := 509;
+pub con LSC_MLOCK:             int64 := 510;
+pub con LSC_MQ_GETSETATTR:     int64 := 512;
+pub con LSC_MQ_TIMEDRECEIVE:   int64 := 513;
+pub con LSC_MQ_TIMEDSEND:      int64 := 514;
+pub con LSC_MSGCTL:            int64 := 515;
+pub con LSC_MSGGET:            int64 := 516;
+pub con LSC_MSGRCV:            int64 := 517;
+pub con LSC_MSGSND:            int64 := 518;
+pub con LSC_MSYNC:             int64 := 519;
+pub con LSC_MUNLOCK:           int64 := 520;
+pub con LSC_PIDFD_GETFD:       int64 := 523;
+pub con LSC_REBOOT:            int64 := 524;
+pub con LSC_RECVMMSG:          int64 := 525;
+pub con LSC_REMOVEXATTR:       int64 := 526;
+pub con LSC_SEMCTL:            int64 := 527;
+pub con LSC_SEMGET:            int64 := 528;
+pub con LSC_SEMOP:             int64 := 529;
+pub con LSC_SENDFILE:          int64 := 530;
+pub con LSC_SENDMMSG:          int64 := 531;
+pub con LSC_SETGID:            int64 := 532;
+pub con LSC_SETNS:             int64 := 533;
+pub con LSC_SETPGID:           int64 := 534;
+pub con LSC_SETSID:            int64 := 535;
+pub con LSC_SHMCTL:            int64 := 536;
+pub con LSC_SHMDT:             int64 := 537;
+pub con LSC_SIGNALFD4:         int64 := 538;
+pub con LSC_TGKILL:            int64 := 539;
+pub con LSC_UMOUNT2:           int64 := 540;
+pub con LSC_UNSHARE:           int64 := 541;
+pub con LSC_EPOLL_PWAIT:       int64 := 542;
+pub con LSC_GETPGID:           int64 := 543;
+// #2045: clock_gettime. Es stand nicht in der 50er-Liste aus #2021, weil es
+// nicht als sys_*-Name gerufen wird — ir_lower bildete es unbedingt auf die
+// LyxOS-ID 211 ab, auch fuer arm64/riscv. Nummer 113 aus
+// /usr/include/asm-generic/unistd.h (__NR_clock_gettime), NACHGESCHLAGEN.
+// Nicht 403 (clock_gettime64): die 64-Bit-Ziele nehmen 113, und diese Tabelle
+// gilt nur fuer arm64 und riscv64.
+pub con LSC_CLOCK_GETTIME:     int64 := 544;
+// #2122: mmap mit allen sechs Argumenten. Bis 1.2.14B wurde `mmap` auf dem
+// IR-Weg zu IRO_ALLOC — Adresse, Schutz, Flags, Deskriptor und Offset fielen
+// still weg, jede Abbildung war anonym und RW. Nummer 222
+// (__NR3264_mmap, asm-generic/unistd.h), NACHGESCHLAGEN.
+//
+// 546 und nicht 545: die 545 traegt EPrintFloat (#2042) — der Namensraum der
+// Builtin-IDs ist backenduebergreifend einer (src/backend/_builtin_ids.md).
+// Ausserhalb von LSC_MIN..LSC_MAX; die Backends fragen deshalb
+// IstLinuxSys(id), nicht den Bereich.
+pub con LSC_MMAP:              int64 := 546;
+// #2156: Pfade und Metadaten. Die generische ABI kennt weder stat/lstat noch
+// readlink/symlink — nur die *at-Formen mit Verzeichnis-Deskriptor; ir_lower
+// setzt dirfd = AT_FDCWD (-100) ein, lstat bekommt AT_SYMLINK_NOFOLLOW
+// (0x100). Nummern NACHGESCHLAGEN in asm-generic/unistd.h.
+// Ausserhalb von LSC_MIN..LSC_MAX (545 ist EPrintFloat), wie LSC_MMAP.
+pub con LSC_NEWFSTATAT:        int64 := 547;   // Nr. 79
+pub con LSC_READLINKAT:        int64 := 548;   // Nr. 78
+pub con LSC_SYMLINKAT:         int64 := 549;   // Nr. 36
+pub con LSC_FSTAT:             int64 := 550;   // Nr. 80
+// #2450: rmdir. Die generische ABI kennt kein `rmdir` -- nur `unlinkat` mit
+// AT_REMOVEDIR. Nummer 35 und das Flag 0x200 NACHGESCHLAGEN in
+// /usr/include/asm-generic/unistd.h bzw. /usr/include/linux/fcntl.h.
+// Bis hierher senkte ir_lower `rmdir` auf die LyxOS-ID 236 (sys_unlink mit
+// UNLINK_DIR), unabhaengig vom Ziel -- auf arm64 und riscv brach damit jedes
+// Programm ab, das std.fs auch nur importiert.
+pub con LSC_UNLINKAT:          int64 := 551;   // Nr. 35
+
+// Syscall-Nummer der generischen Linux-ABI, oder -1 wenn die ID keine ist.
+//
+// -1 statt 0: die Null ist eine GUELTIGE Syscall-Nummer (io_setup), ein
+// Fehlwert muss also ausserhalb des Wertebereichs liegen.
+pub fn LinuxSysNr(id: int64): int64 {
+  if (id == LSC_GETUID)         { return 174; }
+  if (id == LSC_CHROOT)         { return 51; }
+  if (id == LSC_CLONE)          { return 220; }
+  if (id == LSC_EPOLL_CREATE1)  { return 20; }
+  if (id == LSC_INOTIFY_INIT1)  { return 26; }
+  if (id == LSC_IO_URING_SETUP) { return 425; }
+  if (id == LSC_MQ_OPEN)        { return 180; }
+  if (id == LSC_MREMAP)         { return 216; }
+  if (id == LSC_PIDFD_OPEN)     { return 434; }
+  if (id == LSC_PRCTL)          { return 167; }
+  if (id == LSC_PREAD64)        { return 67; }
+  if (id == LSC_PTRACE)         { return 117; }
+  if (id == LSC_RT_SIGACTION)   { return 134; }
+  if (id == LSC_SCHED_YIELD)    { return 124; }
+  if (id == LSC_SHMGET)         { return 194; }
+  if (id == LSC_SETXATTR)       { return 5; }
+  if (id == LSC_BPF)            { return 280; }
+  if (id == LSC_EPOLL_CTL) { return 21; }
+  if (id == LSC_EVENTFD2) { return 19; }
+  if (id == LSC_GETGID) { return 176; }
+  if (id == LSC_GETPPID) { return 173; }
+  if (id == LSC_GETXATTR) { return 8; }
+  if (id == LSC_INOTIFY_ADD_WATCH) { return 27; }
+  if (id == LSC_IO_URING_ENTER) { return 426; }
+  if (id == LSC_MADVISE) { return 233; }
+  if (id == LSC_MQ_UNLINK) { return 181; }
+  if (id == LSC_PERF_EVENT_OPEN) { return 241; }
+  if (id == LSC_PIDFD_SEND_SIGNAL) { return 424; }
+  if (id == LSC_PWRITE64) { return 68; }
+  if (id == LSC_RT_SIGPROCMASK) { return 135; }
+  if (id == LSC_SETHOSTNAME) { return 161; }
+  if (id == LSC_SHMAT) { return 196; }
+  if (id == LSC_FCNTL) { return 25; }
+  if (id == LSC_DUP3) { return 24; }
+  if (id == LSC_FTRUNCATE) { return 46; }
+  if (id == LSC_FSYNC) { return 82; }
+  if (id == LSC_FDATASYNC) { return 83; }
+  if (id == LSC_UNAME) { return 160; }
+  if (id == LSC_GETCPU) { return 168; }
+  if (id == LSC_READV) { return 65; }
+  if (id == LSC_WRITEV) { return 66; }
+  if (id == LSC_STATFS) { return 43; }
+  if (id == LSC_SCHED_GETAFFINITY) { return 123; }
+  if (id == LSC_SCHED_SETAFFINITY) { return 122; }
+  if (id == LSC_GETPRIORITY) { return 141; }
+  if (id == LSC_SETPRIORITY) { return 140; }
+  if (id == LSC_KILL) { return 129; }
+  if (id == LSC_PIPE2) { return 59; }
+  if (id == LSC_SENDTO) { return 206; }
+  if (id == LSC_RECVFROM) { return 207; }
+  if (id == LSC_GETSOCKNAME) { return 204; }
+  if (id == LSC_GETPEERNAME) { return 205; }
+  if (id == LSC_FACCESSAT) { return 48; }
+  if (id == LSC_FUTEX) { return 98; }
+  if (id == LSC_ACCEPT4) { return 242; }
+  if (id == LSC_CAPGET) { return 90; }
+  if (id == LSC_CAPSET) { return 91; }
+  if (id == LSC_FALLOCATE) { return 47; }
+  if (id == LSC_FGETXATTR) { return 10; }
+  if (id == LSC_FLISTXATTR) { return 13; }
+  if (id == LSC_FREMOVEXATTR) { return 16; }
+  if (id == LSC_FSETXATTR) { return 7; }
+  if (id == LSC_FUTEX_WAITV) { return 449; }
+  if (id == LSC_GETEGID) { return 177; }
+  if (id == LSC_GETEUID) { return 175; }
+  if (id == LSC_INOTIFY_RM_WATCH) { return 28; }
+  if (id == LSC_IO_URING_REGISTER) { return 427; }
+  if (id == LSC_LISTXATTR) { return 11; }
+  if (id == LSC_MEMFD_CREATE) { return 279; }
+  if (id == LSC_MINCORE) { return 232; }
+  if (id == LSC_MLOCK) { return 228; }
+  if (id == LSC_MQ_GETSETATTR) { return 185; }
+  if (id == LSC_MQ_TIMEDRECEIVE) { return 183; }
+  if (id == LSC_MQ_TIMEDSEND) { return 182; }
+  if (id == LSC_MSGCTL) { return 187; }
+  if (id == LSC_MSGGET) { return 186; }
+  if (id == LSC_MSGRCV) { return 188; }
+  if (id == LSC_MSGSND) { return 189; }
+  if (id == LSC_MSYNC) { return 227; }
+  if (id == LSC_MUNLOCK) { return 229; }
+  if (id == LSC_PIDFD_GETFD) { return 438; }
+  if (id == LSC_REBOOT) { return 142; }
+  if (id == LSC_RECVMMSG) { return 243; }
+  if (id == LSC_REMOVEXATTR) { return 14; }
+  if (id == LSC_SEMCTL) { return 191; }
+  if (id == LSC_SEMGET) { return 190; }
+  if (id == LSC_SEMOP) { return 193; }
+  if (id == LSC_SENDFILE) { return 71; }
+  if (id == LSC_SENDMMSG) { return 269; }
+  if (id == LSC_SETGID) { return 144; }
+  if (id == LSC_SETNS) { return 268; }
+  if (id == LSC_SETPGID) { return 154; }
+  if (id == LSC_SETSID) { return 157; }
+  if (id == LSC_SHMCTL) { return 195; }
+  if (id == LSC_SHMDT) { return 197; }
+  if (id == LSC_SIGNALFD4) { return 74; }
+  if (id == LSC_TGKILL) { return 131; }
+  if (id == LSC_UMOUNT2) { return 39; }
+  if (id == LSC_UNSHARE) { return 97; }
+  if (id == LSC_EPOLL_PWAIT) { return 22; }
+  if (id == LSC_GETPGID) { return 155; }
+  if (id == LSC_CLOCK_GETTIME) { return 113; }
+  if (id == LSC_MMAP)          { return 222; }   // #2122
+  if (id == LSC_NEWFSTATAT)    { return 79; }    // #2156
+  if (id == LSC_READLINKAT)    { return 78; }
+  if (id == LSC_SYMLINKAT)     { return 36; }
+  if (id == LSC_FSTAT)         { return 80; }
+  if (id == LSC_UNLINKAT)      { return 35; }   // #2450
+  return 0 - 1;
+}
+
+// Wie viele Argumente der Aufruf in die Register legt.
+//
+// Die Zahl steht hier und nicht im Aufrufer, weil sie zur ABI gehoert: sie
+// bestimmt, welche Register der Kernel liest. Zu wenige zu laden hiesse, dem
+// Kernel zu ueberlassen, was zufaellig im Register steht.
+// #2122: Ist die Builtin-ID ein Linux-Syscall aus dieser Tabelle? Die eine
+// Frage fuer arm64 und riscv — LSC_MMAP liegt ausserhalb des Bereichs.
+pub fn IstLinuxSys(id: int64): int64 {
+  if (id >= LSC_MIN && id <= LSC_MAX) { return 1; }
+  if (id == LSC_MMAP) { return 1; }
+  if (id >= LSC_NEWFSTATAT && id <= LSC_UNLINKAT) { return 1; }   // #2156, #2450
+  return 0;
+}
+
+pub fn LinuxSysArgc(id: int64): int64 {
+  if (id == LSC_GETUID)         { return 0; }
+  if (id == LSC_SCHED_YIELD)    { return 0; }
+  if (id == LSC_CHROOT)         { return 1; }
+  if (id == LSC_INOTIFY_INIT1)  { return 1; }
+  if (id == LSC_EPOLL_CREATE1)  { return 1; }
+  if (id == LSC_PIDFD_OPEN)     { return 2; }
+  if (id == LSC_IO_URING_SETUP) { return 2; }
+  if (id == LSC_SHMGET)         { return 3; }
+  if (id == LSC_MQ_OPEN)        { return 4; }
+  if (id == LSC_RT_SIGACTION)   { return 4; }
+  if (id == LSC_PREAD64)        { return 4; }
+  if (id == LSC_PTRACE)         { return 4; }
+  if (id == LSC_MREMAP)         { return 5; }
+  if (id == LSC_PRCTL)          { return 5; }
+  if (id == LSC_SETXATTR)       { return 5; }
+  if (id == LSC_CLONE)          { return 5; }
+  if (id == LSC_BPF)            { return 3; }
+  if (id == LSC_EPOLL_CTL) { return 4; }
+  if (id == LSC_EVENTFD2) { return 2; }
+  if (id == LSC_GETGID) { return 0; }
+  if (id == LSC_GETPPID) { return 0; }
+  if (id == LSC_GETXATTR) { return 4; }
+  if (id == LSC_INOTIFY_ADD_WATCH) { return 3; }
+  if (id == LSC_IO_URING_ENTER) { return 6; }
+  if (id == LSC_MADVISE) { return 3; }
+  if (id == LSC_MQ_UNLINK) { return 1; }
+  if (id == LSC_PERF_EVENT_OPEN) { return 5; }
+  if (id == LSC_PIDFD_SEND_SIGNAL) { return 4; }
+  if (id == LSC_PWRITE64) { return 4; }
+  if (id == LSC_RT_SIGPROCMASK) { return 4; }
+  if (id == LSC_SETHOSTNAME) { return 2; }
+  if (id == LSC_SHMAT) { return 3; }
+  if (id == LSC_FCNTL) { return 3; }
+  if (id == LSC_DUP3) { return 3; }
+  if (id == LSC_FTRUNCATE) { return 2; }
+  if (id == LSC_FSYNC) { return 1; }
+  if (id == LSC_FDATASYNC) { return 1; }
+  if (id == LSC_UNAME) { return 1; }
+  if (id == LSC_GETCPU) { return 3; }
+  if (id == LSC_READV) { return 3; }
+  if (id == LSC_WRITEV) { return 3; }
+  if (id == LSC_STATFS) { return 2; }
+  if (id == LSC_SCHED_GETAFFINITY) { return 3; }
+  if (id == LSC_SCHED_SETAFFINITY) { return 3; }
+  if (id == LSC_GETPRIORITY) { return 2; }
+  if (id == LSC_SETPRIORITY) { return 3; }
+  if (id == LSC_KILL) { return 2; }
+  if (id == LSC_PIPE2) { return 2; }
+  if (id == LSC_SENDTO) { return 6; }
+  if (id == LSC_RECVFROM) { return 6; }
+  if (id == LSC_GETSOCKNAME) { return 3; }
+  if (id == LSC_GETPEERNAME) { return 3; }
+  if (id == LSC_FACCESSAT) { return 3; }
+  if (id == LSC_FUTEX) { return 6; }
+  if (id == LSC_ACCEPT4) { return 4; }
+  if (id == LSC_CAPGET) { return 2; }
+  if (id == LSC_CAPSET) { return 2; }
+  if (id == LSC_FALLOCATE) { return 4; }
+  if (id == LSC_FGETXATTR) { return 4; }
+  if (id == LSC_FLISTXATTR) { return 3; }
+  if (id == LSC_FREMOVEXATTR) { return 2; }
+  if (id == LSC_FSETXATTR) { return 5; }
+  if (id == LSC_FUTEX_WAITV) { return 5; }
+  if (id == LSC_GETEGID) { return 0; }
+  if (id == LSC_GETEUID) { return 0; }
+  if (id == LSC_INOTIFY_RM_WATCH) { return 2; }
+  if (id == LSC_IO_URING_REGISTER) { return 4; }
+  if (id == LSC_LISTXATTR) { return 3; }
+  if (id == LSC_MEMFD_CREATE) { return 2; }
+  if (id == LSC_MINCORE) { return 3; }
+  if (id == LSC_MLOCK) { return 2; }
+  if (id == LSC_MQ_GETSETATTR) { return 3; }
+  if (id == LSC_MQ_TIMEDRECEIVE) { return 5; }
+  if (id == LSC_MQ_TIMEDSEND) { return 5; }
+  if (id == LSC_MSGCTL) { return 3; }
+  if (id == LSC_MSGGET) { return 2; }
+  if (id == LSC_MSGRCV) { return 5; }
+  if (id == LSC_MSGSND) { return 4; }
+  if (id == LSC_MSYNC) { return 3; }
+  if (id == LSC_MUNLOCK) { return 2; }
+  if (id == LSC_PIDFD_GETFD) { return 3; }
+  if (id == LSC_REBOOT) { return 4; }
+  if (id == LSC_RECVMMSG) { return 5; }
+  if (id == LSC_REMOVEXATTR) { return 2; }
+  if (id == LSC_SEMCTL) { return 4; }
+  if (id == LSC_SEMGET) { return 3; }
+  if (id == LSC_SEMOP) { return 3; }
+  if (id == LSC_SENDFILE) { return 4; }
+  if (id == LSC_SENDMMSG) { return 4; }
+  if (id == LSC_SETGID) { return 1; }
+  if (id == LSC_SETNS) { return 2; }
+  if (id == LSC_SETPGID) { return 2; }
+  if (id == LSC_SETSID) { return 0; }
+  if (id == LSC_SHMCTL) { return 3; }
+  if (id == LSC_SHMDT) { return 1; }
+  if (id == LSC_SIGNALFD4) { return 4; }
+  if (id == LSC_TGKILL) { return 3; }
+  if (id == LSC_UMOUNT2) { return 2; }
+  if (id == LSC_UNSHARE) { return 1; }
+  if (id == LSC_EPOLL_PWAIT) { return 6; }
+  if (id == LSC_GETPGID) { return 1; }
+  if (id == LSC_CLOCK_GETTIME) { return 2; }
+  if (id == LSC_MMAP)          { return 6; }     // #2122
+  if (id == LSC_NEWFSTATAT)    { return 4; }     // #2156: dirfd, pfad, buf, flags
+  if (id == LSC_READLINKAT)    { return 4; }     // dirfd, pfad, buf, groesse
+  if (id == LSC_SYMLINKAT)     { return 3; }     // ziel, dirfd, link
+  if (id == LSC_FSTAT)         { return 2; }     // fd, buf
+  if (id == LSC_UNLINKAT)      { return 3; }     // #2450: dirfd, pfad, flags
+  return 0;
+}

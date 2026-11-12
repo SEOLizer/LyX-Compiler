@@ -1,0 +1,295 @@
+// tests/pci_wp4_test.lyx
+// PCI Phase 4 (PCI-11/PCI-12) — Tests ohne root.
+//
+// Beide Wege brauchen fuer den echten Zugriff root (/dev/port bzw.
+// /dev/mem). Was sie falsch machen koennen, ist aber die Adressrechnung —
+// und die ist reine Arithmetik. Ein Fehler darin zeigt auf ein fremdes
+// Geraet oder in fremden Speicher; genau das wird hier geprueft, gegen
+// von Hand nachgerechnete Werte.
+//
+// Der MCFG-Parser arbeitet auf einem Puffer und wird deshalb gegen eine
+// selbst gebaute Tabelle geprueft, nicht gegen die des Systems.
+//
+// Abnahmekriterien:
+// AC-1  CF8-Adresse stimmt bitgenau, Offset wird auf 4 Byte ausgerichtet
+// AC-2  CF8 kennt nur 256 Bytes und nur Domain 0
+// AC-3  ECAM-Adressrechnung stimmt, auch bei startBus != 0
+// AC-4  MCFG: Signatur, Laengenfeld, Eintragsfelder
+// AC-5  MCFG lehnt Muell ab, statt Adressen zu erfinden
+// AC-6  Fehlende Rechte, Kernel-Lockdown und "gibt es nicht" werden
+//       auseinandergehalten — nicht alles als "kein Geraet"
+
+unit tests.pci_wp4_test;
+
+import std.hardware.pci_types;
+import std.hardware.pci_syscalls;
+import std.hardware.pci_config;
+import std.hardware.pci_portio;
+import std.hardware.pci_ecam;
+import std.alloc;
+import std.string;
+import std.io;
+
+var failures: int64 := 0;
+
+fn checkInt(name: pchar, got: int64, want: int64) {
+  if (got == want) {
+    Print("PASS "); Print(name); Print(" = "); PrintLn(IntToStr(got));
+  } else {
+    failures := failures + 1;
+    Print("FAIL "); Print(name); Print(": erwartet "); Print(IntToStr(want));
+    Print(", bekommen "); PrintLn(IntToStr(got));
+  }
+}
+
+// ============================================================
+// AC-1/AC-2: CF8-Adressrechnung
+// ============================================================
+
+fn testPortAddress() {
+  PrintLn("-- AC-1/AC-2 CF8-Adressrechnung --");
+
+  // 0000:00:00.0, Offset 0 → nur das Enable-Bit
+  checkInt("00:00.0 off 0", PciPortIoAddress(0, 0, 0, 0), 0x80000000);
+
+  // 0000:03:00.0, Offset 0 → Bus 3 in Bits 23:16
+  checkInt("03:00.0 off 0", PciPortIoAddress(3, 0, 0, 0), 0x80030000);
+
+  // 0000:00:1f.3, Offset 0x10 → Device 31 (Bits 15:11), Funktion 3
+  checkInt("00:1f.3 off 0x10", PciPortIoAddress(0, 31, 3, 0x10),
+           0x80000000 | (31 << 11) | (3 << 8) | 0x10);
+
+  // Der Offset wird auf vier Byte ausgerichtet — die unteren zwei Bits
+  // gehoeren nicht in die Adresse, sondern in die Wahl des Datenports.
+  checkInt("offset 0x13 wird ausgerichtet", PciPortIoAddress(0, 0, 0, 0x13),
+           PciPortIoAddress(0, 0, 0, 0x10));
+
+  // Groesster gueltiger Fall
+  checkInt("ff:1f.7 off 0xFC", PciPortIoAddress(255, 31, 7, 0xFC),
+           0x80000000 | (255 << 16) | (31 << 11) | (7 << 8) | 0xFC);
+
+  // Grenzen
+  checkInt("bus 256",      PciPortIoAddress(256, 0, 0, 0), PCI_E_BADARG);
+  checkInt("device 32",    PciPortIoAddress(0, 32, 0, 0),  PCI_E_BADARG);
+  checkInt("funktion 8",   PciPortIoAddress(0, 0, 8, 0),   PCI_E_BADARG);
+  checkInt("offset 256",   PciPortIoAddress(0, 0, 0, 256), PCI_E_RANGE);
+  checkInt("offset negativ", PciPortIoAddress(0, 0, 0, -1), PCI_E_RANGE);
+
+  // Aus einer BDF gerechnet muss dasselbe herauskommen.
+  var bdf: int64 := PciBdfParse("0000:03:00.0");
+  checkInt("aus BDF", PciPortIoAddressBdf(bdf, 0), PciPortIoAddress(3, 0, 0, 0));
+
+  // Der Legacy-Weg kennt keine Segmente. Eine BDF aus Domain 1 still auf
+  // Domain 0 abzubilden zeigte auf ein anderes, existierendes Geraet.
+  var other: int64 := PciBdfParse("0001:03:00.0");
+  checkInt("domain 1 wird abgelehnt", PciPortIoAddressBdf(other, 0), PCI_E_NOTSUP);
+
+  // Der erweiterte Config-Space ist ueber CF8 nicht erreichbar.
+  checkInt("offset 0x100", PciPortIoAddressBdf(bdf, 0x100), PCI_E_RANGE);
+}
+
+// ============================================================
+// AC-3: ECAM-Adressrechnung
+// ============================================================
+
+fn testEcamAddress() {
+  PrintLn("-- AC-3 ECAM-Adressrechnung --");
+
+  checkInt("offset 00:00.0",  PciEcamOffset(0, 0, 0, 0), 0);
+  checkInt("offset bus 1",    PciEcamOffset(1, 0, 0, 0), 1048576);
+  checkInt("offset device 1", PciEcamOffset(0, 1, 0, 0), 32768);
+  checkInt("offset fn 1",     PciEcamOffset(0, 0, 1, 0), 4096);
+  checkInt("offset 03:1f.7 + 0x100",
+           PciEcamOffset(3, 31, 7, 0x100),
+           (3 << 20) | (31 << 15) | (7 << 12) | 0x100);
+
+  // Anders als CF8 reicht ECAM bis 4096.
+  checkInt("offset 0xFFF",  PciEcamOffset(0, 0, 0, 0xFFF), 0xFFF);
+  checkInt("offset 4096",   PciEcamOffset(0, 0, 0, 4096),  PCI_E_RANGE);
+  checkInt("bus 256",       PciEcamOffset(256, 0, 0, 0),   PCI_E_BADARG);
+
+  // Volle Adresse mit typischer Basis (0xE0000000)
+  var base: int64 := 0xE0000000;
+  checkInt("adresse 00:00.0", PciEcamAddress(base, 0, 0, 0, 0, 0), base);
+  checkInt("adresse 03:00.0", PciEcamAddress(base, 0, 3, 0, 0, 0), base + (3 << 20));
+
+  // startBus != 0: das Fenster beginnt beim ersten Bus des Segments.
+  // Wer das ignoriert, liest um startBus Megabyte daneben.
+  checkInt("startBus 64, bus 64", PciEcamAddress(base, 64, 64, 0, 0, 0), base);
+  checkInt("startBus 64, bus 65", PciEcamAddress(base, 64, 65, 0, 0, 0), base + 1048576);
+  checkInt("bus unter startBus",  PciEcamAddress(base, 64, 63, 0, 0, 0), PCI_E_RANGE);
+
+  checkInt("basis 0", PciEcamAddress(0, 0, 0, 0, 0, 0), PCI_E_BADARG);
+}
+
+// ============================================================
+// AC-4/AC-5: MCFG-Parser
+// ============================================================
+
+con MCFG_BUF: int64 := 256;
+
+// Baut eine MCFG-Tabelle mit zwei Eintraegen.
+fn makeMcfg(): int64 {
+  var b: int64 := allocZeroed(MCFG_BUF);
+  poke8(b,     77);   // 'M'
+  poke8(b + 1, 67);   // 'C'
+  poke8(b + 2, 70);   // 'F'
+  poke8(b + 3, 71);   // 'G'
+  poke32(b + 4, PCI_MCFG_ENTRY_START + 2 * PCI_MCFG_ENTRY_SIZE);   // Laenge
+
+  // Eintrag 0: Basis 0xE0000000, Segment 0, Busse 0..63
+  var e0: int64 := b + PCI_MCFG_ENTRY_START;
+  poke64(e0,     0xE0000000);
+  poke16(e0 + 8, 0);
+  poke8(e0 + 10, 0);
+  poke8(e0 + 11, 63);
+
+  // Eintrag 1: Basis 0xF0000000, Segment 1, Busse 64..255
+  var e1: int64 := e0 + PCI_MCFG_ENTRY_SIZE;
+  poke64(e1,     0xF0000000);
+  poke16(e1 + 8, 1);
+  poke8(e1 + 10, 64);
+  poke8(e1 + 11, 255);
+
+  return b;
+}
+
+fn testMcfg() {
+  PrintLn("-- AC-4/AC-5 MCFG-Parser --");
+  var b: int64 := makeMcfg();
+  var len: int64 := PCI_MCFG_ENTRY_START + 2 * PCI_MCFG_ENTRY_SIZE;
+
+  checkInt("zwei eintraege", PciMcfgEntryCount(b, len), 2);
+
+  checkInt("e0 basis",    PciMcfgBase(b, len, 0),     0xE0000000);
+  checkInt("e0 segment",  PciMcfgSegment(b, len, 0),  0);
+  checkInt("e0 erster bus", PciMcfgStartBus(b, len, 0), 0);
+  checkInt("e0 letzter bus", PciMcfgEndBus(b, len, 0), 63);
+
+  checkInt("e1 basis",    PciMcfgBase(b, len, 1),     0xF0000000);
+  checkInt("e1 segment",  PciMcfgSegment(b, len, 1),  1);
+  checkInt("e1 erster bus", PciMcfgStartBus(b, len, 1), 64);
+  checkInt("e1 letzter bus", PciMcfgEndBus(b, len, 1), 255);
+
+  checkInt("eintrag 2 gibt es nicht", PciMcfgBase(b, len, 2), PCI_E_BADARG);
+  checkInt("eintrag -1",              PciMcfgBase(b, len, -1), PCI_E_BADARG);
+
+  // AC-5: Muell wird abgelehnt. Ohne Signaturpruefung wuerde jede Datei
+  // als Tabelle gelesen und lieferte Basisadressen, die irgendwo hin
+  // zeigen — ein Abbildungsversuch darauf trifft fremden Speicher.
+  poke8(b, 88);   // 'X' statt 'M'
+  checkInt("falsche signatur", PciMcfgEntryCount(b, len), PCI_E_IO);
+  poke8(b, 77);
+
+  // Laengenfeld groesser als der Puffer: die Tabelle behauptet mehr, als
+  // gelesen wurde.
+  poke32(b + 4, len + 64);
+  checkInt("laenge groesser als puffer", PciMcfgEntryCount(b, len), PCI_E_IO);
+
+  // Laengenfeld kleiner als der Kopf
+  poke32(b + 4, 20);
+  checkInt("laenge kleiner als kopf", PciMcfgEntryCount(b, len), PCI_E_IO);
+  poke32(b + 4, len);
+
+  checkInt("kein puffer", PciMcfgEntryCount(0, len), PCI_E_BADARG);
+  checkInt("puffer zu kurz", PciMcfgEntryCount(b, 8), PCI_E_BADARG);
+
+  // Eine Tabelle ohne Eintraege ist gueltig und leer — nicht kaputt.
+  poke32(b + 4, PCI_MCFG_ENTRY_START);
+  checkInt("tabelle ohne eintraege", PciMcfgEntryCount(b, len), 0);
+
+  free(b, MCFG_BUF);
+}
+
+// ============================================================
+// AC-6: Rechte
+// ============================================================
+
+fn testPermissions() {
+  PrintLn("-- AC-6 Rechte --");
+
+  // /dev/port und /dev/mem gehoeren root. Ohne Rechte muss das als
+  // solches gemeldet werden: "kein Geraet" oder ein stilles 0 liesse den
+  // Aufrufer glauben, die Hardware sei nicht da.
+  var fd: int64 := PciPortOpen();
+  if (fd >= 0) {
+    PrintLn("PASS /dev/port geoeffnet (root)");
+
+    // Mit Rechten: die Host-Bridge muss ueber CF8 dieselbe Vendor-ID
+    // liefern wie ueber sysfs.
+    var bdf: int64 := PciBdfParse("0000:00:00.0");
+    var vidPort: int64 := PciPortIoCfgRead(fd, bdf, PCI_CFG_VENDOR_ID, 2);
+    var sysCtx: int64 := PciCfgOpenSysfs(bdf);
+    if (sysCtx > 0) {
+      var vidSys: int64 := PciVendorId(sysCtx);
+      checkInt("CF8 liefert dieselbe vendor-id wie sysfs", vidPort, vidSys);
+      PciCfgClose(sysCtx);
+    }
+    PciPortClose(fd);
+  } else if (fd == PCI_E_LOCKED) {
+    // Bei Secure Boot sperrt der Kernel /dev/port auch fuer root. Das als
+    // fehlende Rechte zu melden schickte den Betreiber auf eine Suche, die
+    // nirgends hinfuehrt.
+    Print("PASS /dev/port meldet Kernel-Lockdown, Modus ");
+    PrintLn(PciLockdownName(PciKernelLockdown()));
+  } else if (fd == PCI_E_PERM) {
+    PrintLn("PASS /dev/port meldet fehlende rechte (kein root)");
+  } else if (fd == PCI_E_NOTSUP) {
+    PrintLn("SKIP /dev/port nicht vorhanden — Portweg auf diesem System nicht pruefbar");
+  } else {
+    failures := failures + 1;
+    Print("FAIL /dev/port: "); PrintLn(PciErrorName(fd));
+  }
+
+  var buf: int64 := PciMcfgRead(0);
+  if (buf > 0) {
+    PrintLn("PASS MCFG gelesen (root)");
+    PciMcfgFree(buf);
+  } else if (buf == PCI_E_PERM) {
+    PrintLn("PASS MCFG meldet fehlende rechte (kein root)");
+  } else if (buf == PCI_E_NOTSUP) {
+    PrintLn("SKIP keine MCFG-Tabelle — ECAM auf diesem System nicht vorhanden");
+  } else {
+    failures := failures + 1;
+    Print("FAIL MCFG lesen: "); PrintLn(PciErrorName(buf));
+  }
+
+  // Argumentpruefung, die keine Rechte braucht
+  checkInt("portread ohne fd",   PciPortRead(-1, 0x60, 1), PCI_E_BADARG);
+  checkInt("portread port zu gross", PciPortRead(3, 65536, 1), PCI_E_BADARG);
+  checkInt("portread breite 3",  PciPortRead(3, 0x60, 3), PCI_E_BADARG);
+  checkInt("portwrite ohne fd",  PciPortWrite(-1, 0x60, 0, 1), PCI_E_BADARG);
+
+  // Ein Zugriff, der die 32-Bit-Wortgrenze ueberschreitet, ist ueber
+  // CF8/CFC nicht darstellbar: das Datenregister liefert genau ein Wort.
+  var bdf2: int64 := PciBdfParse("0000:00:00.0");
+  checkInt("wortgrenze ueberschritten", PciPortIoCfgRead(3, bdf2, 0x03, 4), PCI_E_BADARG);
+
+  // Lockdown-Erkennung selbst: der Modus muss einer der bekannten sein.
+  var lm: int64 := PciKernelLockdown();
+  if (lm == PCI_LOCKDOWN_NONE || lm == PCI_LOCKDOWN_INTEGRITY ||
+      lm == PCI_LOCKDOWN_CONFIDENTIALITY || lm == PCI_LOCKDOWN_UNKNOWN) {
+    Print("PASS lockdown-modus erkannt: "); PrintLn(PciLockdownName(lm));
+  } else {
+    failures := failures + 1;
+    Print("FAIL lockdown-modus: "); PrintLn(IntToStr(lm));
+  }
+
+  checkInt("ecam ohne kontext",   PciEcamRead(0, 0, 0, 4), PCI_E_BADARG);
+  checkInt("ecam breite 3",       PciEcamRead(8, 0, 0, 3), PCI_E_BADARG);
+  checkInt("ecam open basis 0",   PciEcamOpen(0, 0, 255), PCI_E_BADARG);
+  checkInt("ecam open busbereich", PciEcamOpen(0xE0000000, 200, 100), PCI_E_BADARG);
+  PciEcamClose(0);   // darf nicht abstuerzen
+  PrintLn("PASS ecam close(0) ohne wirkung");
+}
+
+fn main(): int64 {
+  PrintLn("=== PCI Phase 4: pci_portio / pci_ecam ===");
+  testPortAddress();
+  testEcamAddress();
+  testMcfg();
+  testPermissions();
+  Print("=== Fehlgeschlagen: "); PrintLn(IntToStr(failures));
+  if (failures > 0) { return 1; }
+  return 0;
+}

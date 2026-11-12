@@ -22,16 +22,113 @@ pub con MMAP_PROT_RWX:  int64 := 7;   // PROT_READ | PROT_WRITE | PROT_EXEC
 pub con MMAP_ANON:   int64 := 34;  // MAP_PRIVATE | MAP_ANONYMOUS
 pub con MMAP_SHARED: int64 := 1;   // MAP_SHARED (für File-mmap)
 
+// ── Kleinspeicher-Pool (#1258) ───────────────────────────────────────────────
+//
+// Bis 1.0.16C setzte alloc() JEDE Anforderung in ein eigenes mmap um und free()
+// in ein munmap. Das ist bei wenigen grossen Puffern richtig und bei vielen
+// kleinen ruinoes: ein Syscall-Paar kostet auf der Messmaschine rund 25 µs,
+// unabhaengig davon, ob 32 Byte oder 32 KB angefordert werden.
+//
+// Gemessen an SLH-DSA, das praktisch nur aus Hash-Aufrufen mit kleinen
+// Kratzpuffern besteht: SLHParamsMini-KeyGen fuehrte 18.080 mmap und 18.074
+// munmap aus, SLHParams128s hochgerechnet ueber eine Million Paare. Die
+// Laufzeit von 94 s teilte sich in 31,9 s Rechnen und 58,8 s Kernel — zwei
+// Drittel der Zeit lagen also nicht im Verfahren, sondern hier. Der Bericht
+// vermutete die Ursache in der SHA-256-Kompression; die trifft es nicht.
+//
+// Deshalb: kleine Anforderungen werden aus 1-MiB-Bloecken bedient (Bump), grosse
+// behalten ihr eigenes mmap. Freigegebene Kleinbloecke wandern in eine
+// Freiliste je Groessenklasse und werden wiederverwendet.
+//
+// Die Null-Garantie von MAP_ANONYMOUS bleibt erhalten: frischer Speicher kommt
+// genullt vom Kernel, wiederverwendeter wird beim Herausgeben genullt. Das ist
+// kein Luxus — allocZeroed() ist nur ein anderer Name fuer alloc(), und der
+// Bestand verlaesst sich darauf.
+//
+// Was sich VERHAELT anders: ein Zugriff nach free() lief bisher in einen
+// Speicherfehler, weil die Seite wirklich weg war. Jetzt trifft er
+// moeglicherweise wiederverwendeten Speicher. Der Fehler war vorher schon
+// einer — er faellt nur nicht mehr sofort auf.
+
+pub con APOOL_CHUNK:  int64 := 1048576;   // 1 MiB je Block
+pub con APOOL_MAX:    int64 := 4096;      // darueber: eigenes mmap
+con APOOL_CLASSES:    int64 := 10;        // 8,16,32,…,4096
+
+var _apoolNext:  int64 := 0;   // naechste freie Adresse im laufenden Block
+var _apoolEnd:   int64 := 0;   // Ende des laufenden Blocks
+var _apoolHeads: int64 := 0;   // Tabelle der Freilisten-Koepfe, APOOL_CLASSES Eintraege
+
+// Groessenklasse zu einer Anforderung: die kleinste Zweierpotenz >= size,
+// mindestens 8 (ein freier Block traegt den Zeiger auf den naechsten in seinen
+// ersten acht Bytes, muss also mindestens acht Byte gross sein).
+fn _apoolClassSize(size: int64): int64 {
+  var c: int64 := 8;
+  while (c < size) { c := c * 2; }
+  return c;
+}
+
+fn _apoolClassIndex(csz: int64): int64 {
+  var c: int64 := 8;
+  var i: int64 := 0;
+  while (c < csz) { c := c * 2; i := i + 1; }
+  return i;
+}
+
+// Die Kopftabelle liegt selbst in einer eigenen Seite. Sie wird von alloc UND
+// free gebraucht — ein free vor dem ersten alloc ist zulaessig, deshalb legen
+// beide sie an.
+fn _apoolEnsureHeads(): int64 {
+  if (_apoolHeads != 0) { return _apoolHeads; }
+  var t: int64 := mmap(0, 4096, MMAP_PROT_RW, MMAP_ANON, -1, 0);
+  if (t < 0) { return 0; }
+  _apoolHeads := t;
+  return t;
+}
+
+fn _apoolZero(p: int64, n: int64): void {
+  var i: int64 := 0;
+  while (i < n) { poke64(p + i, 0); i := i + 8; }
+}
+
 // Anonymer Heap-Speicher — mmap-basiert, kein libc
 pub fn alloc(size: int64): int64 {
   // WP-26: Zero-Alloc-Guard — verhindert Aliasing-Angriff (C-2)
   if size <= 0 { size := 1; }
   // WP-26: Integer-Overflow-Guard — max 1 GB (C-1)
   if size > 1073741824 { return 0; }
-  var result: int64 := mmap(0, size, MMAP_PROT_RW, MMAP_ANON, -1, 0);
-  // MAP_FAILED (-1) → 0 zurückgeben statt ungültigen Pointer
-  if result < 0 { return 0; }
-  return result;
+
+  // Grosse Anforderungen unveraendert: ein mmap lohnt sich hier, und free()
+  // gibt die Seiten sofort ans System zurueck.
+  if (size > APOOL_MAX) {
+    var big: int64 := mmap(0, size, MMAP_PROT_RW, MMAP_ANON, -1, 0);
+    // MAP_FAILED (-1) → 0 zurückgeben statt ungültigen Pointer
+    if big < 0 { return 0; }
+    return big;
+  }
+
+  var csz: int64 := _apoolClassSize(size);
+  var heads: int64 := _apoolEnsureHeads();
+  if (heads == 0) { return 0; }
+  var idx: int64 := _apoolClassIndex(csz);
+
+  // Zuerst die Freiliste der Klasse.
+  var h: int64 := peek64(heads + idx * 8);
+  if (h != 0) {
+    poke64(heads + idx * 8, peek64(h));
+    _apoolZero(h, csz);
+    return h;
+  }
+
+  // Sonst aus dem laufenden Block schneiden; reicht er nicht, ein neuer.
+  if (_apoolNext + csz > _apoolEnd) {
+    var chunk: int64 := mmap(0, APOOL_CHUNK, MMAP_PROT_RW, MMAP_ANON, -1, 0);
+    if (chunk < 0) { return 0; }
+    _apoolNext := chunk;
+    _apoolEnd  := chunk + APOOL_CHUNK;
+  }
+  var p: int64 := _apoolNext;
+  _apoolNext := _apoolNext + csz;
+  return p;   // frisch aus MAP_ANONYMOUS: bereits genullt
 }
 
 // MAP_ANONYMOUS liefert bereits zero-initialisierte Seiten
@@ -40,14 +137,64 @@ pub fn allocZeroed(size: int64): int64 {
 }
 
 // Speicher freigeben
+//
+// size muss dieselbe Groesse sein, die alloc() bekommen hat — daran hat sich
+// nichts geaendert, munmap verlangte das ebenso.
 pub fn free(ptr: int64, size: int64): void {
-  munmap(ptr, size);
+  if (ptr == 0) { return; }
+  if size <= 0 { size := 1; }
+  if (size > APOOL_MAX) {
+    munmap(ptr, size);
+    return;
+  }
+  var heads: int64 := _apoolEnsureHeads();
+  if (heads == 0) { return; }
+  var idx: int64 := _apoolClassIndex(_apoolClassSize(size));
+  poke64(ptr, peek64(heads + idx * 8));
+  poke64(heads + idx * 8, ptr);
 }
 
-// Deprecated libc-Bindungen (behalten für Kompatibilität)
-extern fn libc_malloc(size: int64): int64;
-extern fn libc_free(ptr: int64): int64;
-extern fn libc_realloc(ptr: int64, size: int64): int64;
+// #1179: Hier standen drei `extern fn libc_*` OHNE link-Klausel. Keines wurde
+// je gebunden: `malloc()` lieferte still 0, `calloc()` schrieb dann in Adresse
+// 0..n (Absturz oder stille Korruption), `free_mem()` gab nichts frei und
+// `realloc_mem()` lieferte 0. Die Einheit hat mit `alloc`/`free` laengst eine
+// eigene, mmap-gestuetzte Belegung — die drei Huellen laufen jetzt darueber
+// und brauchen kein libc.
+//
+// `free_mem(ptr)` kennt die Groesse nicht, `free` (munmap) braucht sie aber.
+// Deshalb wird vor jedem Block ein 8-Byte-Kopf mit der Groesse angelegt; der
+// gelieferte Zeiger zeigt dahinter. Das gilt NUR fuer malloc/calloc/realloc_mem
+// — `alloc`/`free` bleiben unveraendert, sie bekommen die Groesse vom Aufrufer.
+con LIBC_HDR: int64 := 8;
+
+fn libc_malloc(size: int64): int64 {
+  var raw: int64 := alloc(size + LIBC_HDR);
+  if (raw == 0) { return 0; }
+  poke64(raw, size + LIBC_HDR);
+  return raw + LIBC_HDR;
+}
+
+fn libc_free(ptr: int64): int64 {
+  if (ptr == 0) { return 0; }
+  var raw: int64 := ptr - LIBC_HDR;
+  free(raw, peek64(raw));
+  return 0;
+}
+
+fn libc_realloc(ptr: int64, size: int64): int64 {
+  if (ptr == 0) { return libc_malloc(size); }
+  var raw: int64 := ptr - LIBC_HDR;
+  var oldTotal: int64 := peek64(raw);
+  var oldSize: int64 := oldTotal - LIBC_HDR;
+  var neu: int64 := libc_malloc(size);
+  if (neu == 0) { return 0; }
+  var n: int64 := oldSize;
+  if (size < n) { n := size; }
+  var i: int64 := 0;
+  while (i < n) { poke8(neu + i, peek8(ptr + i)); i := i + 1; }
+  libc_free(ptr);
+  return neu;
+}
 
 // Gibt aligned size zurück: ceil(size/8)*8
 fn align_to_8(size: int64): int64 {
@@ -65,6 +212,12 @@ pub fn malloc(size: int64): int64 {
 }
 
 pub fn calloc(count: int64, elem_size: int64): int64 {
+  // WP-26: Integer-Overflow-Guard. count*elem_size darf nicht überlaufen und
+  // nicht das 1-GB-Limit (wie alloc) überschreiten — sonst Under-Allocation →
+  // Heap-Overflow. Division statt Multiplikation, um den Overflow nicht erst
+  // zu provozieren.
+  if (count <= 0 || elem_size <= 0) { return 0; }
+  if (count > 1073741824 / elem_size) { return 0; }
   var total_size: int64 := count * elem_size;
   var ptr: int64 := malloc(total_size);
   if (ptr == 0) {
@@ -73,7 +226,7 @@ pub fn calloc(count: int64, elem_size: int64): int64 {
   var i: int64 := 0;
   while (i < total_size) {
     poke8(ptr + i, 0);
-    i := i + 1;
+    i += 1;
   }
   return ptr;
 }
@@ -93,6 +246,81 @@ pub fn realloc_mem(ptr: int64, new_size: int64): int64 {
   return libc_realloc(ptr, align_to_8(new_size));
 }
 
+// ---------------------------------------------------------------------------
+// #1820: Pool-Allokator (Arena). Bisher gab es ihn nur compilerintern in
+// src/std/alloc.lyx; wer std.alloc benutzte, hatte keinen.
+//
+// Die Namen tragen das Praefix Mem, weil std.cloud.cf.lb ein PoolCreate
+// fuer Lastverteiler-Pools exportiert — ohne Praefix waeren die beiden
+// Units nicht mehr zusammen importierbar. Genau dieselbe Kollision hat
+// in dieser Runde DaysInMonth zwischen std.time und std.datetime erzeugt.
+//
+// Ein Pool ist EIN Block, aus dem der Reihe nach herausgegeben wird. Einzelne
+// Stuecke werden nicht zurueckgegeben — freigegeben wird der ganze Pool auf
+// einmal. Genau dafuer ist er da: viele kurzlebige Stuecke ohne Buchfuehrung.
+//
+// Kopf (32 Byte) am Anfang des Blocks:
+//   +0  Gesamtgroesse des Blocks (mit Kopf)
+//   +8  naechster freier Offset
+//   +16 Kennung 0x4C595850 ("LYXP"), damit ein Fremdzeiger auffaellt
+//   +24 unbenutzt (haelt die Nutzdaten auf 32 ausgerichtet)
+// ---------------------------------------------------------------------------
+con POOL_KOPF: int64 := 32;
+con POOL_MAGIC: int64 := 1280595024;
+
+pub fn MemPoolCreate(size: int64): int64 {
+  if (size <= 0) { return 0; }
+  var gesamt: int64 := size + POOL_KOPF;
+  var blk: int64 := alloc(gesamt);
+  if (blk == 0) { return 0; }
+  poke64(blk, gesamt);
+  poke64(blk + 8, POOL_KOPF);
+  poke64(blk + 16, POOL_MAGIC);
+  poke64(blk + 24, 0);
+  return blk;
+}
+
+// Gibt 0 zurueck, wenn der Pool voll ist — NICHT den letzten Zeiger noch
+// einmal: ein stiller Doppelzeiger waere schlimmer als eine abgelehnte
+// Anforderung.
+pub fn MemPoolAlloc(pl: int64, size: int64): int64 {
+  if (pl == 0) { return 0; }
+  if (peek64(pl + 16) != POOL_MAGIC) { return 0; }
+  if (size <= 0) { return 0; }
+  // Auf 8 aufrunden, damit jeder Zeiger ausgerichtet ist.
+  var n: int64 := ((size + 7) / 8) * 8;
+  var pos: int64 := peek64(pl + 8);
+  var gesamt: int64 := peek64(pl);
+  if (pos + n > gesamt) { return 0; }
+  poke64(pl + 8, pos + n);
+  return pl + pos;
+}
+
+// Setzt den Pool zurueck, ohne den Block freizugeben — die bisher
+// ausgegebenen Zeiger sind danach ungueltig.
+pub fn MemPoolReset(pl: int64): void {
+  if (pl == 0) { return; }
+  if (peek64(pl + 16) != POOL_MAGIC) { return; }
+  poke64(pl + 8, POOL_KOPF);
+}
+
+// Wieviel noch hineinpasst.
+pub fn MemPoolAvail(pl: int64): int64 {
+  if (pl == 0) { return 0; }
+  if (peek64(pl + 16) != POOL_MAGIC) { return 0; }
+  return peek64(pl) - peek64(pl + 8);
+}
+
+// Gibt den ganzen Block frei. Die Kennung wird vorher geloescht, damit ein
+// zweites MemPoolRelease auf denselben Zeiger nicht noch einmal free() ruft.
+pub fn MemPoolRelease(pl: int64): void {
+  if (pl == 0) { return; }
+  if (peek64(pl + 16) != POOL_MAGIC) { return; }
+  var gesamt: int64 := peek64(pl);
+  poke64(pl + 16, 0);
+  free(pl, gesamt);
+}
+
 pub fn size_of_int64(): int64 { return 8; }
 pub fn size_of_ptr(): int64 { return 8; }
 
@@ -108,10 +336,31 @@ pub fn malloc_safe(size: int64): int64 {
   return ptr;
 }
 
+// #1398: Hier stand eine Schleife, die den Versuch endlos wiederholte. Der
+// Name sagt Abbruch zu, die Funktion drehte stattdessen bei voller Last —
+// und zwar genau in der Lage, fuer die sie gedacht ist: eine Ressource, ohne
+// die es nicht weitergeht.
+//
+// Wiederholen konnte ohnehin nie helfen. `malloc` liefert 0 in drei Faellen:
+// Groesse <= 0, Groesse > 1 GiB, und mmap scheitert. Die ersten beiden haengen
+// allein am Argument — die Bedingung aendert sich nie, die Schleife lief
+// garantiert fuer immer. Und beim dritten gibt es niemanden, der nebenher
+// Speicher freigeben koennte: dieses Programm haelt in der Schleife.
+//
+// `panic` ist seit #1149 nicht mehr per try/catch abfangbar und beendet das
+// Programm zuverlaessig. Wer warten WILL, braucht eine andere Funktion mit
+// einer Obergrenze — und einen anderen Namen.
 pub fn malloc_orpanic(size: int64): int64 {
   var ptr: int64 := malloc(size);
-  while (ptr == 0) {
-    ptr := malloc(size);
+  if (ptr == 0) {
+    // Die Groesse gehoert in die Meldung: sie unterscheidet "Speicher alle"
+    // von "Anforderung war von vornherein unzulaessig" (<= 0 oder > 1 GiB),
+    // und das ist der Unterschied zwischen einem Betriebs- und einem
+    // Programmierfehler.
+    EPrintStr("malloc_orpanic: kein Speicher fuer "c);
+    EPrintInt(size);
+    EPrintStrLn(" Byte (Grenze 1 GiB, Anforderung muss > 0 sein)"c);
+    panic("malloc_orpanic: out of memory");
   }
   return ptr;
 }

@@ -1,0 +1,440 @@
+// std/sum.lyx
+// Summieren ohne Stellenverlust: Kahan, Neumaier, paarweise, exakt
+
+@description("Compensated summation for f64: exact two-sum primitives, Kahan and Neumaier accumulators, pairwise and exactly rounded array sums, compensated dot product, and Welford running mean and variance")
+@author("Andreas Roene")
+@copyright("2026 Andreas Roene")
+unit std.sum;
+
+import std.math;
+import std.alloc;
+
+// ── Warum Summieren ein Problem ist ──────────────────────────────────────────
+//
+// Jede Addition zweier f64-Zahlen rundet das Ergebnis auf 53 Bit. Bei zwei
+// Zahlen faellt das nicht ins Gewicht; bei einer Million addiert sich der
+// Rundungsfehler auf. Gemessen mit lyxc 1.0.20E:
+//
+//     1.000.000 mal 0,1   ->  100000,0000013     exakt waeren 100000
+//    10.000.000 mal 0,1   ->  999999,999838      exakt waeren 1000000
+//
+// Von sechzehn Stellen bleiben elf. Wer Messreihen mittelt, Flaechen
+// integriert oder Wahrscheinlichkeiten aufsummiert, verliert genau dort
+// Genauigkeit, wo er sie braucht.
+//
+// ── Was dagegen hilft ────────────────────────────────────────────────────────
+//
+// Der Fehler einer einzelnen Addition ist nicht unbekannt — er laesst sich
+// AUSRECHNEN. Fuer s = a + b gilt exakt:
+//
+//     err = (a - (s - b)) + (b - (s - a))
+//
+// Diese zwei Zahlen zusammen stellen a+b ohne jeden Verlust dar. Kahans
+// Verfahren fuehrt diesen Fehler mit und zieht ihn beim naechsten Schritt
+// wieder ein. Aus einem Fehler, der mit der Zahl der Summanden waechst, wird
+// einer, der praktisch stehen bleibt.
+//
+// ── Warum Kahan allein nicht reicht ──────────────────────────────────────────
+//
+// Kahan setzt voraus, dass die laufende Summe GROESSER ist als der neue
+// Summand. Ist es umgekehrt, verliert die Korrektur ihre Stellen statt sie zu
+// retten. Der Schulfall:
+//
+//     [1, 1e100, 1, -1e100]     exakt: 2
+//     naiv:  0        Kahan: 0        Neumaier: 2
+//
+// Neumaier prueft, welcher der beiden Werte groesser ist, und bildet den
+// Fehlerterm entsprechend. Es kostet einen Vergleich mehr und ist in jedem
+// Fall mindestens so gut. Deshalb ist es hier die Empfehlung, und Kahan steht
+// nur daneben, weil man ihm in fremdem Code begegnet.
+//
+// ── Was es kostet ────────────────────────────────────────────────────────────
+//
+//     naiv        1 Addition je Wert    ungenau
+//     paarweise   1 Addition je Wert    Fehler waechst mit log n statt n
+//     Kahan       4 Operationen         Fehler bleibt praktisch konstant
+//     Neumaier    5 Operationen         wie Kahan, aber ohne dessen Annahme
+//     exakt       unbegrenzt viele      auf die letzte Stelle richtig
+//
+// Paarweise Summierung ist bemerkenswert: sie kostet nichts extra und
+// verbessert die Schranke von O(n*eps) auf O(log n * eps). Wer nur ein
+// bisschen Sorge hat, nimmt sie; wer es genau braucht, Neumaier.
+
+fn _abs(x: f64): f64 {
+  if (x < 0.0) { return 0.0 - x; }
+  return x;
+}
+
+// ── Die exakte Zweiersumme ───────────────────────────────────────────────────
+
+// Summe von a und b, dazu der EXAKTE Rundungsfehler nach errAddr.
+//
+// Zusammen stellen Rueckgabewert und Fehler die Summe a+b ohne Verlust dar:
+// s + err ist mathematisch genau a + b. Das ist die Grundlage aller Verfahren
+// hier und funktioniert ohne jede Annahme ueber die Groesse von a und b.
+//
+// Sechs Operationen (Knuth). Die Klammerung ist wesentlich — ein Optimierer,
+// der sie "vereinfacht", zerstoert das Verfahren.
+pub fn SumTwoSum(a: f64, b: f64, errAddr: int64): f64 {
+  var s: f64 := a + b;
+  var bv: f64 := s - a;
+  var av: f64 := s - bv;
+  var eb: f64 := b - bv;
+  var ea: f64 := a - av;
+  if (errAddr != 0) { pokef64(errAddr, ea + eb); }
+  return s;
+}
+
+// Dasselbe in drei Operationen — setzt aber |a| >= |b| voraus. Ist das nicht
+// erfuellt, ist der Fehlerterm falsch, und zwar ohne jede Warnung.
+pub fn SumFastTwoSum(a: f64, b: f64, errAddr: int64): f64 {
+  var s: f64 := a + b;
+  var z: f64 := s - a;
+  if (errAddr != 0) { pokef64(errAddr, b - z); }
+  return s;
+}
+
+// ── Laufende Summierer ───────────────────────────────────────────────────────
+//
+// Ein Summierer sind zwei f64 im Speicher (16 Byte): die Summe und der
+// mitgefuehrte Fehler. Der Aufrufer besitzt den Platz — so laesst sich in einer
+// Schleife summieren, ohne ein Feld anzulegen.
+//
+//     var acc: int64 := alloc(SUM_ACC_BYTES);
+//     SumNeumaierInit(acc);
+//     while (...) { SumNeumaierAdd(acc, wert); }
+//     var s: f64 := SumNeumaierValue(acc);
+
+pub con SUM_ACC_BYTES: int64 := 16;
+
+pub fn SumKahanInit(acc: int64): void {
+  pokef64(acc, 0.0);
+  pokef64(acc + 8, 0.0);
+}
+
+// Kahans Verfahren: den bekannten Fehler vom neuen Wert abziehen, addieren,
+// und den dabei neu entstandenen Fehler merken.
+pub fn SumKahanAdd(acc: int64, x: f64): void {
+  var s: f64 := peekf64(acc);
+  var c: f64 := peekf64(acc + 8);
+  var y: f64 := x - c;
+  var t: f64 := s + y;
+  // was bei s + y verlorenging
+  var back: f64 := t - s;
+  pokef64(acc + 8, back - y);
+  pokef64(acc, t);
+}
+
+pub fn SumKahanValue(acc: int64): f64 {
+  return peekf64(acc);
+}
+
+pub fn SumNeumaierInit(acc: int64): void {
+  pokef64(acc, 0.0);
+  pokef64(acc + 8, 0.0);
+}
+
+// Neumaiers Verbesserung: der Fehlerterm wird danach gebildet, welcher der
+// beiden Werte groesser ist. Damit faellt Kahans Annahme weg, und der Fall
+// „neuer Summand groesser als die bisherige Summe" wird richtig behandelt.
+//
+// Die Korrektur wird hier ANGESAMMELT und erst am Ende addiert — nicht wie bei
+// Kahan bei jedem Schritt eingezogen.
+pub fn SumNeumaierAdd(acc: int64, x: f64): void {
+  var s: f64 := peekf64(acc);
+  var c: f64 := peekf64(acc + 8);
+  var t: f64 := s + x;
+
+  if (_abs(s) >= _abs(x)) {
+    c := c + ((s - t) + x);
+  }
+  else {
+    c := c + ((x - t) + s);
+  }
+  pokef64(acc, t);
+  pokef64(acc + 8, c);
+}
+
+pub fn SumNeumaierValue(acc: int64): f64 {
+  return peekf64(acc) + peekf64(acc + 8);
+}
+
+// Die noch nicht eingerechnete Korrektur — zeigt, wie viel das Verfahren
+// gerettet hat.
+pub fn SumNeumaierError(acc: int64): f64 {
+  return peekf64(acc + 8);
+}
+
+// ── Summen ueber Felder ──────────────────────────────────────────────────────
+
+// Der naive Weg. Steht hier, damit man den Unterschied messen kann — nicht,
+// damit man ihn benutzt.
+pub fn SumNaive(arr: int64, n: int64): f64 {
+  var s: f64 := 0.0;
+  var i: int64 := 0;
+  while (i < n) {
+    s := s + peekf64(arr + i * 8);
+    i := i + 1;
+  }
+  return s;
+}
+
+pub fn SumKahan(arr: int64, n: int64): f64 {
+  var s: f64 := 0.0;
+  var c: f64 := 0.0;
+  var i: int64 := 0;
+  while (i < n) {
+    var y: f64 := peekf64(arr + i * 8) - c;
+    var t: f64 := s + y;
+    var back: f64 := t - s;
+    c := back - y;
+    s := t;
+    i := i + 1;
+  }
+  return s;
+}
+
+// Die empfohlene Fassung.
+pub fn SumNeumaier(arr: int64, n: int64): f64 {
+  var s: f64 := 0.0;
+  var c: f64 := 0.0;
+  var i: int64 := 0;
+  while (i < n) {
+    var x: f64 := peekf64(arr + i * 8);
+    var t: f64 := s + x;
+    if (_abs(s) >= _abs(x)) { c := c + ((s - t) + x); }
+    else { c := c + ((x - t) + s); }
+    s := t;
+    i := i + 1;
+  }
+  return s + c;
+}
+
+// Paarweise: erst benachbarte Werte addieren, dann deren Summen, und so fort.
+//
+// Kostet keine zusaetzliche Operation, druckt den Fehler aber von O(n) auf
+// O(log n). Der Grund ist einfach: bei der naiven Summe wird der erste Wert
+// n-mal gerundet, hier nur log n mal.
+//
+// Umgesetzt mit einem Stapel von Teilsummen statt Rekursion — bei einer
+// Million Werten waere die Rekursionstiefe zwanzig, aber der Stapel kostet
+// nichts und die Schleife ist ohnehin klarer.
+pub fn SumPairwise(arr: int64, n: int64): f64 {
+  if (n <= 0) { return 0.0; }
+
+  // Stapel: Teilsumme und die Zahl der darin enthaltenen Werte
+  var vals: int64 := alloc(64 * 8);
+  var cnts: int64 := alloc(64 * 8);
+  if (vals == 0) { return SumNaive(arr, n); }
+  if (cnts == 0) { return SumNaive(arr, n); }
+
+  var sp: int64 := 0;
+  var i: int64 := 0;
+  while (i < n) {
+    var v: f64 := peekf64(arr + i * 8);
+    var c: int64 := 1;
+    // solange die oberste Teilsumme gleich viele Werte enthaelt, verschmelzen
+    var run: bool := true;
+    while (run) {
+      if (sp == 0) { run := false; }
+      else {
+        if (peek64(cnts + (sp - 1) * 8) != c) { run := false; }
+        else {
+          sp := sp - 1;
+          v := peekf64(vals + sp * 8) + v;
+          c := c * 2;
+        }
+      }
+    }
+    pokef64(vals + sp * 8, v);
+    poke64(cnts + sp * 8, c);
+    sp := sp + 1;
+    i := i + 1;
+  }
+
+  // Reste von oben nach unten zusammenfassen
+  var total: f64 := 0.0;
+  var k: int64 := sp - 1;
+  while (k >= 0) {
+    total := total + peekf64(vals + k * 8);
+    k := k - 1;
+  }
+
+  free(vals, 64 * 8);
+  free(cnts, 64 * 8);
+  return total;
+}
+
+// Auf die letzte Stelle richtig gerundete Summe.
+//
+// Verfahren nach Shewchuk: statt einer Summe wird eine LISTE von Teilsummen
+// gefuehrt, die sich paarweise nicht ueberlappen. Jeder neue Wert wird mit
+// jeder Teilsumme exakt verrechnet; was dabei an Fehlern abfaellt, wandert
+// selbst in die Liste. Am Ende ist die Summe der Liste exakt, und ihre
+// Rundung auf f64 ist die bestmoegliche Antwort.
+//
+// Das ist dasselbe, was Pythons math.fsum tut.
+//
+// `work` ist ein Arbeitsfeld des Aufrufers mit Platz fuer workCap f64-Werte.
+// Es wird nie mehr gebraucht als 2 + Zahl der verschiedenen Groessenordnungen
+// (praktisch unter 100); reicht es nicht, kommt Neumaiers Ergebnis zurueck.
+pub fn SumExact(arr: int64, n: int64, work: int64, workCap: int64): f64 {
+  var cnt: int64 := 0;
+  var errAddr: int64 := alloc(8);
+  if (errAddr == 0) { return SumNeumaier(arr, n); }
+
+  var overflow: bool := false;
+  var i: int64 := 0;
+  while (i < n) {
+    var x: f64 := peekf64(arr + i * 8);
+    if (!overflow) {
+      var w: int64 := 0;
+      var k: int64 := 0;
+      while (k < cnt) {
+        var y: f64 := peekf64(work + k * 8);
+        x := SumTwoSum(x, y, errAddr);
+        var e: f64 := peekf64(errAddr);
+        if (e != 0.0) {
+          pokef64(work + w * 8, e);
+          w := w + 1;
+        }
+        k := k + 1;
+      }
+      if (w >= workCap) { overflow := true; }
+      else {
+        pokef64(work + w * 8, x);
+        cnt := w + 1;
+      }
+    }
+    i := i + 1;
+  }
+  free(errAddr, 8);
+
+  if (overflow) { return SumNeumaier(arr, n); }
+
+  // Teilsummen von der kleinsten zur groessten addieren
+  var total: f64 := 0.0;
+  var j: int64 := 0;
+  while (j < cnt) {
+    total := total + peekf64(work + j * 8);
+    j := j + 1;
+  }
+  return total;
+}
+
+// ── Verwandtes ───────────────────────────────────────────────────────────────
+
+// Kompensiertes Skalarprodukt. Die Produkte werden einzeln gebildet und
+// kompensiert aufsummiert; der Rundungsfehler der Multiplikation selbst bleibt
+// unberuecksichtigt (dafuer braeuchte es ein exaktes Produkt).
+pub fn SumDot(a: int64, b: int64, n: int64): f64 {
+  var s: f64 := 0.0;
+  var c: f64 := 0.0;
+  var i: int64 := 0;
+  while (i < n) {
+    var x: f64 := peekf64(a + i * 8) * peekf64(b + i * 8);
+    var t: f64 := s + x;
+    if (_abs(s) >= _abs(x)) { c := c + ((s - t) + x); }
+    else { c := c + ((x - t) + s); }
+    s := t;
+    i := i + 1;
+  }
+  return s + c;
+}
+
+// Kompensierter Mittelwert.
+pub fn SumMean(arr: int64, n: int64): f64 {
+  if (n <= 0) { return 0.0; }
+  return SumNeumaier(arr, n) / (n as f64);
+}
+
+// ── Laufender Mittelwert und Streuung ────────────────────────────────────────
+//
+// Verfahren nach Welford: Mittelwert und Streuung in EINEM Durchlauf, ohne die
+// Werte zu behalten und ohne die Quadratsumme zu bilden.
+//
+// Die Schulformel Var = E[x^2] - E[x]^2 ist bei grossen Werten unbrauchbar:
+// bei Werten um 1e9 mit einer Streuung von 1 loeschen sich die beiden Terme
+// bis auf den Rundungsfehler aus, und es kommt eine NEGATIVE Varianz heraus.
+// Welford rechnet stattdessen mit den Abweichungen vom laufenden Mittel und
+// hat dieses Problem nicht.
+//
+// Ein Zaehler sind drei f64 (24 Byte): Anzahl, Mittel, Summe der quadrierten
+// Abweichungen.
+
+pub con SUM_STAT_BYTES: int64 := 24;
+
+pub fn SumStatInit(st: int64): void {
+  pokef64(st, 0.0);
+  pokef64(st + 8, 0.0);
+  pokef64(st + 16, 0.0);
+}
+
+pub fn SumStatAdd(st: int64, x: f64): void {
+  var n: f64 := peekf64(st) + 1.0;
+  var mean: f64 := peekf64(st + 8);
+  var m2: f64 := peekf64(st + 16);
+
+  var d: f64 := x - mean;
+  mean := mean + d / n;
+  var d2: f64 := x - mean;
+  m2 := m2 + d * d2;
+
+  pokef64(st, n);
+  pokef64(st + 8, mean);
+  pokef64(st + 16, m2);
+}
+
+pub fn SumStatCount(st: int64): int64 {
+  var n: f64 := peekf64(st);
+  return n as int64;
+}
+
+pub fn SumStatMean(st: int64): f64 {
+  return peekf64(st + 8);
+}
+
+// Varianz der Grundgesamtheit (durch n).
+pub fn SumStatVarianceP(st: int64): f64 {
+  var n: f64 := peekf64(st);
+  if (n < 1.0) { return 0.0; }
+  return peekf64(st + 16) / n;
+}
+
+// Stichprobenvarianz (durch n-1) — die uebliche Wahl, wenn die Werte eine
+// Stichprobe aus einer groesseren Menge sind.
+pub fn SumStatVarianceS(st: int64): f64 {
+  var n: f64 := peekf64(st);
+  if (n < 2.0) { return 0.0; }
+  return peekf64(st + 16) / (n - 1.0);
+}
+
+pub fn SumStatStdDevP(st: int64): f64 {
+  return SqrtF64(SumStatVarianceP(st));
+}
+
+pub fn SumStatStdDevS(st: int64): f64 {
+  return SqrtF64(SumStatVarianceS(st));
+}
+
+// Zwei getrennt gefuehrte Zaehler zusammenfassen — fuer Auswertungen, die in
+// Teilen laufen (Chan, Golub und LeVeque).
+pub fn SumStatMerge(a: int64, b: int64, out: int64): void {
+  var na: f64 := peekf64(a);
+  var nb: f64 := peekf64(b);
+  var n: f64 := na + nb;
+  if (n == 0.0) {
+    SumStatInit(out);
+    return;
+  }
+
+  var ma: f64 := peekf64(a + 8);
+  var mb: f64 := peekf64(b + 8);
+  var d: f64 := mb - ma;
+  var mean: f64 := ma + d * (nb / n);
+  var m2: f64 := peekf64(a + 16) + peekf64(b + 16) + d * d * (na * nb / n);
+
+  pokef64(out, n);
+  pokef64(out + 8, mean);
+  pokef64(out + 16, m2);
+}

@@ -23,6 +23,17 @@ pub type LBFNativeWriter = class {
     _lcKind:  int64;  // lifecycle kind (LBF_LC_*, default 0 = ONE_SHOT)
     _evBuf:   int64;  // event descriptor buffer (from lc_ev_alloc), 0 = none
     _evCount: int64;  // number of event descriptors
+    // LYXOS-WP-5: Sektions-Byte-Größen (.text/.rodata/.data). 0/unbenutzt → ganzes Image = .text.
+    _textLen:   int64;
+    _rodataLen: int64;
+    _dataLen:   int64;
+    _capBits:   int64;  // LBF CAPS-TLV bits (LBF_CAP_*), aus @capabilities. Default 0 = nur STDIO.
+    // #1971: Ressourcen fuer die LBF_PAGE_RESOURCE-Bloecke. _resBuf zeigt auf
+    // _resN Eintraege zu _resStride Byte, je {Namenszeiger, Namenslaenge,
+    // Bytezeiger, Anzahl Bytes, ...} (Aufbau der Liste in ir_lower: IR_RES_SZ).
+    _resBuf:    int64;
+    _resN:      int64;
+    _resStride: int64;
 
     // Konfiguriert Lifecycle-Kind und Ereignis-Deskriptoren für writeLBF.
     // ev_buf darf 0 sein wenn ev_count == 0.
@@ -30,6 +41,72 @@ pub type LBFNativeWriter = class {
         self._lcKind  := kind;
         self._evBuf   := ev_buf;
         self._evCount := ev_count;
+    }
+
+    // CAPS-TLV-Bits setzen (Union der @capabilities-Bits, LBF_CAP_FS_READ=1/FS_WRITE=2/…).
+    // Ohne dies bleibt CAPS=0 → Pledge-Gate erlaubt nur STDIO, File-Zugriff wird denied.
+    pub fn setCapabilities(bits: int64): void {
+        self._capBits := bits;
+    }
+
+    // #1971: Ressourcen setzen (siehe Felder). n == 0: keine Ressourcenbloecke,
+    // die Datei ist dann byte-identisch zu einer ohne diese Erweiterung.
+    pub fn setResources(buf: int64, n: int64, stride: int64): void {
+        self._resBuf    := buf;
+        self._resN      := n;
+        self._resStride := stride;
+    }
+
+    // #1971: den Ressourcenstrom bauen (Aufbau: lbf_layout.lyx bei
+    // LBF_PAGE_RESOURCE). Liefert den Puffer, die Laenge nach lenBox.
+    fn _resStrom(lenBox: int64): int64 {
+        poke64(lenBox, 0);
+        if self._resN <= 0 { return 0; }
+        var tot: int64 := 8;
+        var i: int64 := 0;
+        while i < self._resN {
+            var e: int64 := self._resBuf + i * self._resStride;
+            tot := tot + 2 + peek64(e + 8) + 4 + 4 + peek64(e + 24);
+            i := i + 1;
+        }
+        var b: int64 := alloc(tot);
+        poke8(b, 76); poke8(b + 1, 89); poke8(b + 2, 82); poke8(b + 3, 83);   // "LYRS"
+        poke32(b + 4, self._resN);
+        var p: int64 := 8;
+        i := 0;
+        while i < self._resN {
+            var e2: int64 := self._resBuf + i * self._resStride;
+            var nl: int64 := peek64(e2 + 8);
+            var dl: int64 := peek64(e2 + 24);
+            if nl > 65535 { EPrintStrLn("error: lbf: Ressourcenname laenger als 65535 Zeichen"c); exit(1); }
+            poke16(b + p, nl);
+            p := p + 2;
+            memcpy(b + p, peek64(e2), nl);
+            p := p + nl;
+            poke32(b + p, dl);
+            poke32(b + p + 4, crc32c(peek64(e2 + 16), dl));
+            p := p + 8;
+            if dl > 0 { memcpy(b + p, peek64(e2 + 16), dl); }
+            p := p + dl;
+            i := i + 1;
+        }
+        poke64(lenBox, tot);
+        return b;
+    }
+
+    // LYXOS-WP-5: Byte-Größen der Sektionen für Multi-Section-SECTION_MAP + Genesis-Counts.
+    pub fn setSections(textLen: int64, rodataLen: int64, dataLen: int64): void {
+        self._textLen   := textLen;
+        self._rodataLen := rodataLen;
+        self._dataLen   := dataLen;
+    }
+
+    // Block-Spanne (Block-granular) für Byte-Bereich [start, start+len) im 4032-gepackten Image.
+    // Bei contiguous-4032 (nicht page-aligned) können benachbarte Sektionen sich einen
+    // Grenzblock teilen — daher rein deskriptiv (per-Sektion-prot ist kernelseitig deferred).
+    fn _spanBlocks(start: int64, len: int64): int64 {
+        if len <= 0 { return 0; }
+        return (1 + (start + len - 1) / LBF_PAYLOAD_SIZE) - (start / LBF_PAYLOAD_SIZE);
     }
 
     // writeLBF — Schreibt eine vollständige LBF-Nativ-Datei.
@@ -71,21 +148,45 @@ pub type LBFNativeWriter = class {
 
         // ── 3. Block-Geometrie ────────────────────────────────────────────────
         var textBlk: int64 := section_block_count(codeLen);
-        var totBlk:  int64 := 1 + textBlk;
+        // #1971: Ressourcenbloecke hinter dem Programm.
+        var resLenBox: int64 := alloc(8);
+        var resStrom: int64 := self._resStrom(resLenBox);
+        var resLen: int64 := peek64(resLenBox);
+        free(resLenBox, 8);
+        var resBlk: int64 := section_block_count(resLen);
+        var totBlk:  int64 := 1 + textBlk + resBlk;
         var fileSz:  int64 := totBlk * LBF_BLOCK_SIZE;
 
         // ── 4. TLV-Pool aufbauen ──────────────────────────────────────────────
         var tbuf:  int64 := alloc(LBF_TLV_MAX_SIZE);
         var tused: int64 := alloc(8);
         poke64(tused, 0);
-        tlv_add_capabilities(tbuf, tused, 0);
+        tlv_add_capabilities(tbuf, tused, self._capBits);
         tlv_add_lifecycle_full(tbuf, tused, self._lcKind, self._evBuf, self._evCount);
-        tlv_add_section(tbuf, tused, 1, textBlk, LBF_SECT_TYPE_TEXT, LBF_SECT_PROT_RX);
+
+        // ── LYXOS-WP-5: Multi-Section-Metadaten (contiguous-4032, uniform RW kernelseitig) ──
+        var tLen: int64 := self._textLen;
+        var rLen: int64 := self._rodataLen;
+        var dLen: int64 := self._dataLen;
+        if tLen <= 0 { if rLen <= 0 { if dLen <= 0 { tLen := codeLen; } } }
+        var roStart: int64 := tLen;
+        var daStart: int64 := tLen + rLen;
+        var textCnt: int64 := self._spanBlocks(0, tLen);
+        var roCnt:   int64 := self._spanBlocks(roStart, rLen);
+        var daCnt:   int64 := self._spanBlocks(daStart, dLen);
+        var roStartBlk: int64 := 1 + roStart / LBF_PAYLOAD_SIZE;
+        var daStartBlk: int64 := 1 + daStart / LBF_PAYLOAD_SIZE;
+
+        tlv_add_section(tbuf, tused, 1, textCnt, LBF_SECT_TYPE_TEXT, LBF_SECT_PROT_RX);
+        if roCnt > 0 { tlv_add_section(tbuf, tused, roStartBlk, roCnt, LBF_SECT_TYPE_RODATA, LBF_SECT_PROT_R); }
+        if daCnt > 0 { tlv_add_section(tbuf, tused, daStartBlk, daCnt, LBF_SECT_TYPE_DATA, LBF_SECT_PROT_RW); }
 
         // ── 5. Genesis-Daten-Puffer befüllen ─────────────────────────────────
         var gd: int64 := genesis_data_alloc();
         poke64(gd + GEN_D_ENTRY_POINT, 0x400000);
-        poke64(gd + GEN_D_TEXT_BLOCKS, textBlk);
+        poke64(gd + GEN_D_TEXT_BLOCKS,   textCnt);
+        poke64(gd + GEN_D_RODATA_BLOCKS, roCnt);
+        poke64(gd + GEN_D_DATA_BLOCKS,   daCnt);
         poke64(gd + GEN_D_FILE_SIZE,   fileSz);
         poke64(gd + GEN_D_TLV_USED,    peek64(tused));
 
@@ -134,6 +235,26 @@ pub type LBFNativeWriter = class {
 
         // ── 9. Text-Sektion schreiben ─────────────────────────────────────────
         var sr: int64 := section_emit(fd, codeBuf, codeLen, LBF_SECT_TYPE_TEXT, 1, totBlk);
+
+        // ── 9b. Ressourcenbloecke (#1971) — eigener page_type, kein Immutable-
+        // Bit noetig: der Lader laedt sie nicht, und ein Werkzeug darf sie
+        // austauschen (danach CRCs neu, wie bei jeder Aenderung).
+        if sr == 0 && resBlk > 0 {
+            var rbuf: int64 := alloc(LBF_BLOCK_SIZE);
+            var rb: int64 := 0;
+            while rb < resBlk && sr == 0 {
+                var roff: int64 := rb * LBF_PAYLOAD_SIZE;
+                var rcopy: int64 := resLen - roff;
+                if rcopy > LBF_PAYLOAD_SIZE { rcopy := LBF_PAYLOAD_SIZE; }
+                section_build_block(rbuf, resStrom + roff, rcopy, 1 + textBlk + rb, totBlk, 0);
+                poke8(rbuf + LBF_H_PAGE_TYPE, LBF_PAGE_RESOURCE);
+                // page_type steht im Kopf, der CRC deckt nur die Nutzlast —
+                // bleibt also gueltig (wie bei lbf_header_set_immutable).
+                if sys_write(fd, rbuf, LBF_BLOCK_SIZE) != LBF_BLOCK_SIZE { sr := 0 - 1; }
+                rb := rb + 1;
+            }
+            free(rbuf, LBF_BLOCK_SIZE);
+        }
         close(fd);
 
         // ── 10. Cleanup ───────────────────────────────────────────────────────
@@ -147,7 +268,7 @@ pub type LBFNativeWriter = class {
         if sr != 0 { return false; }
 
         // ── 11. File-CRC32C finalisieren ──────────────────────────────────────
-        if lbf_finalize_file_crc(path) != 0 { return false; }
+        if lbf_finalize_file_crc(path as int64) != 0 { return false; }
 
         return true;
     }

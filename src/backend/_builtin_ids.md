@@ -1,0 +1,610 @@
+# Builtin-IDs (`IRO_CALL_BUILTIN`)
+
+Die ID im `IRO_CALL_BUILTIN`-Befehl ist ein **globaler Namensraum über alle
+Backends**. Vergeben wird sie in `src/ir_lower.lyx`, ausgewertet in
+`emitBuiltinCall` des jeweiligen Backends.
+
+Diese Datei ist die Belegungsliste. Sie existiert, weil die Vergabe vorher in
+jedem Backend-Zweig neu erfunden wurde: `Printf` und `mem_barrier()` trugen
+beide die 10, wodurch `Printf` auf Linux-ARM64 eine Speicherbarriere emittierte
+und nichts ausgab — ohne Meldung (#1037).
+
+**Vor der Vergabe einer neuen ID hier nachsehen und den Eintrag ergänzen.**
+`tests/builtin_id_test.sh` prüft, dass keine ID doppelt vergeben ist und dass
+jede vergebene ID hier steht.
+
+## Allgemeine IDs
+
+Die ID benennt die **emittierte Operation**, nicht den Namen im Quelltext:
+mehrere Builtins dürfen dieselbe ID benutzen, wenn sie denselben Code brauchen.
+Die Spalte „Lowering von" führt deshalb alle Aufrufer auf — der Test prüft
+gegen genau diese Liste, ein nicht eingetragener Aufrufer gilt als Kollision.
+
+| ID | Operation | Lowering von | Anmerkung |
+|---:|---|---|---|
+| 1 | `write(1, ptr, len)` | `PrintStr`, `PrintLn`, `Print` | Länge −1 = „strlen zur Laufzeit"; **nur das lyxos-Backend wertet den Sentinel aus** |
+| 2 | Ganzzahl nach stdout | `PrintInt`, `PrintLn`, `Print` | ohne Zeilenumbruch; `Print`/`PrintLn` seit #1716 auch mit Zahl-Argument, `PrintLn` haengt den Umbruch als eigenen ID-1-Aufruf an |
+| 3 | Prozessende | `Exit`, `panic` | `panic` beendet mit 1 (#1720) |
+| 4 | Pseudozufallszahl (xorshift64) | `Random` | #1728; der Zustand liegt im Wort hinter den Programm-Globalen |
+| 5 | Zustand des Zufallsgenerators setzen | `RandomSeed` | #1728 |
+| 6 | Teilzeichenkette | `StrSub`, `StrSplit` | StrSplit schneidet seine Felder damit heraus (#2305) |
+| 7 | Verkettung | `StrConcat` | |
+| 8 | Kopie | `StrCopy` | |
+| 9 | Gleitkomma nach stdout | `PrintFloat` | Linux-ARM64 bislang No-op |
+| 545 | Gleitkomma nach **stderr** | `EPrintFloat` | #2042; derselbe Rumpf wie 9, nur fd = 2 — arm64 und riscv teilen sich den Zweig |
+| 10 | Datenbarriere (DMB SY) | `mem_barrier` | |
+| 11 | Befehlsbarriere (ISB SY) | `inst_barrier` | |
+| 12 | Formatierte Ausgabe | `Printf` | war bis 1.0.11C fälschlich 10 |
+| 13 | `write(2, ptr, strlen(ptr))` | `EPrintStr`, `EPrintStrLn`, `EPrint`, `panic` | #1388; Länge rechnet das Backend selbst |
+| 14 | Zeilenumbruch nach stderr | `EPrintStrLn`, `EPrintLn`, `panic` | #1388 |
+| 15 | Länge einer Zeichenkette | `StrLen`, `StrLength`, `EPrintInt`, `StrSplit` | #1388; EPrintInt nutzt sie seit #2266 ausserhalb von lyxos (IntToStr + StrLen + write(2, …)) |
+| 16 | Ganzzahl als Dezimaltext, Zeiger zurück | `IntToStr`, `StrFromInt`, `EPrintInt` | #1720; der Puffer stammt seit #2227 aus dem Bump-Block, nicht vom Stapel — er muss den Aufruf überleben; EPrintInt siehe 15 |
+| 17 | Anzahl der Programmargumente | `GetArgC` | #1720; lyxos: Startrumpf legt argc/argv ab (#1754); arm64/riscv: argv in x28/s10, GetArgC zählt bis NULL (#2110) |
+| 18 | Zeiger auf den Argumentvektor | `GetArgV`, `GetArg` | #1720; `GetArg(i)` ist ID 18 plus ein Lesezugriff, keine eigene ID |
+| 19 | Zeiger auf den Umgebungsblock | `GetEnvBlock` | #1720; auf lyxos und Linux 0 — nur die win64-Laufzeit setzt ihn (#1677) |
+
+**Der allgemeine Bereich ist ausgeschöpft** (mit #1728 auch 4 und 5) — wer eine weitere allgemeine ID braucht, erweitert den Bereich, statt eine bestehende doppelt zu belegen.
+
+## Backend-Abdeckung der allgemeinen IDs
+
+| Backend | behandelt | fehlt |
+|---|---|---|
+| x86-64 (ELF) | eigener Pfad ohne IR-Builtins | — |
+| ARM64 Linux | 1, 2, 3, 6–11, **13, 14, 15**, **200–205, 208, 209** | 12 (`Printf`) — meldet Fehler |
+| ARM64 Windows | 1, 2, 3, 6, 7, 8, 9, 12, **200–205, 208, 209** | 10/11 als ausdrückliches No-op |
+| RISC-V Linux | 1, 2, 3, **13, 15, 200–205, 208, 209** | Rest meldet Fehler (#1388) |
+| ARM Cortex-M | **200–205, 208, 209**; 1, 2, 3, 9, 12, 13, 14 als ausdrücklicher No-op bzw. BKPT | alles Übrige meldet Fehler |
+| Xtensa | 1, 2 | Rest meldet Fehler (#1388, Kodierungen fehlen — vgl. #1281) |
+| lyxos (LBF) | 1, 2, **3**, **4**, **5**, **6**, **9**, **13, 14, 15, 16, 17, 18, 19** + 20 … 256 | 7, 8, 10–12 — melden Fehler (#1715) |
+
+**Speicherzugriffe (200–205, 208, 209)** sind seit #1388 auf ARM64, RISC-V und
+Cortex-M umgesetzt. Sie brauchen kein Betriebssystem und gelten deshalb auch
+im Windows- und im freistehenden Zweig.
+
+**Blockoperationen (210 `memcpy`/`MemCopy`, 216 `memset`/`MemSet`)** liegen
+daneben: drei Argumente ab `argBase`, Rückgabe ist der Zielzeiger (C-Semantik).
+Umgesetzt in lyxos (`rep movsb`/`rep stosb`), ARM64 und RISC-V (byteweise
+Schleife — wortweise bräuchte eine Ausrichtungsprüfung und brächte bei kurzen
+Puffern nichts). Xtensa und Cortex-M melden beide als Fehler.
+
+216 kam mit #1842 dazu: 210 war da, 216 nicht. Gemeldet wurde das als
+lyxos-Lücke, es traf aber jedes Ziel am gemeinsamen IR-Weg — ARM64 und RISC-V
+brachen mit derselben Meldung ab. **Wer eine Blockoperation ergänzt, zieht alle
+drei Backends nach**; die IDs sind eine Aufzählung, keine Einzelfälle.
+
+Eine nicht behandelte ID **muss laut scheitern**. Ein stiller Default-Zweig
+verwandelt jede Lücke in stille Fehlfunktion — dieselbe Klasse wie der
+LyxOS-Builtin-Misdispatch (PR #839) und der verworfene Opcode-Catch-all
+(PR #867).
+
+## Bereich ab 400 — allgemeine IDs, die im Block 1…19 keinen Platz mehr fanden
+
+| ID | Operation | Lowering von | Anmerkung |
+|---:|---|---|---|
+| 400 | abrunden (`roundsd`, Modus 1) | `fFloor` | #1720; SSE4.1, wie auf dem x86-Weg |
+| 401 | aufrunden (`roundsd`, Modus 2) | `fCeil` | #1720 |
+| 402 | kaufmaennisch runden (`roundsd`, Modus 0) | `fRound` | #1720; zur geraden Zahl |
+| 403 | f64 als Text, Zeiger zurück | `FloatToStr` | #1720; derselbe Formatierer wie ID 9, ohne Ausgabe |
+| 404 | Zeichenketten auf Gleichheit | `StrEq`, `StrEquals` | #1720 |
+| 405 | Anfang einer Zeichenkette prüfen | `StrStartsWith` | #1720 |
+| 406 | Dateigröße oder −1 | `FileSize` | #1720; open + seek(ENDE) + close. Nur lyxos emittiert die ID; auf den Linux-IR-Zielen setzt ir_lower sie aus 220/228/221 zusammen (#2258), wie FileReadAll (409) seit #2266 |
+| 407 | Leerraum vorn/hinten entfernen | `StrTrim` | #1720; ändert an Ort und Stelle, gibt Zeiger zurück |
+| 408 | Teilkette suchen, Index oder −1 | `StrFind` | #1720; leere Nadel → 0 |
+| 409 | Datei ganz lesen, nullterminiert | `FileReadAll` | #1720; 0 bei Fehler |
+| 410 | Ereignis an einen Prozess senden | `sys_event_send` | #1734; LyxOS 121 |
+| 411 | Ereignis abholen, nicht blockierend | `sys_event_recv` | #1734; LyxOS 122 |
+| 412 | Ereignis einer bestimmten Queue abholen | `sys_event_recv_pid` | #1734; LyxOS 132 |
+| 413 | Ereignis mit Frist abholen | `sys_event_recv_timeout` | #1734; LyxOS 218 — blockiert NICHT, die Frist löst die Schleife des Aufrufers ein |
+| 414 | TCP verbinden, Sockel zurück | `sys_tcp_connect` | #1734; LyxOS 180 `(ip, port)` — der Sockel entsteht dabei, es gibt kein `socket()` davor |
+| 415 | TCP senden | `sys_tcp_send` | #1734; LyxOS 181 `(sock, buf, len)` — flacher Puffer, kein msghdr |
+| 416 | TCP empfangen | `sys_tcp_recv` | #1734; LyxOS 182 `(sock, buf, max)` |
+| 417 | TCP schließen | `sys_tcp_close` | #1734; LyxOS 183 — kein Halbschließen |
+| 418 | TCP-Zustand | `sys_tcp_status` | #1734; LyxOS 184 → 0=CLOSED 1=SYN_SENT 2=ESTABLISHED 3=FIN_WAIT |
+| 419 | Zugewiesene IP (packed BE), 0 = kein Lease | `sys_net_get_ip` | #1734; LyxOS 141 |
+| 420 | Standard-Gateway | `sys_net_get_gw` | #1734; LyxOS 142 |
+| 421 | Netzmaske | `sys_net_get_mask` | #1734; LyxOS 143 |
+| 422 | Erster DNS-Server | `sys_net_get_dns` | #1734; LyxOS 144 |
+| 423 | Sechs MAC-Bytes in den Puffer | `sys_net_get_mac` | #1734; LyxOS 145 |
+| 424 | Rohen Ethernet-Rahmen senden, max 1500 | `sys_net_send` | #1734; LyxOS 146 |
+| 425 | Einen rohen Rahmen empfangen, 0 = keiner da | `sys_net_recv` | #1734; LyxOS 147 |
+| 426 | 112-Byte-Struktur mit den Schnittstellendaten | `sys_net_get_info` | #1734; LyxOS 211 |
+| 427 | Ein Feld der Schnittstelle setzen | `sys_net_set` | #1734; LyxOS 212 |
+| 428 | ICMP-Echo; der Puffer traegt Parameter rein und Ergebnisse raus | `sys_icmp_ping` | #1734; LyxOS 213 |
+| 429 | DNS-Abfrage; buf Parameter/Ergebnis, a1 = Name | `sys_dns_query` | #1734; LyxOS 214 |
+| 430 | Umgebungsvariable setzen; Zeiger sind PHYSISCH (ELF-Literale) | `sys_setenv` | #1810; LyxOS 92 |
+| 431 | Wert in den Puffer holen, Laenge oder -1; Zeiger PHYSISCH | `sys_getenv` | #1810; LyxOS 93 |
+| 432 | Alle Variablen ueber vmm_op41 ausgeben | `sys_envlist` | #1810; LyxOS 94 |
+| 433 | Alle als KEY=VAL\n in den Puffer; hier USER-virtuell | `sys_envlistbuf` | #1810; LyxOS 133 |
+
+Warum oberhalb des Syscall-Bereichs und nicht darin: das sind keine Syscalls,
+sondern Rechenoperationen, die jedes Backend umsetzen kann. Sie im
+lyxos-Block zu vergeben haette den Namensraum belogen.
+
+**Warum 400 und nicht mehr 300.** Diese IDs lagen zuerst auf 300…309. Seit dem
+2026-08-20 belegt LyxOS die *Syscall-Nummern* 300…326 (§10.9/§10.10). Das sind
+zwei getrennte Namensräume — eine Kollision im Wortsinn war es nicht, und nichts
+war dadurch kaputt. Verschoben wurde trotzdem: in `emit_lyxos.emitBuiltinCall`
+stehen Builtin-ID und Syscall-Nummer in derselben Zeile nebeneinander
+(`else if id == 172 { self.emitVfsSyscall(300, …) }`). Zwei gleiche Zahlen mit
+verschiedener Bedeutung nebeneinander sind eine Falle für den nächsten Leser,
+und die Zuordnungstabelle ist genau die Stelle, an der ein Zahlendreher
+unbemerkt bliebe. Der Bereich 300…399 ist damit **den LyxOS-Nummern
+vorbehalten** und wird für allgemeine IDs nicht mehr vergeben.
+
+## Bereich 20 … 256 — lyxos-Syscalls
+
+`237` ist `sys_clock_nanosleep` (#1720): eigene Nummer statt Alias auf
+`nanosleep` (233), weil der timespec dort am dritten Argument steht und
+`TIMER_ABSTIME` einen Zeitpunkt meint, keine Dauer — die Flagge zu ignorieren
+hiesse, den absoluten Zeitstempel als Dauer zu verschlafen.
+
+`238` ist `sys_gettimeofday` (#1720): das Ziel liefert die Zeit als
+Nanosekunden aus `sys_time_ns` (117), nicht als gefuelltes `timeval` — die
+Umrechnung in Sekunden und Mikrosekunden macht das Backend.
+
+`239` meldet **-ENOSYS** (#1720) und wird von `sys_timerfd_create`,
+`sys_timerfd_settime` und `sys_timerfd_gettime` geteilt. LyxOS hat ein anderes
+Timer-Modell als Linux; eine Abbildung waere eine Behauptung ueber die
+Wartesemantik, und fuer `gettime` gibt es gar keine Entsprechung. Eine ehrliche
+Fehlermeldung ist besser als eine plausible Fehluebersetzung.
+
+Vergeben in `src/ir_lower.lyx` (Abschnitt „VFS syscalls"), ausgewertet in
+`src/backend/lyxos/emit_lyxos.lyx`. Eine LyxOS-Syscall-ID ist an **drei**
+Stellen konsistent zu halten: `sema._regBuiltin`, das Lowering in `ir_lower`
+und `emit_lyxos.emitBuiltinCall`.
+
+## Bereich 172 … 198 — LyxOS-Nummern 300 … 326 (§10.9/§10.10, Stand 2026-08-20)
+
+Auf das Anforderungsdokument `work/lyxos/anforderungen-compiler.md` hin vom
+LyxOS-Team umgesetzt und mit `/bin/systest.elf` bzw. gegen eine echte
+Gegenstelle geprüft — nicht nur übersetzt.
+
+| ID | LyxOS-Nr | Name | Argumente |
+|---:|---:|---|---:|
+| 172 | 300 | `sys_access` | 2 |
+| 173 | 301 | `sys_fcntl` | 3 |
+| 174 | 302 | `sys_dup2` | 2 |
+| 175 | 303 | `sys_dup3` | 3 |
+| 176 | 304 | `sys_ftruncate` | 2 |
+| 177 | 305 | `sys_fsync` | 1 |
+| 178 | 306 | `sys_fdatasync` | 1 |
+| 179 | 307 | `sys_uname` | 1 |
+| 180 | 308 | `sys_getcpu` | 2 |
+| 181 | 309 | `sys_readv` | 3 |
+| 182 | 310 | `sys_writev` | 3 |
+| 183 | 311 | `sys_statfs` | 2 |
+| 184 | 312 | `sys_sched_getaffinity` | 3 |
+| 185 | 313 | `sys_sched_setaffinity` | 3 |
+| 186 | 314 | `sys_getpriority` | 2 |
+| 187 | 315 | `sys_setpriority` | 3 |
+| 188 | 316 | `sys_futex_wait` | 2 |
+| 189 | 317 | `sys_futex_wake` | 2 |
+| 190 | 318 | `sys_futex_requeue` | 3 |
+| 191 | 319 | `sys_kill` | 2 |
+| 192 | 320 | `sys_pipe2` | 2 |
+| 193 | 321 | `sys_udp_open` | 1 |
+| 194 | 322 | `sys_udp_close` | 1 |
+| 195 | 323 | `sys_sendto` | 4 |
+| 196 | 324 | `sys_recvfrom` | 4 |
+| 197 | 325 | `sys_getsockname` | 3 |
+| 198 | 326 | `sys_getpeername` | 2 |
+
+**Keine Formel, sondern Zeile für Zeile.** Andere Blöcke rechnen die Nummer aus
+der ID (`0x0400 + (id - 72)`). Hier nicht: der Bereich hat zwei Quellen
+(§10.9 und die nachgereichte §10.10) und keine Garantie, dass er lückenlos
+bleibt. Eine Formel würde eine künftige Lücke stillschweigend überbrücken und
+auf einen fremden Handler zeigen.
+
+**Die Nummern sind nicht die von Linux.** Nur 0–3, 8, 9 und 24 stimmen zufällig
+überein. Laut LyxOS-Team hätten **19 der 21** angefragten Aufrufe unter
+Linux-Nummerierung einen bestehenden fremden Handler getroffen — Linux 158
+(`arch_prctl`) etwa das dortige `sys_iofs_write_lpid`, das eine 4-KB-Seite ins
+Dateisystem schreibt. Das ist #795 in schlimmer: dort war das Ergebnis falsches
+Verhalten, hier wären es überschriebene Dateien.
+
+### Abweichungen vom POSIX-Verhalten — hier, nicht nur im Kommentar
+
+Wer eine dieser Funktionen benutzt, liest diese Tabelle, nicht den Kernel-Quelltext:
+
+| Name | Weicht ab |
+|---|---|
+| `sys_dup2` | Der Dateizeiger wird **nicht geteilt** (Slot-Kopie). Zwei fds auf dieselbe Datei laufen unabhängig. |
+| `sys_ftruncate` | **Nur Länge 0.** Jede andere Länge meldet −1, statt still etwas anderes zu tun. |
+| `sys_statfs` | Freie Blöcke sind **−1 = unbekannt**, nicht 0. Wer 0 als „voll" liest, irrt. |
+| `sys_getpriority`/`sys_setpriority` | **LyxOS-Skala 0…255** (0 = HARD_RT, 128 = NORMAL, 255 = IDLE), bewusst nicht auf nice −20…19 abgebildet. |
+| `sys_kill` | **Kein Signalmodell.** `sig=0` prüft Existenz, sonst wird der Thread als DEAD markiert. Sich selbst zu töten wird abgelehnt. |
+| `sys_pipe2` | **Blockiert nie** — leer liefert 0, voll nimmt 0 an. Ein 4096-Byte-Ring. |
+| `sys_sendto`/`sys_recvfrom` | **Ein Socket zur Zeit.** Der Aufruf pollt die Karte selbst und verwirft Fremdpakete; währenddessen gehen Pakete für andere Ports verloren. Adressformat `{ip, port}`, kein `sockaddr_in`. Bei `recvfrom` steht bei +16 das Zeitlimit in ms als **Eingabe**. |
+| `sys_access` | `mode` wird ignoriert — FAT32 kennt keine Rechte. |
+| `sys_fcntl` | `O_NONBLOCK` wird gespeichert, aber noch nicht ausgewertet. |
+| `sys_fsync`/`sys_fdatasync` | Erfolg ist hier die Wahrheit, keine Notlüge: FAT32 schreibt write-through. |
+
+Dass das LyxOS-Team diese Punkte benennt statt sie zu verschweigen, ist der
+Grund, warum sie hier stehen können. Eine Abweichung, die nur im Kernel steht,
+ist beim Aufrufer ein Fehler ohne Absender.
+
+## Bereich 212 … 215 — Zeit über den r3_sc_block (#1750)
+
+| ID | LyxOS-Nr | Name | Argumente | Rückgabe |
+|---:|---:|---|---:|---|
+| 212 | 134 | `sys_rtc_read` | 0 | `(Stunden << 8) \| Minuten` |
+| 213 | 138 | `sys_rtc_datetime` | 0 | `(FAT32-Datum << 16) \| FAT32-Zeit` |
+| 214 | 228 | `sys_rdtsc` | 0 | roher TSC-Zählerstand |
+| 215 | 140 | `sys_utime_fd` | 2 | 0 oder −1; setzt mtime auf einem offenen fd |
+
+Dazu wandern **157** (`sys_vsync_wait`, Nr. 116) und **158** (`sys_time_ns`,
+Nr. 117) aus dem WP17-Bereichszweig auf denselben Weg. Ihre IDs bleiben, nur
+der Emitter wechselt.
+
+**Warum ein zweiter Weg.** `emitVfsSyscall` legt die Nummer in `rax` und
+emittiert `SYSCALL`. Der Ring-3-Einstieg `.ring3_dispatch`
+(`bootloader/boot.asm:1519`) kennt aber nur eine Whitelist — 0, 1, 2, 3, 8, 9,
+11, 12, 60, 79, 80, 231, 0x100, 0x203, 0x204…0x020F, 0x999. Alles andere landet
+auf `.r3_unknown` und wird mit `xor eax,eax` beantwortet: **ein unbekannter
+Syscall sieht aus wie Erfolg**. Keine der sechs Zeitnummern steht in dieser
+Liste. Ein Builtin auf dem Registerweg hätte also von der ersten Zeile an still
+0 geliefert — dieselbe Klasse wie #839 und #1741, nur eine Ebene tiefer.
+
+`emitBlockSyscall` geht stattdessen den Weg, den der `/bin`-Werkzeugkasten seit
+jeher nimmt (`bin/bsys.lyx`, `Sys1`…`Sys4`): Blockadresse per `mmap(0, -5, …)`
+holen, `nr` und `a0…a3` hineinschreiben, mit `mmap(0, -6, …)` auslösen. Die
+Nummer steht damit nicht in `rax`, und ausgelöst wird über die **9**, die in
+der Whitelist steht. Über diesen Weg sind alle 184 Kernel-Nummern erreichbar.
+
+**Das Ergebnis kommt aus `rax`, nicht aus `rdx`.** `emitVfsSyscall` schliesst
+mit `MOV rax, rdx` ab — die Zwei-Register-Konvention der Entwurfs-ABI, die im
+Kernel nirgends umgesetzt ist. `.ring3_r3_deferred` lässt den int-0x44-Handler
+das gesicherte `rax` setzen und sysret'et; `rdx` trägt zu dem Zeitpunkt das
+`prot`-Argument des mmap-Aufrufs. `emitBlockSyscall` liest deshalb `rax`.
+Der Registerweg behält sein `MOV rax, rdx` — das ist ein eigener Defekt mit
+eigenem Nachweis und wird hier nicht nebenbei mitgeändert.
+
+**Vier Argumente, nicht mehr.** Der Block trägt `nr` und `a0…a3`
+(`kernel/ring3.lyx:43-52`). Ein fünftes Argument bricht den Bau ab, statt
+still zu verschwinden.
+
+**Die Blockadresse wird je Aufruf neu geholt.** Das kostet einen zusätzlichen
+Sprung in den Kernel. Der Gegenwert wäre ein globaler Zustand samt Frage, wann
+er gültig wird und was bei `sys_spawn` damit passiert — bei einem Aufruf, der
+ohnehin in den Kernel geht, kein guter Tausch.
+
+## Die Entwurfs-ABI ist keine ABI (#1734)
+
+`emitVfsSyscall` prüft seit 1.1.4N jede Nummer gegen den **tatsächlich
+implementierten** Raum: flach **0…228** und **300…326**, dazu der Wissensgraph
+**2063…2066** und die Zeitleiste **2315**. Eine Nummer ausserhalb wird nicht
+emittiert — der Bau bricht mit Builtin-ID, Nummer und Fundstelle ab.
+
+Betroffen sind **106** Zuordnungen, die aus der hex-gruppierten Entwurfs-ABI
+stammen und im Kernel nie gebaut wurden:
+
+| Gruppe | Builtin-IDs | emittierte Entwurfsnummer |
+|---|---|---|
+| IPC/Sync | 72–84 | 0x0400 … 0x040C |
+| Zeit | 85–89 | 0x0500 … 0x0504 |
+| Capabilities | 90–98 | 0x0700 … 0x0708 |
+| Tasks | 99–108 | 0x0B00 … 0x0B09 |
+| KI | 109–115 | 0x0800 … 0x0806 |
+| Embedding | 116–121 | 0x0807 … 0x080C |
+| Sem/Graph | 122–127 | 0x080D … 0x0812 |
+| Lyra | 128–139 | 0x0900 … 0x090B |
+| IOFS | 140–144 | 0x0C00 … 0x0C04 |
+| Debug | 145–150 | 0x0A00 … 0x0A05 |
+| einzeln | 24, 25, 30–34, 36, 39–47, 48–57 | 0x0204, 0x0205, 0x020A–0x0215, 0x0300–0x0305, 0x0600–0x0609 |
+
+Zwei Zufallstreffer bleiben gültig: **0x080F…0x0812** und **0x090B** sind
+dezimal 2063…2066 und 2315 und damit echte Handler. Die Gruppe Sem/Graph trifft
+also teils ins Leere und teils genau richtig — kein Verdienst des Entwurfs,
+sondern der Grund, warum die Prüfung Zahlen vergleicht und keine Gruppen.
+
+**Warum abbrechen und nicht `-ENOSYS`.** Heute trifft eine Entwurfsnummer
+nichts, weil 229…399 im Kernel frei ist; ein Laufzeitfehler wäre also formal
+ausreichend. Nur ist „heute frei" keine Eigenschaft, auf die man baut: wächst
+die flache Tabelle, wandert eine Phantasienummer nach der anderen in belegtes
+Gebiet, und der Tag kündigt sich nicht an. Das LyxOS-Team beziffert, was dann
+passiert — Linux 158 träfe dort `sys_iofs_write_lpid`, das eine 4-KB-Seite ins
+Dateisystem **schreibt**.
+
+**Der Abbruch kostet nichts, was vorher funktioniert hätte.** Alle acht
+stdlib-Units bauen weiter und `make test-lyxos` bleibt grün, weil der
+Erreichbarkeitsfilter (#1727) ungenutzte Rümpfe gar nicht erst lowert. Getroffen
+wird nur, wer eine dieser Funktionen **wirklich aufruft** — und dessen Programm
+hätte vorher einen Syscall ins Nichts abgesetzt.
+
+**Wo es eine echte Nummer gibt, gehört sie angebunden** statt der Entwurfszahl.
+Aus `work/lyxos/antwort-lyxos.md`: Ereignisschleife mit Frist **218**, Ereignisse
+**121/122/132**, TCP **180–184**, rohe Frames **146/147**, Netz/DNS/Ping
+**141–145, 211–214**, IOFS mit Graph **155–188**, Statistik **202/203/205**,
+Neustart **210**, RAM-Disks **153/154**, Audio **219–228**, Fenster **148–152**,
+TSC **228**. Das ist Folgearbeit, kein Teil dieser Prüfung.
+
+**Zwei ungeklärte Punkte, bewusst nicht überschrieben:** `sys_seek` emittierte
+0x0204, die Antwort nennt `sys_lseek` = 8; unser eigener Stand führte 0x0204
+als QEMU-verifiziert. Dasselbe bei `sys_stat` 0x0205 gegen `sys_fstat` 135.
+Beide melden jetzt, statt eine der beiden Lesarten zur Tatsache zu erklären.
+
+
+
+## Linux-Syscalls der IR-Backends (#2021)
+
+Diese IDs bilden **einen** generischen Zweig in `emit_arm64` und
+`riscv_linux`: die Nummer und die Argumentzahl stehen in
+`src/backend/linux_syscalls.lyx`, beide Backends lesen dieselbe Tabelle. Vor
+#2021 wurde jeder Syscall je Backend als eigener Block geschrieben — bei
+diesen zweiunddreissig wären das vierundsechzig handgeschriebene Blöcke
+geworden, die übereinstimmen müssen.
+
+Die Nummern gelten für die **generische** Linux-ABI (`asm-generic/unistd.h`),
+also für arm64 **und** riscv. x86-64 zählt anders und emittiert seine Nummern
+im Codegen selbst.
+
+Nicht vergeben, weil es sie in dieser ABI nicht gibt: `select` (nur
+`pselect6`, mit einem sechsten Argument) und `arch_prctl` (x86-eigen). Beide
+werden von `ir_lower` benannt abgewiesen, statt auf etwas Ähnliches
+abgebildet zu werden.
+
+| ID | Operation | Lowering von | Anmerkung |
+|---:|---|---|---|
+| 440 | Linux-Syscall getuid (Nr. 0) | `sys_getuid` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 441 | Linux-Syscall chroot (Nr. 1) | `sys_chroot` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 442 | Linux-Syscall clone (Nr. 5) | `sys_clone` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 443 | Linux-Syscall epoll_create1 (Nr. 1) | `sys_epoll_create1` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 444 | Linux-Syscall inotify_init1 (Nr. 1) | `sys_inotify_init1` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 445 | Linux-Syscall io_uring_setup (Nr. 2) | `sys_io_uring_setup` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 446 | Linux-Syscall mq_open (Nr. 4) | `sys_mq_open` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 447 | Linux-Syscall mremap (Nr. 5) | `sys_mremap` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 448 | Linux-Syscall pidfd_open (Nr. 2) | `sys_pidfd_open` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 449 | Linux-Syscall prctl (Nr. 5) | `sys_prctl` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 450 | Linux-Syscall pread64 (Nr. 4) | `sys_pread64` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 451 | Linux-Syscall ptrace (Nr. 4) | `sys_ptrace` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 452 | Linux-Syscall rt_sigaction (Nr. 4) | `sys_rt_sigaction` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 453 | Linux-Syscall sched_yield (Nr. 0) | `sys_sched_yield` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 454 | Linux-Syscall shmget (Nr. 3) | `sys_shmget` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 455 | Linux-Syscall setxattr (Nr. 5) | `sys_setxattr` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 456 | Linux-Syscall bpf (Nr. 3) | `sys_bpf` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 457 | Linux-Syscall epoll_ctl (Nr. 4) | `sys_epoll_ctl` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 458 | Linux-Syscall eventfd2 (Nr. 2) | `sys_eventfd2` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 459 | Linux-Syscall getgid (Nr. 0) | `sys_getgid` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 460 | Linux-Syscall getppid (Nr. 0) | `sys_getppid` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 461 | Linux-Syscall getxattr (Nr. 4) | `sys_getxattr` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 462 | Linux-Syscall inotify_add_watch (Nr. 3) | `sys_inotify_add_watch` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 463 | Linux-Syscall io_uring_enter (Nr. 6) | `sys_io_uring_enter` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 464 | Linux-Syscall madvise (Nr. 3) | `sys_madvise` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 465 | Linux-Syscall mq_unlink (Nr. 1) | `sys_mq_unlink` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 466 | Linux-Syscall perf_event_open (Nr. 5) | `sys_perf_event_open` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 467 | Linux-Syscall pidfd_send_signal (Nr. 4) | `sys_pidfd_send_signal` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 468 | Linux-Syscall pwrite64 (Nr. 4) | `sys_pwrite64` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 469 | Linux-Syscall rt_sigprocmask (Nr. 4) | `sys_rt_sigprocmask` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 470 | Linux-Syscall sethostname (Nr. 2) | `sys_sethostname` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 471 | Linux-Syscall shmat (Nr. 3) | `sys_shmat` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+
+
+## Linux-Formen der lyxos-IDs 172…198 (#2024)
+
+Die IDs 172…198 tragen die **LyxOS**-Formen. Ihre Stelligkeit weicht teils ab —
+`sendto` nimmt dort vier Argumente, unter Linux sechs —, und **dieselbe ID kann
+nicht zwei Stelligkeiten tragen**. Die Linux-Formen bekommen deshalb eigene
+IDs; `ir_lower` wählt nach Ziel.
+
+Fünf Namen haben unter Linux keine 1:1-Entsprechung und werden umgeschrieben.
+Das ist kein Raten, weil der eingesetzte Wert jeweils **feststeht**:
+`access(p,m)` → `faccessat(AT_FDCWD,p,m)`, `dup2(a,n)` → `dup3(a,n,0)`,
+`futex_wait`/`wake`/`requeue` → `futex(uaddr, OP, …)` mit OP aus
+`linux/futex.h`.
+
+Nicht vergeben: `sys_udp_open`/`sys_udp_close`. Sie sind LyxOS-eigen (dort ein
+einziger Aufruf, unter Linux `socket`+`bind` bzw. `close`) und werden in der
+gesamten stdlib von niemandem benutzt — `ir_lower` weist sie benannt ab.
+
+| ID | Operation | Lowering von | Anmerkung |
+|---:|---|---|---|
+| 472 | Linux-Syscall fcntl (Nr. 3) | `sys_fcntl` | #2024; Linux-Form der ID aus 172…198 |
+| 473 | Linux-Syscall dup3 (Nr. 3) | `sys_dup3` | #2024; Linux-Form der ID aus 172…198 |
+| 474 | Linux-Syscall ftruncate (Nr. 2) | `sys_ftruncate` | #2024; Linux-Form der ID aus 172…198 |
+| 475 | Linux-Syscall fsync (Nr. 1) | `sys_fsync` | #2024; Linux-Form der ID aus 172…198 |
+| 476 | Linux-Syscall fdatasync (Nr. 1) | `sys_fdatasync` | #2024; Linux-Form der ID aus 172…198 |
+| 477 | Linux-Syscall uname (Nr. 1) | `sys_uname` | #2024; Linux-Form der ID aus 172…198 |
+| 478 | Linux-Syscall getcpu (Nr. 3) | `sys_getcpu` | #2024; Linux-Form der ID aus 172…198 |
+| 479 | Linux-Syscall readv (Nr. 3) | `sys_readv` | #2024; Linux-Form der ID aus 172…198 |
+| 480 | Linux-Syscall writev (Nr. 3) | `sys_writev` | #2024; Linux-Form der ID aus 172…198 |
+| 481 | Linux-Syscall statfs (Nr. 2) | `sys_statfs` | #2024; Linux-Form der ID aus 172…198 |
+| 482 | Linux-Syscall sched_getaffinity (Nr. 3) | `sys_sched_getaffinity` | #2024; Linux-Form der ID aus 172…198 |
+| 483 | Linux-Syscall sched_setaffinity (Nr. 3) | `sys_sched_setaffinity` | #2024; Linux-Form der ID aus 172…198 |
+| 484 | Linux-Syscall getpriority (Nr. 2) | `sys_getpriority` | #2024; Linux-Form der ID aus 172…198 |
+| 485 | Linux-Syscall setpriority (Nr. 3) | `sys_setpriority` | #2024; Linux-Form der ID aus 172…198 |
+| 486 | Linux-Syscall kill (Nr. 2) | `sys_kill` | #2024; Linux-Form der ID aus 172…198 |
+| 487 | Linux-Syscall pipe2 (Nr. 2) | `sys_pipe2` | #2024; Linux-Form der ID aus 172…198 |
+| 488 | Linux-Syscall sendto (Nr. 6) | `sys_sendto` | #2024; Linux-Form der ID aus 172…198 |
+| 489 | Linux-Syscall recvfrom (Nr. 6) | `sys_recvfrom` | #2024; Linux-Form der ID aus 172…198 |
+| 490 | Linux-Syscall getsockname (Nr. 3) | `sys_getsockname` | #2024; Linux-Form der ID aus 172…198 |
+| 491 | Linux-Syscall getpeername (Nr. 3) | `sys_getpeername` | #2024; Linux-Form der ID aus 172…198 |
+| 492 | Linux-Syscall faccessat (Nr. 3) | `sys_faccessat` | #2024; Linux-Form der ID aus 172…198 |
+| 493 | Linux-Syscall futex (Nr. 6) | `sys_futex` | #2024; Linux-Form der ID aus 172…198 |
+
+
+## Weitere Linux-Syscalls (#2021, dritte Runde)
+
+Nummern aus `asm-generic/unistd.h`. `epoll_wait` und `getpgrp` gibt es dort
+nicht; sie werden auf `epoll_pwait(…, 0, 0)` bzw. `getpgid(0)` umgeschrieben —
+der eingesetzte Wert steht jeweils fest.
+
+| ID | Operation | Lowering von | Anmerkung |
+|---:|---|---|---|
+| 494 | Linux-Syscall accept4 (Nr. 4) | `sys_accept4` | #2021 |
+| 495 | Linux-Syscall capget (Nr. 2) | `sys_capget` | #2021 |
+| 496 | Linux-Syscall capset (Nr. 2) | `sys_capset` | #2021 |
+| 497 | Linux-Syscall fallocate (Nr. 4) | `sys_fallocate` | #2021 |
+| 498 | Linux-Syscall fgetxattr (Nr. 4) | `sys_fgetxattr` | #2021 |
+| 499 | Linux-Syscall flistxattr (Nr. 3) | `sys_flistxattr` | #2021 |
+| 500 | Linux-Syscall fremovexattr (Nr. 2) | `sys_fremovexattr` | #2021 |
+| 501 | Linux-Syscall fsetxattr (Nr. 5) | `sys_fsetxattr` | #2021 |
+| 502 | Linux-Syscall futex_waitv (Nr. 5) | `sys_futex_waitv` | #2021 |
+| 503 | Linux-Syscall getegid (Nr. 0) | `sys_getegid` | #2021 |
+| 504 | Linux-Syscall geteuid (Nr. 0) | `sys_geteuid` | #2021 |
+| 505 | Linux-Syscall inotify_rm_watch (Nr. 2) | `sys_inotify_rm_watch` | #2021 |
+| 506 | Linux-Syscall io_uring_register (Nr. 4) | `sys_io_uring_register` | #2021 |
+| 507 | Linux-Syscall listxattr (Nr. 3) | `sys_listxattr` | #2021 |
+| 508 | Linux-Syscall memfd_create (Nr. 2) | `sys_memfd_create` | #2021 |
+| 509 | Linux-Syscall mincore (Nr. 3) | `sys_mincore` | #2021 |
+| 510 | Linux-Syscall mlock (Nr. 2) | `sys_mlock` | #2021 |
+| 512 | Linux-Syscall mq_getsetattr (Nr. 3) | `sys_mq_getsetattr` | #2021 |
+| 513 | Linux-Syscall mq_timedreceive (Nr. 5) | `sys_mq_timedreceive` | #2021 |
+| 514 | Linux-Syscall mq_timedsend (Nr. 5) | `sys_mq_timedsend` | #2021 |
+| 515 | Linux-Syscall msgctl (Nr. 3) | `sys_msgctl` | #2021 |
+| 516 | Linux-Syscall msgget (Nr. 2) | `sys_msgget` | #2021 |
+| 517 | Linux-Syscall msgrcv (Nr. 5) | `sys_msgrcv` | #2021 |
+| 518 | Linux-Syscall msgsnd (Nr. 4) | `sys_msgsnd` | #2021 |
+| 519 | Linux-Syscall msync (Nr. 3) | `sys_msync` | #2021 |
+| 520 | Linux-Syscall munlock (Nr. 2) | `sys_munlock` | #2021 |
+| 523 | Linux-Syscall pidfd_getfd (Nr. 3) | `sys_pidfd_getfd` | #2021 |
+| 524 | Linux-Syscall reboot (Nr. 4) | `sys_reboot` | #2021 |
+| 525 | Linux-Syscall recvmmsg (Nr. 5) | `sys_recvmmsg` | #2021 |
+| 526 | Linux-Syscall removexattr (Nr. 2) | `sys_removexattr` | #2021 |
+| 527 | Linux-Syscall semctl (Nr. 4) | `sys_semctl` | #2021 |
+| 528 | Linux-Syscall semget (Nr. 3) | `sys_semget` | #2021 |
+| 529 | Linux-Syscall semop (Nr. 3) | `sys_semop` | #2021 |
+| 530 | Linux-Syscall sendfile (Nr. 4) | `sys_sendfile` | #2021 |
+| 531 | Linux-Syscall sendmmsg (Nr. 4) | `sys_sendmmsg` | #2021 |
+| 532 | Linux-Syscall setgid (Nr. 1) | `sys_setgid` | #2021 |
+| 533 | Linux-Syscall setns (Nr. 2) | `sys_setns` | #2021 |
+| 534 | Linux-Syscall setpgid (Nr. 2) | `sys_setpgid` | #2021 |
+| 535 | Linux-Syscall setsid (Nr. 0) | `sys_setsid` | #2021 |
+| 536 | Linux-Syscall shmctl (Nr. 3) | `sys_shmctl` | #2021 |
+| 537 | Linux-Syscall shmdt (Nr. 1) | `sys_shmdt` | #2021 |
+| 538 | Linux-Syscall signalfd4 (Nr. 4) | `sys_signalfd4` | #2021 |
+| 539 | Linux-Syscall tgkill (Nr. 3) | `sys_tgkill` | #2021 |
+| 540 | Linux-Syscall umount2 (Nr. 2) | `sys_umount2` | #2021 |
+| 541 | Linux-Syscall unshare (Nr. 1) | `sys_unshare` | #2021 |
+| 542 | Linux-Syscall epoll_pwait (Nr. 6) | `sys_epoll_pwait` | #2021 |
+| 543 | Linux-Syscall getpgid (Nr. 1) | `sys_getpgid` | #2021 |
+| 544 | Linux-Syscall clock_gettime (Nr. 113) | `clock_gettime`, `sys_clock_gettime` | #2021; `LSC_MAX` — die obere Grenze des Bereichs 440…544
+| 546 | Linux-Syscall mmap (Nr. 222, sechs Argumente) | `mmap` | #2122; nur arm64/android-arm64/riscv, LyxOS behaelt IRO_ALLOC; ausserhalb LSC_MIN..LSC_MAX, die Backends fragen `IstLinuxSys` |
+| 547 | Linux-Syscall newfstatat (Nr. 79) | `stat`, `sys_stat`, `lstat`, `sys_lstat`, `sys_newfstatat` | #2156; nur arm64/riscv (generische ABI ohne stat/lstat), dirfd AT_FDCWD, lstat mit AT_SYMLINK_NOFOLLOW |
+| 548 | Linux-Syscall readlinkat (Nr. 78) | `readlink`, `sys_readlink`, `sys_readlinkat` | #2156; nur arm64/riscv, dirfd AT_FDCWD |
+| 549 | Linux-Syscall symlinkat (Nr. 36) | `symlink` | #2156; nur arm64/riscv, newdirfd AT_FDCWD |
+| 550 | Linux-Syscall fstat (Nr. 80) | `sys_fstat` | #2156; nur arm64/riscv |
+| 551 | Linux-Syscall unlinkat (Nr. 35) | `rmdir` | #2450; nur arm64/riscv, dirfd AT_FDCWD, Flag AT_REMOVEDIR (0x200). Auf lyxos bleibt `rmdir` die ID 236 (sys_unlink mit UNLINK_DIR) — und die meldet dort, dass es die Nummer nicht gibt (#2011) |
+
+## Bereich 267 … 272 — IOFS-Volumes und Partitions-Mounts (#2439)
+
+WP32-E im Kernel (IOFS auch unter `/devices/<name>/`, lyx-os `bb77019`) brachte
+sieben Nummern, die LyxOS behandelt und der Compiler nicht kannte: 189–191 und
+196–199. Die Nummern sind in `kernel/ring3.lyx:3436-3471` **nachgelesen**, nicht
+aus der Entwurfs-ABI übernommen.
+
+**Warum ein eigener Block und nicht der lyxos-Bereich 20…256:** der war bis auf
+vier Nummern (199, 217, 218, 219) ausgeschöpft. Sechs verwandte Aufrufe
+hintereinander sind leichter zu prüfen als vier verstreute plus zwei woanders —
+und die Belegungsliste bleibt lesbar. Die vier bleiben für kleine Nachträge im
+alten Block frei.
+
+| ID | LyxOS-Nr | Name | Argumente | Rückgabe |
+|---:|---:|---|---:|---|
+| 267 | 189 | `sys_iofs_select` | 1 (vol) | 0 oder −1; schaltet den aktiven IOFS-Datenträger um |
+| 268 | 190 | `sys_iofs_vol_active` | 0 | Nummer des aktiven Volumes |
+| 269 | 191 | `sys_iofs_vol_count` | 0 | Anzahl der IOFS-Volumes |
+| 270 | 196 | `sys_mount_part` | 3 (disk_id, part_no, name) | 0 oder Fehlercode |
+| 271 | 198 | `sys_mount_list` | 2 (idx, out) | 0 oder −1; füllt 48 Byte je Eintrag |
+| 272 | 199 | `sys_mount_count` | 0 | Anzahl der Einträge |
+
+**`sys_mount_part` nimmt DREI Argumente, nicht vier.** Die Entwurfssignatur
+nennt `(disk_id, part_no, name, flags)`; gebaut ist
+`VfsMountPart(name, disk_id, part_no, MOUNT_TEMP)` — der Kernel setzt die Flags
+selbst, ein vierter Parameter wäre ein Wert, den niemand liest.
+
+**Der Name ist nicht `sys_mount`.** Den gibt es schon: Nummer **85**,
+`sys_mount(vol_id, disk_id, lba_start)`, hängt eine Platte als IOFS-Volume ein.
+Nummer **196** hängt eine Partition unter `/devices/<name>/` ein — gleicher
+Name, andere Bedeutung, und damit nicht entscheidbar, welcher gemeint ist. Es
+sind zwei Builtins, nicht einer mit neuer Nummer.
+
+**`sys_umount` (ID 36) zeigte auf 0x0210 = 528** — eine Entwurfsnummer, die es
+im Kernel nicht gibt; jeder Aufruf scheiterte an der Nummernprüfung aus #1734.
+Gebaut ist **197** mit **einem** Argument (`VfsUmountName`), nicht drei.
+
+## Bereich 253 … 262 — CPU-Abfrage und Bit-Rechenwerke (#2187, #2190, #2177)
+
+Vergeben in `src/ir_lower.lyx`; der Schnellweg (`codegen_x86`) kennt dieselben
+Namen ohne ID, weil er nicht über das IR geht. Die Spalte „Ziele" sagt, wo die
+ID emittiert wird — eine Lücke dort ist ein lauter Abbruch (#1339), kein
+stilles Nichts.
+
+| ID | Bedeutung | Lyx-Name | Ziele | Herkunft |
+|----|-----------|----------|-------|----------|
+| 253 | CPUID, ein Register der Antwort | `cpu_id(leaf, subleaf, welches)` | x86-Familie; auf anderen Architekturen senkt ir_lower auf die Konstante 0 | #2187 |
+| 254 | XGETBV (XCR0) | `cpu_xgetbv(index)` | wie 253 | #2187 |
+| 255 | gesetzte Bits | `popcount(x)` | lyxos, arm64 (CNT+ADDV), riscv (gerechnet), arm-cm4 (SWAR+MUL), esp32 (SWAR) | #2190 |
+| 256 | führende Nullen, `clz(0) == 64` | `clz(x)` | lyxos (BSR + Nullfall), arm64 (CLZ), riscv (gerechnet), arm-cm4 (CLZ), esp32 (Binaersuche) | #2190 |
+| 257 | nachlaufende Nullen, `ctz(0) == 64` | `ctz(x)` | lyxos (BSF + Nullfall), arm64 (RBIT+CLZ), riscv (gerechnet), arm-cm4 (RBIT+CLZ), esp32 (x & -x, Binaersuche) | #2190 |
+| 258 | Bytetausch | `bswap64(x)` | lyxos (BSWAP), arm64 (REV), riscv (gerechnet); arm-cm4/esp32 laut abgewiesen (32-Bit-Wort) | #2190 |
+| 259 | Linksrotation, Weite mod 64 | `rotl(x, n)` | lyxos (ROL), arm64 (NEG+ROR), riscv (SLL/SRL/OR); arm-cm4/esp32 laut abgewiesen | #2190 |
+| 260 | Rechtsrotation, Weite mod 64 | `rotr(x, n)` | lyxos (ROR), arm64 (ROR), riscv (SRL/SLL/OR); arm-cm4/esp32 laut abgewiesen | #2190 |
+| 261 | Linksrotation der unteren 32 Bit, Weite mod 32, Ergebnis null-erweitert | `rotl32(x, n)` | lyxos (ROL r32), arm64 (NEG+ROR w), riscv (SLL/SRL/OR, auf 32 Bit gekuerzt), arm-cm4 (NEG+ROR), esp32 (SSL+SRC) | #2177 |
+| 262 | Rechtsrotation der unteren 32 Bit, Weite mod 32 | `rotr32(x, n)` | lyxos (ROR r32), arm64 (ROR w), riscv (SRL/SLL/OR), arm-cm4 (ROR), esp32 (SSR+SRC) | #2177 |
+| 263 | f64 aus dem Speicher (Bitmuster, 8 Byte) | `peekf64(adr)` | lyxos; andere IR-Ziele senken auf peek64 (202) | #2265 — bis 1.2.20J 253, Kollision mit cpu_id |
+| 264 | f64 in den Speicher | `pokef64(adr, wert)` | lyxos; andere IR-Ziele senken auf poke64 (205) | #2265 — bis 1.2.20J 254, Kollision mit cpu_xgetbv |
+| 265 | f32 laden, auf f64 weiten | `peek32f(adr)` | lyxos; andere IR-Ziele: peek32 (201) + IRO_F32_ZU_F64 | #2265 — bis 1.2.20J 255, Kollision mit popcount |
+| 266 | f64 auf f32 kuerzen, speichern | `poke32f(adr, wert)` | lyxos; andere IR-Ziele: IRO_F64_ZU_F32 + poke32 (204) | #2265 — bis 1.2.20J 256, Kollision mit clz |
+
+Auf x86 sind 255 … 257 an die CPU-Stufe gebunden (`--target-cpu`, `@cpu`):
+ohne Zusage wird gerechnet statt `POPCNT`/`LZCNT`/`TZCNT` zu emittieren, weil
+keiner der drei zum Grundbestand von x86-64 gehört (#2191). `bswap64`, `rotl`,
+`rotr`, `rotl32` und `rotr32` gibt es seit dem 486 bzw. 8086 und werden ungated emittiert.
+
+Auf **arm-cm4** und **esp32** (#2228) haelt das Backend einen int64-Wert als
+EIN 32-Bit-Wort; Vergleiche, Division und PrintInt lesen es vorzeichenbehaftet,
+der dargestellte Wert ist also die Vorzeichenerweiterung. Gerechnet wird unter
+genau dieser Annahme: fuer jeden Wert in [-2^31, 2^31) stimmen popcount/clz/ctz
+mit x86 ueberein (`popcount(-1) == 64`, `clz(0) == ctz(0) == 64`). Ein
+32-Bit-Wort >= 2^31 gilt dort als negativ — `popcount(0xFFFFFFFF)` ist auf
+diesen Zielen 64, auf x86 32. rotl32/rotr32 liefern exakt die 32 Ergebnisbits.
+`bswap64`, `rotl` und `rotr` brauchen das obere Wort und werden laut
+abgewiesen. Esp32 benutzt nur Kernbefehle (SRC, SRLI, SRAI) — NSAU und MULL
+sind Optionen.
+
+## Bereich 560 … 563 — AES-NI (#2383)
+
+Vergeben in `src/ir_lower.lyx`; der Schnellweg (`codegen_x86`) kennt dieselben
+Namen ohne ID. Geschnitten ist auf BLOCKebene, nicht je Runde: ein Builtin je
+Runde haette den Zustand jede Runde durch den Speicher gefuehrt. Alle vier
+arbeiten auf 16-Byte-Bloecken im Speicher, weil Lyx keinen 128-Bit-Werttyp hat.
+
+| ID | Bedeutung | Lyx-Name | Ziele | Herkunft |
+|----|-----------|----------|-------|----------|
+| 560 | ganze Blockverschluesselung (`PXOR`, `AESENC`-Kette, `AESENCLAST`) | `aes_enc_block(dst, src, rk, rounds)` | x86-Familie (codegen_x86 direkt, lyxos ueber die ID); auf arm64/riscv/arm-cm/esp32 senkt ir_lower auf `IRO_PANIC` | #2383 |
+| 561 | ganze Blockentschluesselung (`AESDEC`/`AESDECLAST`, aequivalenter inverser Plan) | `aes_dec_block(dst, src, drk, rounds)` | wie 560 | #2383 |
+| 562 | `AESIMC` auf einem Block | `aes_imc(dst, src)` | wie 560 | #2383 |
+| 563 | `AESENCLAST` gegen einen Nullschluessel = tabellenfreies SubBytes | `aes_subword(dst, src)` | wie 560 | #2383 |
+| 564 | GHASH ueber ganze Bloecke (`PCLMULQDQ`-Kette) | `ghash_blocks(z, h, data, blocks)` | wie 560 | #2390 |
+| 565 | Hardware-Zufall aus dem Rauschgenerator (`RDRAND`) | `rdrand64()` | wie 560 | #2390 |
+| 566 | Hardware-Saat (`RDSEED`) | `rdseed64()` | wie 560 | #2390 |
+| 567 | verschmolzene Multiplikation und Addition (`VFMADD213SD`) | `fma(a, b, c)` | x86-Familie; lyxos ueber die ID (`emit_lyxos` 2500) | #2403 |
+
+| 568 | ganze SHA-256-Kompression (`SHA256RNDS2`/`MSG1`/`MSG2`) | `sha256_compress(state, data, blocks)` | **nur ELF-x86** (0/1/5/6/13), NICHT lyxos (14) — dort PANIC, weil `emit_lyxos` keine SHA-NI-Fassung hat und unbehandelte IDs stumm verwirft | #2391 |
+
+## Bereich 569 … 570 — obere Produkthaelfte (#2460)
+
+| ID | Bedeutung | Lyx-Name | Ziele | Herkunft |
+|----|-----------|----------|-------|----------|
+| 569 | obere 64 Bit des VORZEICHENBEHAFTETEN 128-Bit-Produkts | `mulhi(a, b)` | x86-Familie (codegen_x86 direkt), lyxos (`imul rcx`), arm64 (`SMULH`), riscv (`MULH`, M-Erweiterung); arm-cm4/esp32 laut abgewiesen (32-Bit-Wort) | #1552, IR-Weg #2460 |
+| 570 | obere 64 Bit des VORZEICHENLOSEN Produkts | `umulhi(a, b)` | wie 569, mit `mul rcx` / `UMULH` / `MULHU` | #1552, IR-Weg #2460 |
+
+Die Namen waren seit #1552 nur an ZWEI der drei Stellen bekannt (sema
+`_regBuiltin` und `codegen_x86`); in `ir_lower` fehlten sie. Damit scheiterte
+jedes Ziel, das über das IR geht — gemessen mit 1.2.35C auf win64, arm64,
+riscv und lyxos gleichlautend mit „unbekannter Name im Aufruf: umulhi".
+`divrem128` (sema.lyx:9402, codegen_x86.lyx:21187) hat dieselbe Lücke und ist
+hier NICHT geschlossen: 128/64 ohne Hardwarebefehl ist eine eigene
+Langdivision je Architektur, siehe das zugehörige Issue.
+
+**Warum PANIC und nicht 0.** Bei `cpu_id` (253) ist 0 die *richtige* Antwort
+auf "hat diese CPU AES-NI". Bei einer Verschluesselung gibt es keinen
+plausiblen Ersatzwert — ein stiller Default waere hier eine stille
+Fehlverschluesselung. Erreicht wird das PANIC nicht: `std/crypto/aes.lyx`
+fragt vorher `CpuHasAESNI()`, und `cpu_id` liefert auf Nicht-x86 0. Der Zweig
+steht da, damit die Einheit fuer **jedes** Ziel uebersetzt.
+
+**AESKEYGENASSIST fehlt mit Absicht.** Sein Rundenkonstanten-Operand ist ein
+`imm8`, ein Builtin-Argument ist ein Laufzeitwert. Was es leistet, leistet 563
+zusammen mit dem Rcon-XOR in Lyx, und zwar ebenso tabellenfrei. Das ist ein
+anderer Schnitt, keine Luecke.

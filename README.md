@@ -2,7 +2,7 @@
 
 > A self-hosting systems programming language focused on native code generation, predictable performance, minimal runtime dependencies, and built-in capability-based security.
 
-![Version](https://img.shields.io/badge/version-v1.0.0A-blue)
+![Version](https://img.shields.io/badge/version-v1.2.36F-blue)
 ![Status](https://img.shields.io/badge/status-self--hosting-success)
 ![Platform](https://img.shields.io/badge/linux-x86__64-success)
 ![Platform](https://img.shields.io/badge/linux-arm64-success)
@@ -70,7 +70,7 @@ Stage 2: lyxc       → lyxc (first self-compiled)
 Stage 3: lyxc       → lyxc
 Stage 4: lyxc       → lyxc
 
-MD5(Stage 3) == MD5(Stage 4)  →  fixed point reached
+SHA-256(Stage 3) == SHA-256(Stage 4)  →  fixed point reached
 ```
 
 ---
@@ -246,7 +246,12 @@ The standard library is written entirely in Lyx. All modules are available as so
 
 | Module | Description |
 |--------|-------------|
+| `std.strtype` | `String` — owned byte string (class, operators) |
+| `std.text` | `Text` — validated UTF-8, codepoint-aware (class, operators) |
 | `std.string` | String utilities |
+| `std.unicode` | Opt-in: normalisation (NFC/NFD), case folding, classification |
+| `std.unicode_case` | Opt-in: full Unicode simple case mapping |
+| `std.grapheme` | Opt-in: grapheme cluster segmentation (UAX #29) |
 | `std.regex` | Regular expressions |
 | `std.url` | URL parsing and encoding |
 
@@ -370,6 +375,36 @@ The standard library is written entirely in Lyx. All modules are available as so
 
 ---
 
+## Project Files
+
+Longer builds go into a `*.lpf` project file instead of the command line:
+
+```toml
+[projekt]
+quelle  = "apps/demo.lyx"
+ziel    = "lyxos"
+ausgabe = "build/demo.lbf"
+
+[include]
+pfade = [".", "platform/lyxos"]
+
+[schalter]
+liste = ["--emit=lbf", "-O2"]
+
+[pakete]
+vega = "0.3.1"          # resolved through `lpm resolve`
+```
+
+```bash
+lyxc demo.lpf                     # everything from the file
+lyxc demo.lpf --target=linux      # a switch on the command line wins
+```
+
+Relative paths count from the directory of the `.lpf`, so the same project
+builds the same thing from anywhere. See COMPILER_MANUAL.md §3.3.
+
+---
+
 ## Precompiled Units
 
 ```bash
@@ -440,6 +475,26 @@ cd Lyx
 make
 ```
 
+### License Secret (Dev vs. Release)
+
+The compiler source needs `src/crypto/lic_secret.lyx`, which is gitignored. If
+it is missing, the build copies the committed development default
+`src/crypto/lic_secret.dev.lyx` into place and says so. A fresh clone therefore
+builds without extra steps.
+
+The development default holds a readable placeholder secret and the Ed25519
+public key from RFC 8032 test vector 1 — **not** production values. A release
+build uses real values:
+
+```bash
+python3 tools/gen_lic_secret.py   # writes src/crypto/lic_secret.lyx
+```
+
+Consequence worth knowing: a build with the development default is **not**
+byte-identical to a release build, because the secret is compiled in.
+`make singularity` still passes (it compares S3 against S4, both built from the
+same source), but the resulting hash differs from the anchored fixpoint.
+
 ### Running Tests
 
 ```bash
@@ -470,8 +525,8 @@ Two binary formats are used:
 
 | Format | Magic | Purpose |
 |--------|-------|---------|
-| **LBF-IR** | `LBF\0` | IR opcode bytecode — runs on POSIX Linux via `lbf_run` interpreter (for testing) |
-| **LBF-Nativ** | `LYX!` | Native x86-64/ARM64 machine code, 4 KB page-aligned — production format for the LyxOS kernel |
+| **LBF-IR** | `LBF\0` | IR opcode bytecode — emitted via `--emit=lbf` (for testing/simulation) |
+| **LBF-Nativ** | `LYX!` | Native x86-64/ARM64 machine code, 4 KB page-aligned, CRC32C-protected blocks — production format. A native loader (`lbf_run`) validates and executes a `LYX!` file in-process (mmap RWX + jump, no ELF intermediate). |
 
 ### Implementation Status
 
@@ -493,7 +548,7 @@ Two binary formats are used:
 | Runtime library, stdlib adaptation, error return convention | LX-19 – LX-21 | ✅ Done |
 | Debug & telemetry, integration tests | LX-22, LX-23 | ✅ Done |
 
-**Phase 8 — LBF-Nativ production format (12 Work Packages): in progress**
+**Phase 8 — LBF-Nativ production format (12 Work Packages): nearly complete**
 
 | Work Package | Description | Status |
 |--------------|-------------|--------|
@@ -501,14 +556,14 @@ Two binary formats are used:
 | LX-26 | Genesis-Content Serializer | ✅ Done |
 | LX-27 | TLV Framework | ✅ Done |
 | LX-28 | Section Block Emitter | ✅ Done |
-| LX-29 | Supply Chain Security | Offen |
-| LX-30 | lyxc backend `--target=lyxos` → `LYX!` | Offen |
-| LX-31 | `lbf_loader` POSIX loader | Offen |
-| LX-32 | `lbf_import` IOFS import | Offen |
-| LX-33 | Dependency resolver | Offen |
-| LX-34 | Zero-Load Executor (Kernel) | Offen |
-| LX-35 | `lbf-dump` inspection tool | Offen |
-| LX-36 | Lifecycle descriptor | Offen |
+| LX-29 | Supply Chain Security | ✅ Done |
+| LX-30 | LBF-Nativ backend | ✅ Done |
+| LX-31 | `lbf_loader` + native runtime (`lbf_run`) | ✅ Done |
+| LX-32 | `lbf_import` IOFS import | ✅ Done |
+| LX-33 | Dependency resolver | ✅ Done |
+| LX-34 | Zero-Load Executor (Kernel) | In Development |
+| LX-35 | `lbf-dump` inspection tool | ✅ Done |
+| LX-36 | Lifecycle descriptor | ✅ Done |
 
 Compile and run a LyxOS program today (via the IR interpreter):
 
@@ -523,7 +578,8 @@ lbf_run prog.lbf
 
 ### In Progress
 
-- LyxOS Phase 8 — LBF-Nativ production format (LX-29 – LX-36)
+- LyxOS Phase 8 — Zero-Load Kernel Executor (LX-34; LX-25–36 otherwise complete)
+- ARM64 backend — virtual methods / VMT + inheritance (procedural, structs, static methods done)
 - Language Server Protocol (LSP)
 - Incremental compilation
 

@@ -5,22 +5,68 @@
 @copyright("2024-2025 Andreas Röne")
 unit std.pack;
 
+import std.alloc;   // #1462: 8-Byte-Kratzpuffer fuer die Bit-Umdeutung
+
 // Write a varint (7-bit encoding, high bit = more follows)
-pub fn WriteVarInt(buf: int64, pos: int64, val: int64): int64 {
-  var i: int64 := 0;
-  var v: int64 := val;
-  while (v >= 128) {
-    var b: int64 := (v & 127) | 128;
-    var off: int64 := pos + i;
-    poke8(buf + off, b);
-    v := v >> 7;
-    i := i + 1;
+// #1463: `while (v >= 128)` ist fuer negative Werte sofort falsch — es wurde
+// GENAU EIN Byte `v & 127` geschrieben, die oberen Bits fielen weg, und
+// ReadVarInt las eine positive Zahl zurueck (-1 wurde zu 127).
+//
+// Umgesetzt ist die ZickZack-Kodierung (wie in Protocol Buffers): das
+// Vorzeichen wandert ins unterste Bit, kleine Betraege bleiben kurz. Damit
+// braucht -1 ein Byte statt zehn, und der Rundlauf stimmt fuer den ganzen
+// int64-Bereich. Die Kodierung aendert sich damit — wer Dateien mit der alten
+// Fassung geschrieben hat, liest sie nicht mehr; die alte Fassung konnte
+// negative Werte aber ohnehin nicht ablegen.
+// #1501: Die ZickZack-Abbildung liegt jetzt an EINER Stelle. Vorher stand sie
+// in WriteVarInt und fehlte in VarIntSize — die beiden liefen auseinander, und
+// wer die Puffergroesse mit VarIntSize vorausrechnete, reservierte zu wenig.
+//
+// Gerechnet wird in Bitform statt ueber den Betrag: `(v << 1) ^ (v >> 63)`
+// bleibt auch fuer INT64_MIN und INT64_MAX definiert. Die vorherige Fassung
+// bildete `(0 - val) << 1`, was ab 2^62 ueberlief und das Vorzeichen kippte —
+// MAX und MIN kamen als EIN Byte heraus.
+fn _zickZack(val: int64): int64 {
+  return (val << 1) ^ (val >> 63);
+}
+
+// Rueckrichtung. Das `& 0x7FFF...` macht aus dem arithmetischen `>>` ein
+// logisches — sonst zoege das Vorzeichenbit die oberen Bits mit.
+fn _entZickZack(v: int64): int64 {
+  return ((v >> 1) & 0x7FFFFFFFFFFFFFFF) ^ (0 - (v & 1));
+}
+
+// Zahl der Bytes, die die schon abgebildete Zahl belegt. Gezaehlt wird mit
+// LOGISCHER Verschiebung: nach der Abbildung ist der Wert als vorzeichenlose
+// 64-Bit-Zahl zu lesen, und `v >= 128` waere fuer das gesetzte oberste Bit
+// sofort falsch — genau daran brach die alte Zaehlung bei grossen Werten.
+fn _varIntBytes(zz: int64): int64 {
+  var v: int64 := zz;
+  var i: int64 := 1;
+  while (i < 10) {
+    v := (v >> 7) & 0x01FFFFFFFFFFFFFF;
+    if (v == 0) { return i; }
+    i += 1;
   }
-  var off2: int64 := pos + i;
-  var b2: int64 := v & 127;
-  poke8(buf + off2, b2);
-  var ret: int64 := i + 1;
-  return ret;
+  return 10;
+}
+
+pub fn WriteVarInt(buf: int64, pos: int64, val: int64): int64 {
+  var v: int64 := _zickZack(val);
+  var i: int64 := 0;
+  while (i < 9) {
+    var rest: int64 := (v >> 7) & 0x01FFFFFFFFFFFFFF;
+    if (rest == 0) {
+      poke8(buf + pos + i, v & 127);
+      return i + 1;
+    }
+    poke8(buf + pos + i, (v & 127) | 128);
+    v := rest;
+    i += 1;
+  }
+  // Zehntes Byte: hier sind hoechstens noch die obersten Bits uebrig.
+  poke8(buf + pos + i, v & 127);
+  return i + 1;
 }
 
 // Read a varint
@@ -29,18 +75,13 @@ pub fn ReadVarInt(buf: int64, pos: int64): int64 {
   var shift: int64 := 0;
   var i: int64 := 0;
   while (i < 10) {
-    var off: int64 := pos + i;
-    var b: int64 := peek8(buf + off) & 255;
-    var bits: int64 := b & 127;
-    var shifted: int64 := bits << shift;
-    result := result | shifted;
-    i := i + 1;
-    if ((b & 128) == 0) {
-      return result;
-    }
-    shift := shift + 7;
+    var b: int64 := peek8(buf + pos + i) & 255;
+    result := result | ((b & 127) << shift);
+    i += 1;
+    if ((b & 128) == 0) { return _entZickZack(result); }   // #1501
+    shift += 7;
   }
-  return result;
+  return _entZickZack(result);
 }
 
 // Pack int64 (8 bytes, little-endian)
@@ -98,6 +139,11 @@ pub fn UnpackInt32(buf: int64, pos: int64): int64 {
   result := result | (b1 << 8);
   result := result | (b2 << 16);
   result := result | (b3 << 24);
+  // #1270: Vorzeichen-Zuschnitt. Die Funktion heisst Int32, nicht UInt32 —
+  // zugesagt ist also die vorzeichenbehaftete Deutung. Ohne diesen Schritt kam
+  // -1000 als 4294966296 zurueck: das Bitmuster stimmte, nur die Auslegung
+  // fehlte.
+  if (result >= 2147483648) { result := result - 4294967296; }
   return result;
 }
 
@@ -115,6 +161,7 @@ pub fn UnpackInt16(buf: int64, pos: int64): int64 {
   var p1: int64 := pos + 1; var b1: int64 := peek8(buf + p1) & 255;
   result := result | b0;
   result := result | (b1 << 8);
+  if (result >= 32768) { result := result - 65536; }   // #1270
   return result;
 }
 
@@ -126,7 +173,9 @@ pub fn PackInt8(buf: int64, pos: int64, val: int64): int64 {
 
 // Unpack int8
 pub fn UnpackInt8(buf: int64, pos: int64): int64 {
-  return peek8(buf + pos) & 255;
+  var result: int64 := peek8(buf + pos) & 255;
+  if (result >= 128) { result := result - 256; }   // #1270
+  return result;
 }
 
 // Pack bool (1 byte)
@@ -145,54 +194,120 @@ pub fn UnpackBool(buf: int64, pos: int64): bool {
 }
 
 // Pack float64 (8 bytes IEEE 754)
+// #1462: Hier stand `val as int64` — das KONVERTIERT den Zahlenwert (3.5 wird
+// zu 3), statt das Bitmuster zu uebernehmen. Nach dem Rundlauf waren alle
+// Nachkommastellen weg, und ein Empfaenger, der IEEE 754 erwartet, bekam eine
+// ganz andere Zahl.
+//
+// `pokef64`/`peekf64` schreiben und lesen den Wert als f64; ueber dieselbe
+// Adresse mit `peek64` gelesen kommt das Bitmuster heraus. Das ist die
+// Umdeutung, die hier gebraucht wird — eine Umwandlung gibt es dafuer nicht.
+fn f64ZuBits(val: f64): int64 {
+  var t: int64 := alloc(8);
+  pokef64(t, val);
+  var bits: int64 := peek64(t);
+  free(t, 8);
+  return bits;
+}
+
+fn bitsZuF64(bits: int64): f64 {
+  var t: int64 := alloc(8);
+  poke64(t, bits);
+  var v: f64 := peekf64(t);
+  free(t, 8);
+  return v;
+}
+
 pub fn PackFloat64(buf: int64, pos: int64, val: f64): int64 {
-  var bits: int64 := val as int64;
-  return PackInt64(buf, pos, bits);
+  return PackInt64(buf, pos, f64ZuBits(val));
 }
 
 // Unpack float64
 pub fn UnpackFloat64(buf: int64, pos: int64): f64 {
-  var bits: int64 := UnpackInt64(buf, pos);
-  return bits as f64;
+  return bitsZuF64(UnpackInt64(buf, pos));   // #1462
 }
 
 // Pack float32 (4 bytes IEEE 754)
+// #1462: Fuer 32 Bit muss das Muster umgerechnet werden — die unteren 32 Bit
+// eines f64-Musters sind KEIN f32. Vorzeichen, Exponent (11 -> 8 Bit, Bias 1023
+// -> 127) und Mantisse (52 -> 23 Bit) werden einzeln uebertragen.
 pub fn PackFloat32(buf: int64, pos: int64, val: f64): int64 {
-  var bits: int64 := val as int64;
-  var bits32: int64 := bits & 4294967295;
+  var b: int64 := f64ZuBits(val);
+  var sign: int64 := (b >> 63) & 1;
+  var exp:  int64 := (b >> 52) & 2047;
+  var man:  int64 := b & 4503599627370495;
+
+  var e32: int64 := 0;
+  var m32: int64 := 0;
+  if (exp == 0) {
+    // null oder subnormal — als Null uebernehmen
+    e32 := 0;
+    m32 := 0;
+  }
+  if (exp == 2047) {
+    e32 := 255;                       // inf oder NaN
+    if (man != 0) { m32 := 1; }
+  }
+  if (exp != 0 && exp != 2047) {
+    var e: int64 := exp - 1023 + 127;
+    if (e <= 0)   { e32 := 0;   m32 := 0; }        // unterlaeuft f32
+    if (e >= 255) { e32 := 255; m32 := 0; }        // ueberlaeuft f32 -> inf
+    if (e > 0 && e < 255) { e32 := e; m32 := man / 536870912; }   // 52 -> 23 Bit
+  }
+
+  var bits32: int64 := (sign << 31) | (e32 << 23) | m32;
   return PackInt32(buf, pos, bits32);
 }
 
 // Unpack float32
 pub fn UnpackFloat32(buf: int64, pos: int64): f64 {
-  var bits: int64 := UnpackInt32(buf, pos);
-  return bits as f64;
+  var b: int64 := UnpackInt32(buf, pos) & 4294967295;   // #1462
+  var sign: int64 := (b >> 31) & 1;
+  var e32:  int64 := (b >> 23) & 255;
+  var m32:  int64 := b & 8388607;
+
+  var exp: int64 := 0;
+  var man: int64 := 0;
+  if (e32 == 0)   { exp := 0;    man := 0; }
+  if (e32 == 255) { exp := 2047; if (m32 != 0) { man := 1; } }
+  if (e32 != 0 && e32 != 255) {
+    exp := e32 - 127 + 1023;
+    man := m32 * 536870912;
+  }
+  return bitsZuF64((sign << 63) | (exp << 52) | man);
 }
 
 // Pack string: varint length + bytes
-pub fn PackString(buf: int64, pos: int64, s: int64): int64 {
+pub fn PackString(buf: int64, pos: int64, s: pchar): int64 {   // #1343
+  var sp: int64 := s as int64;
   var len: int64 := 0;
   var i: int64 := 0;
-  while (peek8(s + i) != 0) {
-    len := len + 1;
-    i := i + 1;
+  while (peek8(sp + i) != 0) {
+    len += 1;
+    i += 1;
   }
   var bytesWritten: int64 := WriteVarInt(buf, pos, len);
   i := 0;
   while (i < len) {
-    var srcOff: int64 := s + i;
+    var srcOff: int64 := sp + i;
     var bw: int64 := bytesWritten + i;
     var dstOff: int64 := pos + bw;
     poke8(buf + dstOff, peek8(srcOff));
-    i := i + 1;
+    i += 1;
   }
   var total: int64 := bytesWritten + len;
   return total;
 }
 
 // Unpack string (returns pointer into buf at string start, after varint)
+//
+// #1270: Die Funktion gab die Startposition EINSCHLIESSLICH des
+// VarInt-Laengenpraefixes zurueck — der Aufrufer bekam einen Zeiger auf die
+// Laenge statt auf die Zeichen, entgegen dem eigenen Kommentar darueber. Das
+// Praefix wird jetzt uebersprungen.
 pub fn UnpackString(buf: int64, pos: int64): int64 {
-  return buf + pos;
+  var slen: int64 := ReadVarInt(buf, pos);
+  return buf + pos + VarIntSize(slen);
 }
 
 // Pack null marker
@@ -217,15 +332,11 @@ pub fn UnpackArrayStart(buf: int64, pos: int64): int64 {
 }
 
 // Get size needed for packing an integer in varint format
+// #1501: Rechnet jetzt ueber dieselbe Abbildung wie WriteVarInt. Vorher zaehlte
+// sie auf dem Originalwert; da ZickZack den Betrag verdoppelt, meldete sie fuer
+// 64, 127, 8192 und jeden negativen Wert ein Byte zu wenig.
 pub fn VarIntSize(val: int64): int64 {
-  var i: int64 := 0;
-  var v: int64 := val;
-  while (v >= 128) {
-    v := v >> 7;
-    i := i + 1;
-  }
-  var ret: int64 := i + 1;
-  return ret;
+  return _varIntBytes(_zickZack(val));
 }
 
 // Calculate total pack size for a string
@@ -233,8 +344,8 @@ pub fn StringPackSize(s: int64): int64 {
   var len: int64 := 0;
   var i: int64 := 0;
   while (peek8(s + i) != 0) {
-    len := len + 1;
-    i := i + 1;
+    len += 1;
+    i += 1;
   }
   var vs: int64 := VarIntSize(len);
   var total: int64 := vs + len;

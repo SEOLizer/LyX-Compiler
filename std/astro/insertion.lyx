@@ -1,0 +1,280 @@
+// std/astro/insertion.lyx
+// Einschwenken in eine Umlaufbahn: Einfangschub, Zirkularisierung,
+// Korrekturschuebe.
+//
+// Der Unterschied zu std.astro.orbit ist nicht thematisch, sondern eine
+// Frage der Richtung: dort wird eine BAHN beschrieben, hier eine AENDERUNG
+// von einer Bahn zur naechsten. Beides hat geschlossene Loesungen und ist
+// deshalb gegen die Formel pruefbar.
+//
+// Die eine Tatsache, aus der alles folgt: WER AUF EINER HYPERBEL ANKOMMT,
+// BLEIBT NICHT VON SELBST. Eine Sonde mit v_unendlich > 0 hat mehr Energie
+// als zum Entkommen noetig; ohne Schub fliegt sie vorbei, gleichgueltig wie
+// nah sie kommt. Der Einfang ist kein Manoever, das man sich sparen kann —
+// er ist die Bedingung dafuer, dass es ueberhaupt eine Umlaufbahn gibt.
+//
+// NICHT enthalten, weil es den Zwei-Koerper-Rahmen verlaesst:
+//   * Aerobraking und Aerocapture (brauchen ein Atmosphaerenmodell),
+//   * schwacher Dauerschub (die Formeln hier gelten fuer den STOSS),
+//   * Zielsteuerung auf eine B-Ebene ueber mehrere Koerper hinweg.
+// Wer das braucht, bekommt hier richtige Zahlen fuer den idealisierten Fall
+// und muss den Rest woanders rechnen. Das steht hier, damit niemand die
+// Grenze erst im Flug bemerkt.
+//
+// Einheiten SI.
+
+@description("Einfangschub, Zirkularisierung und Korrekturschuebe")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+unit std.astro.insertion;
+
+import std.math;
+import std.astro.state;
+import std.astro.orbit;
+
+// ── Anflugtempo ───────────────────────────────────────────────────────────
+
+// Tempo im Perizentrum der Anflughyperbel [m/s]:
+//   v_p = sqrt(v_inf^2 + 2*mu/r_p)
+//
+// Dieselbe Formel wie AInjectionSpeed in std.astro.orbit — dort fuer den
+// Aufbruch, hier fuer die Ankunft. Sie steht nicht zweimal da: diese
+// Funktion ruft jene. Zwei Rechnungen desselben Werts wuerden mit der Zeit
+// auseinanderlaufen, und genau daran ist in diesem Projekt schon mehrfach
+// etwas kaputtgegangen.
+pub fn AApproachSpeed(mu: f64, rp: f64, vInf: f64): f64 {
+  return AInjectionSpeed(mu, rp, vInf);
+}
+
+// ── Einfang ───────────────────────────────────────────────────────────────
+
+// Bremsschub im Perizentrum, um aus der Anflughyperbel eine Ellipse mit
+// Perizentrum rp und Apozentrum ra zu machen [m/s].
+//
+// Der Wert ist POSITIV und meint den Betrag; die Richtung ist entgegen der
+// Flugrichtung. Ein vorzeichenbehaftetes Ergebnis waere hier irrefuehrend,
+// weil der Schub nie in Flugrichtung geht.
+pub fn ACaptureDv(mu: f64, vInf: f64, rp: f64, ra: f64): f64 {
+  if (mu <= 0.0 || rp <= 0.0 || ra < rp || vInf < 0.0) { return AError(); }
+  var vHyp: f64 := AApproachSpeed(mu, rp, vInf);
+  var a:  f64 := (rp + ra) / 2.0;
+  var vTarget: f64 := AVisViva(mu, rp, a);
+  if (AIsError(vHyp) || AIsError(vTarget)) { return AError(); }
+  return vHyp - vTarget;
+}
+
+// Einfang direkt in die Kreisbahn: der Sonderfall ra = rp.
+// Das ist der TEUERSTE Einfang — jede Ellipse ist billiger.
+pub fn ACaptureDvCircular(mu: f64, vInf: f64, r: f64): f64 {
+  return ACaptureDv(mu, vInf, r, r);
+}
+
+// Der billigste moegliche Einfang [m/s]: gerade so viel bremsen, dass die
+// Bahnenergie knapp negativ wird.
+//
+//   dv_min = v_p(hyperbolisch) - v_flucht(rp) = sqrt(v_inf^2 + 2mu/rp) - sqrt(2mu/rp)
+//
+// Die entstehende Bahn ist beliebig gross und damit praktisch unbrauchbar
+// (Umlaufzeiten von Monaten, und die geringste Stoerung loest sie wieder).
+// Der Wert taugt als UNTERE SCHRANKE fuer die Auslegung, nicht als Plan.
+pub fn ACaptureDvMinimal(mu: f64, vInf: f64, rp: f64): f64 {
+  var vHyp: f64 := AApproachSpeed(mu, rp, vInf);
+  var vEsc: f64 := AEscapeSpeed(mu, rp);
+  if (AIsError(vHyp) || AIsError(vEsc)) { return AError(); }
+  return vHyp - vEsc;
+}
+
+// Die praktische Richtung: welches Apozentrum erreicht ein gegebener
+// Bremsschub?
+//
+// Fuer die Planung ist das die wichtigere Frage — der Treibstoff steht fest,
+// gesucht ist die Bahn. Reicht der Schub nicht fuer einen Einfang, meldet die
+// Funktion das, statt ein negatives oder unendliches Apozentrum zu liefern.
+pub fn AApoapsisAfterCapture(mu: f64, vInf: f64, rp: f64, dv: f64): f64 {
+  if (dv < 0.0) { return AError(); }
+  var vHyp: f64 := AApproachSpeed(mu, rp, vInf);
+  if (AIsError(vHyp)) { return AError(); }
+  var vNew2: f64 := vHyp - dv;
+  if (vNew2 <= 0.0) { return AError(); }        // mehr als abgebremst
+  var a: f64 := ASemiMajorAxis(mu, rp, vNew2);
+  if (AIsError(a) || a <= 0.0) { return AError(); }   // immer noch offen
+  var ra: f64 := 2.0 * a - rp;
+  if (ra < rp) { return AError(); }
+  return ra;
+}
+
+// Reicht der Treibstoff fuer einen Einfang ueberhaupt?
+pub fn ACapturePossible(mu: f64, vInf: f64, rp: f64, dvBudget: f64): bool {
+  var dvMin: f64 := ACaptureDvMinimal(mu, vInf, rp);
+  if (AIsError(dvMin)) { return false; }
+  return dvBudget > dvMin;
+}
+
+// ── Nach dem Einfang ──────────────────────────────────────────────────────
+
+// Zirkularisieren: aus der Ellipse mit Perizentrum rp und Apozentrum ra eine
+// Kreisbahn machen, durch einen Schub im APOZENTRUM.
+//
+// Dort ist es am billigsten, weil das Tempo dort am kleinsten ist — dieselbe
+// Ueberlegung wie beim Drehen der Bahnebene.
+pub fn ACircularizeDv(mu: f64, rp: f64, ra: f64): f64 {
+  if (mu <= 0.0 || rp <= 0.0 || ra < rp) { return AError(); }
+  var a:  f64 := (rp + ra) / 2.0;
+  var va: f64 := AVisViva(mu, ra, a);          // Tempo im Apozentrum
+  var vCirc: f64 := ACircularSpeed(mu, ra);
+  if (AIsError(va) || AIsError(vCirc)) { return AError(); }
+  return vCirc - va;                              // positiv: beschleunigen
+}
+
+// Perizentrum anheben, durch einen Schub im Apozentrum [m/s].
+//
+// Das ist der uebliche zweite Schritt nach dem Einfang: das Anflugperizentrum
+// liegt oft tief in der Atmosphaere oder dicht ueber der Oberflaeche, weil
+// dort der Einfang am billigsten ist. Angehoben wird danach.
+pub fn ARaisePeriapsisDv(mu: f64, ra: f64, rpAlt: f64, rpNeu: f64): f64 {
+  if (mu <= 0.0 || ra <= 0.0 || rpAlt <= 0.0 || rpNeu <= 0.0) { return AError(); }
+  if (rpAlt > ra || rpNeu > ra) { return AError(); }
+  var vOld: f64 := AVisViva(mu, ra, (rpAlt + ra) / 2.0);
+  var vNew: f64 := AVisViva(mu, ra, (rpNeu + ra) / 2.0);
+  if (AIsError(vOld) || AIsError(vNew)) { return AError(); }
+  return vNew - vOld;
+}
+
+// ── Verlassen der Umlaufbahn ──────────────────────────────────────────────
+//
+// Die Gegenrichtung zum Einfang, und es sind zwei verschiedene Fragen:
+//
+//   HINUNTER — das Perizentrum so weit absenken, dass die Atmosphaere den
+//              Rest erledigt (Deorbit).
+//   HINAUS   — so viel Energie zulegen, dass die Bahn offen wird (Flucht;
+//              das rechnet AEscapeDv in std.astro.orbit).
+//
+// Beide sind Hohmann-Halbmanoever: EIN Schub auf der einen Seite der Bahn
+// aendert die andere Seite.
+
+// Bremsschub, um aus einer Kreisbahn mit Radius r ein Perizentrum bei
+// rZiel zu erreichen [m/s], positiv als Betrag.
+//
+// Aus 400 km Hoehe auf ein Perizentrum von 50 km sind das rund 100 m/s —
+// erstaunlich wenig gemessen daran, dass es die ganze Rueckkehr ausloest.
+// Der Grund: gebremst wird nicht die Bahn, sondern nur ihre GEGENSEITE.
+pub fn ADeorbitDvCircular(mu: f64, r: f64, rTarget: f64): f64 {
+  if (mu <= 0.0 || r <= 0.0 || rTarget <= 0.0 || rTarget >= r) { return AError(); }
+  var vCirc: f64 := ACircularSpeed(mu, r);
+  var a:  f64 := (r + rTarget) / 2.0;
+  var vt: f64 := AVisViva(mu, r, a);
+  if (AIsError(vCirc) || AIsError(vt)) { return AError(); }
+  return vCirc - vt;
+}
+
+// Dasselbe aus einer ELLIPSE heraus: gebremst wird im Apozentrum, weil es
+// dort am billigsten ist.
+pub fn ADeorbitDv(mu: f64, rp: f64, ra: f64, rTarget: f64): f64 {
+  if (mu <= 0.0 || rp <= 0.0 || ra < rp || rTarget <= 0.0 || rTarget >= ra) { return AError(); }
+  var vOld: f64 := AVisViva(mu, ra, (rp + ra) / 2.0);
+  var vNew: f64 := AVisViva(mu, ra, (rTarget + ra) / 2.0);
+  if (AIsError(vOld) || AIsError(vNew)) { return AError(); }
+  return vOld - vNew;
+}
+
+// Welches Perizentrum erzeugt ein gegebener Bremsschub aus einer Kreisbahn?
+// Die Planungsrichtung — der Treibstoff steht fest, gesucht ist, wo man
+// eintaucht.
+pub fn APeriapsisAfterBraking(mu: f64, r: f64, dv: f64): f64 {
+  if (mu <= 0.0 || r <= 0.0 || dv < 0.0) { return AError(); }
+  var vCirc: f64 := ACircularSpeed(mu, r);
+  if (AIsError(vCirc)) { return AError(); }
+  var vNew2: f64 := vCirc - dv;
+  if (vNew2 <= 0.0) { return AError(); }
+  var a: f64 := ASemiMajorAxis(mu, r, vNew2);
+  if (AIsError(a) || a <= 0.0) { return AError(); }
+  var rPeri: f64 := 2.0 * a - r;
+  if (rPeri < 0.0) { return AError(); }     // trifft den Koerper
+  return rPeri;
+}
+
+// Erreicht der Bremsschub ueberhaupt die Atmosphaere?
+pub fn ADeorbitSufficient(mu: f64, r: f64, dv: f64, rLimit: f64): bool {
+  var rp: f64 := APeriapsisAfterBraking(mu, r, dv);
+  if (AIsError(rp)) { return false; }
+  return rp <= rLimit;
+}
+
+// ── Korrekturschuebe aus Zustaenden ───────────────────────────────────────
+//
+// Bis hier war jede Groesse eine Zahl aus einer Formel. Ein wirklicher
+// Korrekturschub entsteht anders: aus dem Vergleich zweier Zustaende AM
+// SELBEN ORT — wo bin ich, wo muesste ich sein.
+
+// Schubvektor, der den Ist-Zustand in den Soll-Zustand ueberfuehrt [m/s].
+//
+// Beide Zustaende muessen am selben Ort und im selben Rahmen stehen; das
+// prueft die Funktion NICHT, weil sie den Rahmen nicht kennt. Dafuer gibt es
+// AFrameMatches in std.astro.state — und diesen Satz hier.
+pub fn ACorrectionVec(ist: AState, soll: AState): AVec3 {
+  if (!AStateValid(ist) || !AStateValid(soll)) {
+    return AVec(AError(), AError(), AError());
+  }
+  return ASub(AVelocity(soll), AVelocity(ist));
+}
+
+pub fn ACorrectionDv(ist: AState, soll: AState): f64 {
+  var d: AVec3 := ACorrectionVec(ist, soll);
+  if (AVecIsError(d)) { return AError(); }
+  return AMagnitude(d);
+}
+
+// Zerlegung des Korrekturschubs in das begleitende Dreibein des IST-Zustands:
+// wie viel davon ist Beschleunigen, wie viel Anheben, wie viel Drehen der
+// Ebene.
+//
+// So wird ein Schub in der Praxis ausgeschrieben — "12 m/s prograde" ist
+// eine Anweisung, "(3.1, -8.4, 7.9) m/s im Inertialsystem" ist es nicht.
+
+pub fn ACorrectionPrograde(ist: AState, soll: AState): f64 {
+  var d: AVec3 := ACorrectionVec(ist, soll);
+  var t: AVec3 := ATangent(ist);
+  if (AVecIsError(d) || AVecIsError(t)) { return AError(); }
+  return ADot(d, t);
+}
+
+pub fn ACorrectionRadial(ist: AState, soll: AState): f64 {
+  var d:  AVec3 := ACorrectionVec(ist, soll);
+  var er: AVec3 := AUnitVec(APosition(ist));
+  if (AVecIsError(d) || AVecIsError(er)) { return AError(); }
+  return ADot(d, er);
+}
+
+// Anteil senkrecht auf der Bahnebene — der Teil, der die Ebene dreht und
+// deshalb der teuerste je Wirkung ist.
+pub fn ACorrectionNormal(ist: AState, soll: AState): f64 {
+  var d: AVec3 := ACorrectionVec(ist, soll);
+  var b: AVec3 := ABinormal(ist);
+  if (AVecIsError(d) || AVecIsError(b)) { return AError(); }
+  return ADot(d, b);
+}
+
+// Bremsschub, um am aktuellen Ort auf die Kreisbahn zu kommen [m/s].
+//
+// Der Betrag der Differenz zwischen Ist-Geschwindigkeit und der Kreisbahn-
+// geschwindigkeit IN DER AKTUELLEN BAHNEBENE. Anders als ACircularizeDv
+// braucht diese Fassung keine Bahnelemente, sondern nur den Zustand — sie ist
+// die Form, die eine Bordrechnung benutzt.
+pub fn ACircularizeFromStateDv(mu: f64, ist: AState): f64 {
+  if (mu <= 0.0 || !AStateValid(ist)) { return AError(); }
+  var r:  f64 := ARadius(ist);
+  var vCirc: f64 := ACircularSpeed(mu, r);
+  if (AIsError(vCirc)) { return AError(); }
+  // Die Kreisbahn am selben Ort und in derselben Ebene: Richtung senkrecht
+  // auf dem Ort, in der Bahnebene — das ist genau die Tangente MINUS ihrem
+  // radialen Anteil.
+  var er: AVec3 := AUnitVec(APosition(ist));
+  var v:  AVec3 := AVelocity(ist);
+  if (AVecIsError(er)) { return AError(); }
+  var vr: f64 := ADot(v, er);
+  var vt: AVec3 := ASub(v, AScale(er, vr));    // Querkomponente
+  var nt: f64 := AMagnitude(vt);
+  if (nt <= 0.0) { return AError(); }         // rein radiale Bewegung
+  var soll: AVec3 := AScale(vt, vCirc / nt);
+  return AMagnitude(ASub(soll, v));
+}

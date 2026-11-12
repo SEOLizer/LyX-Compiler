@@ -1,0 +1,212 @@
+// std/crypto/pkey.lyx — private und oeffentliche Schluessel aus DER/PEM lesen
+//
+// Teil von #2096 (natives TLS ohne OpenSSL): ein TLS-Server muss seinen
+// eigenen Schluessel laden koennen, ohne OpenSSL und ohne eigenes Format.
+// Unterstuetzt werden die beiden Formen, die Werkzeuge wie openssl und
+// certbot ausgeben:
+//
+//   PKCS#8 (PEM-Label "PRIVATE KEY"):
+//     PrivateKeyInfo ::= SEQUENCE { version INTEGER, privateKeyAlgorithm
+//                        AlgorithmIdentifier, privateKey OCTET STRING }
+//   SEC1 (PEM-Label "EC PRIVATE KEY"):
+//     ECPrivateKey ::= SEQUENCE { version INTEGER, privateKey OCTET STRING,
+//                      parameters [0] OBJECT IDENTIFIER OPTIONAL,
+//                      publicKey [1] BIT STRING OPTIONAL }
+//
+// Oeffentliche API:
+//   PkeyLiesEcPrivat(der, derLen, out32): int64
+//     Liefert die Kurvenkennung (1 = secp256r1, 2 = secp384r1) und schreibt
+//     den Skalar links mit Nullen aufgefuellt nach out32 (32 bzw. 48 Byte),
+//     oder 0, wenn der Puffer kein lesbarer EC-Schluessel ist.
+//   PkeyLiesSpkiEc(der, derLen, outX, outY): int64
+//     Oeffentlicher EC-Punkt aus einem SubjectPublicKeyInfo.
+
+unit std.crypto.pkey;
+
+import std.alloc;
+import std.crypto.der;
+
+fn pkOidP256(p: int64): int64 {
+    poke8(p + 0, 0x2a); poke8(p + 1, 0x86); poke8(p + 2, 0x48); poke8(p + 3, 0xce);
+    poke8(p + 4, 0x3d); poke8(p + 5, 0x03); poke8(p + 6, 0x01); poke8(p + 7, 0x07);
+    return 8;
+}
+
+fn pkOidP384(p: int64): int64 {
+    poke8(p + 0, 0x2b); poke8(p + 1, 0x81); poke8(p + 2, 0x04);
+    poke8(p + 3, 0x00); poke8(p + 4, 0x22);
+    return 5;
+}
+
+fn pkOidEcPub(p: int64): int64 {
+    poke8(p + 0, 0x2a); poke8(p + 1, 0x86); poke8(p + 2, 0x48); poke8(p + 3, 0xce);
+    poke8(p + 4, 0x3d); poke8(p + 5, 0x02); poke8(p + 6, 0x01);
+    return 7;
+}
+
+fn pkKurveAusOid(der: int64, feld: int64, ob: int64): int64 {
+    if (DerOidGleich(der, feld, ob, pkOidP256(ob))) { return 1; }
+    if (DerOidGleich(der, feld, ob, pkOidP384(ob))) { return 2; }
+    return 0;
+}
+
+fn pkSkalarLen(kurve: int64): int64 {
+    if (kurve == 1) { return 32; }
+    if (kurve == 2) { return 48; }
+    return 0;
+}
+
+// Schreibt den Inhalt (pos, len) links nullgefuellt nach out (breite Byte).
+// Laengere Werte als die Kurvenbreite werden abgewiesen (false) — ein
+// stilles Abschneiden wuerde einen falschen Schluessel ergeben.
+fn pkLinksFuellen(der: int64, pos: int64, len: int64, out: int64, breite: int64): bool {
+    if (len <= 0 || len > breite) { return false; }
+    var i: int64 := 0;
+    while (i < breite - len) { poke8(out + i, 0); i := i + 1; }
+    var j: int64 := 0;
+    while (j < len) { poke8(out + breite - len + j, peek8(der + pos + j)); j := j + 1; }
+    return true;
+}
+
+// ECPrivateKey (SEC1). `kurveVorgabe` ist die aus PKCS#8 bekannte Kurve oder
+// 0, wenn sie nur hier im parameters-Feld steht.
+fn pkLiesSec1(der: int64, ende: int64, pos: int64, kurveVorgabe: int64,
+              out: int64): int64 {
+    // Ein Kratzblock, ein free am einzigen Rueckgabepunkt, kein `defer`.
+    // Gemessen ist der Fehlschlag jedes zweiten Handschlags mit der
+    // defer-Fassung (siehe std/crypto/x509.lyx und #2380); die Ursache ist
+    // dort offen, die Umgehung hier dieselbe.
+    var fg: int64 := DerFeldGroesse();
+    var kratzGr: int64 := fg * 4 + 16;
+    var kratz: int64 := alloc(kratzGr);
+    if (kratz == 0) { panic("pkey: kein Speicher"); }
+    var f: int64 := kratz;
+    var k: int64 := kratz + fg;
+    var p0: int64 := kratz + fg * 2;
+    var kk: int64 := kratz + fg * 3;
+    var ob: int64 := kratz + fg * 4;
+    var erg: int64 := 0;
+
+    if (DerLies(der, ende, pos, f) && DerTag(f) == 0x30) {
+        var innen: int64 := DerInhalt(f) + DerInhaltLen(f);
+        if (DerLies(der, innen, DerInhalt(f), k) && DerTag(k) == 0x02
+            && DerGanzzahl(der, innen, k) == 1) {
+            var q: int64 := DerNaechste(k);
+            if (DerLies(der, innen, q, k) && DerTag(k) == 0x04) {
+                var skalarPos: int64 := DerInhalt(k);
+                var skalarLen: int64 := DerInhaltLen(k);
+                var kurve: int64 := kurveVorgabe;
+                // parameters [0] — vorhanden, wenn die Kurve hier steht.
+                var r: int64 := DerNaechste(k);
+                if (r < innen && DerLies(der, innen, r, p0) && DerTag(p0) == 0xA0) {
+                    if (DerErstesKind(der, innen, p0, kk) && DerTag(kk) == 0x06) {
+                        var kv: int64 := pkKurveAusOid(der, kk, ob);
+                        if (kv != 0) { kurve := kv; }
+                    }
+                }
+                var breite: int64 := pkSkalarLen(kurve);
+                if (breite != 0 && pkLinksFuellen(der, skalarPos, skalarLen, out, breite)) {
+                    erg := kurve;
+                }
+            }
+        }
+    }
+    free(kratz, kratzGr);
+    return erg;
+}
+
+// Liest einen EC-Privatschluessel, PKCS#8 oder SEC1.
+pub fn PkeyLiesEcPrivat(der: int64, derLen: int64, out: int64): int64 {
+    if (der == 0 || derLen <= 0) { return 0; }
+    var fg: int64 := DerFeldGroesse();
+    var kratzGr: int64 := fg * 4 + 16;
+    var kratz: int64 := alloc(kratzGr);
+    if (kratz == 0) { panic("pkey: kein Speicher"); }
+    var f: int64 := kratz;
+    var k: int64 := kratz + fg;
+    var h: int64 := kratz + fg * 2;
+    var a: int64 := kratz + fg * 3;
+    var ob: int64 := kratz + fg * 4;
+    var erg: int64 := 0;
+
+    if (DerLies(der, derLen, 0, f) && DerTag(f) == 0x30) {
+        var innen: int64 := DerInhalt(f) + DerInhaltLen(f);
+        if (DerLies(der, innen, DerInhalt(f), k) && DerTag(k) == 0x02) {
+            var ver: int64 := DerGanzzahl(der, innen, k);
+            if (ver == 0) {
+                // PKCS#8: version 0, dann AlgorithmIdentifier, dann OCTET STRING
+                var q: int64 := DerNaechste(k);
+                if (DerLies(der, innen, q, h) && DerTag(h) == 0x30) {
+                    var algEnde: int64 := DerInhalt(h) + DerInhaltLen(h);
+                    var kurve: int64 := 0;
+                    if (DerLies(der, algEnde, DerInhalt(h), a) && DerTag(a) == 0x06
+                        && DerOidGleich(der, a, ob, pkOidEcPub(ob))) {
+                        if (DerLies(der, algEnde, DerNaechste(a), a) && DerTag(a) == 0x06) {
+                            kurve := pkKurveAusOid(der, a, ob);
+                        }
+                    }
+                    if (kurve != 0) {
+                        if (DerLies(der, innen, DerNaechste(h), k) && DerTag(k) == 0x04) {
+                            erg := pkLiesSec1(der, DerInhalt(k) + DerInhaltLen(k),
+                                              DerInhalt(k), kurve, out);
+                        }
+                    }
+                }
+            } else {
+                if (ver == 1) {
+                    // SEC1 direkt
+                    erg := pkLiesSec1(der, derLen, 0, 0, out);
+                }
+            }
+        }
+    }
+    free(kratz, kratzGr);
+    return erg;
+}
+
+// Oeffentlicher EC-Punkt aus einem SubjectPublicKeyInfo. Liefert die
+// Kurvenkennung und schreibt X und Y (je 32 bzw. 48 Byte), oder 0.
+pub fn PkeyLiesSpkiEc(der: int64, derLen: int64, outX: int64, outY: int64): int64 {
+    if (der == 0 || derLen <= 0) { return 0; }
+    var fg: int64 := DerFeldGroesse();
+    var kratzGr: int64 := fg * 3 + 32;
+    var kratz: int64 := alloc(kratzGr);
+    if (kratz == 0) { panic("pkey: kein Speicher"); }
+    var f: int64 := kratz;
+    var g: int64 := kratz + fg;
+    var h: int64 := kratz + fg * 2;
+    var ob: int64 := kratz + fg * 3;
+    var pp: int64 := kratz + fg * 3 + 16;
+    var ll: int64 := kratz + fg * 3 + 24;
+    var erg: int64 := 0;
+
+    if (DerLies(der, derLen, 0, f) && DerTag(f) == 0x30) {
+        var innen: int64 := DerInhalt(f) + DerInhaltLen(f);
+        if (DerLies(der, innen, DerInhalt(f), g) && DerTag(g) == 0x30) {
+            var algEnde: int64 := DerInhalt(g) + DerInhaltLen(g);
+            var kurve: int64 := 0;
+            if (DerLies(der, algEnde, DerInhalt(g), h) && DerTag(h) == 0x06
+                && DerOidGleich(der, h, ob, pkOidEcPub(ob))) {
+                if (DerLies(der, algEnde, DerNaechste(h), h) && DerTag(h) == 0x06) {
+                    kurve := pkKurveAusOid(der, h, ob);
+                }
+            }
+            if (kurve != 0 && DerLies(der, innen, DerNaechste(g), h)
+                && DerTag(h) == 0x03 && DerBitKette(der, h, pp, ll)) {
+                var breite: int64 := pkSkalarLen(kurve);
+                if (peek64(ll) == 1 + 2 * breite
+                    && (peek8(der + peek64(pp)) & 0xFF) == 4) {
+                    var i: int64 := 0;
+                    while (i < breite) {
+                        poke8(outX + i, peek8(der + peek64(pp) + 1 + i));
+                        poke8(outY + i, peek8(der + peek64(pp) + 1 + breite + i));
+                        i += 1;
+                    }
+                    erg := kurve;
+                }
+            }
+        }
+    }
+    free(kratz, kratzGr);
+    return erg;
+}

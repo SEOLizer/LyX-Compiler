@@ -82,7 +82,8 @@ Diese Capabilities sind in jedem Lyx-Programm automatisch aktiv:
 
 | Capability | Beschreibung |
 |-----------|-------------|
-| `system.time` | Systemzeit lesen |
+| `system.time` | Systemzeit lesen **und warten** (`clock_gettime`, `nanosleep`, `clock_nanosleep`) |
+| `system.tty` | Terminal einstellen — `ioctl` nur mit `TCGETS`/`TCSETS`/`TCSETSW`/`TCSETSF`/`TIOCGWINSZ`/`TIOCSWINSZ` |
 | `system.env` | Umgebungsvariablen lesen (Compile-Zeit-Filter) |
 | `system.rand` | Kryptographisch sichere Zufallszahlen |
 | `system.unsafe.format_string` | Format-String-Funktionen (printf etc.) |
@@ -96,7 +97,127 @@ Diese Capabilities sind in jedem Lyx-Programm automatisch aktiv:
 | `fs.create` | Neue Dateien und Verzeichnisse anlegen |
 | `fs.delete` | Dateien und Verzeichnisse löschen |
 | `fs.meta` | Metadaten lesen (stat, Verzeichnislisting) |
+| `fs.perm` | Zugriffsrechte und Eigentümer ändern (chmod, chown) |
+
+Welche Syscalls die einzelne Capability freigibt, steht im seccomp-Generator
+(`src/security/seccomp_gen.lyx`) und ist durch `tests/seccomp_filter_test.sh`
+festgehalten — je Fall wird geprueft, dass der erlaubte Aufruf laeuft **und**
+der nicht gewaehrte weiterhin mit `SIGSYS` stirbt.
+
+Zwei Festlegungen, die sich nicht aus der Tabelle ergeben:
+
+* **`rename` verlangt `fs.create` UND `fs.delete`.** Umbenennen legt am Ziel an
+  und entfernt an der Quelle; mit nur einer der beiden waere es ein Weg, ohne
+  `fs.delete` zu loeschen.
+* **Optionen der eigenen Verbindung gehören zur Netzwerk-Capability.**
+  `setsockopt`, `getsockopt`, `getsockname` und `getpeername` sind mit jeder
+  `network.*`-Capability erlaubt: wer eine Verbindung aufbauen darf, darf ihre
+  Puffergrößen und Zeitgrenzen einstellen und wissen, mit wem er spricht. Ohne
+  `setsockopt` stirbt jeder TLS-Handshake, weil OpenSSL `TCP_ULP` setzt
+  (#1193).
+* **Metadaten lesen und schreiben sind getrennt.** `chmod` und `chown` hängen
+  an `fs.perm`, nicht an `fs.meta` — wer nur ein Verzeichnis auflisten will,
+  soll nicht stillschweigend Rechte umschreiben dürfen (#1188).
+* **Eine Dateidatenbank braucht `fs.delete`.** `std.db.sqlite` mit einem Pfad
+  (nicht `:memory:`) entfernt am Ende jeder Transaktion die Journaldatei;
+  ohne `fs.delete` stirbt der Lauf an `unlink`, und zwar erst beim ersten
+  Schreiben, nicht beim Öffnen. Das ist die Grenze, nicht eine Lücke: Löschen
+  ist genau das Recht, das `fs.delete` beschreibt. Der gemessene Nachweis
+  (`--seccomp-trap`, #1348) nennt `si_syscall=__NR_unlink` — ohne diesen
+  Schalter ist die verworfene Nummer von aussen nicht bestimmbar (#2279).
+  Nötig ist also: `fs.read, fs.write, fs.create, fs.delete`, dazu
+  `system.rand` und `fs.meta`.
+
+Immer erlaubt, ohne Capability: `exit_group`, `exit`, `brk`, `mmap(anon)`,
+`munmap`, `write`, `prctl`, `prlimit64`, `futex`, Signal-Rueckkehr,
+`getrandom` (Stack-Canary) sowie ein Basissatz harmloser Introspektion —
+`getpid`, `gettid`, `getppid`, `getuid`, `geteuid`, `getgid`, `getegid`. Diese
+geben Auskunft ueber den eigenen Prozess und beruehren nichts ausserhalb davon;
+ohne sie ist eine extern gelinkte Bibliothek nicht benutzbar (OpenSSL ruft
+`getpid` beim Init). `clock_gettime` gehoert bewusst NICHT dazu — dafuer gibt
+es `system.time`, das seit #1866 auch `nanosleep` und `clock_nanosleep`
+abdeckt: wer die Uhr lesen darf, darf auch warten, und ohne das Recht laesst
+sich ueber `nanosleep` auch keine Zeit messen.
 | `fs.exec` | Ausführbare Dateien starten |
+
+#### Prozessrechte und Namensräume
+
+| Capability | Beschreibung |
+|-----------|-------------|
+| `process.privileges` | Eigene Kennung wechseln: `setuid`, `setgid`, `setsid`, `setpgid`, `capget`/`capset`, `pidfd_*` |
+| `system.namespace` | `unshare`, `setns`, `chroot`, `mount`, `umount2` |
+| `system.admin` | `reboot`, `sethostname` — verändert die Maschine, nicht den eigenen Prozess |
+
+Drei Namen statt einem, weil die Vertrauensfragen verschieden sind. Rechte
+**abzugeben** (nach dem Start auf einen unprivilegierten Nutzer wechseln) ist
+das gewünschte Muster — genau das ließ sich vorher nicht deklarieren, und wer
+es brauchte, baute ohne `@capabilities` und verlor damit den ganzen Filter.
+
+#### IPC
+
+| Capability | Beschreibung |
+|-----------|-------------|
+| `ipc.shm` | System-V-Shared-Memory: `shmget`, `shmat`, `shmdt`, `shmctl` |
+| `ipc.queue` | Nachrichtenschlangen: `msg*` (System V) und `mq_*` (POSIX) |
+| `ipc.sem` | Semaphoren: `semget`, `semop`, `semctl` |
+
+Getrennt von `memory.mmap`: gemeinsamer Speicher **zwischen Prozessen** ist
+eine andere Zusage als eine anonyme Abbildung im eigenen Adressraum.
+
+#### Beobachtung
+
+| Capability | Beschreibung |
+|-----------|-------------|
+| `debug.trace` | `ptrace`, `perf_event_open` — liest fremde Prozesse |
+| `kernel.bpf` | `bpf`, `io_uring_*` — lädt Code in den Kernel |
+
+Diese beiden hängen ausdrücklich an eigenen Namen und nicht an einer
+bestehenden Capability: an `process.fork` gehängt wären sie unsichtbar.
+
+#### Ein- und Ausgabe
+
+| Capability | Beschreibung |
+|-----------|-------------|
+| `io.wait` | Auf Deskriptoren warten: `poll`, `ppoll`, `select`, `epoll_*`, `eventfd2`, `signalfd4`, `timerfd_*`; dazu `rt_sigprocmask` (eigene Maske) und `read` auf bereits offene Deskriptoren (#2111) |
+| `io.fd` | Deskriptoren erzeugen und verdoppeln: `pipe`, `pipe2`, `dup`, `dup2`, `dup3` |
+| `fs.xattr` | Erweiterte Attribute: `getxattr`/`setxattr`/`listxattr`/`removexattr` (+ `f`-Varianten) |
+| `fs.watch` | Dateiänderungen beobachten: `inotify_init1`, `inotify_add_watch`, `inotify_rm_watch` |
+| `fs.cwd` | `chdir` — `getcwd` war immer erlaubt, `chdir` nicht: man durfte fragen, wo man ist, aber nicht woanders hingehen |
+
+`io.wait` macht kein neues Objekt erreichbar — gewartet wird auf das, was das
+Programm ohnehin schon hat. `eventfd`, `signalfd` und `timerfd` erzeugen
+allerdings Deskriptoren, weshalb die Zusage ausdrücklich bleibt und nicht in
+den impliziten Basissatz wandert.
+
+**Signale über `signalfd` empfangen** (#2111) geht mit `io.wait` allein. Bis
+1.2.14B fehlten dafür zwei Aufrufe: `rt_sigprocmask` — das Signal muss in der
+eigenen Maske blockiert sein, sonst wird es am signalfd vorbei zugestellt —
+hing an `process.signal`, das auch `kill` auf fremde Prozesse erlaubt, und das
+`read` auf den signalfd an `fs.read`. Seitdem gilt:
+
+* `rt_sigprocmask` steht unter `io.wait` (und weiter unter `process.signal`).
+  Es wirkt nur auf den aufrufenden Thread. `rt_sigaction` war schon immer
+  erlaubt (Signal-Handler, `SIG_IGN`).
+* `read` steht unter `io.wait`. seccomp kann den Deskriptortyp nicht prüfen —
+  das ist `read` auf **jeden offenen** Deskriptor: signalfd, eventfd, timerfd,
+  aber auch stdin und geerbte Deskriptoren. Vertretbar, weil **Öffnen gesperrt
+  bleibt**: `open`/`openat` gibt es nur mit `fs.read`/`fs.write`/`fs.create`,
+  ein Dateisystemobjekt wird über `io.wait` also nicht erreichbar. Es ist das
+  Gegenstück zu `write`, das auf jedem offenen Deskriptor implizit erlaubt
+  ist. `pread64`, `readv` und `lseek` bleiben bei `fs.read`.
+* `kill` und `tgkill` bleiben allein bei `process.signal`.
+
+Festgehalten in `tests/capability_signalfd_test.sh` — mit beiden Seiten:
+die Probe läuft unter `[io.wait, system.time]`, `kill`/`tgkill` auf einen
+fremden Prozess und `open` sterben dort weiterhin an `SIGSYS`.
+
+Auf `--target=lyxos` ändert sich nichts: weder `io.wait` noch
+`process.signal` setzen ein CAPS-Bit, Signalmasken sind dort nicht über das
+Manifest geregelt.
+
+`fcntl` gehört **nicht** zu `io.fd`: es ist seit #1276 unter `fs.read` und
+`fs.write` mit Argumentfilter freigegeben (`F_GETFD`, `F_SETFD`, `F_GETFL`,
+`F_SETFL` und die Sperren).
 
 #### Memory
 
@@ -116,6 +237,8 @@ Diese Capabilities sind in jedem Lyx-Programm automatisch aktiv:
 | `network.unix` | Unix Domain Sockets |
 | `network.raw` | Raw Sockets (erfordert `CAP_NET_RAW` des OS-Prozesses) |
 
+Jede dieser Capabilities (außer `network.raw`) gibt zusätzlich die Datenübertragung auf bestehenden Sockets frei: `sendto`, `recvfrom`, `sendmsg`, `recvmsg`, `setsockopt`/`getsockopt`, `getsockname`/`getpeername`, `close`. Welche Sockets entstehen dürfen, bestimmen `socket()`, `connect()` und `bind()` der jeweiligen Capability (#2120: `sendto`/`recvfrom` fehlten bis 1.2.14C bei `network.unix` und `network.tcp.bind`).
+
 #### Hardware
 
 | Capability | Argument | Gerät | Beschreibung |
@@ -124,6 +247,40 @@ Diese Capabilities sind in jedem Lyx-Programm automatisch aktiv:
 | `hardware.i2c` | `bus: N` | `/dev/i2c-N` | I2C-Bus |
 | `hardware.spi` | `bus: N, cs: M` | `/dev/spidevN.M` | SPI-Bus |
 | `hardware.usb` | *(keine)* | `/dev/bus/usb` | USB-Gerät |
+| `hardware.block` | *(keine)* | *(nur LyxOS)* | Rohzugriff auf Blockgeräte |
+
+##### Was davon im LBF-Ziel ankommt (#1755)
+
+`--target=lyxos` schreibt die Capabilities als Bitmaske in die CAPS-TLV des
+Programms; der Kernel wertet sie beim Syscall aus. **Abgebildet sind nur diese:**
+
+| Capability | Bit |
+|---|---|
+| `fs.read` | `0x1` |
+| `fs.write` | `0x2` |
+| `network.*` | `0x4` |
+| `process.*` | `0x8` |
+| `ki.embed` | `0x10` |
+| `ki.graph` | `0x20` |
+| `hardware.block` | `0x40` |
+| `audio.*` | `0x80` (reserviert — es gibt derzeit keine `audio`-Capability) |
+| `hardware.i2c`, `hardware.usb`, `hardware.gpio`, `hardware.spi` | `0x100` |
+
+`hardware.i2c`, `hardware.usb`, `hardware.gpio` und `hardware.spi` teilen sich
+`0x100` (#1759). Das ist Absicht: LyxOS kennt für den direkten Gerätezugriff
+genau eine Klasse (`PLEDGE_DEVICE`), und feiner getrennte Bits wären eine
+Zusage, die niemand durchsetzen könnte. Aufteilen lässt sich das später, ohne
+die bestehenden Bedeutungen zu verschieben. `hardware.block` bleibt davon
+getrennt — Blockgeräte sind im Kernel eine eigene Klasse (`PLEDGE_BLOCK`).
+
+Capabilities, die **kein Bit setzen** — etwa `fs.create`, `fs.meta`,
+`memory.mmap` —, sind für das Ziel gültig, aber wirkungslos; der Compiler warnt
+beim Übersetzen darauf. `system.*` sind die impliziten Rechte (Programmende,
+Heap, Zufall, Zeit); sie brauchen kein Bit und werden nicht gemeldet.
+
+Ein Programm, dessen sämtliche Capabilities kein Bit setzen, kommt beim
+Ladeprogramm an wie eines ohne Manifest und bekommt den Vorgabewert „nur
+Standardausgabe".
 
 #### Prozess
 
@@ -131,7 +288,7 @@ Diese Capabilities sind in jedem Lyx-Programm automatisch aktiv:
 |-----------|-------------|
 | `process.fork` | Kindprozesse erzeugen |
 | `process.exec` | Andere Programme ausführen |
-| `process.signal` | Signale an andere Prozesse senden |
+| `process.signal` | Signale an andere Prozesse senden (`kill`, `tgkill`); die eigene Signalmaske braucht es nicht, dafür reicht `io.wait` (#2111) |
 | `process.sched` | Prozess-Priorität ändern |
 
 ---
@@ -212,13 +369,48 @@ import
 
 ### 5.3 Fehlende Grants
 
-Ein Import ohne explizites `grant` erzeugt eine Compiler-Warnung und reduziert den Security-Score:
+Ein Import ohne explizites `grant` erzeugt eine Compiler-Warnung:
 
 ```
-warning: Import ohne explizites grant — Security-Score -2
+warning: Import ohne explizites grant — mit `grant` wird die Deklaration des Moduls geprüft (#1340)
 ```
 
-Das Programm kompiliert trotzdem. Für maximalen Score alle Imports mit `grant` versehen.
+Das Programm kompiliert trotzdem. Die +10 des Score gibt es aber nur, wenn
+**jeder** Import ein `grant` trägt — der Posten ist ganz oder gar nicht, nicht
+anteilig.
+
+### 5.4 Transitivität: das Grant gilt für die ganze Hülle
+
+Ein `grant` bindet den Import **und alles, was dieser Import seinerseits
+importiert**. Die Deklaration einer Unit nennt deshalb nicht nur ihren eigenen
+Bedarf, sondern die transitive Hülle über ihre `import std.*`-Kanten:
+
+```
+std.cloud.gcp.compute → std.cloud.gcp.transport → std.cloud.gcp.credentials → std.fs
+```
+
+`std.cloud.gcp.compute` deklariert damit `fs.read`, obwohl in seiner eigenen
+Quelle kein Dateizugriff steht — über drei Kanten kann einer stattfinden. Die
+Alternative wäre gewesen, nur den eigenen Bedarf zu deklarieren; dann wäre die
+Eindämmung bei der ersten Weiterreichung zu Ende, und `grant [network.tcp.connect]`
+auf `std.cloud.gcp.compute` hätte eine Zusicherung ausgewiesen, die der Code
+nicht hält (#1340, Punkt 4).
+
+Der Preis ist Weite: wer über vier Ecken `std.fs` erreicht, führt dessen
+Rechte. Wer enger will, importiert enger — die Hülle ist eine Aussage über den
+Import-Graphen, nicht über den Stil der Unit.
+
+Die Deklarationen in `std/` sind **gemessen, nicht geschätzt**: abgeleitet aus
+den OS-Builtins, die eine Unit aufruft, dann transitiv fortgeschrieben. Zwei
+Feinheiten, die eine grobe Ableitung falsch macht:
+
+- `read`/`write`/`lseek` sagen nichts über das Dateisystem — auf einem
+  Socket-Deskriptor sind sie Netzverkehr, auf stdout Ausgabe. Sie zählen nur
+  als `fs.*`, wenn die Unit selbst einen Datei-Deskriptor öffnet.
+- `memory.mmap` meint die datei- oder speichergestützte *geteilte* Abbildung.
+  Die anonyme Heap-Abbildung fällt unter `system.memory.heap`; wer die
+  Deklaration der Konstante `MMAP_SHARED` schon als Nutzung zählt, vererbt
+  `memory.mmap` über `std.alloc` an praktisch jede Unit.
 
 ---
 
@@ -399,7 +591,7 @@ Der Score bewertet die Qualität des Sicherheitsmodells (aktuell max. 40, mit op
 | W^X | +5 | Immer aktiv im generierten ELF |
 | RELRO | +5 | Immer aktiv (kein GOT im statischen ELF) |
 | PIE | +0 | Nicht implementiert (geplant) |
-| Grant-Vollständigkeit | +10 | Alle Imports mit explizitem `grant` (–2 pro fehlendem) |
+| Grant-Vollständigkeit | +10 | Nur wenn ALLE Imports ein `grant` tragen — sonst 0 (#1340) |
 | seccomp | +5 | Bei aktivem LCBS (nicht `--capabilities=compat`) |
 | landlock | +5 | Bei aktivem LCBS (Kernel ≥ 5.13) |
 | Stack Canaries | +5 Bonus | Geplant |
@@ -436,11 +628,42 @@ Der Score bewertet die Qualität des Sicherheitsmodells (aktuell max. 40, mit op
 | 22 | `hardware.i2c` | Hardware |
 | 23 | `hardware.spi` | Hardware |
 | 24 | `hardware.usb` | Hardware |
+| 31 | `hardware.block` | Hardware |
 | 25 | `process.fork` | Prozess |
 | 26 | `process.exec` | Prozess |
 | 27 | `process.signal` | Prozess |
 | 28 | `process.sched` | Prozess |
 | 29 | `process.exit` | Prozess |
+| 30 | `fs.perm` | Dateisystem |
+| 32 | `system.config` | System |
+| 33 | `ki.embed` | KI |
+| 34 | `ki.graph` | KI |
+| 35 | `audio.mic` | Audio |
+| 36 | `audio.play` | Audio |
+| 37 | `io.wait` | Ein-/Ausgabe |
+| 38 | `io.fd` | Ein-/Ausgabe |
+| 39 | `system.tty` | System |
+| 40 | `process.privileges` | Prozess |
+| 41 | `system.namespace` | System |
+| 42 | `system.admin` | System |
+| 43 | `ipc.shm` | IPC |
+| 44 | `ipc.queue` | IPC |
+| 45 | `ipc.sem` | IPC |
+| 46 | `fs.xattr` | Dateisystem |
+| 47 | `fs.watch` | Dateisystem |
+| 48 | `fs.cwd` | Dateisystem |
+| 49 | `debug.trace` | Beobachtung |
+| 50 | `kernel.bpf` | Beobachtung |
+| 51 | `ui.notify` | Oberfläche |
+
+**`ui.notify` gilt nur auf LyxOS** (#1912). Es setzt Bit `0x800` im CAPS-TLV des
+LBF-Manifests, das der Kernel auf `PLEDGE_NOTIFY` abbildet; damit ist
+`sys_toast_post` (344) erreichbar. Unter Linux gibt der Name **keinen** Syscall
+frei — es gibt dort keinen für systemweite Meldungen. Er ist trotzdem
+deklarierbar, damit dasselbe Programm auf beiden Zielen übersetzt.
+
+Das **Lesen** fremder Meldungen (`sys_toast_fetch` 345, `sys_toast_seq` 346) ist
+ausdrücklich **nicht** enthalten: wer melden darf, darf deshalb nicht mitlesen.
 
 ---
 

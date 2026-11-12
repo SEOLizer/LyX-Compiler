@@ -1,0 +1,170 @@
+// examples/hardware/pci_lowlevel.lyx
+// Die beiden kernelfreien Wege zum Config-Space nebeneinander:
+// 0xCF8/0xCFC (PCI-11) und ECAM (PCI-12).
+//
+// Beide brauchen root — der eine /dev/port, der andere /dev/mem und die
+// ACPI-Tabelle MCFG. Ohne root sagt das Programm, was fehlt, statt Nullen
+// zu zeigen.
+//
+//   lyxc examples/hardware/pci_lowlevel.lyx -o pci_lowlevel
+//   sudo ./pci_lowlevel [bdf]
+//
+// Ohne Argument wird die Host-Bridge 0000:00:00.0 genommen.
+//
+// Warum das interessant ist: derselbe Registerinhalt wird ueber drei
+// voellig verschiedene Wege geholt (sysfs, Portpaar, Speicherfenster).
+// Stimmen sie ueberein, stimmt die Adressrechnung.
+
+unit examples.hardware.pci_lowlevel;
+
+import std.hardware.pci_types;
+import std.hardware.pci_syscalls;
+import std.hardware.pci_config;
+import std.hardware.pci_portio;
+import std.hardware.pci_ecam;
+import std.alloc;
+import std.io;
+
+// Sagt, was zu tun waere — je nachdem, woran es liegt.
+fn printHint(code: int64) {
+  if (code == PCI_E_LOCKED) {
+    Print("  (Kernel-Lockdown ist aktiv, Modus ");
+    Print(PciLockdownName(PciKernelLockdown()));
+    PrintLn(" — Secure Boot abschalten oder lockdown=none booten)");
+  } else if (code == PCI_E_PERM) {
+    PrintLn("  (als root ausfuehren)");
+  } else if (code == PCI_E_NOTSUP) {
+    PrintLn("  (auf diesem System nicht vorhanden)");
+  } else {
+    PrintLn("");
+  }
+}
+
+fn printHex(val: int64, digits: int64) {
+  var buf: int64 := alloc(24);
+  var s: pchar := buf as pchar;
+  PciStrAppendHex(buf, 0, 24, val, digits);
+  Print(s);
+  free(buf, 24);
+}
+
+fn showSysfs(bdf: int64) {
+  Print("sysfs   : ");
+  var ctx: int64 := PciCfgOpenSysfs(bdf);
+  if (ctx < 0) { PrintLn(PciErrorName(ctx)); return; }
+  printHex(PciVendorId(ctx), 4);
+  Print(":");
+  printHex(PciDeviceId(ctx), 4);
+  Print("  Klasse ");
+  printHex(PciBaseClass(ctx), 2);
+  printHex(PciSubclass(ctx), 2);
+  PrintLn("");
+  PciCfgClose(ctx);
+}
+
+fn showPortIo(bdf: int64) {
+  Print("CF8/CFC : ");
+  var fd: int64 := PciPortOpen();
+  if (fd < 0) {
+    Print(PciErrorName(fd));
+    printHint(fd);
+    return;
+  }
+
+  var vid: int64 := PciPortIoCfgRead(fd, bdf, PCI_CFG_VENDOR_ID, 2);
+  var did: int64 := PciPortIoCfgRead(fd, bdf, PCI_CFG_DEVICE_ID, 2);
+  var cls: int64 := PciPortIoCfgRead(fd, bdf, PCI_CFG_CLASS, 1);
+  var sub: int64 := PciPortIoCfgRead(fd, bdf, PCI_CFG_SUBCLASS, 1);
+  if (vid < 0) {
+    Print(PciErrorName(vid));
+    PrintLn("");
+  } else {
+    printHex(vid, 4); Print(":"); printHex(did, 4);
+    Print("  Klasse "); printHex(cls, 2); printHex(sub, 2);
+    Print("   Adressregisterwert 0x");
+    printHex(PciPortIoAddressBdf(bdf, 0), 8);
+    PrintLn("");
+  }
+  PciPortClose(fd);
+}
+
+fn showEcam(bdf: int64) {
+  Print("ECAM    : ");
+
+  var lenSlot: int64 := alloc(8);
+  poke64(lenSlot, 0);
+  var mcfg: int64 := PciMcfgRead(lenSlot);
+  if (mcfg < 0) {
+    Print(PciErrorName(mcfg));
+    printHint(mcfg);
+    free(lenSlot, 8);
+    return;
+  }
+  var mlen: int64 := peek64(lenSlot);
+  free(lenSlot, 8);
+
+  var count: int64 := PciMcfgEntryCount(mcfg, mlen);
+  Print("MCFG mit ");
+  Print(IntToStr(count));
+  Print(" Segment(en), erstes: Basis 0x");
+  printHex(PciMcfgBase(mcfg, mlen, 0), 8);
+  Print(", Busse ");
+  Print(IntToStr(PciMcfgStartBus(mcfg, mlen, 0)));
+  Print("..");
+  Print(IntToStr(PciMcfgEndBus(mcfg, mlen, 0)));
+  PrintLn("");
+  PciMcfgFree(mcfg);
+
+  var ctx: int64 := PciEcamOpenAuto();
+  if (ctx < 0) {
+    Print("          Abbildung: ");
+    Print(PciErrorName(ctx));
+    printHint(ctx);
+    return;
+  }
+
+  Print("          ");
+  printHex(PciEcamRead(ctx, bdf, PCI_CFG_VENDOR_ID, 2), 4);
+  Print(":");
+  printHex(PciEcamRead(ctx, bdf, PCI_CFG_DEVICE_ID, 2), 4);
+  Print("  Klasse ");
+  printHex(PciEcamRead(ctx, bdf, PCI_CFG_CLASS, 1), 2);
+  printHex(PciEcamRead(ctx, bdf, PCI_CFG_SUBCLASS, 1), 2);
+  PrintLn("");
+
+  // Nur ECAM erreicht den erweiterten Bereich ab 0x100.
+  var ext: int64 := PciEcamRead(ctx, bdf, PCI_EXT_CAP_START, 4);
+  Print("          Erweiterter Bereich @0x100: 0x");
+  printHex(ext, 8);
+  if (ext == 0 || ext == 4294967295) { Print("  (leer — kein PCIe-Geraet)"); }
+  else {
+    Print("  Ext-Cap-ID ");
+    printHex(ext & 65535, 4);
+  }
+  PrintLn("");
+
+  PciEcamClose(ctx);
+}
+
+fn main(argc: int64, argv: pchar): int64 {
+  var bdf: int64 := PciBdfParse("0000:00:00.0");
+  if (argc > 1) {
+    bdf := PciBdfParse(ArgvGet(argv, 1));
+    if (bdf < 0) {
+      PrintLn("Unbrauchbare Adresse. Erwartet wird z.B. 0000:00:1f.3");
+      return 1;
+    }
+  }
+
+  var addr: int64 := alloc(PCI_BDF_STR_LEN);
+  var addrStr: pchar := addr as pchar;
+  PciBdfFormat(addr, bdf);
+  Print("Geraet: ");
+  PrintLn(addrStr);
+  free(addr, PCI_BDF_STR_LEN);
+
+  showSysfs(bdf);
+  showPortIo(bdf);
+  showEcam(bdf);
+  return 0;
+}

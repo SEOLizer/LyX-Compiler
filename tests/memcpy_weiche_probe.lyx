@@ -1,0 +1,211 @@
+// tests/memcpy_weiche_probe.lyx — Nachweis fuer _lyx_memcpy (T1.3).
+//
+// Die Groessenweiche hat vier Wege (0..16, 17..32, 33..64, ab 65) und drei
+// Sprungstellen. Ein Test, der nur „die Zieldatei ist da" prueft, waere von
+// jedem der vier Wege erfuellt, auch vom falschen. Geprueft wird deshalb
+// JEDES BYTE des Ergebnisses, und zwar
+//
+//   1. fuer alle Laengen 0..80 (jede Weiche, jede Grenze: 16/17, 32/33,
+//      64/65) und
+//   2. fuer alle Versaetze 0..16 von Ziel UND Quelle — die kurzen Wege
+//      lesen mit `movdqu` unausgerichtet, und sie lesen das ENDE des
+//      Bereichs ueberlappend mit dem Anfang;
+//   3. dazu der Rueckgabewert: memcpy gibt den ZIELzeiger zurueck (#1842);
+//   4. UEBERLAPPUNG in beiden Richtungen, gegen eine byteweise
+//      VORWAERTSkopie gerechnet — genau das, was `rep movsb` vorher tat.
+//      Ohne die Ueberlappungsweiche im Helfer ist dieser Teil rot, denn
+//      die vektorisierten Wege lesen erst alles und schreiben dann, geben
+//      also die ALTEN Quellbytes weiter statt der fortgeschriebenen.
+//   5. Laenge 0 veraendert nichts.
+
+@description("Nachweis: _lyx_memcpy kopiert jedes Byte richtig, auch bei Ueberlappung")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+
+import std.io;
+
+fn muster(p: int64, n: int64, saat: int64): void {
+  var i: int64 := 0;
+  while (i < n) { poke8(p + i, 1 + ((i * 7 + saat) % 251)); i += 1; }
+}
+
+fn main(): int64 {
+  var fehler: int64 := 0;
+  var geprueft: int64 := 0;
+
+  var quelle: int64 := alloc(512);
+  var ziel:   int64 := alloc(512);
+  var soll:   int64 := alloc(512);
+
+  // --- 1 bis 3: Laengen und Versaetze ---------------------------------
+  var vq: int64 := 0;
+  while (vq <= 16) {
+    var vz: int64 := 0;
+    while (vz <= 16) {
+      var n: int64 := 0;
+      while (n <= 80) {
+        var q: int64 := quelle + vq;
+        var z: int64 := ziel + vz;
+        muster(quelle, 512, 3);
+        // Wachposten rund um den Zielbereich: der Helfer darf KEIN Byte
+        // ausserhalb der Laenge schreiben.
+        var w: int64 := 0;
+        while (w < 512) { poke8(ziel + w, 170); w += 1; }
+        var rueck: int64 := memcpy(z, q, n);
+        geprueft += 1;
+        if (rueck != z) {
+          PrintStr("FEHLER Rueckgabe: n="c); PrintInt(n);
+          PrintStr(" gab "c); PrintInt(rueck - ziel);
+          PrintStr(", erwartet "c); PrintLn(vz);
+          fehler += 1;
+        }
+        var i: int64 := 0;
+        while (i < n) {
+          if (peek8(z + i) != peek8(q + i)) {
+            PrintStr("FEHLER Inhalt: vq="c); PrintInt(vq);
+            PrintStr(" vz="c); PrintInt(vz);
+            PrintStr(" n="c); PrintInt(n);
+            PrintStr(" Byte "c); PrintLn(i);
+            fehler += 1;
+            i := n;
+          }
+          i += 1;
+        }
+        // Wachposten vor und hinter dem Bereich
+        if (vz > 0 && peek8(z - 1) != 170) {
+          PrintStr("FEHLER vor dem Bereich geschrieben: vz="c); PrintInt(vz);
+          PrintStr(" n="c); PrintLn(n);
+          fehler += 1;
+        }
+        if (peek8(z + n) != 170) {
+          PrintStr("FEHLER hinter dem Bereich geschrieben: vz="c); PrintInt(vz);
+          PrintStr(" n="c); PrintLn(n);
+          fehler += 1;
+        }
+        n += 1;
+      }
+      vz += 1;
+    }
+    vq += 1;
+  }
+
+  // --- 1b: die langen Wege (.mittel ab 65, .gross ab 512) -------------
+  // Die Laengen 0..80 treffen .bis16/.bis32/.bis64 und den Anfang von
+  // .mittel. Ohne diese Liste blieben der Schwanz der Mittelschleife und
+  // `rep movsb` ungeprueft — und genau dort liegen die Grenzen.
+  var gross: int64 := alloc(4096);
+  var gziel: int64 := alloc(4096);
+  var langen: int64 := alloc(96);
+  poke64(langen + 0,  65);  poke64(langen + 8,  96);
+  poke64(langen + 16, 97);  poke64(langen + 24, 128);
+  poke64(langen + 32, 129); poke64(langen + 40, 255);
+  poke64(langen + 48, 256); poke64(langen + 56, 511);
+  poke64(langen + 64, 512); poke64(langen + 72, 513);
+  poke64(langen + 80, 1000);
+  var li: int64 := 0;
+  while (li < 11) {
+    var ln: int64 := peek64(langen + li * 8);
+    var vo: int64 := 0;
+    while (vo <= 8) {
+      muster(gross, 4096, 17);
+      var gw: int64 := 0;
+      while (gw < 4096) { poke8(gziel + gw, 170); gw += 1; }
+      var rb: int64 := memcpy(gziel + vo, gross + vo, ln);
+      geprueft += 1;
+      if (rb != gziel + vo) {
+        PrintStr("FEHLER Rueckgabe lang: n="c); PrintLn(ln);
+        fehler += 1;
+      }
+      var gi: int64 := 0;
+      while (gi < ln) {
+        if (peek8(gziel + vo + gi) != peek8(gross + vo + gi)) {
+          PrintStr("FEHLER Inhalt lang: n="c); PrintInt(ln);
+          PrintStr(" versatz="c); PrintInt(vo);
+          PrintStr(" Byte "c); PrintLn(gi);
+          fehler += 1;
+          gi := ln;
+        }
+        gi += 1;
+      }
+      if (peek8(gziel + vo + ln) != 170) {
+        PrintStr("FEHLER hinter dem Bereich (lang): n="c); PrintLn(ln);
+        fehler += 1;
+      }
+      if (vo > 0 && peek8(gziel + vo - 1) != 170) {
+        PrintStr("FEHLER vor dem Bereich (lang): n="c); PrintLn(ln);
+        fehler += 1;
+      }
+      vo += 1;
+    }
+    li += 1;
+  }
+
+  // --- 4: Ueberlappung, gegen byteweise Vorwaertskopie ----------------
+  var abstand: int64 := 1;
+  while (abstand <= 40) {
+    var n2: int64 := 1;
+    while (n2 <= 80) {   // 1..80 deckt .bis16/.bis32/.bis64 und .mittel ab
+      // (a) Ziel HINTER der Quelle
+      muster(quelle, 512, 11);
+      var s: int64 := 0;
+      while (s < 512) { poke8(soll + s, peek8(quelle + s)); s += 1; }
+      var j: int64 := 0;
+      while (j < n2) { poke8(soll + abstand + j, peek8(soll + j)); j += 1; }  // byteweise vorwaerts
+      memcpy(quelle + abstand, quelle, n2);
+      geprueft += 1;
+      var k: int64 := 0;
+      while (k < 512) {
+        if (peek8(quelle + k) != peek8(soll + k)) {
+          PrintStr("FEHLER Ueberlappung vorwaerts: abstand="c); PrintInt(abstand);
+          PrintStr(" n="c); PrintInt(n2);
+          PrintStr(" Byte "c); PrintLn(k);
+          fehler += 1;
+          k := 512;
+        }
+        k += 1;
+      }
+      // (b) Ziel VOR der Quelle
+      muster(quelle, 512, 29);
+      var s2: int64 := 0;
+      while (s2 < 512) { poke8(soll + s2, peek8(quelle + s2)); s2 += 1; }
+      var j2: int64 := 0;
+      while (j2 < n2) { poke8(soll + j2, peek8(soll + abstand + j2)); j2 += 1; }
+      memcpy(quelle, quelle + abstand, n2);
+      geprueft += 1;
+      var k2: int64 := 0;
+      while (k2 < 512) {
+        if (peek8(quelle + k2) != peek8(soll + k2)) {
+          PrintStr("FEHLER Ueberlappung rueckwaerts: abstand="c); PrintInt(abstand);
+          PrintStr(" n="c); PrintInt(n2);
+          PrintStr(" Byte "c); PrintLn(k2);
+          fehler += 1;
+          k2 := 512;
+        }
+        k2 += 1;
+      }
+      n2 += 1;
+    }
+    abstand += 1;
+  }
+
+  // --- 5: Laenge 0 ----------------------------------------------------
+  var w2: int64 := 0;
+  while (w2 < 512) { poke8(ziel + w2, 55); w2 += 1; }
+  memcpy(ziel, quelle, 0);
+  geprueft += 1;
+  var u: int64 := 0;
+  while (u < 512) {
+    if (peek8(ziel + u) != 55) {
+      PrintStr("FEHLER Laenge 0 hat geschrieben, Byte "c); PrintLn(u);
+      fehler += 1;
+      u := 512;
+    }
+    u += 1;
+  }
+
+  PrintStr("geprueft="c); PrintInt(geprueft);
+  PrintStr(" fehler="c); PrintLn(fehler);
+  if (fehler != 0) { return 1; }
+  PrintLn("ALL PASS");
+  return 0;
+}

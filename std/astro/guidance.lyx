@@ -1,0 +1,178 @@
+// std/astro/guidance.lyx
+// Guidance: dichteste Annaeherung, Querabweichung, Restflugzeit,
+// Sichtlinienrate fuer Proportional Navigation.
+//
+// ZUSCHNITT: eigene Unit, nicht Teil von std.astro.orbit — und der Grund ist
+// die PRUEFBARKEIT, nicht das Thema (#1900). Bahnmechanik laesst sich gegen
+// geschlossene Loesungen und Literaturwerte pruefen; Guidance nur gegen
+// Szenarien mit bekanntem Ausgang. Das sind verschiedene Testarten und damit
+// verschiedene Vertrauensstufen, und fuer einen DO-178C-Nachweis ist genau
+// das der Unterschied.
+//
+// ALLE Groessen hier sind RELATIV: Ort und Geschwindigkeit des Ziels MINUS
+// die eigenen, in EINEM Rahmen. Wer absolute Zustaende hineingibt, bekommt
+// eine Zahl, die wie ein Ergebnis aussieht. Die Unit kann das nicht
+// bemerken — deshalb tragen alle Parameter `Rel` im Namen.
+//
+// Der Zeitverlauf ist GERADLINIG-GLEICHFOERMIG gerechnet: keine Beschleunigung,
+// keine Gravitation. Fuer die letzten Sekunden einer Annaeherung ist das die
+// uebliche und gute Naeherung; fuer einen Transfer ueber Stunden ist es
+// falsch, und dann gehoert die Rechnung nach std.astro.orbit.
+//
+// Einheiten durchgehend SI: Meter, Meter je Sekunde, Sekunden, Radiant je
+// Sekunde.
+
+@description("Dichteste Annaeherung, Querabweichung und Sichtlinienrate")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+unit std.astro.guidance;
+
+import std.math;
+import std.astro.state;
+
+// Unterhalb dieser Relativgeschwindigkeit [m/s] gibt es keinen
+// Annaeherungszeitpunkt: zwei Koerper mit gleicher Geschwindigkeit naehern
+// sich nie und entfernen sich nie. Die Division dadurch ist der Fall, den
+// die Meldung zu #1900 ausdruecklich nennt.
+pub fn AGuidanceThreshold(): f64 { return 0.000000000001; }   // 1e-12
+
+// ── Abstand und Annaeherung ───────────────────────────────────────────────
+
+pub fn ARange(rRel: AVec3): f64 { return AMagnitude(rRel); }
+
+// Annaeherungsrate [m/s], POSITIV beim Naeherkommen.
+//
+// Das Vorzeichen ist eine Festlegung und keine Selbstverstaendlichkeit: die
+// Ableitung des Abstands ist beim Naeherkommen negativ. Hier gilt die
+// Konvention der Zielverfolgung (closing velocity), weil jede Formel der
+// Proportional Navigation sie so verwendet.
+pub fn AClosingSpeed(rRel: AVec3, vRel: AVec3): f64 {
+  var r: f64 := AMagnitude(rRel);
+  if (r < AGuidanceThreshold()) { return AError(); }
+  return 0.0 - ADot(rRel, vRel) / r;
+}
+
+// Zeit bis zur dichtesten Annaeherung [s].
+//
+// t = -(r . v) / |v|^2
+//
+// Ein NEGATIVER Wert wird zurueckgegeben, nicht auf 0 geklemmt: er sagt, dass
+// die dichteste Annaeherung bereits VORBEI ist. Das ist eine Auskunft, und
+// wer sie auf 0 abschneidet, macht aus "zu spaet" ein "jetzt".
+pub fn ATimeToCPA(rRel: AVec3, vRel: AVec3): f64 {
+  var vv: f64 := ADot(vRel, vRel);
+  if (vv < AGuidanceThreshold()) { return AError(); }
+  return 0.0 - ADot(rRel, vRel) / vv;
+}
+
+// Abstand zum Zeitpunkt der dichtesten Annaeherung [m].
+pub fn ADistanceAtCPA(rRel: AVec3, vRel: AVec3): f64 {
+  var t: f64 := ATimeToCPA(rRel, vRel);
+  if (AIsError(t)) { return AError(); }
+  return AMagnitude(AAdd(rRel, AScale(vRel, t)));
+}
+
+// Relativer Ort zu einem beliebigen Zeitpunkt [m], geradlinig-gleichfoermig.
+pub fn ARelPositionAt(rRel: AVec3, vRel: AVec3, t: f64): AVec3 {
+  if (AIsError(t)) { return AVec(AError(), AError(), AError()); }
+  return AAdd(rRel, AScale(vRel, t));
+}
+
+// ── Querabweichung ────────────────────────────────────────────────────────
+
+// Senkrechter Abstand des Ziels von der eigenen Bahngeraden [m].
+//
+// Gemessen wird SENKRECHT auf die Geschwindigkeitsrichtung — nicht auf die
+// Verbindungslinie. Der Unterschied ist keine Kleinigkeit: bei 50 km Abstand
+// und 50 Grad zwischen beiden liegen 12 km dazwischen. Der Fehler faellt nur
+// auf, wenn ein Test einen SCHIEFEN Fall rechnet; ein rechtwinkliger Fall
+// gibt beidesmal dasselbe.
+pub fn ACrossTrack(rRel: AVec3, vRel: AVec3): f64 {
+  var v: f64 := AMagnitude(vRel);
+  if (v < AGuidanceThreshold()) { return AError(); }
+  return AMagnitude(ACross(rRel, vRel)) / v;
+}
+
+// Abstand ENTLANG der Bahngeraden [m], positiv wenn das Ziel voraus liegt.
+pub fn AAlongTrack(rRel: AVec3, vRel: AVec3): f64 {
+  var v: f64 := AMagnitude(vRel);
+  if (v < AGuidanceThreshold()) { return AError(); }
+  return ADot(rRel, vRel) / v;
+}
+
+// ── Restflugzeit ──────────────────────────────────────────────────────────
+
+// Restflugzeit [s] aus Abstand und Annaeherungsrate.
+//
+// Entfernt sich das Ziel (Annaeherungsrate <= 0), gibt es keine Restflugzeit.
+// Ein grosser positiver Wert waere dort besonders gefaehrlich: er sieht aus
+// wie "noch viel Zeit".
+pub fn ATimeToGo(rRel: AVec3, vRel: AVec3): f64 {
+  var vc: f64 := AClosingSpeed(rRel, vRel);
+  if (AIsError(vc)) { return AError(); }
+  if (vc <= AGuidanceThreshold()) { return AError(); }
+  return AMagnitude(rRel) / vc;
+}
+
+// ── Sichtlinie ────────────────────────────────────────────────────────────
+
+// Drehvektor der Sichtlinie [rad/s]:  omega = (r x v) / |r|^2
+//
+// Der BETRAG ist die Sichtlinienrate, die RICHTUNG die Drehachse. Beides
+// zusammen, weil Proportional Navigation das Kreuzprodukt braucht und nicht
+// nur den Betrag.
+pub fn ALosRate(rRel: AVec3, vRel: AVec3): AVec3 {
+  var rr: f64 := ADot(rRel, rRel);
+  if (rr < AGuidanceThreshold()) { return AVec(AError(), AError(), AError()); }
+  return AScale(ACross(rRel, vRel), 1.0 / rr);
+}
+
+// Betrag der Sichtlinienrate [rad/s].
+pub fn ALosRateMagnitude(rRel: AVec3, vRel: AVec3): f64 {
+  var w: AVec3 := ALosRate(rRel, vRel);
+  if (AVecIsError(w)) { return AError(); }
+  return AMagnitude(w);
+}
+
+// Einheitsvektor der Sichtlinie. Bei Abstand null gibt es keine Richtung.
+pub fn ALosUnit(rRel: AVec3): AVec3 { return AUnitVec(rRel); }
+
+// ── Proportional Navigation ───────────────────────────────────────────────
+
+// Sollbeschleunigung [m/s^2] der echten Proportional Navigation:
+//
+//   a = N * Vc * (omega x r_hat)
+//
+// N ist der Navigationsbeiwert, ueblich 3 bis 5. Die Beschleunigung steht
+// SENKRECHT auf der Sichtlinie — sie dreht die Sichtlinie still, sie bremst
+// nicht. Wer sie entlang der Sichtlinie ansetzt, hat eine Verfolgungskurve
+// und keine Proportional Navigation.
+//
+// Der Kern der Aussage: bei KONSTANTER Sichtlinienrichtung ist omega null und
+// damit die Sollbeschleunigung null — Kollisionskurs. Genau das prueft der
+// Test, und es ist die Eigenschaft, wegen der das Verfahren benutzt wird.
+pub fn AProNavAccel(rRel: AVec3, vRel: AVec3, n: f64): AVec3 {
+  if (AIsError(n) || n <= 0.0) { return AVec(AError(), AError(), AError()); }
+  var vc: f64 := AClosingSpeed(rRel, vRel);
+  if (AIsError(vc)) { return AVec(AError(), AError(), AError()); }
+  var w: AVec3 := ALosRate(rRel, vRel);
+  if (AVecIsError(w)) { return w; }
+  var rh: AVec3 := AUnitVec(rRel);
+  if (AVecIsError(rh)) { return rh; }
+  return AScale(ACross(w, rh), n * vc);
+}
+
+// Liegt Kollisionskurs vor? Sichtlinienrate unterhalb der Schranke UND das
+// Ziel kommt naeher.
+//
+// Beide Haelften sind noetig: eine ruhende Sichtlinie bei WACHSENDEM Abstand
+// ist gerade kein Kollisionskurs, sondern ein sich entfernendes Ziel auf
+// derselben Geraden.
+pub fn AOnCollisionCourse(rRel: AVec3, vRel: AVec3, rateSchranke: f64): bool {
+  if (AIsError(rateSchranke) || rateSchranke < 0.0) { return false; }
+  var w: f64 := ALosRateMagnitude(rRel, vRel);
+  if (AIsError(w)) { return false; }
+  var vc: f64 := AClosingSpeed(rRel, vRel);
+  if (AIsError(vc)) { return false; }
+  return w <= rateSchranke && vc > 0.0;
+}

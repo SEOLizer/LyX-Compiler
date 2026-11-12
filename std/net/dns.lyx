@@ -1,6 +1,7 @@
 // Lyx Network Library - DNS Resolver
 // DNS client for A, AAAA, MX, CNAME record lookups
 
+@capabilities([fs.read, network.tcp.bind, network.tcp.connect, network.udp.connect])
 unit std.net.dns;
 
 import std.net.socket;
@@ -46,6 +47,12 @@ pub con DNS_RCODE_REFUSED: int64 := 5;  // Query refused
 
 // Default DNS servers
 pub con DNS_PORT: int64 := 53;
+// #1641: Zeitgrenze und Zahl der Versuche fuer eine Anfrage. Bleibt die
+// Antwort aus — verworfene Anfrage, Paketverlust, unerreichbarer Server —,
+// war der Aufrufer vorher fuer immer blockiert. Zwei Sekunden je Versuch,
+// dreimal, danach false: das ist das Verhalten eines System-Resolvers.
+pub con DNS_TIMEOUT_SEK: int64 := 2;
+pub con DNS_VERSUCHE: int64 := 3;
 pub con DNS_DOH_PORT: int64 := 443;
 
 // Cache settings
@@ -113,19 +120,19 @@ fn dns_encode_name(buf: int64, offset: int64, name: int64, nameLen: int64): int6
     if (c == 46) {  // '.' character
       poke8(buf + labelStart, labelLen);
       labelStart := pos;
-      pos := pos + 1;
+      pos += 1;
       labelLen := 0;
     } else {
       poke8(buf + pos, c);
-      pos := pos + 1;
-      labelLen := labelLen + 1;
+      pos += 1;
+      labelLen += 1;
     }
-    i := i + 1;
+    i += 1;
   }
   
   poke8(buf + labelStart, labelLen);
   poke8(buf + pos, 0);
-  pos := pos + 1;
+  pos += 1;
   
   return pos - offset;
 }
@@ -156,15 +163,15 @@ fn dns_build_query(buf: int64, name: int64, nameLen: int64, queryType: int64): i
   
   // Question section
   var nameBytes: int64 := dns_encode_name(buf, offset, name, nameLen);
-  offset := offset + nameBytes;
+  offset += nameBytes;
   
   poke8(buf + offset, (queryType >> 8) & 0xFF);
   poke8(buf + offset + 1, queryType & 0xFF);
-  offset := offset + 2;
+  offset += 2;
   
   poke8(buf + offset, 0x00);
   poke8(buf + offset + 1, 0x01);
-  offset := offset + 2;
+  offset += 2;
   
   return offset;
 }
@@ -190,7 +197,7 @@ fn dns_skip_name(buf: int64, offset: int64, maxLen: int64): int64 {
 
     if ((len & 0xC0) == 0xC0) {
       // WP-14.2: Hop zählen; bei zu vielen Hops Fehler signalisieren
-      ptrHops := ptrHops + 1;
+      ptrHops += 1;
       if (ptrHops > 100) { return maxLen; }
       return pos + 2;
     }
@@ -208,7 +215,10 @@ fn dns_skip_name(buf: int64, offset: int64, maxLen: int64): int64 {
 // ============================================================================
 // Internal: Parse DNS response (extended)
 // Supports A, AAAA, MX, CNAME records
-// resultPtr: pointer to 64-byte result buffer
+// resultPtr: pointer to a 128-byte result buffer (Layout siehe oben; Daten-Region
+//   Offset 40..127 = 88 Bytes). WICHTIG: NICHT 64 Bytes allozieren — NS/TXT/SOA/PTR
+//   schreiben bis zu 64 Daten-Bytes ab Offset 40 (→ bis Offset 103). Ein 64-Byte-
+//   Puffer würde überlaufen (SEC-BUG-03-Folge: Doku war widersprüchlich).
 // queryType: the type of record we asked for
 // Returns: true on success, false on error
 // ============================================================================
@@ -224,7 +234,7 @@ fn dns_parse_response_ex(buf: int64, bufLen: int64, resultPtr: int64, queryType:
   var ttl: int64;
   var rdlength: int64;
   
-  // Initialize result (64 bytes)
+  // Initialize result header fields (Reader liest Daten nur bis dataLen → kein Leak)
   poke8(resultPtr + 0, 0);     // success = false
   poke8(resultPtr + 8, 0);     // recordType = 0
   poke8(resultPtr + 16, 0);    // ttl = 0
@@ -277,8 +287,8 @@ fn dns_parse_response_ex(buf: int64, bufLen: int64, resultPtr: int64, queryType:
   i := 0;
   while (i < qdcount) {
     offset := dns_skip_name(buf, offset, bufLen);
-    offset := offset + 4;
-    i := i + 1;
+    offset += 4;
+    i += 1;
   }
   
   // Parse answer section
@@ -291,17 +301,17 @@ fn dns_parse_response_ex(buf: int64, bufLen: int64, resultPtr: int64, queryType:
     }
     
     rtype := (peek8(buf + offset) << 8) | peek8(buf + offset + 1);
-    offset := offset + 2;
+    offset += 2;
     
     rclass := (peek8(buf + offset) << 8) | peek8(buf + offset + 1);
-    offset := offset + 2;
+    offset += 2;
     
     ttl := (peek8(buf + offset) << 24) | (peek8(buf + offset + 1) << 16) |
            (peek8(buf + offset + 2) << 8) | peek8(buf + offset + 3);
-    offset := offset + 4;
+    offset += 4;
     
     rdlength := (peek8(buf + offset) << 8) | peek8(buf + offset + 1);
-    offset := offset + 2;
+    offset += 2;
 
     // SEC-BUG-03: rdata-Bounds-Check — rdlength kommt aus dem Netzwerk (untrusted).
     // Ohne diesen Check liest jeder Record-Handler OOB wenn rdlength über bufLen zeigt.
@@ -311,8 +321,8 @@ fn dns_parse_response_ex(buf: int64, bufLen: int64, resultPtr: int64, queryType:
 
     // Check if this is the record type we're looking for
     if (rclass != DNS_CLASS_IN) {
-      offset := offset + rdlength;
-      i := i + 1;
+      offset += rdlength;
+      i += 1;
       continue;
     }
     
@@ -343,7 +353,7 @@ fn dns_parse_response_ex(buf: int64, bufLen: int64, resultPtr: int64, queryType:
       var j: int64 := 0;
       while (j < 16) {
         poke8(resultPtr + 40 + j, peek8(buf + offset + j));
-        j := j + 1;
+        j += 1;
       }
       
       // Store TTL
@@ -374,7 +384,7 @@ fn dns_parse_response_ex(buf: int64, bufLen: int64, resultPtr: int64, queryType:
       var j: int64 := 0;
       while (j < copyLen) {
         poke8(resultPtr + 40 + j, peek8(buf + offset + j));
-        j := j + 1;
+        j += 1;
       }
       
       // Store TTL
@@ -413,7 +423,7 @@ fn dns_parse_response_ex(buf: int64, bufLen: int64, resultPtr: int64, queryType:
       var j: int64 := 0;
       while (j < copyLen) {
         poke8(resultPtr + 42 + j, peek8(buf + offset + 2 + j));
-        j := j + 1;
+        j += 1;
       }
       
       // Store TTL
@@ -441,7 +451,7 @@ fn dns_parse_response_ex(buf: int64, bufLen: int64, resultPtr: int64, queryType:
       var j: int64 := 0;
       while (j < copyLen) {
         poke8(resultPtr + 40 + j, peek8(buf + offset + j));
-        j := j + 1;
+        j += 1;
       }
       
       // Store TTL
@@ -470,7 +480,7 @@ fn dns_parse_response_ex(buf: int64, bufLen: int64, resultPtr: int64, queryType:
       var j: int64 := 0;
       while (j < copyLen) {
         poke8(resultPtr + 40 + j, peek8(buf + offset + j));
-        j := j + 1;
+        j += 1;
       }
       
       // Store TTL
@@ -499,7 +509,7 @@ fn dns_parse_response_ex(buf: int64, bufLen: int64, resultPtr: int64, queryType:
       var j: int64 := 0;
       while (j < copyLen) {
         poke8(resultPtr + 40 + j, peek8(buf + offset + j));
-        j := j + 1;
+        j += 1;
       }
       
       // Store TTL
@@ -527,7 +537,7 @@ fn dns_parse_response_ex(buf: int64, bufLen: int64, resultPtr: int64, queryType:
       var j: int64 := 0;
       while (j < copyLen) {
         poke8(resultPtr + 40 + j, peek8(buf + offset + j));
-        j := j + 1;
+        j += 1;
       }
       
       // Store TTL
@@ -556,7 +566,7 @@ fn dns_parse_response_ex(buf: int64, bufLen: int64, resultPtr: int64, queryType:
       var j: int64 := 0;
       while (j < copyLen) {
         poke8(resultPtr + 40 + j, peek8(buf + offset + j));
-        j := j + 1;
+        j += 1;
       }
       
       // Store TTL
@@ -584,7 +594,7 @@ fn dns_parse_response_ex(buf: int64, bufLen: int64, resultPtr: int64, queryType:
       var j: int64 := 0;
       while (j < copyLen) {
         poke8(resultPtr + 40 + j, peek8(buf + offset + j));
-        j := j + 1;
+        j += 1;
       }
       
       // Store TTL
@@ -612,7 +622,7 @@ fn dns_parse_response_ex(buf: int64, bufLen: int64, resultPtr: int64, queryType:
       var j: int64 := 0;
       while (j < copyLen) {
         poke8(resultPtr + 40 + j, peek8(buf + offset + j));
-        j := j + 1;
+        j += 1;
       }
       
       // Store TTL
@@ -640,7 +650,7 @@ fn dns_parse_response_ex(buf: int64, bufLen: int64, resultPtr: int64, queryType:
       var j: int64 := 0;
       while (j < copyLen) {
         poke8(resultPtr + 40 + j, peek8(buf + offset + j));
-        j := j + 1;
+        j += 1;
       }
       
       // Store TTL
@@ -657,8 +667,8 @@ fn dns_parse_response_ex(buf: int64, bufLen: int64, resultPtr: int64, queryType:
       return true;
     }
     
-    offset := offset + rdlength;
-    i := i + 1;
+    offset += rdlength;
+    i += 1;
   }
   
   return false;
@@ -676,7 +686,6 @@ pub fn DNSResolve(hostname: int64, hostnameLen: int64, dnsServerIP: int64, resul
   var buf: int64;
   var queryLen: int64;
   var nread: int64;
-  var sendRet: int64;
 
   // Initialize result
   poke8(resultPtr + 0, 0);
@@ -698,14 +707,7 @@ pub fn DNSResolve(hostname: int64, hostnameLen: int64, dnsServerIP: int64, resul
 
   queryLen := dns_build_query(buf, hostname, hostnameLen, DNS_TYPE_A);
 
-  sendRet := UDPSocketSendToAddr(sock, buf, queryLen, dnsServerIP, DNS_PORT);
-  if (sendRet < 0) {
-    BufferFree(buf, 512);
-    UDPSocketClose(sock);
-    return false;
-  }
-
-  nread := UDPSocketRecv(sock, buf, 512, 0, 0);
+  nread := dns_frage_mit_zeitlimit(sock, buf, queryLen, dnsServerIP);
   if (nread < 12) {
     BufferFree(buf, 512);
     UDPSocketClose(sock);
@@ -719,16 +721,40 @@ pub fn DNSResolve(hostname: int64, hostnameLen: int64, dnsServerIP: int64, resul
 // Generic DNS Resolve (supports any record type)
 // ============================================================================
 
+// #1641: Anfrage senden und mit Zeitgrenze auf die Antwort warten. Kommt keine,
+// wird wiederholt; nach DNS_VERSUCHE Anlaeufen gibt die Funktion auf und
+// liefert eine Laenge < 0. Vorher stand hier ein blockierendes
+// UDPSocketRecv ohne jede Grenze.
+fn dns_frage_mit_zeitlimit(sock: UDPSocket, buf: int64, queryLen: int64,
+                           dnsServerIP: int64): int64 {
+  // Ein Fehlschlag beim Setzen der Grenze ist kein Grund aufzugeben — dann
+  // verhaelt sich der Aufruf wie bisher, statt gar nicht zu fragen. Gemeldet
+  // wird er ueber den Rueckgabewert von UDPSocketSetRecvTimeout, den der
+  // Aufrufer hier nicht braucht.
+  UDPSocketSetRecvTimeout(sock, DNS_TIMEOUT_SEK, 0);
+  var versuch: int64 := 0;
+  while (versuch < DNS_VERSUCHE) {
+    var sendRet: int64 := UDPSocketSendToAddr(sock, buf, queryLen, dnsServerIP, DNS_PORT);
+    if (sendRet < 0) { return 0 - 1; }
+    var nread: int64 := UDPSocketRecv(sock, buf, 512, 0, 0);
+    if (nread >= 12) { return nread; }
+    // nread < 0 heisst hier in aller Regel EAGAIN/EWOULDBLOCK: die Zeit ist
+    // abgelaufen. Ein zu kurzer Kopf ist ebenso unbrauchbar — beides fuehrt
+    // zum naechsten Versuch.
+    versuch := versuch + 1;
+  }
+  return 0 - 1;
+}
+
 // Resolve hostname using specified DNS server and record type
 // queryType: DNS_TYPE_A, DNS_TYPE_AAAA, DNS_TYPE_MX, DNS_TYPE_CNAME
-// resultPtr: pointer to 64-byte result buffer
+// resultPtr: pointer to a 128-byte result buffer (NICHT 64 — siehe dns_parse_response_ex)
 // Returns: true on success, false on error
 pub fn DNSResolveEx(hostname: int64, hostnameLen: int64, dnsServerIP: int64, queryType: int64, resultPtr: int64): bool {
   var sock: UDPSocket;
   var buf: int64;
   var queryLen: int64;
   var nread: int64;
-  var sendRet2: int64;
 
   // Initialize result
   poke8(resultPtr + 0, 0);
@@ -751,14 +777,7 @@ pub fn DNSResolveEx(hostname: int64, hostnameLen: int64, dnsServerIP: int64, que
 
   queryLen := dns_build_query(buf, hostname, hostnameLen, queryType);
 
-  sendRet2 := UDPSocketSendToAddr(sock, buf, queryLen, dnsServerIP, DNS_PORT);
-  if (sendRet2 < 0) {
-    BufferFree(buf, 512);
-    UDPSocketClose(sock);
-    return false;
-  }
-
-  nread := UDPSocketRecv(sock, buf, 512, 0, 0);
+  nread := dns_frage_mit_zeitlimit(sock, buf, queryLen, dnsServerIP);
   if (nread < 12) {
     BufferFree(buf, 512);
     UDPSocketClose(sock);
@@ -949,13 +968,13 @@ pub fn DNSResolveDNSKEYGoogle(hostname: int64, hostnameLen: int64, resultPtr: in
 // Resolve using Google's public DNS (8.8.8.8)
 pub fn DNSResolveGoogle(hostname: int64, hostnameLen: int64, resultPtr: int64): bool {
   var googleDNS: int64 := IPPack(8, 8, 8, 8);
-  return DNSResolve(hostname, hostnameLen, googleDNS, resultPtr);
+  return DNSResolve(hostname as int64, hostnameLen, googleDNS, resultPtr);
 }
 
 // Resolve using Cloudflare's DNS (1.1.1.1)
 pub fn DNSResolveCloudflare(hostname: int64, hostnameLen: int64, resultPtr: int64): bool {
   var cfDNS: int64 := IPPack(1, 1, 1, 1);
-  return DNSResolve(hostname, hostnameLen, cfDNS, resultPtr);
+  return DNSResolve(hostname as int64, hostnameLen, cfDNS, resultPtr);
 }
 
 // ============================================================================
@@ -972,21 +991,118 @@ fn hostnameLen(hostname: int64): int64 {
     if (peek8(hostname + i) == 0) {
       return i;
     }
+    i += 1;
+  }
+  return 0;
+}
+
+// #1330: Eine Adresse in Textform ist keine Frage an einen Nameserver.
+// Erkennt "a.b.c.d" mit Oktetten 0..255 und liefert sie gepackt; 0 heisst
+// "das ist keine literale IPv4", nicht "unbekannter Host".
+fn dns_parseLiteralIPv4(hostname: int64, len: int64): int64 {
+  var i: int64 := 0;
+  var cur: int64 := 0;
+  var ziffern: int64 := 0;
+  var punkte: int64 := 0;
+  var o1: int64 := 0;
+  var o2: int64 := 0;
+  var o3: int64 := 0;
+  var c: int64 := 0;
+  while (i < len) {
+    c := peek8(hostname + i);
+    if (c >= 48 && c <= 57) {
+      cur := cur * 10 + (c - 48);
+      ziffern := ziffern + 1;
+      if (ziffern > 3 || cur > 255) { return 0; }
+    } else if (c == 46) {
+      if (ziffern == 0) { return 0; }
+      punkte := punkte + 1;
+      if (punkte == 1) { o1 := cur; }
+      else if (punkte == 2) { o2 := cur; }
+      else if (punkte == 3) { o3 := cur; }
+      else { return 0; }
+      cur := 0; ziffern := 0;
+    } else {
+      return 0;
+    }
     i := i + 1;
   }
+  if (punkte != 3 || ziffern == 0) { return 0; }
+  // 0.0.0.0 kaeme als 0 heraus und waere von "keine literale IPv4" nicht zu
+  // unterscheiden. Als Verbindungsziel ist die Adresse ohnehin sinnlos —
+  // sie faellt hier bewusst durch und geht den Namensweg.
+  return IPPack(o1, o2, o3, cur);
+}
+
+// #1330: /etc/hosts. Ohne diese Stufe war "localhost" ueber die Unit nicht
+// aufloesbar — oeffentliches DNS kennt den Namen nicht. Gelesen wird nur
+// IPv4; Zeilen ab '#' sind Kommentar, Aliase hinter dem kanonischen Namen
+// zaehlen mit.
+fn dns_lookupEtcHosts(hostname: int64, len: int64): int64 {
+  var buf: int64 := mmap(0, 65536, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (buf == 0) { return 0; }
+  var fd: int64 := open("/etc/hosts", 0, 0);
+  if (fd < 0) { munmap(buf, 65536); return 0; }
+  var n: int64 := sys_read(fd, buf, 65535);
+  sys_close(fd);
+  if (n <= 0) { munmap(buf, 65536); return 0; }
+  poke8(buf + n, 0);
+
+  var i: int64 := 0;
+  while (i < n) {
+    // Zeilenende suchen
+    var ze: int64 := i;
+    while (ze < n && peek8(buf + ze) != 10) { ze := ze + 1; }
+    // Kommentar abschneiden
+    var e: int64 := i;
+    while (e < ze && peek8(buf + e) != 35) { e := e + 1; }
+
+    // Erstes Feld: die Adresse
+    var p: int64 := i;
+    while (p < e && (peek8(buf + p) == 32 || peek8(buf + p) == 9)) { p := p + 1; }
+    var as1: int64 := p;
+    while (p < e && peek8(buf + p) != 32 && peek8(buf + p) != 9) { p := p + 1; }
+    var ip: int64 := dns_parseLiteralIPv4(buf + as1, p - as1);
+
+    // Restliche Felder: kanonischer Name und Aliase
+    if (ip != 0) {
+      while (p < e) {
+        while (p < e && (peek8(buf + p) == 32 || peek8(buf + p) == 9)) { p := p + 1; }
+        var ns: int64 := p;
+        while (p < e && peek8(buf + p) != 32 && peek8(buf + p) != 9) { p := p + 1; }
+        if (p - ns == len) {
+          var k: int64 := 0;
+          var gleich: int64 := 1;
+          while (k < len) {
+            if (peek8(buf + ns + k) != peek8(hostname + k)) { gleich := 0; k := len; }
+            k := k + 1;
+          }
+          if (gleich != 0) { munmap(buf, 65536); return ip; }
+        }
+      }
+    }
+    i := ze + 1;
+  }
+  munmap(buf, 65536);
   return 0;
 }
 
 // Simple hostname resolver using default DNS server
 // hostname: null-terminated string (e.g., "google.com")
 // Returns: packed IPv4 address in network byte order, or 0 on failure
-pub fn GetHostByName(hostname: int64): int64 {
+//
+// #1330: Reihenfolge wie bei einem System-Resolver — literale Adresse,
+// /etc/hosts, der Nameserver aus /etc/resolv.conf, erst zuletzt Google.
+// Bis hierher ging JEDE Anfrage an 8.8.8.8; damit war weder 127.0.0.1 noch
+// localhost noch irgendein Name im eigenen Netz erreichbar, und jede
+// Verbindung verriet ihr Ziel nach draussen.
+pub fn GetHostByName(hostname: pchar): int64 {
   var result: int64;
   var len: int64;
   var success: bool;
   
   // Calculate hostname length
-  len := hostnameLen(hostname);
+  len := hostnameLen(hostname as int64);   // #1343
   if (len == 0) {
     return 0;
   }
@@ -997,8 +1113,20 @@ pub fn GetHostByName(hostname: int64): int64 {
     return 0;
   }
   
-  // Resolve using Google DNS
-  success := DNSResolveGoogle(hostname, len, result);
+  // #1330: die beiden lokalen Stufen vor der Netzanfrage
+  var lit: int64 := dns_parseLiteralIPv4(hostname as int64, len);
+  if (lit != 0) { munmap(result, 128); return lit; }
+  var lokal: int64 := dns_lookupEtcHosts(hostname as int64, len);
+  if (lokal != 0) { munmap(result, 128); return lokal; }
+
+  // Nameserver aus /etc/resolv.conf, Google nur als Rueckfall
+  var srv: int64 := dns_parse_resolv_conf();
+  if (srv != 0) {
+    success := DNSResolve(hostname as int64, len, srv, result);
+    if (!success) { success := DNSResolveGoogle(hostname as int64, len, result); }
+  } else {
+    success := DNSResolveGoogle(hostname as int64, len, result);
+  }
   
   if (success) {
     // Extract IPv4 address from result
@@ -1008,7 +1136,7 @@ pub fn GetHostByName(hostname: int64): int64 {
   }
   
   // Try Cloudflare as fallback
-  success := DNSResolveCloudflare(hostname, len, result);
+  success := DNSResolveCloudflare(hostname as int64, len, result);
   
   if (success) {
     var ip: int64 := DNSResultGetIPv4(result);
@@ -1026,7 +1154,7 @@ pub fn ResolveHost(hostname: int64): IPAddr {
   var addr: IPAddr;
   var ip: int64;
   
-  ip := GetHostByName(hostname);
+  ip := GetHostByName(hostname as pchar);   // #1343
   
   if (ip == 0) {
     addr.family := 0;
@@ -1047,14 +1175,14 @@ pub fn ResolveHost(hostname: int64): IPAddr {
 // Writes the address as two int64 halves to outHi / outLo (each a poke64 pointer).
 // Returns true on success.  Tries Google DNS first, Cloudflare as fallback.
 pub fn GetHostByNameV6(hostname: int64, outHi: int64, outLo: int64): bool {
-  var len: int64 := hostnameLen(hostname);
+  var len: int64 := hostnameLen(hostname as int64);
   if (outHi != 0) { poke64(outHi, 0); }
   if (outLo != 0) { poke64(outLo, 0); }
   if (len == 0) { return false; }
   var result: int64 := mmap(0, 128, PROT_RW, MAP_ANON, FD_NONE, 0);
   if (result == 0) { return false; }
-  var ok: bool := DNSResolveAAAAGoogle(hostname, len, result);
-  if (!ok) { ok := DNSResolveAAAACoudflare(hostname, len, result); }
+  var ok: bool := DNSResolveAAAAGoogle(hostname as int64, len, result);
+  if (!ok) { ok := DNSResolveAAAACoudflare(hostname as int64, len, result); }
   if (ok) {
     var hi: int64 := DNSResultGetIPv6Hi(result);
     var lo: int64 := DNSResultGetIPv6Lo(result);
@@ -1088,7 +1216,7 @@ pub fn DNSPrintIPV6(data: int64) {
     
     if (word == 0 && first) {
       // Skip leading zeros
-      i := i + 2;
+      i += 2;
       continue;
     }
     
@@ -1104,7 +1232,7 @@ pub fn DNSPrintIPV6(data: int64) {
     }
     PrintInt(word);
     
-    i := i + 2;
+    i += 2;
   }
 }
 
@@ -1154,28 +1282,28 @@ pub fn DNSResultIsSuccess(resultPtr: int64): bool {
 fn dns_write_decimal(dst: int64, pos: int64, n: int64): int64 {
   if (n >= 100) {
     poke8(dst + pos, 48 + n / 100);
-    pos := pos + 1;
+    pos += 1;
     poke8(dst + pos, 48 + (n / 10 - (n / 100) * 10));
-    pos := pos + 1;
+    pos += 1;
     poke8(dst + pos, 48 + (n - (n / 10) * 10));
-    pos := pos + 1;
+    pos += 1;
   } else if (n >= 10) {
     poke8(dst + pos, 48 + n / 10);
-    pos := pos + 1;
+    pos += 1;
     poke8(dst + pos, 48 + (n - (n / 10) * 10));
-    pos := pos + 1;
+    pos += 1;
   } else {
     poke8(dst + pos, 48 + n);
-    pos := pos + 1;
+    pos += 1;
   }
   return pos;
 }
 
-fn dns_lit(dst: int64, pos: int64, src: int64, len: int64): int64 {
+fn dns_lit(dst: int64, pos: int64, src: pchar, len: int64): int64 {   // #1221
   var i: int64 := 0;
   while (i < len) {
     poke8(dst + pos + i, peek8(src + i));
-    i := i + 1;
+    i += 1;
   }
   return pos + len;
 }
@@ -1227,7 +1355,7 @@ fn dns_build_ptr6_name(ip6: int64, buf: int64): int64 {
     if (i < 15) {
       poke8(buf + pos, 46); pos := pos + 1;
     }
-    i := i + 1;
+    i += 1;
   }
   poke8(buf + pos, 46);  pos := pos + 1;
   poke8(buf + pos, 105); pos := pos + 1;  // i
@@ -1270,7 +1398,7 @@ fn dns_hostname_match(a: int64, aLen: int64, b: int64, bLen: int64): bool {
   var i: int64 := 0;
   while (i < aLen) {
     if (peek8(a + i) != peek8(b + i)) { return false; }
-    i := i + 1;
+    i += 1;
   }
   return true;
 }
@@ -1289,14 +1417,14 @@ fn dns_cache_lookup(hostname: int64, hostnameLen: int64, queryType: int64, resul
             var j: int64 := 0;
             while (j < 16) {
               poke64(resultPtr + j * 8, peek64(entry + 96 + j * 8));
-              j := j + 1;
+              j += 1;
             }
             return true;
           }
         }
       }
     }
-    i := i + 1;
+    i += 1;
   }
   return false;
 }
@@ -1316,7 +1444,7 @@ fn dns_cache_store(hostname: int64, hostnameLen: int64, queryType: int64, result
       target := i;
       break;
     }
-    i := i + 1;
+    i += 1;
   }
   var entry: int64 := dns_cache_entry(target);
   poke64(entry + 0, 0);
@@ -1325,12 +1453,12 @@ fn dns_cache_store(hostname: int64, hostnameLen: int64, queryType: int64, result
   i := 0;
   while (i < hnLen) {
     poke8(entry + 32 + i, peek8(hostname + i));
-    i := i + 1;
+    i += 1;
   }
   var j: int64 := 0;
   while (j < 16) {
     poke64(entry + 96 + j * 8, peek64(resultPtr + j * 8));
-    j := j + 1;
+    j += 1;
   }
   poke64(entry + 16, queryType);
   poke64(entry + 24, hnLen);
@@ -1343,7 +1471,7 @@ pub fn DNSCacheClear() {
   var i: int64 := 0;
   while (i < DNS_CACHE_SLOTS) {
     poke64(dns_cache_entry(i) + 0, 0);
-    i := i + 1;
+    i += 1;
   }
 }
 
@@ -1411,7 +1539,7 @@ fn dns_parse_resolv_conf(): int64 {
           if (c >= 48 && c <= 57) {
             cur := cur * 10 + (c - 48);
           } else if (c == 46) {
-            dotCount := dotCount + 1;
+            dotCount += 1;
             if (dotCount == 1) { oct1 := cur; }
             else if (dotCount == 2) { oct2 := cur; }
             else if (dotCount == 3) { oct3 := cur; }
@@ -1419,7 +1547,7 @@ fn dns_parse_resolv_conf(): int64 {
           } else {
             break;
           }
-          pos := pos + 1;
+          pos += 1;
         }
         oct4 := cur;
         if (dotCount == 3) {
@@ -1428,7 +1556,7 @@ fn dns_parse_resolv_conf(): int64 {
         }
       }
     }
-    i := i + 1;
+    i += 1;
   }
 
   munmap(buf, 1024);
@@ -1440,7 +1568,7 @@ pub fn DNSResolveSystem(hostname: int64, hostnameLen: int64, resultPtr: int64): 
   if (ns == 0) {
     ns := IPPack(8, 8, 8, 8);
   }
-  return DNSResolve(hostname, hostnameLen, ns, resultPtr);
+  return DNSResolve(hostname as int64, hostnameLen, ns, resultPtr);
 }
 
 pub fn DNSResolveSystemEx(hostname: int64, hostnameLen: int64, queryType: int64, resultPtr: int64): bool {
@@ -1496,9 +1624,9 @@ fn dns_doh_build_request(queryBuf: int64, queryLen: int64, httpBuf: int64): int6
   i := 0;
   while (i < queryLen) {
     poke8(httpBuf + pos + i, peek8(queryBuf + i));
-    i := i + 1;
+    i += 1;
   }
-  pos := pos + queryLen;
+  pos += queryLen;
   return pos;
 }
 
@@ -1553,7 +1681,7 @@ fn dns_doh_resolve(hostname: int64, hostnameLen: int64, queryType: int64, result
     return false;
   }
 
-  conn := TLSConnect(ctx, tcpConn.fd, sniBuf);
+  conn := TLSConnect(ctx, tcpConn.fd, sniBuf as pchar);
   munmap(sniBuf, 16);
   if (conn.connected == 0) {
     sys_close(tcpConn.fd);
@@ -1597,7 +1725,7 @@ fn dns_doh_resolve(hostname: int64, hostnameLen: int64, queryType: int64, result
       bodyStart := i + 4;
       break;
     }
-    i := i + 1;
+    i += 1;
   }
 
   if (bodyStart == 0 || n - bodyStart < 12) {

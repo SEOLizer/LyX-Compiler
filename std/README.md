@@ -630,8 +630,11 @@ Hash functions for data structures, integrity and passwords.
 - `HashFarm32(data: pchar): int64` - FarmHash32
 - `HashFarm64(data: pchar): int64` - FarmHash64
 - `HashFarm64Hex(data: pchar): pchar` - FarmHash64 as hex
-- `HashxxHash32(data: pchar): int64` - xxHash32 (very fast)
-- `HashxxHash64(data: pchar): int64` - xxHash64
+- `HashxxHash32(data: pchar): int64` - xxHash32 (XXH32, seed 0)
+- `HashxxHash64(data: pchar): int64` - xxHash64 (XXH64, seed 0)
+- `XXHash32(data: int64, len: int64, seed: int64): int64` - XXH32 over a buffer
+- `XXHash64(data: int64, len: int64, seed: int64): int64` - XXH64 over a buffer
+- `XXHash64Str(s: pchar): int64` - XXH64 of a string, seed 0
 - `HashCRC32(data: pchar): int64` - CRC32
 - `HashInt64/32(key: int64): int64` - Integer hash
 
@@ -892,7 +895,8 @@ All coordinates are stored as **microdegrees** (int64):
 - `DistanceKm(p1, p2: GeoPoint): int64` - Distance in kilometers
 - `DistanceSq(p1, p2: GeoPoint): int64` - Squared distance (for comparisons)
 - `IsWithinDistanceM(p1, p2: GeoPoint, thresholdM: int64): bool` - Distance threshold
-- `HaversineDistanceM(p1, p2: GeoPoint): int64` - Precise great-circle distance
+- `DistanceMApprox(p1, p2: GeoPoint): int64` - Näherung für den **Nahbereich** (bis ~100 km, +0,6 %); weltweit falsch (+64 % auf der Südhalbkugel, Faktor 180 an der Datumsgrenze, #1888). Für weltweite Werte `std.geo.sphere`
+- `HaversineDistanceM(p1, p2: GeoPoint): int64` - **veralteter Name** für `DistanceMApprox`; es ist keine Haversine
 - `DistanceMCorrected(p1, p2: GeoPoint): int64` - With cosine correction
 
 ### GeoPoint Helpers

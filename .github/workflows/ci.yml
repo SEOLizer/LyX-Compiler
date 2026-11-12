@@ -2,9 +2,15 @@ name: Bootstrap CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, develop ]
   pull_request:
-    branches: [ main ]
+    branches: [ main, develop ]
+
+# #1696: `develop` war hier nicht genannt. Gearbeitet wird nach den
+# Arbeitsregeln aber ausschliesslich gegen `develop` -- Branches gehen von dort
+# aus, PRs dorthin zurueck. Die CI lief damit fuer keinen einzigen echten PR,
+# sondern nur beim seltenen Zusammenfuehren nach `main`. Ein Lauf, der zu spaet
+# kommt, ist so gut wie keiner.
 
 jobs:
   build-and-test:
@@ -17,6 +23,49 @@ jobs:
       - name: Make seed binary executable
         run: chmod +x src/lyxc_bootstrap
 
+      # #1933: tests/lyx_units_fuzz_test.sh rechnet std.sparse gegen eine
+      # numpy-Referenz nach. numpy ist auf ubuntu-latest NICHT vorinstalliert,
+      # der Vergleich fiel damit aus. scipy ist optional (die Referenz prueft
+      # das selbst), wird aber mitgenommen: es misst zusaetzlich gegen eine
+      # zweite, unabhaengige Implementierung.
+      - name: Python-Referenzen (numpy/scipy)
+        run: python3 -m pip install --quiet numpy scipy
+
+      # #2087/#2089/#2090: tests/pg_live_test.sh legt sich einen eigenen
+      # Wegwerf-Cluster an (initdb, nur 127.0.0.1). Fehlt PostgreSQL, ist der
+      # Test rot ("NICHT gemessen") — die Live-Teile von pg_01..pg_11 melden
+      # dagegen SKIP und haben #2087 deshalb nie gesehen.
+      - name: PostgreSQL fuer die Live-Tests
+        run: |
+          ls /usr/lib/postgresql/*/bin/initdb >/dev/null 2>&1 || { sudo apt-get update -qq; sudo apt-get install -y -qq postgresql; }
+          ls /usr/lib/postgresql/*/bin/initdb
+
+      # #2020: qemu fehlte hier, und damit meldete JEDER Test, der die Wirkung
+      # auf arm64/riscv misst, "qemu fehlt -- die Wirkung wurde NICHT gemessen"
+      # und wurde rot. Das ist die richtige Meldung (still ueberspringen waere
+      # schlimmer), aber sie machte die CI dauerhaft rot: fuenf Merges in Folge
+      # liefen ueber ein rotes Ergebnis hinweg, und ein Lauf, den niemand mehr
+      # liest, ist so gut wie keiner.
+      #
+      # Betroffen sind die Wirkungstests aus #2019/#2022/#2025/#2026/#2021/
+      # #2024/#2037 und #2020 -- der gesamte IR-Weg wird ueber qemu belegt.
+      # Ohne diesen Schritt prueft die CI nur x86_64 und damit genau die
+      # Haelfte, die ohnehin selten bricht.
+      - name: qemu fuer arm64/riscv (Wirkungstests)
+        run: |
+          sudo apt-get update -qq
+          # #2048: `qemu-user-static` gibt es ab qemu 10 nicht mehr als Paket;
+          # der Nachfolger `qemu-user` liefert dieselben Emulatoren ohne die
+          # Endung. tests/lib/qemu.sh findet beide Namen.
+          sudo apt-get install -y -qq qemu-user-static || sudo apt-get install -y -qq qemu-user
+          # Scheitert LAUT, wenn keiner der beiden Namen da ist — sonst liefe
+          # der Lauf weiter und mässe arm64/riscv nicht.
+          . tests/lib/qemu.sh
+          [ -n "$QEMU_ARM64" ]   || { echo "qemu fuer arm64 fehlt"; exit 1; }
+          [ -n "$QEMU_RISCV64" ] || { echo "qemu fuer riscv64 fehlt"; exit 1; }
+          "$QEMU_ARM64" --version | head -1
+          "$QEMU_RISCV64" --version | head -1
+
       - name: Build lyxc from bootstrap
         run: make build
 
@@ -25,6 +74,45 @@ jobs:
 
       - name: Integration test
         run: make test
+
+      # tests/lyx/** und die bekannt roten .sh-Tests. Beide Ziele liefen bis
+      # #1112 nirgends — ein Ziel, das niemand aufruft, ist derselbe Verfall
+      # wie ein Test, der in keinem Ziel steht.
+      - name: Lyx integration tests (tests/lyx/**)
+        run: make test-lyx-integration
+
+      - name: Known-red tests (.sh)
+        run: make test-known-red
+
+      # #1696: Beide lyxos-Ziele hingen an keinem Sammelziel und liefen
+      # nirgends. Entsprechend waren sie rot, ohne dass es auffiel: drei
+      # Dateien in tests/lyxos/ scheiterten seit ihrer Einfuehrung (LX-23) am
+      # Parser. Dieselbe Lehre wie oben bei #1112, nur eine Ecke weiter.
+      #
+      # Beide pruefen ausschliesslich, ob UEBERSETZT wird -- der erzeugte Code
+      # laeuft auf dem Buildhost nicht. Als Rauchtest ist das in Ordnung; es
+      # ist zugleich die einzige Absicherung des Ziels.
+      - name: LyxOS integration (tests/lyxos/**)
+        run: make test-lyxos
+
+      - name: LyxOS units (tests/suite-lyxos.txt)
+        run: make test-lyxos-units
+
+      # #1696: Beim Nachzaehlen fielen zwei weitere Ziele auf, die niemand
+      # faehrt. `test-lyx` ist die VOLLSUITE (408 Tests) — bis eben lief hier
+      # nur test-lyx-integration, ein anderer Runner. `test-external` prueft
+      # nur die UEBERSETZBARKEIT (Zugangsdaten braucht es dafuer nicht) und
+      # wurde nach #1004 ausdruecklich als Verfallsschutz gebaut; er lief
+      # seither selbst nirgends.
+      #
+      # test-lyx konnte vorher gar nicht gruen sein: tests/suite-full.txt
+      # nennt drei Dateien, die .gitignore ausschloss (#1699, in diesem PR mit
+      # behoben) — auf einem frischen Klon fehlten sie.
+      - name: Lyx full suite (tests/suite-full.txt)
+        run: make test-lyx
+
+      - name: External suite (Uebersetzbarkeit)
+        run: make test-external
 
       - name: Snapshot tests
         run: |

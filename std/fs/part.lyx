@@ -1,0 +1,407 @@
+// std/fs/part.lyx — Partitionstabellen: MBR und GPT
+//
+// Diese Unit liest kein Dateisystem. Sie beantwortet die Frage, die VOR
+// jedem Dateisystem steht: wo auf dem Datentraeger faengt es an?
+//
+// Die vier Leser der Sammlung (std.fs.fat, .exfat, .ext4, .ntfs) nehmen
+// allesamt einen Byte-Versatz entgegen. Bisher musste ihn der Aufrufer von
+// Hand kennen — damit lasen sie Abbilder, aber keine Datentraeger. Diese
+// Unit liefert ihn:
+//
+//     var t: PartTable := PartScan(fd, 512);
+//     var vol: FatVolume := FatMount(fd, PartByteOffset(t, 0));
+//
+// ZWEI SCHEMATA, und beide muessen bedient werden — eine Karte mit MBR und
+// eine Platte mit GPT stehen nebeneinander im selben Geraeteschacht:
+//
+//   MBR: vier Eintraege zu 16 Byte ab Offset 446. Mehr als vier gibt es nur
+//        ueber eine ERWEITERTE Partition, die eine verkettete Liste weiterer
+//        Tabellen enthaelt (EBR). Deren Versatzangaben sind die haeufigste
+//        Falle des Formats — siehe unten.
+//   GPT: ein Kopf bei Sektor 1 und ein Feld von Eintraegen zu je 128 Byte.
+//        Kopf und Eintragsfeld tragen je eine CRC32; diese Unit PRUEFT sie,
+//        statt ihnen zu glauben.
+//
+// Eine GPT-Platte traegt bei Sektor 0 zusaetzlich einen SCHUTZ-MBR mit einem
+// Eintrag vom Typ 0xEE. Wer nur den MBR liest, sieht deshalb EINE Partition
+// ueber die ganze Platte und haelt eine 4-TB-GPT-Platte fuer eine
+// unformatierte 2-TB-Platte. Deshalb wird IMMER zuerst auf GPT geprueft.
+//
+// NUR LESEN. Eine Partitionstabelle zu schreiben heisst, alle Daten
+// dahinter aufs Spiel zu setzen; das gehoert nicht in eine Unit, die
+// nebenbei importiert wird.
+
+@description("Partitionstabellen lesen: MBR mit EBR-Kette und GPT mit CRC-Pruefung")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+@capabilities([fs.read, fs.meta, system.memory.heap])
+
+unit std.fs.part;
+
+import std.alloc;
+import std.io;
+
+pub con PART_ERR: int64 := 0 - 1;
+
+pub con PART_SCHEMA_KEINS: int64 := 0;
+pub con PART_SCHEMA_MBR:   int64 := 1;
+pub con PART_SCHEMA_GPT:   int64 := 2;
+
+// Mehr als das traegt kein uebliches Medium; die Grenze steht hier, damit ein
+// beschaedigtes Eintragsfeld nicht in eine unbegrenzte Belegung laeuft.
+pub con PART_MAX: int64 := 128;
+
+// MBR-Typbytes, die eine ERWEITERTE Partition kennzeichnen. Alle drei
+// bedeuten dasselbe; wer nur 0x05 kennt, uebersieht die Platten, die mit
+// LBA-Adressierung (0x0F) angelegt wurden — und das sind fast alle.
+pub con PART_TYP_ERW_CHS:   int64 := 0x05;
+pub con PART_TYP_ERW_LBA:   int64 := 0x0F;
+pub con PART_TYP_ERW_LINUX: int64 := 0x85;
+
+// Der Schutz-MBR einer GPT-Platte.
+pub con PART_TYP_GPT_SCHUTZ: int64 := 0xEE;
+
+pub type PartTable = struct {
+  fd:          int64;
+  sectorSize:  int64;
+  schema:      int64;
+  count:       int64;
+  eintraege:   int64;   // count * 48 Byte
+  kopfCrcOk:   bool;    // nur GPT
+  feldCrcOk:   bool;    // nur GPT
+  gueltig:     bool;
+}
+
+pub type PartEntry = struct {
+  nummer:      int64;   // 1-basiert, wie in den Werkzeugen
+  startLba:    int64;
+  sectors:     int64;
+  typ:         int64;   // MBR: Typbyte; GPT: 0
+  istErweitert: bool;   // MBR-Behaelter, traegt selbst kein Dateisystem
+  istLogisch:  bool;    // MBR: aus der EBR-Kette
+  istGpt:      bool;
+}
+
+// ── Kleine Helfer ─────────────────────────────────────────────────────────
+
+fn _u8(p: int64, off: int64): int64 { return peek8(p + off) & 255; }
+
+fn _u16(p: int64, off: int64): int64 {
+  return (peek8(p + off) & 255) | ((peek8(p + off + 1) & 255) << 8);
+}
+
+fn _u32(p: int64, off: int64): int64 {
+  return (peek8(p + off)     & 255)
+       | ((peek8(p + off + 1) & 255) << 8)
+       | ((peek8(p + off + 2) & 255) << 16)
+       | ((peek8(p + off + 3) & 255) << 24);
+}
+
+fn _u64(p: int64, off: int64): int64 { return _u32(p, off) | (_u32(p, off + 4) << 32); }
+
+fn _leseSektor(t: PartTable, lba: int64, puffer: int64): int64 {
+  var pos: int64 := lba * t.sectorSize;
+  if (lseek(t.fd, pos, 0) != pos) { return 0; }
+  if (read(t.fd, puffer as pchar, t.sectorSize) != t.sectorSize) { return 0; }
+  return 1;
+}
+
+// CRC32 (IEEE 802.3) — dieselbe Rechnung wie in std.fs.fat und im Compiler.
+pub fn PartCrc32(daten: int64, len: int64): int64 {
+  var crc: int64 := 0xFFFFFFFF;
+  var i: int64 := 0;
+  while (i < len) {
+    crc := crc ^ (peek8(daten + i) & 0xFF);
+    var b: int64 := 0;
+    while (b < 8) {
+      if ((crc & 1) != 0) { crc := ((crc >> 1) & 0x7FFFFFFF) ^ (0 - 306674912); }
+      else { crc := (crc >> 1) & 0x7FFFFFFF; }
+      b := b + 1;
+    }
+    i := i + 1;
+  }
+  return (crc ^ 0xFFFFFFFF) & 0xFFFFFFFF;
+}
+
+fn _setzeEintrag(t: PartTable, idx: int64, nummer: int64, start: int64,
+                 sectors: int64, typ: int64, erw: int64, log: int64, gpt: int64): void {
+  var e: int64 := t.eintraege + idx * 48;
+  poke64(e,      nummer);
+  poke64(e + 8,  start);
+  poke64(e + 16, sectors);
+  poke64(e + 24, typ);
+  poke64(e + 32, erw);
+  poke64(e + 40, log | (gpt << 1));
+}
+
+pub fn PartIstErweitert(typ: int64): bool {
+  return typ == PART_TYP_ERW_CHS || typ == PART_TYP_ERW_LBA || typ == PART_TYP_ERW_LINUX;
+}
+
+// ── GPT ───────────────────────────────────────────────────────────────────
+
+fn _lesGpt(ref t: PartTable): int64 {
+  var ss: int64 := t.sectorSize;
+  var kopf: int64 := alloc(ss);
+  if (_leseSektor(t, 1, kopf) == 0) { free(kopf, ss); return 0; }
+
+  // "EFI PART"
+  if (_u8(kopf,0) != 69 || _u8(kopf,1) != 70 || _u8(kopf,2) != 73 || _u8(kopf,3) != 32
+   || _u8(kopf,4) != 80 || _u8(kopf,5) != 65 || _u8(kopf,6) != 82 || _u8(kopf,7) != 84) {
+    free(kopf, ss); return 0;
+  }
+
+  var kopfGroesse: int64 := _u32(kopf, 12);
+  if (kopfGroesse < 92 || kopfGroesse > ss) { free(kopf, ss); return 0; }
+
+  // Die CRC32 des Kopfes wird ueber ihn selbst gerechnet — mit dem CRC-Feld
+  // auf NULL. Wer das Feld stehen laesst, bekommt nie eine Uebereinstimmung
+  // und haelt jede heile Platte fuer beschaedigt.
+  var sollKopf: int64 := _u32(kopf, 16);
+  var kopie: int64 := alloc(kopfGroesse);
+  var i: int64 := 0;
+  while (i < kopfGroesse) { poke8(kopie + i, peek8(kopf + i)); i := i + 1; }
+  poke8(kopie + 16, 0); poke8(kopie + 17, 0); poke8(kopie + 18, 0); poke8(kopie + 19, 0);
+  t.kopfCrcOk := PartCrc32(kopie, kopfGroesse) == sollKopf;
+  free(kopie, kopfGroesse);
+
+  var eintragLba: int64 := _u64(kopf, 72);
+  var anzahl:     int64 := _u32(kopf, 80);
+  var groesse:    int64 := _u32(kopf, 84);
+  var sollFeld:   int64 := _u32(kopf, 88);
+  free(kopf, ss);
+
+  if (groesse < 128 || groesse > 4096) { return 0; }
+  if (anzahl == 0 || anzahl > 1024) { return 0; }
+
+  // Das ganze Eintragsfeld auf einmal — die CRC32 gilt fuer alle Eintraege
+  // zusammen, auch die leeren.
+  var feldBytes: int64 := anzahl * groesse;
+  var feld: int64 := alloc(feldBytes);
+  var pos: int64 := eintragLba * ss;
+  if (lseek(t.fd, pos, 0) != pos) { free(feld, feldBytes); return 0; }
+  if (read(t.fd, feld as pchar, feldBytes) != feldBytes) { free(feld, feldBytes); return 0; }
+  t.feldCrcOk := PartCrc32(feld, feldBytes) == sollFeld;
+
+  var n: int64 := 0;
+  var k: int64 := 0;
+  while (k < anzahl && n < PART_MAX) {
+    var e: int64 := feld + k * groesse;
+    // Ein Eintrag mit lauter Nullen im Typ-GUID ist UNBENUTZT. Die Luecken
+    // muessen uebersprungen, duerfen aber nicht die Nummerierung
+    // verschieben: Partition 3 heisst 3, auch wenn 2 fehlt.
+    var leer: bool := true;
+    var b: int64 := 0;
+    while (b < 16) { if (_u8(e, b) != 0) { leer := false; b := 16; } else { b := b + 1; } }
+    if (!leer) {
+      var s: int64 := _u64(e, 32);
+      var f: int64 := _u64(e, 40);
+      _setzeEintrag(t, n, k + 1, s, f - s + 1, 0, 0, 0, 1);
+      n := n + 1;
+    }
+    k := k + 1;
+  }
+  free(feld, feldBytes);
+
+  t.count := n;
+  t.schema := PART_SCHEMA_GPT;
+  return 1;
+}
+
+// ── MBR ───────────────────────────────────────────────────────────────────
+
+fn _lesMbr(ref t: PartTable): int64 {
+  var ss: int64 := t.sectorSize;
+  var sek: int64 := alloc(ss);
+  if (_leseSektor(t, 0, sek) == 0) { free(sek, ss); return 0; }
+  if (_u8(sek, 510) != 0x55 || _u8(sek, 511) != 0xAA) { free(sek, ss); return 0; }
+
+  var n: int64 := 0;
+  var erwStart: int64 := 0;
+  var i: int64 := 0;
+  while (i < 4) {
+    var e: int64 := sek + 446 + i * 16;
+    var typ: int64 := _u8(e, 4);
+    var start: int64 := _u32(e, 8);
+    var anz: int64 := _u32(e, 12);
+    if (typ != 0 && anz != 0) {
+      var erw: int64 := 0;
+      if (PartIstErweitert(typ)) { erw := 1; erwStart := start; }
+      _setzeEintrag(t, n, i + 1, start, anz, typ, erw, 0, 0);
+      n := n + 1;
+    }
+    i := i + 1;
+  }
+  free(sek, ss);
+
+  // Die EBR-Kette. Hier steckt die Falle des Formats: in einem EBR ist der
+  // Versatz des ERSTEN Eintrags relativ zu DIESEM EBR, der des ZWEITEN aber
+  // relativ zum Anfang der ERWEITERTEN Partition. Wer beide gleich behandelt,
+  // findet die zweite logische Partition an der falschen Stelle — und dort
+  // steht mit einiger Wahrscheinlichkeit etwas, das wie ein Bootsektor
+  // aussieht.
+  if (erwStart != 0) {
+    var ebr: int64 := alloc(ss);
+    var akt: int64 := erwStart;
+    var nummer: int64 := 5;          // logische Partitionen zaehlen ab 5
+    var runden: int64 := 0;
+    var weiter: bool := true;
+    while (weiter && n < PART_MAX && runden < PART_MAX) {
+      runden := runden + 1;
+      if (_leseSektor(t, akt, ebr) == 0) { weiter := false; }
+      else {
+        if (_u8(ebr, 510) != 0x55 || _u8(ebr, 511) != 0xAA) { weiter := false; }
+        else {
+          var e1: int64 := ebr + 446;
+          var typ1: int64 := _u8(e1, 4);
+          var st1: int64 := _u32(e1, 8);
+          var an1: int64 := _u32(e1, 12);
+          if (typ1 != 0 && an1 != 0) {
+            _setzeEintrag(t, n, nummer, akt + st1, an1, typ1, 0, 1, 0);
+            n := n + 1;
+            nummer := nummer + 1;
+          }
+          // Der zweite Eintrag zeigt auf den naechsten EBR — relativ zum
+          // ANFANG der erweiterten Partition.
+          var e2: int64 := ebr + 446 + 16;
+          var typ2: int64 := _u8(e2, 4);
+          var st2: int64 := _u32(e2, 8);
+          if (typ2 != 0 && st2 != 0 && PartIstErweitert(typ2)) { akt := erwStart + st2; }
+          else { weiter := false; }
+        }
+      }
+    }
+    free(ebr, ss);
+  }
+
+  t.count := n;
+  t.schema := PART_SCHEMA_MBR;
+  return 1;
+}
+
+// ── Öffentliche Schnittstelle ─────────────────────────────────────────────
+
+// Die Tabelle eines Datentraegers lesen.
+//
+// GPT wird ZUERST geprueft: eine GPT-Platte traegt bei Sektor 0 einen
+// Schutz-MBR mit einem Eintrag vom Typ 0xEE ueber die ganze Platte. Wer
+// zuerst den MBR liest, findet genau diesen einen Eintrag und haelt die
+// Platte fuer eine einzige riesige Partition.
+pub fn PartScan(fd: int64, sectorSize: int64): PartTable {
+  var t: PartTable;
+  t.fd := fd;
+  t.sectorSize := sectorSize;
+  t.schema := PART_SCHEMA_KEINS;
+  t.count := 0;
+  t.eintraege := 0;
+  t.kopfCrcOk := false;
+  t.feldCrcOk := false;
+  t.gueltig := false;
+  if (sectorSize != 512 && sectorSize != 1024 && sectorSize != 2048 && sectorSize != 4096) {
+    return t;
+  }
+  t.eintraege := alloc(PART_MAX * 48);
+  if (_lesGpt(t) == 1) { t.gueltig := true; return t; }
+  if (_lesMbr(t) == 1) { t.gueltig := true; return t; }
+  free(t.eintraege, PART_MAX * 48);
+  t.eintraege := 0;
+  return t;
+}
+
+pub fn PartFree(ref t: PartTable): void {
+  if (t.eintraege != 0) { free(t.eintraege, PART_MAX * 48); t.eintraege := 0; }
+  t.gueltig := false;
+  t.count := 0;
+}
+
+pub fn PartValid(t: PartTable): bool { return t.gueltig; }
+pub fn PartCount(t: PartTable): int64 { return t.count; }
+pub fn PartSchema(t: PartTable): int64 { return t.schema; }
+
+pub fn PartGet(t: PartTable, idx: int64, ref e: PartEntry): int64 {
+  if (!t.gueltig || idx < 0 || idx >= t.count) { return PART_ERR; }
+  var p: int64 := t.eintraege + idx * 48;
+  e.nummer   := peek64(p);
+  e.startLba := peek64(p + 8);
+  e.sectors  := peek64(p + 16);
+  e.typ      := peek64(p + 24);
+  e.istErweitert := peek64(p + 32) != 0;
+  var f: int64 := peek64(p + 40);
+  e.istLogisch := (f & 1) != 0;
+  e.istGpt     := (f & 2) != 0;
+  return 1;
+}
+
+// DER Zweck dieser Unit: der Byte-Versatz, den FatMount, ExfatMount,
+// Ext4Mount und NtfsMount entgegennehmen.
+pub fn PartByteOffset(t: PartTable, idx: int64): int64 {
+  var e: PartEntry;
+  if (PartGet(t, idx, e) != 1) { return PART_ERR; }
+  return e.startLba * t.sectorSize;
+}
+
+pub fn PartByteSize(t: PartTable, idx: int64): int64 {
+  var e: PartEntry;
+  if (PartGet(t, idx, e) != 1) { return PART_ERR; }
+  return e.sectors * t.sectorSize;
+}
+
+// Der Name einer GPT-Partition (36 Zeichen UTF-16). Bei MBR gibt es keinen —
+// das Format kennt kein Namensfeld, und ein leerer Rueckgabewert ist hier
+// die Wahrheit, kein Fehler.
+pub fn PartName(t: PartTable, idx: int64, buf: int64, max: int64): int64 {
+  poke8(buf, 0);
+  if (!t.gueltig || t.schema != PART_SCHEMA_GPT) { return 0; }
+  var e: PartEntry;
+  if (PartGet(t, idx, e) != 1) { return PART_ERR; }
+
+  var ss: int64 := t.sectorSize;
+  var kopf: int64 := alloc(ss);
+  if (_leseSektor(t, 1, kopf) == 0) { free(kopf, ss); return PART_ERR; }
+  var eintragLba: int64 := _u64(kopf, 72);
+  var groesse: int64 := _u32(kopf, 84);
+  free(kopf, ss);
+
+  var roh: int64 := alloc(groesse);
+  var pos: int64 := eintragLba * ss + (e.nummer - 1) * groesse;
+  if (lseek(t.fd, pos, 0) != pos) { free(roh, groesse); return PART_ERR; }
+  if (read(t.fd, roh as pchar, groesse) != groesse) { free(roh, groesse); return PART_ERR; }
+
+  var n: int64 := 0;
+  var weiter: bool := true;
+  while (weiter && n < 36 && n < max - 1) {
+    var lo: int64 := _u8(roh, 56 + n * 2);
+    var hi: int64 := _u8(roh, 57 + n * 2);
+    if (lo == 0 && hi == 0) { weiter := false; }
+    else {
+      if (hi != 0) { poke8(buf + n, 63); } else { poke8(buf + n, lo); }
+      n := n + 1;
+    }
+  }
+  poke8(buf + n, 0);
+  free(roh, groesse);
+  return n;
+}
+
+// Die ersten vier Byte des Typ-GUID einer GPT-Partition — sie genuegen, um
+// die gaengigen Arten auseinanderzuhalten (EFI-System, Linux-Dateisystem,
+// Microsoft-Daten). Der ganze GUID ist ueber PartTypeGuid zu haben.
+pub fn PartTypeGuid(t: PartTable, idx: int64, buf: int64): int64 {
+  if (!t.gueltig || t.schema != PART_SCHEMA_GPT) { return PART_ERR; }
+  var e: PartEntry;
+  if (PartGet(t, idx, e) != 1) { return PART_ERR; }
+  var ss: int64 := t.sectorSize;
+  var kopf: int64 := alloc(ss);
+  if (_leseSektor(t, 1, kopf) == 0) { free(kopf, ss); return PART_ERR; }
+  var eintragLba: int64 := _u64(kopf, 72);
+  var groesse: int64 := _u32(kopf, 84);
+  free(kopf, ss);
+  var roh: int64 := alloc(groesse);
+  var pos: int64 := eintragLba * ss + (e.nummer - 1) * groesse;
+  if (lseek(t.fd, pos, 0) != pos) { free(roh, groesse); return PART_ERR; }
+  if (read(t.fd, roh as pchar, groesse) != groesse) { free(roh, groesse); return PART_ERR; }
+  var i: int64 := 0;
+  while (i < 16) { poke8(buf + i, peek8(roh + i)); i := i + 1; }
+  free(roh, groesse);
+  return 16;
+}

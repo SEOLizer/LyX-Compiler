@@ -1,0 +1,630 @@
+// std/aero/perf.lyx — Flugleistung: Steigen, Sinken, Reiseflug, Wind
+//
+// Das, was ein Flugführungsrechner (MCDU/FMS) an Bord ausrechnet, aufgebaut
+// auf std.aero.atmos. Ohne die dortige Atmosphäre wäre hier jede Zahl falsch:
+// Steigrate, Reichweite und Sinkprofil hängen an Dichte und Temperatur.
+//
+// DER ENTWURFSGEDANKE: ein FMS rechnet nicht "die" Sinkrate. Es beantwortet
+// VIER VERSCHIEDENE FRAGEN, und wer sie verwechselt, bekommt eine Zahl, die
+// plausibel aussieht und nicht zur Lage passt:
+//
+//   1. GEOMETRISCH — welche Sinkrate hält einen 3°-Pfad bei dieser
+//      Grundgeschwindigkeit? Das ist reine Trigonometrie und hängt NUR an der
+//      Grundgeschwindigkeit, nicht am Flugzeug.
+//   2. ZWANGSPUNKT  — welche Rate erreicht "FL100 bei 30 NM"? Auch Geometrie,
+//      aber mit Höhe und Strecke als Vorgabe.
+//   3. LEERLAUF     — wo muss der Sinkflug beginnen, damit er im Leerlauf
+//      aufgeht? Das hängt am Flugzeug (Gleitzahl) und am Wind.
+//   4. WIRTSCHAFTLICH — welche Geschwindigkeit minimiert die Gesamtkosten bei
+//      gegebenem Cost Index? Das ist eine Optimierung, keine Geometrie.
+//
+// Jede dieser Fragen hat hier ihre eigene Funktion mit eigenem Namen. Eine
+// gemeinsame "Sinkrate()" wäre bequem und würde genau die Verwechslung
+// einladen, um die es geht.
+//
+// GENAUSO AUF DER STEIGSEITE: die beste Steigrate ist ein
+// ENERGIEÜBERSCHUSS-Problem (überschüssige Leistung geteilt durch Gewicht),
+// nicht Geometrie. Und die optimale Reiseflughöhe folgt aus W/δ — deshalb
+// steigt sie im Verlauf des Fluges, während Treibstoff verbrennt. Wer sie als
+// feste Zahl führt, fliegt die zweite Hälfte zu tief.
+//
+// WAS HIER NICHT STEHT: alles, was aus dem Flughandbuch eines bestimmten
+// Musters kommt — Schub- und Widerstandspolaren, V-Geschwindigkeiten,
+// Buffet-Grenzen, Klappenpläne. Diese Unit rechnet mit den Kennzahlen, die
+// der Aufrufer aus seinem Handbuch mitbringt (Gleitzahl, spezifischer
+// Verbrauch, Flügelfläche). Ein eingebauter "typischer" Wert wäre für jedes
+// Muster falsch und würde nirgends auffallen.
+//
+// EINHEITEN wie in std.aero.atmos: im Namen. ft, kt, NM, fpm, kg — die
+// Einheiten der Luftfahrt, nicht SI, weil an dieser Schnittstelle mit ihnen
+// gearbeitet wird.
+
+@description("Flugleistung: Steig-/Sinkraten, Sinkflugbeginn, Reiseflug, Cost Index, Wind")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+@capabilities([])
+
+unit std.aero.perf;
+
+import std.math;
+import std.aero.atmos;
+
+// ── Winkel ────────────────────────────────────────────────────────────────
+
+fn _grad(rad: f64): f64 { return rad * 180.0 / Pi(); }
+fn _rad(grad: f64): f64 { return grad * Pi() / 180.0; }
+
+pub fn AvGradZuRad(grad: f64): f64 { return _rad(grad); }
+pub fn AvRadZuGrad(rad: f64): f64 { return _grad(rad); }
+
+fn _endlich(x: f64): bool { return x == x; }
+
+// ── 1. Geometrie: Pfadwinkel, Sinkrate, Gradient ──────────────────────────
+//
+// Diese vier Funktionen hängen NUR an der Grundgeschwindigkeit und der
+// Geometrie — kein Flugzeugtyp, keine Atmosphäre. Deshalb stehen sie zuerst
+// und getrennt von allem, was Flugzeugkennzahlen braucht.
+
+// Sinkrate, die einen gegebenen Bahnwinkel bei gegebener Grundgeschwindigkeit
+// hält. Für einen 3°-Pfad bei 140 kt sind das rund 743 ft/min.
+//
+// Die Faustformel "halbe Grundgeschwindigkeit mal 10" (140 kt → 700 fpm)
+// liegt hier drei Prozent daneben; sie taugt zum Nachrechnen im Kopf, nicht
+// als Rechnung im Gerät.
+pub fn AvSinkrateFpm(grundgeschwKt: f64, bahnwinkelGrad: f64): f64 {
+  if (_endlich(grundgeschwKt) == false || grundgeschwKt < 0.0) { return AvError(); }
+  if (_endlich(bahnwinkelGrad) == false) { return AvError(); }
+  var fpmProKt: f64 := AvKtToFpm(1.0);
+  return grundgeschwKt * fpmProKt * TanF64(_rad(bahnwinkelGrad));
+}
+
+// Umkehrung: welcher Bahnwinkel entsteht aus Rate und Grundgeschwindigkeit?
+pub fn AvBahnwinkelGrad(grundgeschwKt: f64, rateFpm: f64): f64 {
+  if (_endlich(grundgeschwKt) == false || grundgeschwKt <= 0.0) { return AvError(); }
+  if (_endlich(rateFpm) == false) { return AvError(); }
+  var vFpm: f64 := grundgeschwKt * AvKtToFpm(1.0);
+  return _grad(AtanF64(rateFpm / vFpm));
+}
+
+// Gradient in Prozent — die Größe, in der Hindernisfreiheit und
+// Startsteigflug-Vorgaben ausgedrückt sind.
+pub fn AvGradientProzent(hoehenaenderungFt: f64, streckeNm: f64): f64 {
+  if (_endlich(hoehenaenderungFt) == false) { return AvError(); }
+  if (_endlich(streckeNm) == false || streckeNm <= 0.0) { return AvError(); }
+  var streckeFt: f64 := streckeNm * AV_NM_IN_M / AV_FT_IN_M;
+  return 100.0 * hoehenaenderungFt / streckeFt;
+}
+
+// Steigrate, die einen geforderten Gradienten bei gegebener
+// Grundgeschwindigkeit einhält. So sind Abflugverfahren geschrieben:
+// "3,3 % bis 2000 ft" — und die Frage an Bord lautet, welche Rate das ist.
+pub fn AvRateFuerGradientFpm(grundgeschwKt: f64, gradientProzent: f64): f64 {
+  if (_endlich(grundgeschwKt) == false || grundgeschwKt < 0.0) { return AvError(); }
+  if (_endlich(gradientProzent) == false) { return AvError(); }
+  return grundgeschwKt * AvKtToFpm(1.0) * (gradientProzent / 100.0);
+}
+
+// ── 2. Zwangspunkt: "FL100 bei 30 NM" ─────────────────────────────────────
+//
+// Die zweite der vier Fragen. Sie kennt keine Gleitzahl — sie sagt nur, was
+// nötig IST. Ob das Flugzeug es kann, entscheidet der Aufrufer, indem er das
+// Ergebnis gegen die Leerlauf-Sinkrate hält.
+
+pub fn AvNoetigeSinkrateFpm(hoeheJetztFt: f64, hoeheZielFt: f64,
+                             streckeNm: f64, grundgeschwKt: f64): f64 {
+  if (_endlich(hoeheJetztFt) == false || _endlich(hoeheZielFt) == false) { return AvError(); }
+  if (_endlich(streckeNm) == false || streckeNm <= 0.0) { return AvError(); }
+  if (_endlich(grundgeschwKt) == false || grundgeschwKt <= 0.0) { return AvError(); }
+  var abzubauenFt: f64 := hoeheJetztFt - hoeheZielFt;
+  var minuten: f64 := 60.0 * streckeNm / grundgeschwKt;
+  if (minuten <= 0.0) { return AvError(); }
+  return abzubauenFt / minuten;
+}
+
+// Derselbe Zwangspunkt als Bahnwinkel — die Form, in der ein Anflugprofil
+// beurteilt wird ("steiler als 3,5°" heißt: umplanen).
+pub fn AvNoetigerWinkelGrad(hoeheJetztFt: f64, hoeheZielFt: f64,
+                             streckeNm: f64): f64 {
+  if (_endlich(hoeheJetztFt) == false || _endlich(hoeheZielFt) == false) { return AvError(); }
+  if (_endlich(streckeNm) == false || streckeNm <= 0.0) { return AvError(); }
+  var dhFt: f64 := hoeheJetztFt - hoeheZielFt;
+  var streckeFt: f64 := streckeNm * AV_NM_IN_M / AV_FT_IN_M;
+  return _grad(AtanF64(dhFt / streckeFt));
+}
+
+// ── 3. Sinkflugbeginn (Top of Descent) ────────────────────────────────────
+//
+// Die dritte Frage, und die einzige der drei geometrischen, die das FLUGZEUG
+// kennt: im Leerlauf sinkt es mit seiner Gleitzahl, und der Wind verschiebt
+// den Punkt.
+//
+// Die Faustformel "3 mal die abzubauenden Tausend Fuß" (FL350 → 105 NM) ist
+// eine 3:1-Regel und entspricht rund 3,2°. Sie steht hier als eigene
+// Funktion, weil sie im Cockpit tatsächlich benutzt wird — aber daneben die
+// Rechnung, die Gleitzahl und Wind berücksichtigt.
+
+pub fn AvTodStreckeNmFaustformel(hoeheJetztFt: f64, hoeheZielFt: f64): f64 {
+  if (_endlich(hoeheJetztFt) == false || _endlich(hoeheZielFt) == false) { return AvError(); }
+  var dh: f64 := hoeheJetztFt - hoeheZielFt;
+  if (dh < 0.0) { return AvError(); }
+  return 3.0 * dh / 1000.0;
+}
+
+// Sinkflugbeginn mit Gleitzahl und Wind.
+//
+// `gleitzahl` ist Strecke je Höhe (L/D im Sinkflug, für Verkehrsflugzeuge
+// typisch 15 bis 18) — sie kommt aus dem Handbuch, nicht aus dieser Unit.
+// Rückenwind schiebt: die Strecke wird länger, der Punkt liegt früher.
+// `windKomponenteKt` ist positiv bei Rückenwind.
+pub fn AvTodStreckeNm(hoeheJetztFt: f64, hoeheZielFt: f64, gleitzahl: f64,
+                       eigengeschwKt: f64, windKomponenteKt: f64): f64 {
+  if (_endlich(hoeheJetztFt) == false || _endlich(hoeheZielFt) == false) { return AvError(); }
+  if (_endlich(gleitzahl) == false || gleitzahl <= 0.0) { return AvError(); }
+  if (_endlich(eigengeschwKt) == false || eigengeschwKt <= 0.0) { return AvError(); }
+  if (_endlich(windKomponenteKt) == false) { return AvError(); }
+  var dhFt: f64 := hoeheJetztFt - hoeheZielFt;
+  if (dhFt < 0.0) { return AvError(); }
+  var dhNm: f64 := dhFt * AV_FT_IN_M / AV_NM_IN_M;
+  var streckeStill: f64 := gleitzahl * dhNm;
+  // Über Grund verlängert sich die Strecke im Verhältnis der
+  // Grundgeschwindigkeit zur Eigengeschwindigkeit.
+  var grund: f64 := eigengeschwKt + windKomponenteKt;
+  if (grund <= 0.0) { return AvError(); }   // Gegenwind stärker als das Flugzeug
+  return streckeStill * grund / eigengeschwKt;
+}
+
+// Die Sinkrate, die zu diesem Leerlaufprofil gehört.
+pub fn AvTodSinkrateFpm(gleitzahl: f64, eigengeschwKt: f64,
+                         windKomponenteKt: f64): f64 {
+  if (_endlich(gleitzahl) == false || gleitzahl <= 0.0) { return AvError(); }
+  if (_endlich(eigengeschwKt) == false || eigengeschwKt <= 0.0) { return AvError(); }
+  if (_endlich(windKomponenteKt) == false) { return AvError(); }
+  var grund: f64 := eigengeschwKt + windKomponenteKt;
+  if (grund <= 0.0) { return AvError(); }
+  // Der Bahnwinkel folgt aus der Gleitzahl über Grund.
+  var winkel: f64 := _grad(AtanF64(1.0 / (gleitzahl * grund / eigengeschwKt)));
+  return AvSinkrateFpm(grund, winkel);
+}
+
+// ── Steigen: Energieüberschuss ────────────────────────────────────────────
+//
+// Die Steigrate ist überschüssige Leistung je Gewicht: ROC = (T − D)·V / W.
+// Das ist keine Geometrie und keine Faustformel, sondern die Definition —
+// und der Grund, warum die Steigrate mit der Höhe abnimmt (der Schub fällt)
+// und mit dem Gewicht (der Nenner wächst).
+//
+// Schub und Widerstand bringt der Aufrufer aus seinem Handbuch mit; sie sind
+// musterabhängig und haben in einer allgemeinen Unit nichts verloren.
+
+pub fn AvSteigrateFpm(schubN: f64, widerstandN: f64, tasKt: f64,
+                       masseKg: f64): f64 {
+  if (_endlich(schubN) == false || _endlich(widerstandN) == false) { return AvError(); }
+  if (_endlich(tasKt) == false || tasKt < 0.0) { return AvError(); }
+  if (_endlich(masseKg) == false || masseKg <= 0.0) { return AvError(); }
+  var vMs: f64 := AvKtToMs(tasKt);
+  var gewichtN: f64 := masseKg * AV_G0;
+  var steigMs: f64 := (schubN - widerstandN) * vMs / gewichtN;
+  // In ft/min. Ein negativer Wert ist kein Fehler, sondern die Aussage, dass
+  // es nicht reicht — und genau die will der Aufrufer sehen.
+  return steigMs / AV_FT_IN_M * 60.0;
+}
+
+// Steigwinkel aus derselben Bilanz. Für kleine Winkel gilt sin γ ≈ (T−D)/W;
+// hier steht der Arkussinus, weil die Näherung bei Startsteigflügen mit
+// hohem Schub-Gewicht-Verhältnis mehrere Grad danebenliegt.
+pub fn AvSteigwinkelGrad(schubN: f64, widerstandN: f64, masseKg: f64): f64 {
+  if (_endlich(schubN) == false || _endlich(widerstandN) == false) { return AvError(); }
+  if (_endlich(masseKg) == false || masseKg <= 0.0) { return AvError(); }
+  var verh: f64 := (schubN - widerstandN) / (masseKg * AV_G0);
+  if (verh > 1.0 || verh < 0.0 - 1.0) { return AvError(); }
+  return _grad(AsinF64(verh));
+}
+
+// Zeit für einen Steigabschnitt bei mittlerer Steigrate, in Minuten.
+pub fn AvSteigzeitMin(vonFt: f64, bisFt: f64, mittlereRateFpm: f64): f64 {
+  if (_endlich(vonFt) == false || _endlich(bisFt) == false) { return AvError(); }
+  if (_endlich(mittlereRateFpm) == false || mittlereRateFpm <= 0.0) { return AvError(); }
+  var dh: f64 := bisFt - vonFt;
+  if (dh < 0.0) { return AvError(); }
+  return dh / mittlereRateFpm;
+}
+
+// Zurückgelegte Strecke in diesem Abschnitt.
+pub fn AvSteigstreckeNm(vonFt: f64, bisFt: f64, mittlereRateFpm: f64,
+                         grundgeschwKt: f64): f64 {
+  var min: f64 := AvSteigzeitMin(vonFt, bisFt, mittlereRateFpm);
+  if (AvIsError(min)) { return AvError(); }
+  if (_endlich(grundgeschwKt) == false || grundgeschwKt < 0.0) { return AvError(); }
+  return grundgeschwKt * min / 60.0;
+}
+
+// Dienstgipfelhöhe: die Druckhöhe, in der die Steigrate auf einen Restwert
+// fällt (üblich 100 ft/min bei Strahlflugzeugen, 500 ft/min bei Kolben).
+// Gesucht wird über eine Bisektion, weil die Steigrate mit der Höhe fällt,
+// aber nicht geschlossen umkehrbar ist.
+//
+// `schubProDelta` ist der Schub auf Meereshöhe; er wird proportional zum
+// Druckverhältnis δ angesetzt — die einfachste Näherung, die die Richtung
+// richtig trifft. Wer eine bessere Schubkurve hat, rechnet damit selbst.
+pub fn AvDienstgipfelhoeheM(schubSlN: f64, widerstandN: f64, tasKt: f64,
+                             masseKg: f64, restrateFpm: f64): f64 {
+  if (_endlich(schubSlN) == false || schubSlN <= 0.0) { return AvError(); }
+  if (_endlich(restrateFpm) == false || restrateFpm < 0.0) { return AvError(); }
+  var unten: f64 := 0.0;
+  var oben: f64 := AV_OBERGRENZE_M;
+  var rUnten: f64 := AvSteigrateFpm(schubSlN, widerstandN, tasKt, masseKg);
+  if (AvIsError(rUnten)) { return AvError(); }
+  if (rUnten <= restrateFpm) { return AvError(); }   // schafft es nicht einmal unten
+  var i: int64 := 0;
+  while (i < 80) {
+    var mitte: f64 := (unten + oben) / 2.0;
+    var delta: f64 := AvDelta(mitte);
+    if (AvIsError(delta)) { return AvError(); }
+    var r: f64 := AvSteigrateFpm(schubSlN * delta, widerstandN, tasKt, masseKg);
+    if (AvIsError(r)) { return AvError(); }
+    if (r > restrateFpm) { unten := mitte; } else { oben := mitte; }
+    i := i + 1;
+  }
+  return (unten + oben) / 2.0;
+}
+
+// ── Reiseflug ─────────────────────────────────────────────────────────────
+
+// Spezifische Reichweite: Strecke je Treibstoffmasse (NM/kg). Die Größe, die
+// im Reiseflug maximiert wird.
+pub fn AvSpezifischeReichweiteNmProKg(tasKt: f64, verbrauchKgProH: f64): f64 {
+  if (_endlich(tasKt) == false || tasKt < 0.0) { return AvError(); }
+  if (_endlich(verbrauchKgProH) == false || verbrauchKgProH <= 0.0) { return AvError(); }
+  return tasKt / verbrauchKgProH;
+}
+
+// Breguet-Reichweite für Strahlflugzeuge, in NM.
+//
+// R = (V/c) · (L/D) · ln(m_start / m_ende)
+//
+// `sfcProH` ist der spezifische Verbrauch als Anteil je Stunde (Treibstoff je
+// Schub und Zeit, dimensionslos gemacht über die Schub-Gewicht-Bilanz).
+pub fn AvBreguetReichweiteNm(tasKt: f64, sfcProH: f64, gleitzahl: f64,
+                              masseStartKg: f64, masseEndeKg: f64): f64 {
+  if (_endlich(tasKt) == false || tasKt <= 0.0) { return AvError(); }
+  if (_endlich(sfcProH) == false || sfcProH <= 0.0) { return AvError(); }
+  if (_endlich(gleitzahl) == false || gleitzahl <= 0.0) { return AvError(); }
+  if (_endlich(masseStartKg) == false || masseStartKg <= 0.0) { return AvError(); }
+  if (_endlich(masseEndeKg) == false || masseEndeKg <= 0.0) { return AvError(); }
+  if (masseEndeKg > masseStartKg) { return AvError(); }
+  return (tasKt / sfcProH) * gleitzahl * LogF64(masseStartKg / masseEndeKg);
+}
+
+// Flugdauer nach Breguet, in Stunden.
+pub fn AvBreguetFlugdauerH(sfcProH: f64, gleitzahl: f64,
+                            masseStartKg: f64, masseEndeKg: f64): f64 {
+  if (_endlich(sfcProH) == false || sfcProH <= 0.0) { return AvError(); }
+  if (_endlich(gleitzahl) == false || gleitzahl <= 0.0) { return AvError(); }
+  if (_endlich(masseStartKg) == false || masseStartKg <= 0.0) { return AvError(); }
+  if (_endlich(masseEndeKg) == false || masseEndeKg <= 0.0) { return AvError(); }
+  if (masseEndeKg > masseStartKg) { return AvError(); }
+  return (gleitzahl / sfcProH) * LogF64(masseStartKg / masseEndeKg);
+}
+
+// OPTIMALE REISEFLUGHÖHE.
+//
+// Im Reiseflug fliegt ein Flugzeug bei konstantem Auftriebsbeiwert und
+// konstanter Machzahl am günstigsten. Daraus folgt: das Verhältnis aus
+// Gewicht und Druckverhältnis, W/δ, ist im Optimum konstant. Wird das
+// Flugzeug leichter, muss δ kleiner werden — die optimale Höhe STEIGT im
+// Verlauf des Fluges. Genau deshalb gibt es Stufensteigflüge.
+//
+// `wProDeltaOpt` ist die musterabhängige Kennzahl aus dem Handbuch (Gewicht
+// in Newton bei δ = 1).
+pub fn AvOptimaleHoeheM(masseKg: f64, wProDeltaOptN: f64): f64 {
+  if (_endlich(masseKg) == false || masseKg <= 0.0) { return AvError(); }
+  if (_endlich(wProDeltaOptN) == false || wProDeltaOptN <= 0.0) { return AvError(); }
+  var deltaZiel: f64 := masseKg * AV_G0 / wProDeltaOptN;
+  if (deltaZiel <= 0.0 || deltaZiel > 1.0) { return AvError(); }
+  return AvHoeheAusDruckM(deltaZiel * AV_P0_PA);
+}
+
+// Der Höhengewinn eines Stufensteigflugs, wenn Treibstoff verbrannt ist.
+pub fn AvStufensteigGewinnM(masseVorherKg: f64, masseNachherKg: f64,
+                             wProDeltaOptN: f64): f64 {
+  var h1: f64 := AvOptimaleHoeheM(masseVorherKg, wProDeltaOptN);
+  var h2: f64 := AvOptimaleHoeheM(masseNachherKg, wProDeltaOptN);
+  if (AvIsError(h1) || AvIsError(h2)) { return AvError(); }
+  return h2 - h1;
+}
+
+// COST INDEX.
+//
+// Der Cost Index ist das Verhältnis von Zeitkosten zu Treibstoffkosten:
+// CI = (Kosten je Stunde) / (Kosten je kg). CI = 0 heißt "Treibstoff ist
+// alles" — die Maschine fliegt maximale Reichweite. Ein hoher CI heißt
+// "Zeit ist teuer" — sie fliegt schneller und verbraucht mehr.
+//
+// Die Gesamtkosten eines Abschnitts sind Zeitkosten plus Treibstoffkosten;
+// diese Funktion liefert sie in der Einheit "kg-Äquivalent", der Größe, in
+// der ein FMS vergleicht.
+pub fn AvGesamtkostenKgAequiv(flugzeitH: f64, treibstoffKg: f64,
+                               costIndex: f64): f64 {
+  if (_endlich(flugzeitH) == false || flugzeitH < 0.0) { return AvError(); }
+  if (_endlich(treibstoffKg) == false || treibstoffKg < 0.0) { return AvError(); }
+  if (_endlich(costIndex) == false || costIndex < 0.0) { return AvError(); }
+  return treibstoffKg + costIndex * flugzeitH;
+}
+
+// Welche von zwei Geschwindigkeiten ist bei diesem Cost Index günstiger?
+// Liefert 1 für die erste, 2 für die zweite, 0 bei Gleichstand.
+//
+// Zwei Angebote zu vergleichen ist die Form, in der die Frage an Bord
+// tatsächlich auftritt — nicht als geschlossene Optimierung, für die man die
+// vollständige Verbrauchskurve des Musters bräuchte.
+pub fn AvGuenstigere(zeit1H: f64, kraftstoff1Kg: f64,
+                      zeit2H: f64, kraftstoff2Kg: f64, costIndex: f64): int64 {
+  var k1: f64 := AvGesamtkostenKgAequiv(zeit1H, kraftstoff1Kg, costIndex);
+  var k2: f64 := AvGesamtkostenKgAequiv(zeit2H, kraftstoff2Kg, costIndex);
+  if (AvIsError(k1) || AvIsError(k2)) { return 0 - 1; }
+  if (k1 < k2) { return 1; }
+  if (k2 < k1) { return 2; }
+  return 0;
+}
+
+// ── Wind ──────────────────────────────────────────────────────────────────
+//
+// Windrichtung ist in der Luftfahrt die Richtung, AUS der der Wind weht.
+// Beide Winkel in Grad rechtweisend.
+
+// Gegen-/Rückenwindkomponente. Positiv = Rückenwind.
+pub fn AvWindkomponenteKt(kursGrad: f64, windRichtungGrad: f64,
+                           windStaerkeKt: f64): f64 {
+  if (_endlich(kursGrad) == false || _endlich(windRichtungGrad) == false) { return AvError(); }
+  if (_endlich(windStaerkeKt) == false || windStaerkeKt < 0.0) { return AvError(); }
+  var diff: f64 := _rad(windRichtungGrad - kursGrad);
+  // Weht der Wind aus der Flugrichtung, ist die Komponente negativ.
+  return 0.0 - windStaerkeKt * CosF64(diff);
+}
+
+// Seitenwindkomponente, immer als Betrag — für den Vergleich mit der
+// zulässigen Grenze.
+pub fn AvSeitenwindKt(kursGrad: f64, windRichtungGrad: f64,
+                       windStaerkeKt: f64): f64 {
+  if (_endlich(kursGrad) == false || _endlich(windRichtungGrad) == false) { return AvError(); }
+  if (_endlich(windStaerkeKt) == false || windStaerkeKt < 0.0) { return AvError(); }
+  var diff: f64 := _rad(windRichtungGrad - kursGrad);
+  return AbsF64(windStaerkeKt * SinF64(diff));
+}
+
+// Vorhaltewinkel und Grundgeschwindigkeit aus dem Winddreieck.
+pub fn AvVorhaltewinkelGrad(kursGrad: f64, tasKt: f64,
+                             windRichtungGrad: f64, windStaerkeKt: f64): f64 {
+  if (_endlich(tasKt) == false || tasKt <= 0.0) { return AvError(); }
+  var seiten: f64 := AvSeitenwindKt(kursGrad, windRichtungGrad, windStaerkeKt);
+  if (AvIsError(seiten)) { return AvError(); }
+  var verh: f64 := seiten / tasKt;
+  if (verh > 1.0) { return AvError(); }    // Wind stärker als das Flugzeug
+  return _grad(AsinF64(verh));
+}
+
+pub fn AvGrundgeschwindigkeitKt(kursGrad: f64, tasKt: f64,
+                                 windRichtungGrad: f64, windStaerkeKt: f64): f64 {
+  if (_endlich(tasKt) == false || tasKt <= 0.0) { return AvError(); }
+  var wca: f64 := AvVorhaltewinkelGrad(kursGrad, tasKt, windRichtungGrad, windStaerkeKt);
+  if (AvIsError(wca)) { return AvError(); }
+  var laengs: f64 := AvWindkomponenteKt(kursGrad, windRichtungGrad, windStaerkeKt);
+  if (AvIsError(laengs)) { return AvError(); }
+  return tasKt * CosF64(_rad(wca)) + laengs;
+}
+
+// ── Kurvengeometrie ───────────────────────────────────────────────────────
+//
+// Ein Flugzeug fliegt keine Ecken. Wo die Route abknickt, beginnt die Kurve
+// SCHON VORHER und endet dahinter — die geflogene Strecke ist kuerzer als die
+// Summe der Schenkel. Ohne diese Rechnung liegen alle Positionen weiter
+// hinten falsch, und zwar mit jedem Knick ein Stueck mehr.
+//
+// Die Kurve haengt an der WAHREN Geschwindigkeit, nicht an der angezeigten:
+// in grosser Hoehe ist derselbe Kurvenradius bei gleicher Querneigung
+// erheblich groesser. Genau deshalb nehmen diese Funktionen TAS.
+
+// Kurvenradius aus TAS und Querneigung. r = v² / (g · tan φ)
+pub fn AvKurvenradiusNm(tasKt: f64, querneigungGrad: f64): f64 {
+  if (_endlich(tasKt) == false || tasKt <= 0.0) { return AvError(); }
+  if (_endlich(querneigungGrad) == false) { return AvError(); }
+  if (querneigungGrad <= 0.0 || querneigungGrad >= 90.0) { return AvError(); }
+  var v: f64 := AvKtToMs(tasKt);
+  var rM: f64 := v * v / (AV_G0 * TanF64(_rad(querneigungGrad)));
+  return AvMToNm(rM);
+}
+
+// Kurvengeschwindigkeit in Grad je Sekunde. ω = g · tan φ / v
+pub fn AvKurvenrateGradProS(tasKt: f64, querneigungGrad: f64): f64 {
+  if (_endlich(tasKt) == false || tasKt <= 0.0) { return AvError(); }
+  if (querneigungGrad <= 0.0 || querneigungGrad >= 90.0) { return AvError(); }
+  var v: f64 := AvKtToMs(tasKt);
+  return _grad(AV_G0 * TanF64(_rad(querneigungGrad)) / v);
+}
+
+// Welche Querneigung ergibt eine gewuenschte Kurvenrate? Die Standardkurve
+// mit 3°/s braucht bei 480 kt TAS eine Querneigung, die kein
+// Verkehrsflugzeug fliegt — deshalb wird oben herum mit fester Querneigung
+// gekurvt und die Rate faellt.
+pub fn AvQuerneigungFuerRateGrad(tasKt: f64, rateGradProS: f64): f64 {
+  if (_endlich(tasKt) == false || tasKt <= 0.0) { return AvError(); }
+  if (_endlich(rateGradProS) == false || rateGradProS <= 0.0) { return AvError(); }
+  var v: f64 := AvKtToMs(tasKt);
+  return _grad(AtanF64(_rad(rateGradProS) * v / AV_G0));
+}
+
+// KURVENVORHALT (turn anticipation): wie weit vor dem Knickpunkt beginnt die
+// Kurve? d = r · tan(Δψ/2).
+//
+// Bei 180° waere die Tangente unendlich — eine Kehrtwende laesst sich nicht
+// abkuerzen. Deshalb ist alles ab 180° hier ein Fehler und keine sehr grosse
+// Zahl: eine grosse Zahl saehe aus wie ein Ergebnis.
+pub fn AvKurvenvorhaltNm(tasKt: f64, querneigungGrad: f64,
+                          kursaenderungGrad: f64): f64 {
+  if (_endlich(kursaenderungGrad) == false) { return AvError(); }
+  var dpsi: f64 := AbsF64(kursaenderungGrad);
+  if (dpsi >= 180.0) { return AvError(); }
+  if (dpsi == 0.0) { return 0.0; }
+  var r: f64 := AvKurvenradiusNm(tasKt, querneigungGrad);
+  if (AvIsError(r)) { return AvError(); }
+  return r * TanF64(_rad(dpsi / 2.0));
+}
+
+// Streckengewinn durch die Kurve: um so viel ist der geflogene Weg kuerzer
+// als ueber die Ecke. Zweimal der Vorhalt minus der Bogen.
+pub fn AvKurvenabkuerzungNm(tasKt: f64, querneigungGrad: f64,
+                             kursaenderungGrad: f64): f64 {
+  var d: f64 := AvKurvenvorhaltNm(tasKt, querneigungGrad, kursaenderungGrad);
+  if (AvIsError(d)) { return AvError(); }
+  var r: f64 := AvKurvenradiusNm(tasKt, querneigungGrad);
+  if (AvIsError(r)) { return AvError(); }
+  var bogen: f64 := r * _rad(AbsF64(kursaenderungGrad));
+  return 2.0 * d - bogen;
+}
+
+// Dauer der Kurve in Sekunden — geht in die Zeitvorhersage ein.
+pub fn AvKurvendauerS(tasKt: f64, querneigungGrad: f64,
+                       kursaenderungGrad: f64): f64 {
+  var rate: f64 := AvKurvenrateGradProS(tasKt, querneigungGrad);
+  if (AvIsError(rate) || rate <= 0.0) { return AvError(); }
+  if (_endlich(kursaenderungGrad) == false) { return AvError(); }
+  return AbsF64(kursaenderungGrad) / rate;
+}
+
+// ── Pseudo-Wegpunkte ──────────────────────────────────────────────────────
+//
+// Was ein FMS dem Piloten anzeigt, ist keine Zahl, sondern ein ORT: auf dem
+// Navigationsdisplay erscheint der Sinkflugbeginn als Symbol auf der
+// Flugroute, dazu der Steigflugabschluss, der Verzoegerungspunkt und
+// Stufensteigfluege. Diese Punkte stehen in keiner Navigationsdatenbank —
+// der Rechner erzeugt sie aus dem Profil, deshalb "Pseudo"-Wegpunkte.
+//
+// Die Funktionen darueber liefern STRECKEN. Die hier liefern POSITIONEN
+// ENTLANG DER ROUTE, gemessen vom Startpunkt in NM — genau die Groesse, an
+// der das Symbol gezeichnet wird. Der Unterschied ist nicht kosmetisch: eine
+// Strecke von 105 NM ist erst dann ein Punkt, wenn klar ist, WOVOR sie liegt.
+
+// STEIGFLUGABSCHLUSS (Top of Climb): wo ist die Reiseflughoehe erreicht?
+// Position vom Startpunkt aus.
+pub fn AvTopOfClimbNm(startPositionNm: f64, hoeheStartFt: f64,
+                       reiseflughoeheFt: f64, mittlereRateFpm: f64,
+                       grundgeschwKt: f64): f64 {
+  var strecke: f64 := AvSteigstreckeNm(hoeheStartFt, reiseflughoeheFt,
+                                       mittlereRateFpm, grundgeschwKt);
+  if (AvIsError(strecke)) { return AvError(); }
+  if (_endlich(startPositionNm) == false) { return AvError(); }
+  return startPositionNm + strecke;
+}
+
+// SINKFLUGBEGINN (Top of Descent) als Position auf der Route.
+//
+// `zwangspunktNm` ist die Position, an der die Zielhoehe erreicht sein muss —
+// bei einem Anflug der Punkt, ab dem das Anflugprofil gilt. Der T/D liegt um
+// die Sinkstrecke DAVOR.
+//
+// Liegt der Punkt vor dem jetzigen Ort, ist die Antwort ein Fehler und keine
+// negative Zahl: "der Sinkflug haette schon begonnen haben muessen" ist eine
+// Lage, keine Position.
+pub fn AvTopOfDescentNm(zwangspunktNm: f64, hoeheJetztFt: f64,
+                         hoeheZielFt: f64, gleitzahl: f64,
+                         eigengeschwKt: f64, windKomponenteKt: f64): f64 {
+  if (_endlich(zwangspunktNm) == false) { return AvError(); }
+  var strecke: f64 := AvTodStreckeNm(hoeheJetztFt, hoeheZielFt, gleitzahl,
+                                     eigengeschwKt, windKomponenteKt);
+  if (AvIsError(strecke)) { return AvError(); }
+  var pos: f64 := zwangspunktNm - strecke;
+  if (pos < 0.0) { return AvError(); }
+  return pos;
+}
+
+// VERZOEGERUNGSPUNKT (Decel): wo muss die Verzoegerung auf die
+// Anfluggeschwindigkeit beginnen? Ergibt sich aus der Geschwindigkeitsdifferenz
+// und der erreichbaren Verzoegerung.
+//
+// `verzoegerungKtProMin` ist musterabhaengig (im Leerlauf, sauber, typisch
+// 10 bis 20 kt/min) und kommt vom Aufrufer.
+pub fn AvDecelPunktNm(anflugPunktNm: f64, vonKt: f64, aufKt: f64,
+                       verzoegerungKtProMin: f64, grundgeschwKt: f64): f64 {
+  if (_endlich(anflugPunktNm) == false) { return AvError(); }
+  if (_endlich(vonKt) == false || _endlich(aufKt) == false) { return AvError(); }
+  if (vonKt < aufKt) { return AvError(); }        // das waere Beschleunigen
+  if (_endlich(verzoegerungKtProMin) == false || verzoegerungKtProMin <= 0.0) { return AvError(); }
+  if (_endlich(grundgeschwKt) == false || grundgeschwKt <= 0.0) { return AvError(); }
+  var minuten: f64 := (vonKt - aufKt) / verzoegerungKtProMin;
+  var strecke: f64 := grundgeschwKt * minuten / 60.0;
+  var pos: f64 := anflugPunktNm - strecke;
+  if (pos < 0.0) { return AvError(); }
+  return pos;
+}
+
+// Ist ein Zwangspunkt ueberhaupt erreichbar?
+//
+// Verglichen wird der NOETIGE Bahnwinkel mit dem, den das Flugzeug im
+// Leerlauf schafft. Die Frage stellt sich an Bord staendig ("wir sind zu
+// hoch") und ist der Grund, warum ein FMS eine Meldung ausgibt, statt still
+// ein unmoegliches Profil zu zeichnen.
+pub fn AvZwangspunktErreichbar(hoeheJetztFt: f64, hoeheZielFt: f64,
+                                streckeNm: f64, gleitzahl: f64,
+                                eigengeschwKt: f64, windKomponenteKt: f64): bool {
+  var noetig: f64 := AvNoetigerWinkelGrad(hoeheJetztFt, hoeheZielFt, streckeNm);
+  if (AvIsError(noetig)) { return false; }
+  var moeglichStrecke: f64 := AvTodStreckeNm(hoeheJetztFt, hoeheZielFt, gleitzahl,
+                                             eigengeschwKt, windKomponenteKt);
+  if (AvIsError(moeglichStrecke)) { return false; }
+  // Erreichbar, wenn die im Leerlauf benoetigte Strecke in die verfuegbare
+  // passt. Gleichstand gilt als erreichbar — mit exakt null Reserve.
+  return moeglichStrecke <= streckeNm;
+}
+
+// Wie viel Hoehe ist bis zum Zwangspunkt zu viel? Positiv heisst: so viele
+// Fuss ueber dem Profil. Das ist die Zahl hinter der Anzeige, ob man auf dem
+// Pfad liegt.
+pub fn AvAbweichungVomProfilFt(hoeheJetztFt: f64, hoeheZielFt: f64,
+                                streckeNm: f64, gleitzahl: f64,
+                                eigengeschwKt: f64, windKomponenteKt: f64): f64 {
+  if (_endlich(streckeNm) == false || streckeNm < 0.0) { return AvError(); }
+  if (_endlich(gleitzahl) == false || gleitzahl <= 0.0) { return AvError(); }
+  if (_endlich(eigengeschwKt) == false || eigengeschwKt <= 0.0) { return AvError(); }
+  if (_endlich(windKomponenteKt) == false) { return AvError(); }
+  if (_endlich(hoeheJetztFt) == false || _endlich(hoeheZielFt) == false) { return AvError(); }
+  var grund: f64 := eigengeschwKt + windKomponenteKt;
+  if (grund <= 0.0) { return AvError(); }
+  // Hoehe, die auf dieser Strecke im Leerlauf abgebaut werden kann.
+  var streckeStillNm: f64 := streckeNm * eigengeschwKt / grund;
+  var abbaubarNm: f64 := streckeStillNm / gleitzahl;
+  var abbaubarFt: f64 := abbaubarNm * AV_NM_IN_M / AV_FT_IN_M;
+  var noetigFt: f64 := hoeheJetztFt - hoeheZielFt;
+  return noetigFt - abbaubarFt;
+}
+
+// ── Umkehrpunkte ──────────────────────────────────────────────────────────
+
+// PUNKT GLEICHER ZEIT: von hier aus dauert es gleich lang, weiterzufliegen
+// oder umzukehren. Wichtig über Wasser und in der Wüste — und der Wind
+// verschiebt ihn erheblich, weil er in eine Richtung hilft und in die andere
+// bremst.
+//
+// Rückgabe: Strecke vom Startpunkt in NM.
+pub fn AvPunktGleicherZeitNm(gesamtstreckeNm: f64, tasKt: f64,
+                              windKomponenteKt: f64): f64 {
+  if (_endlich(gesamtstreckeNm) == false || gesamtstreckeNm <= 0.0) { return AvError(); }
+  if (_endlich(tasKt) == false || tasKt <= 0.0) { return AvError(); }
+  if (_endlich(windKomponenteKt) == false) { return AvError(); }
+  var vHin: f64 := tasKt + windKomponenteKt;
+  var vZurueck: f64 := tasKt - windKomponenteKt;
+  if (vHin <= 0.0 || vZurueck <= 0.0) { return AvError(); }
+  return gesamtstreckeNm * vZurueck / (vHin + vZurueck);
+}
+
+// PUNKT OHNE WIEDERKEHR: der letzte Punkt, von dem aus der Treibstoff noch
+// zur Rückkehr reicht.
+pub fn AvPunktOhneWiederkehrNm(nutzbareStundenH: f64, tasKt: f64,
+                                windKomponenteKt: f64): f64 {
+  if (_endlich(nutzbareStundenH) == false || nutzbareStundenH <= 0.0) { return AvError(); }
+  if (_endlich(tasKt) == false || tasKt <= 0.0) { return AvError(); }
+  if (_endlich(windKomponenteKt) == false) { return AvError(); }
+  var vHin: f64 := tasKt + windKomponenteKt;
+  var vZurueck: f64 := tasKt - windKomponenteKt;
+  if (vHin <= 0.0 || vZurueck <= 0.0) { return AvError(); }
+  return nutzbareStundenH * vHin * vZurueck / (vHin + vZurueck);
+}

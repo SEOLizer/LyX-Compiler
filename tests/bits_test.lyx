@@ -1,0 +1,939 @@
+// tests/bits_test.lyx
+// Selbstpruefende Testbatterie fuer std.bits.
+//
+// Der Kern braucht keine fremden Sollwerte: jede schnelle Fassung wird gegen
+// eine LANGSAME, offensichtlich richtige Fassung gestellt, die Bit fuer Bit
+// arbeitet. Der SWAR-Popcount faltet 64 Bit in zwoelf Schritten, die
+// Vergleichsfassung prueft vierundsechzig Mal einzeln — dieselbe Antwort auf
+// voellig anderem Weg.
+//
+// Dazu Sollwerte aus Python (int.bit_count, bin()), Identitaeten
+// (Rank/Select sind zueinander invers, Gray-Code ist umkehrbar, Reverse ist
+// selbstinvers), Randfaelle (0, -1, kleinste negative Zahl, Wortgrenzen) und
+// Negativkontrollen.
+
+unit main;
+
+import std.bits;
+import std.math;
+import std.alloc;
+
+var _fails: int64 := 0;
+var _checks: int64 := 0;
+
+fn CheckI(name: pchar, got: int64, want: int64): void {
+  _checks := _checks + 1;
+  if (got != want) {
+    _fails := _fails + 1;
+    PrintStr("FAIL "c);
+    PrintStr(name);
+    PrintStr(" got="c);
+    PrintInt(got);
+    PrintStr(" want="c);
+    PrintInt(want);
+    PrintStr("\n"c);
+  }
+}
+
+fn CheckB(name: pchar, got: bool, want: bool): void {
+  _checks := _checks + 1;
+  if (got != want) {
+    _fails := _fails + 1;
+    PrintStr("FAIL "c);
+    PrintStr(name);
+    PrintStr("\n"c);
+  }
+}
+
+// ── Die langsamen Gegenfassungen ─────────────────────────────────────────────
+//
+// Bewusst stumpf: keine Faltung, keine Multiplikation, kein Kniff. Sie
+// benutzen ausschliesslich BitsTest, das seinerseits nur schiebt und maskiert.
+
+fn SlowPop(x: int64): int64 {
+  var c: int64 := 0;
+  var i: int64 := 0;
+  while (i < 64) {
+    if (BitsTest(x, i)) { c := c + 1; }
+    i := i + 1;
+  }
+  return c;
+}
+
+fn SlowClz(x: int64): int64 {
+  var c: int64 := 0;
+  var i: int64 := 63;
+  var run: bool := true;
+  while (run) {
+    if (i < 0) { run := false; }
+    else {
+      if (BitsTest(x, i)) { run := false; }
+      else {
+        c := c + 1;
+        i := i - 1;
+      }
+    }
+  }
+  return c;
+}
+
+fn SlowCtz(x: int64): int64 {
+  var c: int64 := 0;
+  var i: int64 := 0;
+  var run: bool := true;
+  while (run) {
+    if (i > 63) { run := false; }
+    else {
+      if (BitsTest(x, i)) { run := false; }
+      else {
+        c := c + 1;
+        i := i + 1;
+      }
+    }
+  }
+  return c;
+}
+
+fn SlowReverse(x: int64): int64 {
+  var v: int64 := 0;
+  var i: int64 := 0;
+  while (i < 64) {
+    if (BitsTest(x, i)) { v := BitsSet(v, 63 - i); }
+    i := i + 1;
+  }
+  return v;
+}
+
+fn SlowRotl(x: int64, n: int64): int64 {
+  var k: int64 := n % 64;
+  if (k < 0) { k := k + 64; }
+  var v: int64 := 0;
+  var i: int64 := 0;
+  while (i < 64) {
+    if (BitsTest(x, i)) { v := BitsSet(v, (i + k) % 64); }
+    i := i + 1;
+  }
+  return v;
+}
+
+fn SlowShr(x: int64, n: int64): int64 {
+  var v: int64 := 0;
+  var i: int64 := 0;
+  while (i < 64) {
+    var src: int64 := i + n;
+    if (src < 64) {
+      if (BitsTest(x, src)) { v := BitsSet(v, i); }
+    }
+    i := i + 1;
+  }
+  return v;
+}
+
+fn SlowSwapBytes(x: int64): int64 {
+  var v: int64 := 0;
+  var b: int64 := 0;
+  while (b < 8) {
+    var byte: int64 := BitsExtract(x, b * 8, 8);
+    v := BitsDeposit(v, (7 - b) * 8, 8, byte);
+    b := b + 1;
+  }
+  return v;
+}
+
+var _s: int64 := 88172645463325252;
+
+fn Rnd(): int64 {
+  _s := _s * 6364136223846793005 + 1442695040888963407;
+  return _s;
+}
+
+fn main(): int64 {
+  var MONE: int64 := 0 - 1;
+  var MIN: int64 := 1 << 63;
+
+  // ── Masken und Schieben ────────────────────────────────────────────────────
+  CheckI("mask0"c, BitsMask(0), 0);
+  CheckI("maskNeg"c, BitsMask(0 - 5), 0);
+  CheckI("mask1"c, BitsMask(1), 1);
+  CheckI("mask8"c, BitsMask(8), 255);
+  CheckI("mask63"c, BitsMask(63), 9223372036854775807);
+  CheckI("mask64"c, BitsMask(64), MONE);
+  CheckI("mask99"c, BitsMask(99), MONE);
+
+  // Das ist der Kern: >> zieht das Vorzeichen nach, BitsShr nicht.
+  CheckI("shrOfMinusOne"c, BitsShr(MONE, 63), 1);
+  CheckI("shrOfMinusOne60"c, BitsShr(MONE, 60), 15);
+  CheckI("shrArithmeticDiffers"c, MONE >> 63, MONE);
+  CheckI("shr0"c, BitsShr(255, 0), 255);
+  CheckI("shr64"c, BitsShr(MONE, 64), 0);
+  CheckI("shr99"c, BitsShr(MONE, 99), 0);
+  CheckI("shrNeg"c, BitsShr(255, 0 - 3), 255);
+  CheckI("shl0"c, BitsShl(255, 0), 255);
+  CheckI("shl64"c, BitsShl(255, 64), 0);
+  CheckI("shlMin"c, BitsShl(1, 63), MIN);
+
+  // ── Popcount ───────────────────────────────────────────────────────────────
+  // Sollwerte aus Python int.bit_count() bzw. bin(x & (2**64-1)).count('1')
+  CheckI("pop0"c, BitsPopCount(0), 0);
+  CheckI("pop1"c, BitsPopCount(1), 1);
+  CheckI("pop255"c, BitsPopCount(255), 8);
+  CheckI("pop256"c, BitsPopCount(256), 1);
+  CheckI("popMax"c, BitsPopCount(9223372036854775807), 63);
+  CheckI("popMin"c, BitsPopCount(MIN), 1);
+  CheckI("popMinusOne"c, BitsPopCount(MONE), 64);
+  CheckI("popMinusTwo"c, BitsPopCount(0 - 2), 63);
+  CheckI("pop5555"c, BitsPopCount(0x5555555555555555), 32);
+  CheckI("popDeadbeef"c, BitsPopCount(0xDEADBEEF), 24);
+  CheckI("pop123456789"c, BitsPopCount(123456789), 16);
+
+  // Genau der Fall, an dem std.math scheitert
+  CheckI("popNegativeIsFull"c, BitsPopCount(MONE), 64);
+
+  // ── Paritaet ───────────────────────────────────────────────────────────────
+  CheckI("par0"c, BitsParity(0), 0);
+  CheckI("par1"c, BitsParity(1), 1);
+  CheckI("par3"c, BitsParity(3), 0);
+  CheckI("par255"c, BitsParity(255), 0);
+  CheckI("par7"c, BitsParity(7), 1);
+  CheckI("parMinusOne"c, BitsParity(MONE), 0);
+  CheckI("parMin"c, BitsParity(MIN), 1);
+
+  // ── Fuehrende und nachlaufende Nullen ──────────────────────────────────────
+  CheckI("clz0"c, BitsClz(0), 64);
+  CheckI("clz1"c, BitsClz(1), 63);
+  CheckI("clz255"c, BitsClz(255), 56);
+  CheckI("clzMin"c, BitsClz(MIN), 0);
+  CheckI("clzMinusOne"c, BitsClz(MONE), 0);
+  CheckI("ctz0"c, BitsCtz(0), 64);
+  CheckI("ctz1"c, BitsCtz(1), 0);
+  CheckI("ctz8"c, BitsCtz(8), 3);
+  CheckI("ctz256"c, BitsCtz(256), 8);
+  CheckI("ctzMin"c, BitsCtz(MIN), 63);
+  CheckI("ctzMinusOne"c, BitsCtz(MONE), 0);
+  CheckI("ctzMinusTwo"c, BitsCtz(0 - 2), 1);
+
+  CheckI("highest0"c, BitsHighestSet(0), 0 - 1);
+  CheckI("highest1"c, BitsHighestSet(1), 0);
+  CheckI("highest255"c, BitsHighestSet(255), 7);
+  CheckI("highestMin"c, BitsHighestSet(MIN), 63);
+  CheckI("lowest0"c, BitsLowestSet(0), 0 - 1);
+  CheckI("lowest8"c, BitsLowestSet(8), 3);
+  CheckI("lowestMin"c, BitsLowestSet(MIN), 63);
+
+  // clz + ctz + popcount <= 64, und fuer eine Zweierpotenz genau 64
+  CheckI("clzCtzPow2"c, BitsClz(256) + BitsCtz(256) + BitsPopCount(256), 64);
+
+  CheckI("hamming"c, BitsHamming(0, MONE), 64);
+  CheckI("hammingSelf"c, BitsHamming(12345, 12345), 0);
+  CheckI("hamming1"c, BitsHamming(0, 1), 1);
+  CheckI("hammingBytes"c, BitsHamming(0xFF, 0x0F), 4);
+
+  // ── Einzelne Bits ──────────────────────────────────────────────────────────
+  CheckB("test0of1"c, BitsTest(1, 0), true);
+  CheckB("test1of1"c, BitsTest(1, 1), false);
+  CheckB("test63ofMin"c, BitsTest(MIN, 63), true);
+  CheckB("testNegIdx"c, BitsTest(MONE, 0 - 1), false);
+  CheckB("testBigIdx"c, BitsTest(MONE, 64), false);
+  CheckI("set"c, BitsSet(0, 5), 32);
+  CheckI("setIdempotent"c, BitsSet(32, 5), 32);
+  CheckI("setOob"c, BitsSet(7, 64), 7);
+  CheckI("clear"c, BitsClear(255, 0), 254);
+  CheckI("clearMissing"c, BitsClear(254, 0), 254);
+  CheckI("toggleOn"c, BitsToggle(0, 3), 8);
+  CheckI("toggleOff"c, BitsToggle(8, 3), 0);
+  CheckI("setMin"c, BitsSet(0, 63), MIN);
+  CheckI("clearMin"c, BitsClear(MONE, 63), 9223372036854775807);
+
+  CheckI("extract"c, BitsExtract(0xABCD, 4, 8), 0xBC);
+  CheckI("extractLow"c, BitsExtract(0xABCD, 0, 4), 0xD);
+  CheckI("extractZeroLen"c, BitsExtract(0xABCD, 0, 0), 0);
+  CheckI("extractTop"c, BitsExtract(MONE, 60, 4), 15);
+  CheckI("deposit"c, BitsDeposit(0, 4, 8, 0xBC), 0xBC0);
+  CheckI("depositOverwrites"c, BitsDeposit(0xFFFF, 4, 8, 0), 0xF00F);
+  CheckI("depositMasks"c, BitsDeposit(0, 0, 4, 0xFF), 0xF);
+  CheckI("depositZeroLen"c, BitsDeposit(0xAB, 0, 0, 0xFF), 0xAB);
+  CheckI("extractDepositRound"c, BitsExtract(BitsDeposit(0, 12, 16, 0x1234), 12, 16), 0x1234);
+
+  // ── Umordnen ───────────────────────────────────────────────────────────────
+  CheckI("rotl0"c, BitsRotl(0xF, 0), 0xF);
+  CheckI("rotl4"c, BitsRotl(0xF, 4), 0xF0);
+  CheckI("rotl64"c, BitsRotl(0xF, 64), 0xF);
+  CheckI("rotlWrap"c, BitsRotl(1, 63), MIN);
+  CheckI("rotlWrapAround"c, BitsRotl(MIN, 1), 1);
+  CheckI("rotrWrap"c, BitsRotr(1, 1), MIN);
+  CheckI("rotlNeg"c, BitsRotl(0xF0, 0 - 4), 0xF);
+  CheckI("rotlMinusOne"c, BitsRotl(MONE, 17), MONE);
+  // Hin und zurueck
+  CheckI("rotRound"c, BitsRotr(BitsRotl(0x123456789ABCDEF, 23), 23), 0x123456789ABCDEF);
+
+  CheckI("rev1"c, BitsReverse(1), MIN);
+  CheckI("revMin"c, BitsReverse(MIN), 1);
+  CheckI("rev0"c, BitsReverse(0), 0);
+  CheckI("revMinusOne"c, BitsReverse(MONE), MONE);
+  // selbstinvers
+  CheckI("revTwice"c, BitsReverse(BitsReverse(0x123456789ABCDEF)), 0x123456789ABCDEF);
+  // Popcount bleibt beim Spiegeln erhalten
+  CheckI("revKeepsPop"c, BitsPopCount(BitsReverse(0xDEADBEEF)), BitsPopCount(0xDEADBEEF));
+
+  CheckI("swap1"c, BitsSwapBytes(1), 0x0100000000000000);
+  CheckI("swapTwice"c, BitsSwapBytes(BitsSwapBytes(0x1122334455667788)), 0x1122334455667788);
+  CheckI("swapKnown"c, BitsSwapBytes(0x0000000000000102), 0x0201000000000000);
+
+  // ── Zweierpotenzen ─────────────────────────────────────────────────────────
+  CheckB("isPow2.0"c, BitsIsPow2(0), false);
+  CheckB("isPow2.1"c, BitsIsPow2(1), true);
+  CheckB("isPow2.2"c, BitsIsPow2(2), true);
+  CheckB("isPow2.3"c, BitsIsPow2(3), false);
+  CheckB("isPow2.min"c, BitsIsPow2(MIN), true);
+  CheckB("isPow2.minusOne"c, BitsIsPow2(MONE), false);
+  CheckI("floorPow2.0"c, BitsFloorPow2(0), 0);
+  CheckI("floorPow2.1"c, BitsFloorPow2(1), 1);
+  CheckI("floorPow2.7"c, BitsFloorPow2(7), 4);
+  CheckI("floorPow2.8"c, BitsFloorPow2(8), 8);
+  CheckI("floorPow2.neg"c, BitsFloorPow2(0 - 5), 0);
+  CheckI("ceilPow2.0"c, BitsCeilPow2(0), 1);
+  CheckI("ceilPow2.1"c, BitsCeilPow2(1), 1);
+  CheckI("ceilPow2.5"c, BitsCeilPow2(5), 8);
+  CheckI("ceilPow2.8"c, BitsCeilPow2(8), 8);
+  CheckI("ceilPow2.9"c, BitsCeilPow2(9), 16);
+  // Ab 2^62 gibt es keine positive Zweierpotenz mehr darueber
+  var p62: int64 := BitsShl(1, 62);
+  CheckI("ceilPow2.62"c, BitsCeilPow2(p62), p62);
+  CheckI("ceilPow2.over"c, BitsCeilPow2(p62 + 1), 0);
+
+  // ── Gray-Code ──────────────────────────────────────────────────────────────
+  CheckI("gray0"c, BitsGrayEncode(0), 0);
+  CheckI("gray1"c, BitsGrayEncode(1), 1);
+  CheckI("gray2"c, BitsGrayEncode(2), 3);
+  CheckI("gray3"c, BitsGrayEncode(3), 2);
+  CheckI("gray4"c, BitsGrayEncode(4), 6);
+  // Die eigentliche Eigenschaft: aufeinanderfolgende Codes unterscheiden sich
+  // in GENAU einem Bit. Ueber 2000 Werte geprueft, nicht behauptet.
+  var grayBad: int64 := 0;
+  var grayRound: int64 := 0;
+  var g: int64 := 0;
+  while (g < 2000) {
+    var a: int64 := BitsGrayEncode(g);
+    var b: int64 := BitsGrayEncode(g + 1);
+    if (BitsHamming(a, b) != 1) { grayBad := grayBad + 1; }
+    if (BitsGrayDecode(a) != g) { grayRound := grayRound + 1; }
+    g := g + 1;
+  }
+  CheckI("grayOneBitApart"c, grayBad, 0);
+  CheckI("grayRoundTrip"c, grayRound, 0);
+  CheckI("grayDecodeMinusOne"c, BitsGrayDecode(BitsGrayEncode(MONE)), MONE);
+
+  // ── Zufallsabgleich schnell gegen langsam ──────────────────────────────────
+  //
+  // 3000 Zufallswoerter, jeweils die gefaltete gegen die bitweise Fassung.
+  // Beide Wege haben nichts gemeinsam ausser dem Ergebnis.
+  var badPop: int64 := 0;
+  var badClz: int64 := 0;
+  var badCtz: int64 := 0;
+  var badRev: int64 := 0;
+  var badRot: int64 := 0;
+  var badShr: int64 := 0;
+  var badSwap: int64 := 0;
+  var badPar: int64 := 0;
+  var badHigh: int64 := 0;
+
+  var t: int64 := 0;
+  while (t < 3000) {
+    var x: int64 := Rnd();
+    // gelegentlich duenn besetzte Muster, sonst faende man Fehler in den
+    // oberen Bits nie
+    var kind: int64 := t % 4;
+    if (kind == 1) { x := x & Rnd(); }
+    if (kind == 2) { x := x & Rnd() & Rnd(); }
+    if (kind == 3) { x := x | Rnd(); }
+
+    if (BitsPopCount(x) != SlowPop(x)) { badPop := badPop + 1; }
+    if (BitsClz(x) != SlowClz(x)) { badClz := badClz + 1; }
+    if (BitsCtz(x) != SlowCtz(x)) { badCtz := badCtz + 1; }
+    if (BitsReverse(x) != SlowReverse(x)) { badRev := badRev + 1; }
+    if (BitsSwapBytes(x) != SlowSwapBytes(x)) { badSwap := badSwap + 1; }
+    if (BitsParity(x) != (SlowPop(x) % 2)) { badPar := badPar + 1; }
+
+    var sh: int64 := t % 65;
+    if (BitsRotl(x, sh) != SlowRotl(x, sh)) { badRot := badRot + 1; }
+    if (BitsShr(x, sh) != SlowShr(x, sh)) { badShr := badShr + 1; }
+
+    var hi: int64 := BitsHighestSet(x);
+    if (x == 0) {
+      if (hi != 0 - 1) { badHigh := badHigh + 1; }
+    }
+    else {
+      if (hi != 63 - SlowClz(x)) { badHigh := badHigh + 1; }
+      if (!BitsTest(x, hi)) { badHigh := badHigh + 1; }
+    }
+    t := t + 1;
+  }
+  CheckI("fuzzPop"c, badPop, 0);
+  CheckI("fuzzClz"c, badClz, 0);
+  CheckI("fuzzCtz"c, badCtz, 0);
+  CheckI("fuzzReverse"c, badRev, 0);
+  CheckI("fuzzSwapBytes"c, badSwap, 0);
+  CheckI("fuzzParity"c, badPar, 0);
+  CheckI("fuzzRotl"c, badRot, 0);
+  CheckI("fuzzShr"c, badShr, 0);
+  CheckI("fuzzHighest"c, badHigh, 0);
+
+  // ── Bitmengen ──────────────────────────────────────────────────────────────
+  CheckI("words0"c, BitsetWords(0), 0);
+  CheckI("words1"c, BitsetWords(1), 1);
+  CheckI("words64"c, BitsetWords(64), 1);
+  CheckI("words65"c, BitsetWords(65), 2);
+  CheckI("words200"c, BitsetWords(200), 4);
+
+  // 200 Elemente: drei volle Woerter plus acht Bit — die Wortgrenze ist genau
+  // die Stelle, an der Rank/Select typisch danebengreifen.
+  var N: int64 := 200;
+  var W: int64 := BitsetWords(N);
+  var A: int64 := alloc(W * 8);
+  var B: int64 := alloc(W * 8);
+  var C: int64 := alloc(W * 8);
+
+  BitsetClearAll(A, N);
+  CheckI("emptyCount"c, BitsetCount(A, N), 0);
+  CheckB("emptyIsEmpty"c, BitsetIsEmpty(A, N), true);
+  CheckI("emptyNext"c, BitsetNext(A, N, 0), 0 - 1);
+  CheckI("emptySelect"c, BitsetSelect(A, N, 0), 0 - 1);
+  CheckI("emptyRank"c, BitsetRank(A, N, N), 0);
+
+  BitsetSetAll(A, N);
+  CheckI("fullCount"c, BitsetCount(A, N), N);
+  CheckB("fullNotEmpty"c, BitsetIsEmpty(A, N), false);
+  // Der Punkt an SetAll: die ueberzaehligen Bits des letzten Wortes duerfen
+  // NICHT mitzaehlen. Ohne die Maske kaeme hier 256 heraus.
+  CheckI("fullCountNoOverhang"c, BitsetCount(A, N), 200);
+  CheckI("fullSelectLast"c, BitsetSelect(A, N, N - 1), N - 1);
+  CheckI("fullSelectPast"c, BitsetSelect(A, N, N), 0 - 1);
+  CheckI("fullRank"c, BitsetRank(A, N, N), N);
+  CheckI("fullRankMid"c, BitsetRank(A, N, 70), 70);
+
+  BitsetClearAll(A, N);
+  BitsetSet(A, 0);
+  BitsetSet(A, 63);
+  BitsetSet(A, 64);
+  BitsetSet(A, 65);
+  BitsetSet(A, 127);
+  BitsetSet(A, 128);
+  BitsetSet(A, 199);
+  CheckI("setCount"c, BitsetCount(A, N), 7);
+  CheckB("setTest0"c, BitsetTest(A, 0), true);
+  CheckB("setTest1"c, BitsetTest(A, 1), false);
+  CheckB("setTest63"c, BitsetTest(A, 63), true);
+  CheckB("setTest64"c, BitsetTest(A, 64), true);
+  CheckB("setTest199"c, BitsetTest(A, 199), true);
+  CheckB("setTestNeg"c, BitsetTest(A, 0 - 1), false);
+
+  // Rank zaehlt STRIKT unterhalb
+  CheckI("rank0"c, BitsetRank(A, N, 0), 0);
+  CheckI("rank1"c, BitsetRank(A, N, 1), 1);
+  CheckI("rank63"c, BitsetRank(A, N, 63), 1);
+  CheckI("rank64"c, BitsetRank(A, N, 64), 2);
+  CheckI("rank65"c, BitsetRank(A, N, 65), 3);
+  CheckI("rank66"c, BitsetRank(A, N, 66), 4);
+  CheckI("rank128"c, BitsetRank(A, N, 128), 5);
+  CheckI("rankAll"c, BitsetRank(A, N, N), 7);
+  CheckI("rankOver"c, BitsetRank(A, N, 9999), 7);
+  CheckI("rankNeg"c, BitsetRank(A, N, 0 - 3), 0);
+
+  CheckI("select0"c, BitsetSelect(A, N, 0), 0);
+  CheckI("select1"c, BitsetSelect(A, N, 1), 63);
+  CheckI("select2"c, BitsetSelect(A, N, 2), 64);
+  CheckI("select3"c, BitsetSelect(A, N, 3), 65);
+  CheckI("select4"c, BitsetSelect(A, N, 4), 127);
+  CheckI("select5"c, BitsetSelect(A, N, 5), 128);
+  CheckI("select6"c, BitsetSelect(A, N, 6), 199);
+  CheckI("select7"c, BitsetSelect(A, N, 7), 0 - 1);
+  CheckI("selectNeg"c, BitsetSelect(A, N, 0 - 1), 0 - 1);
+
+  CheckI("next0"c, BitsetNext(A, N, 0), 0);
+  CheckI("next1"c, BitsetNext(A, N, 1), 63);
+  CheckI("next64"c, BitsetNext(A, N, 64), 64);
+  CheckI("next66"c, BitsetNext(A, N, 66), 127);
+  CheckI("next129"c, BitsetNext(A, N, 129), 199);
+  CheckI("next200"c, BitsetNext(A, N, 200), 0 - 1);
+  CheckI("nextNeg"c, BitsetNext(A, N, 0 - 5), 0);
+
+  // Durchlaufen muss genau die gesetzten Elemente liefern
+  var seen: int64 := 0;
+  var it: int64 := BitsetNext(A, N, 0);
+  while (it >= 0) {
+    seen := seen + 1;
+    it := BitsetNext(A, N, it + 1);
+  }
+  CheckI("iterationCount"c, seen, 7);
+
+  BitsetClear(A, 64);
+  CheckI("afterClearCount"c, BitsetCount(A, N), 6);
+  CheckB("afterClearTest"c, BitsetTest(A, 64), false);
+  BitsetToggle(A, 64);
+  CheckB("afterToggleTest"c, BitsetTest(A, 64), true);
+  BitsetToggle(A, 64);
+
+  // ── Mengenoperationen ──────────────────────────────────────────────────────
+  BitsetClearAll(A, N);
+  BitsetClearAll(B, N);
+  BitsetSet(A, 5);   BitsetSet(A, 70);  BitsetSet(A, 150);
+  BitsetSet(B, 70);  BitsetSet(B, 150); BitsetSet(B, 199);
+
+  BitsetAnd(A, B, C, N);
+  CheckI("andCount"c, BitsetCount(C, N), 2);
+  CheckB("andHas70"c, BitsetTest(C, 70), true);
+  CheckB("andHas5"c, BitsetTest(C, 5), false);
+  CheckI("countAndNoTemp"c, BitsetCountAnd(A, B, N), 2);
+
+  BitsetOr(A, B, C, N);
+  CheckI("orCount"c, BitsetCount(C, N), 4);
+  CheckI("countOrNoTemp"c, BitsetCountOr(A, B, N), 4);
+
+  BitsetXor(A, B, C, N);
+  CheckI("xorCount"c, BitsetCount(C, N), 2);
+  CheckB("xorHas5"c, BitsetTest(C, 5), true);
+  CheckB("xorHas70"c, BitsetTest(C, 70), false);
+  CheckI("hammingSets"c, BitsetHamming(A, B, N), 2);
+
+  BitsetAndNot(A, B, C, N);
+  CheckI("andNotCount"c, BitsetCount(C, N), 1);
+  CheckB("andNotHas5"c, BitsetTest(C, 5), true);
+
+  // |a| + |b| = |a und b| + |a oder b| — gilt fuer beliebige Mengen
+  var sizes: int64 := BitsetCount(A, N) + BitsetCount(B, N);
+  CheckI("inclusionExclusion"c, sizes,
+         BitsetCountAnd(A, B, N) + BitsetCountOr(A, B, N));
+
+  BitsetNot(A, C, N);
+  CheckI("notCount"c, BitsetCount(C, N), N - 3);
+  CheckB("notHas5"c, BitsetTest(C, 5), false);
+  CheckB("notHas6"c, BitsetTest(C, 6), true);
+  // Auch hier duerfen die ueberzaehligen Bits nicht auftauchen
+  CheckB("notHas199"c, BitsetTest(C, 199), true);
+  BitsetNot(C, C, N);
+  CheckB("notTwice"c, BitsetEquals(A, C, N), true);
+
+  CheckB("equalsSelf"c, BitsetEquals(A, A, N), true);
+  CheckB("equalsOther"c, BitsetEquals(A, B, N), false);
+  BitsetAnd(A, B, C, N);
+  CheckB("subsetTrue"c, BitsetSubset(C, A, N), true);
+  CheckB("subsetFalse"c, BitsetSubset(A, C, N), false);
+  BitsetClearAll(C, N);
+  CheckB("emptyIsSubset"c, BitsetSubset(C, A, N), true);
+
+  // ── Rank und Select sind zueinander invers ─────────────────────────────────
+  //
+  // Fuer jedes gesetzte Element i gilt select(rank(i)) = i, und fuer jedes k
+  // gilt rank(select(k)) = k. Ueber eine Zufallsmenge auf allen 200 Stellen
+  // geprueft — das trifft Wortgrenzenfehler zuverlaessig.
+  BitsetClearAll(A, N);
+  var put: int64 := 0;
+  var i: int64 := 0;
+  while (i < N) {
+    var r: int64 := Rnd();
+    if ((BitsShr(r, 13) & 3) == 0) {
+      BitsetSet(A, i);
+      put := put + 1;
+    }
+    i := i + 1;
+  }
+  CheckI("randomCount"c, BitsetCount(A, N), put);
+
+  var badRank: int64 := 0;
+  var badSel: int64 := 0;
+  var badIter: int64 := 0;
+  var running: int64 := 0;
+  i := 0;
+  while (i < N) {
+    if (BitsetRank(A, N, i) != running) { badRank := badRank + 1; }
+    if (BitsetTest(A, i)) {
+      if (BitsetSelect(A, N, running) != i) { badSel := badSel + 1; }
+      running := running + 1;
+    }
+    i := i + 1;
+  }
+  CheckI("rankMatchesRunning"c, badRank, 0);
+  CheckI("selectInvertsRank"c, badSel, 0);
+
+  var k: int64 := 0;
+  while (k < put) {
+    var pos: int64 := BitsetSelect(A, N, k);
+    if (BitsetRank(A, N, pos) != k) { badIter := badIter + 1; }
+    if (!BitsetTest(A, pos)) { badIter := badIter + 1; }
+    k := k + 1;
+  }
+  CheckI("rankInvertsSelect"c, badIter, 0);
+
+  // Durchlaufen muss dieselbe Folge liefern wie Select
+  var mismatch: int64 := 0;
+  var idx: int64 := 0;
+  it := BitsetNext(A, N, 0);
+  while (it >= 0) {
+    if (it != BitsetSelect(A, N, idx)) { mismatch := mismatch + 1; }
+    idx := idx + 1;
+    it := BitsetNext(A, N, it + 1);
+  }
+  CheckI("iterMatchesSelect"c, mismatch, 0);
+  CheckI("iterCountMatches"c, idx, put);
+
+  // ── Schieben: Saettigung statt Maskierung ──────────────────────────────────
+  //
+  // Die eingebauten Operatoren nehmen die Weite modulo 64. Hier festgehalten,
+  // damit der Unterschied nicht irgendwann "vereinfacht" wird.
+  var n64: int64 := 64;
+  var n65: int64 := 65;
+  var nneg: int64 := 0 - 1;
+  var one: int64 := 1;
+  CheckI("nativeShlWraps"c, one << n64, 1);
+  CheckI("nativeShlWraps65"c, one << n65, 2);
+  CheckI("nativeShlNeg"c, one << nneg, MIN);
+  CheckI("nativeSarWraps"c, MONE >> n64, MONE);
+  CheckI("bitsShlSaturates"c, BitsShl(1, 64), 0);
+  CheckI("bitsShlSaturates65"c, BitsShl(1, 65), 0);
+  CheckI("bitsShlNegIsNoop"c, BitsShl(1, 0 - 1), 1);
+  CheckI("bitsShrSaturates"c, BitsShr(MONE, 64), 0);
+  CheckB("shlDiffersFromNative"c, BitsShl(1, 64) == (one << n64), false);
+
+  // Arithmetisches Schieben mit gesaettigter Weite
+  CheckI("sar0"c, BitsSar(255, 0), 255);
+  CheckI("sar1"c, BitsSar(256, 1), 128);
+  CheckI("sarNegKeepsSign"c, BitsSar(0 - 8, 1), 0 - 4);
+  CheckI("sarNegRoundsDown"c, BitsSar(0 - 7, 1), 0 - 4);
+  CheckI("sarNeg64"c, BitsSar(MONE, 64), MONE);
+  CheckI("sarNeg99"c, BitsSar(0 - 5, 99), MONE);
+  CheckI("sarPos64"c, BitsSar(12345, 64), 0);
+  CheckI("sarMin"c, BitsSar(MIN, 63), MONE);
+  CheckI("sarNegShift"c, BitsSar(255, 0 - 2), 255);
+  // Der Unterschied zum logischen Schieben, an einer Stelle festgehalten
+  CheckI("sarVsShr"c, BitsSar(MONE, 1), MONE);
+  CheckI("shrVsSar"c, BitsShr(MONE, 1), 9223372036854775807);
+
+  // Verlust beim Linksschieben
+  CheckB("shlOverflowNo"c, BitsShlOverflows(1, 62), false);
+  CheckB("shlOverflowSign"c, BitsShlOverflows(1, 63), false);
+  CheckB("shlOverflowYes"c, BitsShlOverflows(1, 64), true);
+  CheckB("shlOverflowZero"c, BitsShlOverflows(0, 99), false);
+  CheckB("shlOverflowNeg"c, BitsShlOverflows(5, 0 - 1), false);
+  CheckB("shlOverflowMinusOne"c, BitsShlOverflows(MONE, 1), true);
+  // 255 << 56 passt noch genau: Bit 7 landet auf Bit 63.
+  CheckB("shlOverflow255fits"c, BitsShlOverflows(255, 56), false);
+  CheckB("shlOverflow255lost"c, BitsShlOverflows(255, 57), true);
+
+  var okFlag: int64 := alloc(8);
+  CheckI("shlCheckedVal"c, BitsShlChecked(3, 4, okFlag), 48);
+  CheckI("shlCheckedOk"c, peek64(okFlag), 1);
+  BitsShlChecked(MONE, 1, okFlag);
+  CheckI("shlCheckedLost"c, peek64(okFlag), 0);
+  CheckI("shlCheckedNullOk"c, BitsShlChecked(3, 4, 0), 48);
+
+  // Trichterschieben ueber die Wortgrenze
+  CheckI("pairShr0"c, BitsShrPair(MONE, 0x1234, 0), 0x1234);
+  CheckI("pairShrAll"c, BitsShrPair(0xABCD, 0, 64), 0xABCD);
+  CheckI("pairShrHalf"c, BitsShrPair(1, 0, 63), 2);
+  CheckI("pairShrPullsDown"c, BitsShrPair(0xFF, 0, 60), 0xFF0);
+  CheckI("pairShrOnes"c, BitsShrPair(MONE, MONE, 32), MONE);
+  CheckI("pairShrZeroHi"c, BitsShrPair(0, MONE, 32), 4294967295);
+  CheckI("pairShl0"c, BitsShlPair(0x1234, MONE, 0), 0x1234);
+  CheckI("pairShlAll"c, BitsShlPair(0, 0xABCD, 64), 0xABCD);
+  CheckI("pairShlPullsUp"c, BitsShlPair(0, MIN, 1), 1);
+  // Hin und zurueck durch das Paar: der Wert wandert im unteren Wort nach oben
+  // und wird als Fenster wieder herausgelesen.
+  var loShift: int64 := BitsShl(0xABC, 20);
+  var hiShift: int64 := BitsShlPair(0, 0xABC, 20);
+  CheckI("pairRoundHi"c, hiShift, 0);
+  CheckI("pairRound"c, BitsShrPair(0, loShift, 20), 0xABC);
+  // Und ueber die Grenze hinweg: 0xABC ab Bit 60 liegt in BEIDEN Woertern.
+  var lo2: int64 := BitsShl(0xABC, 60);
+  var hi2: int64 := BitsShlPair(0, 0xABC, 60);
+  CheckI("pairSplitRound"c, BitsShrPair(hi2, lo2, 60), 0xABC);
+  CheckB("pairSplitUsesHi"c, hi2 != 0, true);
+
+  // ── Bitmengen verschieben ──────────────────────────────────────────────────
+  var S: int64 := alloc(W * 8);
+  var T: int64 := alloc(W * 8);
+
+  BitsetClearAll(S, N);
+  BitsetSet(S, 0);
+  BitsetSet(S, 5);
+  BitsetSet(S, 63);
+  BitsetSet(S, 64);
+  BitsetSet(S, 130);
+
+  // Um 0 verschieben ist eine Kopie
+  BitsetShl(S, T, N, 0);
+  CheckB("shiftZeroIsCopy"c, BitsetEquals(S, T, N), true);
+
+  // Nicht wortausgerichtet: genau hier greift das Trichterschieben
+  BitsetShl(S, T, N, 1);
+  CheckI("bsShl1Count"c, BitsetCount(T, N), 5);
+  CheckB("bsShl1has1"c, BitsetTest(T, 1), true);
+  CheckB("bsShl1has6"c, BitsetTest(T, 6), true);
+  CheckB("bsShl1has64"c, BitsetTest(T, 64), true);
+  CheckB("bsShl1has65"c, BitsetTest(T, 65), true);
+  CheckB("bsShl1has131"c, BitsetTest(T, 131), true);
+  CheckB("bsShl1has0"c, BitsetTest(T, 0), false);
+
+  // Genau eine Wortbreite
+  BitsetShl(S, T, N, 64);
+  CheckI("bsShl64Count"c, BitsetCount(T, N), 5);
+  CheckB("bsShl64has64"c, BitsetTest(T, 64), true);
+  CheckB("bsShl64has127"c, BitsetTest(T, 127), true);
+  CheckB("bsShl64has128"c, BitsetTest(T, 128), true);
+  CheckB("bsShl64has194"c, BitsetTest(T, 194), true);
+
+  // Was oben herausfaellt, ist weg
+  BitsetShl(S, T, N, 100);
+  CheckI("bsShlLoses"c, BitsetCount(T, N), 4);
+  CheckB("bsShlLostTop"c, BitsetTest(T, 30), false);
+  BitsetShl(S, T, N, N);
+  CheckI("bsShlAllOut"c, BitsetCount(T, N), 0);
+  BitsetShl(S, T, N, 9999);
+  CheckI("bsShlFarOut"c, BitsetCount(T, N), 0);
+
+  // Rechts
+  BitsetShr(S, T, N, 1);
+  CheckI("bsShr1Count"c, BitsetCount(T, N), 4);
+  CheckB("bsShr1has4"c, BitsetTest(T, 4), true);
+  CheckB("bsShr1has62"c, BitsetTest(T, 62), true);
+  CheckB("bsShr1has63"c, BitsetTest(T, 63), true);
+  CheckB("bsShr1has129"c, BitsetTest(T, 129), true);
+  BitsetShr(S, T, N, 64);
+  CheckI("bsShr64Count"c, BitsetCount(T, N), 2);
+  CheckB("bsShr64has0"c, BitsetTest(T, 0), true);
+  CheckB("bsShr64has66"c, BitsetTest(T, 66), true);
+
+  // Negative Weite dreht die Richtung um
+  BitsetShl(S, T, N, 0 - 5);
+  var T2: int64 := alloc(W * 8);
+  BitsetShr(S, T2, N, 5);
+  CheckB("bsShlNegIsShr"c, BitsetEquals(T, T2, N), true);
+
+  // An Ort und Stelle muss dasselbe herauskommen
+  var i2: int64 := 0;
+  while (i2 < W) {
+    poke64(T + i2 * 8, peek64(S + i2 * 8));
+    i2 := i2 + 1;
+  }
+  BitsetShl(T, T, N, 7);
+  BitsetShl(S, T2, N, 7);
+  CheckB("bsShlInPlace"c, BitsetEquals(T, T2, N), true);
+  i2 := 0;
+  while (i2 < W) {
+    poke64(T + i2 * 8, peek64(S + i2 * 8));
+    i2 := i2 + 1;
+  }
+  BitsetShr(T, T, N, 7);
+  BitsetShr(S, T2, N, 7);
+  CheckB("bsShrInPlace"c, BitsetEquals(T, T2, N), true);
+
+  // Hin und zurueck: was nicht herausfaellt, kommt zurueck
+  BitsetClearAll(T, N);
+  BitsetSet(T, 10);
+  BitsetSet(T, 70);
+  BitsetShl(T, T2, N, 13);
+  BitsetShr(T2, T2, N, 13);
+  CheckB("bsShiftRound"c, BitsetEquals(T, T2, N), true);
+
+  // Zyklisch: die Zahl der Elemente bleibt IMMER gleich
+  BitsetRotl(S, T, N, 0);
+  CheckB("bsRot0"c, BitsetEquals(S, T, N), true);
+  BitsetRotl(S, T, N, 37);
+  CheckI("bsRotKeepsCount"c, BitsetCount(T, N), BitsetCount(S, N));
+  BitsetRotl(S, T, N, N);
+  CheckB("bsRotFullTurn"c, BitsetEquals(S, T, N), true);
+  BitsetRotl(S, T, N, 1);
+  CheckB("bsRot1has1"c, BitsetTest(T, 1), true);
+  CheckB("bsRot1has131"c, BitsetTest(T, 131), true);
+  // Das oberste Element wandert an den Anfang
+  BitsetClearAll(T2, N);
+  BitsetSet(T2, N - 1);
+  BitsetRotl(T2, T, N, 1);
+  CheckB("bsRotWraps"c, BitsetTest(T, 0), true);
+  CheckI("bsRotWrapCount"c, BitsetCount(T, N), 1);
+  // Negativ dreht rueckwaerts
+  BitsetRotl(S, T, N, 0 - 37);
+  BitsetRotl(T, T2, N, 37);
+  CheckB("bsRotNegInverse"c, BitsetEquals(S, T2, N), true);
+
+  // Verschieben gegen ein bitweises Vorbild — 300 Zufallsfaelle.
+  // Die Vergleichsfassung setzt Bit fuer Bit um und kennt keine Wortgrenze.
+  var badShift: int64 := 0;
+  var trial2: int64 := 0;
+  while (trial2 < 300) {
+    BitsetClearAll(S, N);
+    var put2: int64 := 0;
+    while (put2 < 12) {
+      var r2: int64 := Rnd();
+      var pos2: int64 := BitsShr(r2, 20) % N;
+      if (pos2 < 0) { pos2 := 0 - pos2; }
+      BitsetSet(S, pos2 % N);
+      put2 := put2 + 1;
+    }
+    var kk: int64 := (trial2 * 7) % (N + 20);
+    var left: bool := (trial2 % 2) == 0;
+
+    if (left) { BitsetShl(S, T, N, kk); }
+    else { BitsetShr(S, T, N, kk); }
+
+    // bitweises Vorbild
+    BitsetClearAll(T2, N);
+    var b2: int64 := 0;
+    while (b2 < N) {
+      if (BitsetTest(S, b2)) {
+        var dst: int64 := b2 - kk;
+        if (left) { dst := b2 + kk; }
+        if (dst >= 0) {
+          if (dst < N) { BitsetSet(T2, dst); }
+        }
+      }
+      b2 := b2 + 1;
+    }
+    if (!BitsetEquals(T, T2, N)) { badShift := badShift + 1; }
+    trial2 := trial2 + 1;
+  }
+  CheckI("fuzzBitsetShift"c, badShift, 0);
+
+  free(S, W * 8);  free(T, W * 8);  free(T2, W * 8);  free(okFlag, 8);
+
+  // ── Rotation schmalerer Breiten ────────────────────────────────────────────
+  //
+  // Sollwerte aus Python. 32 Bit ist der Regelfall in Streuwert- und
+  // Verschluesselungsfunktionen, nicht 64.
+  CheckI("rotl32.known"c, BitsRotl32(0x12345678, 8), 0x34567812);
+  CheckI("rotr32.known"c, BitsRotr32(0x12345678, 8), 0x78123456);
+  CheckI("rotl32.wraps"c, BitsRotl32(0x80000000, 1), 1);
+  CheckI("rotr32.wraps"c, BitsRotr32(1, 1), 0x80000000);
+  CheckI("rotl32.zero"c, BitsRotl32(0x12345678, 0), 0x12345678);
+  CheckI("rotl32.full"c, BitsRotl32(0x12345678, 32), 0x12345678);
+  CheckI("rotl32.over"c, BitsRotl32(0x12345678, 40), 0x34567812);
+  CheckI("rotl32.neg"c, BitsRotl32(0x12345678, 0 - 8), 0x78123456);
+  CheckI("rotl32.allOnes"c, BitsRotl32(0xFFFFFFFF, 13), 0xFFFFFFFF);
+  // Die obere Haelfte gehoert nicht zur Zahl und muss verschwinden
+  CheckI("rotl32.masksInput"c, BitsRotl32(0xAAAAAAAA12345678, 8), 0x34567812);
+  CheckI("rotr32.masksInput"c, BitsRotr32(0xAAAAAAAA12345678, 8), 0x78123456);
+  CheckI("rotl32.noLeak"c, BitsRotl32(0x80000000, 1), 1);
+
+  CheckI("rotl16"c, BitsRotl16(0x1234, 4), 0x2341);
+  CheckI("rotr16"c, BitsRotr16(0x1234, 4), 0x4123);
+  CheckI("rotl16.wraps"c, BitsRotl16(0x8000, 1), 1);
+  CheckI("rotl16.masks"c, BitsRotl16(0xFFFF1234, 4), 0x2341);
+  CheckI("rotl8"c, BitsRotl8(0x81, 1), 3);
+  CheckI("rotr8"c, BitsRotr8(3, 1), 0x81);
+  CheckI("rotl8.full"c, BitsRotl8(0xAB, 8), 0xAB);
+  CheckI("rotl8.masks"c, BitsRotl8(0xFF00 | 0x81, 1), 3);
+
+  CheckI("rotlN.width64"c, BitsRotlN(1, 63, 64), MIN);
+  CheckI("rotlN.width1"c, BitsRotlN(1, 1, 1), 1);
+  CheckI("rotlN.width0"c, BitsRotlN(0xFF, 3, 0), 0);
+  CheckI("rotlN.width3"c, BitsRotlN(0b101, 1, 3), 0b011);
+  CheckI("rotrN.width3"c, BitsRotrN(0b101, 1, 3), 0b110);
+
+  // Rotation ist umkehrbar und erhaelt die Zahl der Bits — fuer JEDE Breite.
+  var badRot2: int64 := 0;
+  var wdt: int64 := 2;
+  while (wdt <= 64) {
+    var val: int64 := 0x0123456789ABCDEF & BitsMask(wdt);
+    var sh2: int64 := 0;
+    while (sh2 <= wdt) {
+      var r: int64 := BitsRotlN(val, sh2, wdt);
+      if (BitsRotrN(r, sh2, wdt) != val) { badRot2 := badRot2 + 1; }
+      if (BitsPopCount(r) != BitsPopCount(val)) { badRot2 := badRot2 + 1; }
+      // ueber die Breite hinaus darf nichts stehen
+      if ((r & (~BitsMask(wdt))) != 0) { badRot2 := badRot2 + 1; }
+      // links um k ist rechts um width-k
+      if (r != BitsRotrN(val, wdt - sh2, wdt)) { badRot2 := badRot2 + 1; }
+      sh2 := sh2 + 1;
+    }
+    wdt := wdt + 1;
+  }
+  CheckI("rotWidthsSound"c, badRot2, 0);
+
+  // 128-Bit-Rotation
+  var rhi: int64 := alloc(8);
+  var rlo: int64 := alloc(8);
+  BitsRotlPair(0, 1, 0, rhi, rlo);
+  CheckI("pairRot0hi"c, peek64(rhi), 0);
+  CheckI("pairRot0lo"c, peek64(rlo), 1);
+  // Um 64 vertauscht die Woerter
+  BitsRotlPair(0xAAAA, 0xBBBB, 64, rhi, rlo);
+  CheckI("pairRot64hi"c, peek64(rhi), 0xBBBB);
+  CheckI("pairRot64lo"c, peek64(rlo), 0xAAAA);
+  // Bit 127 wandert auf Bit 0
+  BitsRotlPair(MIN, 0, 1, rhi, rlo);
+  CheckI("pairRotWrapLo"c, peek64(rlo), 1);
+  CheckI("pairRotWrapHi"c, peek64(rhi), 0);
+  // Volle Drehung
+  BitsRotlPair(0x1234, 0x5678, 128, rhi, rlo);
+  CheckI("pairRotFullHi"c, peek64(rhi), 0x1234);
+  CheckI("pairRotFullLo"c, peek64(rlo), 0x5678);
+  // Hin und zurueck
+  BitsRotlPair(0x1122334455667788, 0x99AABBCCDDEEFF00, 37, rhi, rlo);
+  var kh: int64 := peek64(rhi);
+  var kl: int64 := peek64(rlo);
+  BitsRotlPair(kh, kl, 128 - 37, rhi, rlo);
+  CheckI("pairRotRoundHi"c, peek64(rhi), 0x1122334455667788);
+  CheckI("pairRotRoundLo"c, peek64(rlo), 0x99AABBCCDDEEFF00);
+  // Bitzahl bleibt erhalten
+  BitsRotlPair(0x1122334455667788, 0x99AABBCCDDEEFF00, 91, rhi, rlo);
+  CheckI("pairRotKeepsPop"c,
+         BitsPopCount(peek64(rhi)) + BitsPopCount(peek64(rlo)),
+         BitsPopCount(0x1122334455667788) + BitsPopCount(0x99AABBCCDDEEFF00));
+  // outHi/outLo duerfen 0 sein
+  BitsRotlPair(1, 2, 3, 0, rlo);
+  CheckI("pairRotNullHi"c, peek64(rlo), 16);
+  free(rhi, 8);  free(rlo, 8);
+
+  // Bitmengen zyklisch nach rechts
+  var R1: int64 := alloc(W * 8);
+  var R2: int64 := alloc(W * 8);
+  BitsetClearAll(R1, N);
+  BitsetSet(R1, 0);
+  BitsetSet(R1, 65);
+  BitsetSet(R1, 199);
+  BitsetRotr(R1, R2, N, 1);
+  CheckI("bsRotrCount"c, BitsetCount(R2, N), 3);
+  CheckB("bsRotrWraps"c, BitsetTest(R2, N - 1), true);
+  CheckB("bsRotrHas64"c, BitsetTest(R2, 64), true);
+  CheckB("bsRotrHas198"c, BitsetTest(R2, 198), true);
+  // Rotl und Rotr heben sich auf
+  BitsetRotl(R2, R1, N, 1);
+  BitsetClearAll(R2, N);
+  BitsetSet(R2, 0);
+  BitsetSet(R2, 65);
+  BitsetSet(R2, 199);
+  CheckB("bsRotrInverse"c, BitsetEquals(R1, R2, N), true);
+  free(R1, W * 8);  free(R2, W * 8);
+
+  // ── Negativkontrollen ──────────────────────────────────────────────────────
+  //
+  // Erstens: der Abgleich schnell/langsam muss anschlagen, wenn man ihn
+  // beluegt. SlowPop auf einem veraenderten Wert darf NICHT mehr passen.
+  var probe: int64 := 0x0F0F0F0F0F0F0F0F;
+  CheckI("negCtrlAgrees"c, BitsPopCount(probe), SlowPop(probe));
+  CheckB("negCtrlCatches"c, BitsPopCount(probe) == SlowPop(probe | 0x10), false);
+
+  // Zweitens: der Fehler, den diese Unit ueberhaupt erst noetig macht. Die
+  // Teile-durch-zwei-Schleife aus std.math, hier nachgebaut, muss bei -1 ein
+  // ANDERES Ergebnis liefern als die richtige Fassung.
+  var v: int64 := MONE;
+  var c: int64 := 0;
+  while (v != 0) {
+    c := c + (v & 1);
+    v := v / 2;
+  }
+  CheckI("negCtrlBrokenLoop"c, c, 1);
+  CheckB("negCtrlBrokenDiffers"c, c == BitsPopCount(MONE), false);
+
+  // Drittens: haette BitsShr das Vorzeichen nachgezogen, waere der Popcount
+  // von -1 nicht 64. Der Unterschied ist hier festgehalten.
+  CheckB("negCtrlShiftDiffers"c, BitsShr(MONE, 1) == (MONE >> 1), false);
+
+  free(A, W * 8);  free(B, W * 8);  free(C, W * 8);
+
+  PrintStr("checks="c);
+  PrintInt(_checks);
+  PrintStr(" fails="c);
+  PrintInt(_fails);
+  PrintStr("\n"c);
+  return _fails;
+}

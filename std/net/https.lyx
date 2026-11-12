@@ -1,11 +1,24 @@
 // Lyx HTTPS Client - Secure HTTP over TLS
 // Uses std.net.tls (OpenSSL) for encryption
 //
+// CAPABILITIES (#1348): Wer dieses Modul unter @capabilities nutzt, braucht
+//   network.tcp.connect   Verbindung zum Server
+//   memory.mmap           OpenSSL-Puffer
+//   fs.read UND fs.meta   Zertifikatspruefung gegen den CA-Store des Systems:
+//                         OpenSSL scannt /usr/lib/ssl/certs und stattet die
+//                         Kandidaten ab (getdents64, stat, lstat, statx) —
+//                         das haengt an fs.meta, nicht an fs.read.
+// Fehlt fs.meta, laeuft der Handshake bis zur Zertifikatspruefung und der
+// Prozess stirbt dann an SIGSYS: kein Rueckgabewert, keine Meldung. Der
+// Compiler warnt beim Uebersetzen, wenn dieses Modul importiert ist und die
+// beiden Capabilities fehlen.
+//
 // Usage:
 //   import std.net.https;
 //   var resp: HTTPResponse := HTTPSGet("example.com", "/index.html");
 //   PrintStr(resp.bodyPtr);
 //   HTTPResponseFree(resp);
+@capabilities([fs.read, network.tcp.bind, network.tcp.connect, network.udp.connect])
 
 unit std.net.https;
 
@@ -19,7 +32,7 @@ import std.net.types;
 // host: hostname (e.g., "example.com")
 // path: URL path (e.g., "/index.html")
 // Returns HTTPResponse with body allocated via mmap (caller must free)
-pub fn HTTPSGet(host: int64, path: int64): HTTPResponse {
+pub fn HTTPSGet(host: pchar, path: pchar): HTTPResponse {
   var response: HTTPResponse;
   var ctx: TLSContext;
   var conn: TLSConn;
@@ -37,6 +50,13 @@ pub fn HTTPSGet(host: int64, path: int64): HTTPResponse {
   response.contentLength := 0;
   response.bodyPtr := 0;
   response.bodySize := 0;
+  // #1534: Diese beiden fehlten. HTTPResponseFree prueft `headersRaw != 0` und
+  // ruft dann munmap darauf — bei nie gesetztem Feld entschied Stack-Rauschen
+  // ueber Adresse UND Laenge. Meist scheiterte der Aufruf mit EINVAL und fiel
+  // nicht auf; traf der Muellwert eine gemappte Adresse, wurde fremder
+  // Speicher freigegeben.
+  response.headersRaw := 0;
+  response.headersSize := 0;
   
   // Initialize TLS
   ctx := TLSInit();
@@ -45,7 +65,7 @@ pub fn HTTPSGet(host: int64, path: int64): HTTPResponse {
   }
   
   // Resolve hostname
-  ip := GetHostByName(host);
+  ip := GetHostByName(host as pchar);
   if (ip == 0) {
     TLSFree(ctx);
     return response;
@@ -59,7 +79,7 @@ pub fn HTTPSGet(host: int64, path: int64): HTTPResponse {
   }
   
   // TLS handshake
-  conn := TLSConnect(ctx, tcpConn.fd, host);
+  conn := TLSConnect(ctx, tcpConn.fd, host as pchar);
   if (conn.connected == 0) {
     sys_close(tcpConn.fd);
     TLSFree(ctx);
@@ -85,8 +105,18 @@ pub fn HTTPSGet(host: int64, path: int64): HTTPResponse {
   }
   
   // Send request over TLS
-  n := TLSWrite(conn, requestBuf, 4096);
-  munmap(requestBuf, 4096);
+  // #1346: HTTPRequestBuild liefert einen Puffer mit 16-Byte-Kopf
+  // ([0..7] allocSize, [8..15] reqSize), der Text beginnt bei +16. Bis
+  // hierher gingen die 16 Byte Binaerdaten mit ueber die Leitung, dahinter
+  // Nullpadding bis 4096 — der Server sah keine gueltige Requestzeile und
+  // antwortete 400. HTTPSSend machte es von Anfang an richtig; nur die
+  // beiden Komfortfunktionen lasen den Puffer roh.
+  //
+  // Auch das Freigeben war falsch: 4096 statt der wirklich abgebildeten
+  // allocSize — bei langen Pfaden blieb Speicher liegen, bei kurzen wurde
+  // ueber die Mappinggrenze hinaus unmapped.
+  n := TLSWrite(conn, requestBuf + 16, peek64(requestBuf + 8));
+  munmap(requestBuf, peek64(requestBuf));
   
   if (n <= 0) {
     TLSClose(conn);
@@ -122,7 +152,7 @@ pub fn HTTPSGet(host: int64, path: int64): HTTPResponse {
     }
     var r: int64 := TLSRead(conn, buf + total, 16384);
     if (r <= 0) { break; }
-    total := total + r;
+    total += r;
     if (total >= 67108864) { break; }   // 64 MiB safety cap
   }
   TLSClose(conn);
@@ -133,88 +163,161 @@ pub fn HTTPSGet(host: int64, path: int64): HTTPResponse {
     munmap(buf, cap);
     return response;
   }
-  n := total;   // the parsing below scans the full accumulated response
+  n := total;   // der Parser sieht die vollstaendig gelesene Antwort
 
-  // Parse status line
-  i := 0;
-  while (i < n - 13) {
-    if (peek8(buf + i) == 72 && peek8(buf + i + 1) == 84 && 
-        peek8(buf + i + 2) == 84 && peek8(buf + i + 3) == 80 &&
-        peek8(buf + i + 4) == 47) {
-      i := i + 9;
-      response.statusCode := 0;
-      response.statusCode := response.statusCode * 10 + (peek8(buf + i) - 48);
-      response.statusCode := response.statusCode * 10 + (peek8(buf + i + 1) - 48);
-      response.statusCode := response.statusCode * 10 + (peek8(buf + i + 2) - 48);
-      break;
-    }
-    i := i + 1;
-  }
-  
-  // Find Content-Length. HTTP header names are case-insensitive, and CDNs
-  // (Cloudflare) send them lowercased — match on (byte | 0x20) so "content-
-  // length" and "Content-Length" both hit. ('-' is unaffected by | 0x20.)
-  i := 0;
-  while (i < n - 16) {
-    if ((peek8(buf + i) | 32) == 99 && (peek8(buf + i + 1) | 32) == 111 &&
-        (peek8(buf + i + 2) | 32) == 110 && (peek8(buf + i + 3) | 32) == 116 &&
-        (peek8(buf + i + 4) | 32) == 101 && (peek8(buf + i + 5) | 32) == 110 &&
-        (peek8(buf + i + 6) | 32) == 116 && (peek8(buf + i + 7) | 32) == 45 &&
-        (peek8(buf + i + 8) | 32) == 108 && (peek8(buf + i + 9) | 32) == 101 &&
-        (peek8(buf + i + 10) | 32) == 110 && (peek8(buf + i + 11) | 32) == 103 &&
-        (peek8(buf + i + 12) | 32) == 116 && (peek8(buf + i + 13) | 32) == 104) {
-      i := i + 14;
-      // Skip the ":" and any spaces between the header name and its value.
-      while (i < n && (peek8(buf + i) < 48 || peek8(buf + i) > 57)) {
-        i := i + 1;
-      }
-      response.contentLength := 0;
-      while (i < n) {
-        var c: int64 := peek8(buf + i);
-        if (c < 48 || c > 57) {
-          break;
-        }
-        response.contentLength := response.contentLength * 10 + (c - 48);
-        i := i + 1;
-      }
-      break;
-    }
-    i := i + 1;
-  }
-  
-  // Find body start
-  var bodyStart: int64 := 0;
-  i := 0;
-  while (i < n - 4) {
-    if (peek8(buf + i) == 13 && peek8(buf + i + 1) == 10 &&
-        peek8(buf + i + 2) == 13 && peek8(buf + i + 3) == 10) {
-      bodyStart := i + 4;
-      break;
-    }
-    i := i + 1;
-  }
-  
-  // Extract body
-  if (bodyStart > 0) {
-    var bodyLen: int64 := n - bodyStart;
-    if (bodyLen > 0) {
-      response.bodyPtr := mmap(0, bodyLen, PROT_RW, MAP_ANON, FD_NONE, 0);
-      if (response.bodyPtr != 0) {
-        i := 0;
-        while (i < bodyLen) {
-          poke8(response.bodyPtr + i, peek8(buf + bodyStart + i));
-          i := i + 1;
-        }
-        response.bodySize := bodyLen;
-      }
-    }
-  }
-
+  // #1534/#1539: Hier stand eine eigene, kuerzere Auswertung — nur die
+  // Statuszeile und der Rumpf ab \r\n\r\n. Kopfzeilen wurden nicht uebernommen
+  // (#1534) und `Transfer-Encoding: chunked` nicht aufgeloest (#1539); ab der
+  // ersten gechunkten Antwort kam der Rumpf mit Laengenrahmen durchsetzt an.
+  //
+  // Es gilt jetzt derselbe Parser wie ueber TCP. Er liest nicht vom Socket,
+  // deshalb passt er auch auf den TLS-Weg.
+  response := HTTPParseResponse(response, buf, n);
   munmap(buf, cap);
   return response;
 }
 
 // HTTPS POST request
+// #1264: Ein VOLLSTAENDIGER Request ueber TLS — Methode, Kopfzeilen und Rumpf
+// bestimmt der Aufrufer. Die drei Cloud-Transporte (aws, cf, digitalocean)
+// hatten sich diesen Weg selbst zusammengesetzt und dabei zwei Funktionen mit
+// falscher Stelligkeit gerufen: `DNSResolve(host)` (vier Parameter) und
+// `HTTPSend(tlsConn, conn)` (einer). Beides uebersetzte, weil die Pruefung an
+// der Unit-Grenze endete; zur Laufzeit kamen die fehlenden Werte vom Stack.
+// Statt den Fehler dreimal zu flicken, steht der Weg jetzt EINMAL hier — als
+// dieselbe Abfolge, die HTTPSGet seit jeher benutzt.
+pub fn HTTPSSend(req: HTTPRequest): HTTPResponse {
+  var host: int64 := req.host;
+  var response: HTTPResponse;
+  var ctx: TLSContext;
+  var conn: TLSConn;
+  var ip: int64;
+  var tcpConn: TCPConn;
+  var requestBuf: int64;
+  var buf: int64;
+  var n: int64;
+  var i: int64;
+  
+  // Initialize response
+  response.statusCode := 0;
+  response.statusText := 0;
+  response.headerCount := 0;
+  response.contentLength := 0;
+  response.bodyPtr := 0;
+  response.bodySize := 0;
+  // #1534: Diese beiden fehlten. HTTPResponseFree prueft `headersRaw != 0` und
+  // ruft dann munmap darauf — bei nie gesetztem Feld entschied Stack-Rauschen
+  // ueber Adresse UND Laenge. Meist scheiterte der Aufruf mit EINVAL und fiel
+  // nicht auf; traf der Muellwert eine gemappte Adresse, wurde fremder
+  // Speicher freigegeben.
+  response.headersRaw := 0;
+  response.headersSize := 0;
+  
+  // Initialize TLS
+  ctx := TLSInit();
+  if (ctx.initialized == 0) {
+    return response;
+  }
+  
+  // Resolve hostname
+  ip := GetHostByName(host as pchar);
+  if (ip == 0) {
+    TLSFree(ctx);
+    return response;
+  }
+  
+  // Connect TCP
+  tcpConn := TCPConnect(ip, HTTPS_PORT);
+  if (tcpConn.fd < 0) {
+    TLSFree(ctx);
+    return response;
+  }
+  
+  // TLS handshake
+  conn := TLSConnect(ctx, tcpConn.fd, host as pchar);
+  if (conn.connected == 0) {
+    sys_close(tcpConn.fd);
+    TLSFree(ctx);
+    return response;
+  }
+  
+  requestBuf := HTTPRequestBuild(req);
+  if (requestBuf == 0) {
+    TLSClose(conn);
+    sys_close(tcpConn.fd);
+    TLSFree(ctx);
+    return response;
+  }
+  
+  // Senden: der Puffer traegt Belegungs- und Nutzgroesse im Kopf (je 8 Byte).
+  // HTTPSGet schreibt hier feste 4096 Byte — das ist eine eigene Unsauberkeit
+  // und bleibt unberuehrt; hier wird die wirkliche Laenge benutzt.
+  var reqAlloc: int64 := peek64(requestBuf);
+  var reqSize:  int64 := peek64(requestBuf + 8);
+  n := TLSWrite(conn, requestBuf + 16, reqSize);
+  munmap(requestBuf, reqAlloc);
+  
+  if (n <= 0) {
+    TLSClose(conn);
+    sys_close(tcpConn.fd);
+    TLSFree(ctx);
+    return response;
+  }
+  
+  // Receive the full response. The request sends "Connection: close", so the
+  // server ends the TLS stream when done; we read into a growable buffer until
+  // TLSRead reports the close (<= 0). This handles responses far larger than a
+  // single TLS record — e.g. multi-MB package archives.
+  var cap: int64 := 65536;
+  buf := mmap(0, cap, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (buf == 0) {
+    TLSClose(conn);
+    sys_close(tcpConn.fd);
+    TLSFree(ctx);
+    return response;
+  }
+  var total: int64 := 0;
+  while (true) {
+    // Grow before each read so there is always room for a full chunk.
+    if (total + 16384 > cap) {
+      var newCap: int64 := cap * 2;
+      var nb: int64 := mmap(0, newCap, PROT_RW, MAP_ANON, FD_NONE, 0);
+      if (nb == 0) { break; }
+      var k: int64 := 0;
+      while (k < total) { poke8(nb + k, peek8(buf + k)); k := k + 1; }
+      munmap(buf, cap);
+      buf := nb;
+      cap := newCap;
+    }
+    var r: int64 := TLSRead(conn, buf + total, 16384);
+    if (r <= 0) { break; }
+    total += r;
+    if (total >= 67108864) { break; }   // 64 MiB safety cap
+  }
+  TLSClose(conn);
+  sys_close(tcpConn.fd);
+  TLSFree(ctx);
+
+  if (total <= 0) {
+    munmap(buf, cap);
+    return response;
+  }
+  n := total;   // der Parser sieht die vollstaendig gelesene Antwort
+
+  // #1534/#1539: Hier stand eine eigene, kuerzere Auswertung — nur die
+  // Statuszeile und der Rumpf ab \r\n\r\n. Kopfzeilen wurden nicht uebernommen
+  // (#1534) und `Transfer-Encoding: chunked` nicht aufgeloest (#1539); ab der
+  // ersten gechunkten Antwort kam der Rumpf mit Laengenrahmen durchsetzt an.
+  //
+  // Es gilt jetzt derselbe Parser wie ueber TCP. Er liest nicht vom Socket,
+  // deshalb passt er auch auf den TLS-Weg.
+  response := HTTPParseResponse(response, buf, n);
+  munmap(buf, cap);
+  return response;
+}
+
+// HTTPS POST request
+
 pub fn HTTPSPost(host: int64, path: int64, body: int64, bodySize: int64): HTTPResponse {
   var response: HTTPResponse;
   var ctx: TLSContext;
@@ -232,13 +335,20 @@ pub fn HTTPSPost(host: int64, path: int64, body: int64, bodySize: int64): HTTPRe
   response.contentLength := 0;
   response.bodyPtr := 0;
   response.bodySize := 0;
+  // #1534: Diese beiden fehlten. HTTPResponseFree prueft `headersRaw != 0` und
+  // ruft dann munmap darauf — bei nie gesetztem Feld entschied Stack-Rauschen
+  // ueber Adresse UND Laenge. Meist scheiterte der Aufruf mit EINVAL und fiel
+  // nicht auf; traf der Muellwert eine gemappte Adresse, wurde fremder
+  // Speicher freigegeben.
+  response.headersRaw := 0;
+  response.headersSize := 0;
   
   ctx := TLSInit();
   if (ctx.initialized == 0) {
     return response;
   }
   
-  ip := GetHostByName(host);
+  ip := GetHostByName(host as pchar);
   if (ip == 0) {
     TLSFree(ctx);
     return response;
@@ -250,7 +360,7 @@ pub fn HTTPSPost(host: int64, path: int64, body: int64, bodySize: int64): HTTPRe
     return response;
   }
   
-  conn := TLSConnect(ctx, tcpConn.fd, host);
+  conn := TLSConnect(ctx, tcpConn.fd, host as pchar);
   if (conn.connected == 0) {
     sys_close(tcpConn.fd);
     TLSFree(ctx);
@@ -274,8 +384,18 @@ pub fn HTTPSPost(host: int64, path: int64, body: int64, bodySize: int64): HTTPRe
     return response;
   }
   
-  n := TLSWrite(conn, requestBuf, 4096);
-  munmap(requestBuf, 4096);
+  // #1346: HTTPRequestBuild liefert einen Puffer mit 16-Byte-Kopf
+  // ([0..7] allocSize, [8..15] reqSize), der Text beginnt bei +16. Bis
+  // hierher gingen die 16 Byte Binaerdaten mit ueber die Leitung, dahinter
+  // Nullpadding bis 4096 — der Server sah keine gueltige Requestzeile und
+  // antwortete 400. HTTPSSend machte es von Anfang an richtig; nur die
+  // beiden Komfortfunktionen lasen den Puffer roh.
+  //
+  // Auch das Freigeben war falsch: 4096 statt der wirklich abgebildeten
+  // allocSize — bei langen Pfaden blieb Speicher liegen, bei kurzen wurde
+  // ueber die Mappinggrenze hinaus unmapped.
+  n := TLSWrite(conn, requestBuf + 16, peek64(requestBuf + 8));
+  munmap(requestBuf, peek64(requestBuf));
   
   if (n <= 0) {
     TLSClose(conn);
@@ -302,48 +422,9 @@ pub fn HTTPSPost(host: int64, path: int64, body: int64, bodySize: int64): HTTPRe
     return response;
   }
   
-  // Parse response (same as HTTPSGet)
-  i := 0;
-  while (i < n - 13) {
-    if (peek8(buf + i) == 72 && peek8(buf + i + 1) == 84 && 
-        peek8(buf + i + 2) == 84 && peek8(buf + i + 3) == 80 &&
-        peek8(buf + i + 4) == 47) {
-      i := i + 9;
-      response.statusCode := 0;
-      response.statusCode := response.statusCode * 10 + (peek8(buf + i) - 48);
-      response.statusCode := response.statusCode * 10 + (peek8(buf + i + 1) - 48);
-      response.statusCode := response.statusCode * 10 + (peek8(buf + i + 2) - 48);
-      break;
-    }
-    i := i + 1;
-  }
-  
-  var bodyStart: int64 := 0;
-  i := 0;
-  while (i < n - 4) {
-    if (peek8(buf + i) == 13 && peek8(buf + i + 1) == 10 &&
-        peek8(buf + i + 2) == 13 && peek8(buf + i + 3) == 10) {
-      bodyStart := i + 4;
-      break;
-    }
-    i := i + 1;
-  }
-  
-  if (bodyStart > 0) {
-    var bodyLen: int64 := n - bodyStart;
-    if (bodyLen > 0) {
-      response.bodyPtr := mmap(0, bodyLen, PROT_RW, MAP_ANON, FD_NONE, 0);
-      if (response.bodyPtr != 0) {
-        i := 0;
-        while (i < bodyLen) {
-          poke8(response.bodyPtr + i, peek8(buf + bodyStart + i));
-          i := i + 1;
-        }
-        response.bodySize := bodyLen;
-      }
-    }
-  }
-  
+  // #1534/#1539: siehe HTTPSGet — derselbe Parser wie ueber TCP, statt der
+  // dritten Teilkopie im Baum.
+  response := HTTPParseResponse(response, buf, n);
   munmap(buf, 8192);
   return response;
 }

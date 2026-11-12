@@ -1,0 +1,183 @@
+// std/cpu/clock.lyx — gemessener Takt waehrend aktiver Ausfuehrung (#2401)
+//
+// Der effektive Takt ist der einzige Taktwert, mit dem man eine Messung in
+// Takte umrechnen oder eine Verbesserung von einer veraenderten Messbedingung
+// unterscheiden kann. Die naheliegenden Wege sind alle falsch oder gesperrt:
+//
+//   * `scaling_cur_freq` ist der ANGEFORDERTE Zustand, nicht der Takt (#2400).
+//   * Der TSC laeuft mit konstanter Rate und ist NICHT der Kerntakt. Ihn als
+//     Takt zu nehmen waere ein stiller Default mit plausiblem Wert — die
+//     schlimmste Sorte.
+//   * APERF/MPERF liegen in MSRs. Bei Lockdown `integrity` (Secure Boot) ist
+//     der MSR-Zugriff auch fuer root gesperrt; auf dieser Maschine ist der Weg
+//     nicht benutzbar und darf nicht die einzige Umsetzung sein.
+//
+// Tragfaehig ist `perf_event_open` auf PERF_COUNT_HW_CPU_CYCLES, an den
+// eigenen Thread gebunden: der Zaehler laeuft NUR, waehrend der Thread
+// tatsaechlich auf einem Kern ausgefuehrt wird.
+//
+//   effective_active_hz = zyklen * 1e9 / aktive_ns
+//
+// Im Nenner steht die AKTIVE Zeit (CLOCK_THREAD_CPUTIME_ID), nicht die
+// Wanduhrzeit — sonst senkt jede Schlafphase im Messfenster den Wert, und das
+// Ergebnis waere ein ueber Schlafphasen verwaschener Mittelwert statt des
+// Takts. Beide Zeiten stehen im Bericht, damit das Verhaeltnis sichtbar ist.
+//
+// Scheitert perf_event_open, ist das ein ERGEBNIS mit Status
+// (permission_denied bei EACCES/EPERM, not_exposed_by_vm ohne PMU) — keine
+// Schaetzung und kein Rueckfall auf scaling_cur_freq.
+
+@description("Gemessener Takt waehrend aktiver Ausfuehrung ueber gezaehlte Kernzyklen")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+unit std.cpu.clock;
+
+import std.alloc;
+import std.cpu.status;
+import std.debug;
+import std.time;
+
+// Messhandle: {fd, t0_monoton, t0_aktiv, zyklen0}
+pub con CPU_MESS_SZ: int64 := 32;
+
+// Messung beginnen. Rueckgabe: Handle, oder 0 bei Fehlschlag (dann traegt
+// `status` den Grund).
+pub fn CpuMessStart(status: int64): int64 {
+  // Flags 0: Kernelzeit wird MITgezaehlt. Das ist hier richtig — der Thread
+  // laeuft auch waehrend eines Syscalls auf dem Kern, und der Nenner
+  // (CLOCK_THREAD_CPUTIME_ID) enthaelt diese Zeit ebenfalls. Mit
+  // exclude_kernel kaeme ein Bruch aus Nutzerzyklen und Gesamtzeit heraus:
+  // gemessen 94,5e6 Zyklen gegen 398 ms, also 237 MHz statt 3,39 GHz — ein
+  // plausibel aussehender, voellig falscher Wert.
+  //
+  // Ausdruecklich NICHT exclusive (das Bit, das bis #2401 faelschlich gesetzt
+  // wurde): ein exklusiver Zaehler zwingt jedes gleichzeitig laufende
+  // `perf stat` ins Multiplexing und macht damit die Gegenprobe kaputt.
+  var fd: int64 := PerfCountFlags(PERF_TYPE_HARDWARE, PERF_COUNT_HW_CPU_CYCLES, 0);
+  if (fd < 0) {
+    var st: int64 := CpuStatusAusErrno(fd);
+    // Kein PMU in einer VM meldet ENOENT (-2); das ist hier nicht
+    // "unsupported" im Sinne von "Datei fehlt", sondern genau der Fall
+    // not_exposed_by_vm.
+    if (fd == 0 - 2) { st := CPU_ST_NOT_EXPOSED_BY_VM; }
+    CpuWertFehlt(status, st, "perf_event_open(HW_CPU_CYCLES)"c);
+    return 0;
+  }
+  var h: int64 := alloc(CPU_MESS_SZ);
+  if (h == 0) {
+    close(fd);
+    CpuWertFehlt(status, CPU_ST_NOT_IMPLEMENTED, "alloc"c);
+    return 0;
+  }
+  PerfReset(fd);
+  PerfEnable(fd);
+  poke64(h + 0,  fd);
+  poke64(h + 8,  GetTimeNs(CLOCK_MONOTONIC));
+  poke64(h + 16, GetTimeNs(CLOCK_THREAD_CPUTIME_ID));
+  poke64(h + 24, PerfRead(fd));
+  CpuWertSetzen(status, 1, "perf_event_open(HW_CPU_CYCLES)"c);
+  return h;
+}
+
+// Messung beenden und die vier Groessen in die uebergebenen Traeger
+// schreiben. `hz` ist der gesuchte Wert; `fenster` die Wanduhrzeit, `aktiv`
+// die Zeit, in der der Thread wirklich lief, `zyklen` der Zaehlerstand.
+pub fn CpuMessStop(h: int64, hz: int64, fenster: int64, zyklen: int64, aktiv: int64): void {
+  if (h == 0) {
+    CpuWertFehlt(hz, CPU_ST_NOT_IMPLEMENTED, "kein Messhandle"c);
+    CpuWertFehlt(fenster, CPU_ST_NOT_IMPLEMENTED, "kein Messhandle"c);
+    CpuWertFehlt(zyklen, CPU_ST_NOT_IMPLEMENTED, "kein Messhandle"c);
+    CpuWertFehlt(aktiv, CPU_ST_NOT_IMPLEMENTED, "kein Messhandle"c);
+    return;
+  }
+  var fd: int64 := peek64(h + 0);
+  var c1: int64 := PerfRead(fd);
+  var t1: int64 := GetTimeNs(CLOCK_MONOTONIC);
+  var a1: int64 := GetTimeNs(CLOCK_THREAD_CPUTIME_ID);
+  PerfDisable(fd);
+  close(fd);
+
+  var dz: int64 := c1 - peek64(h + 24);
+  var dt: int64 := t1 - peek64(h + 8);
+  var da: int64 := a1 - peek64(h + 16);
+
+  CpuWertSetzen(fenster, dt, "clock_gettime(CLOCK_MONOTONIC)"c);
+  CpuWertSetzen(aktiv, da, "clock_gettime(CLOCK_THREAD_CPUTIME_ID)"c);
+  if (c1 < 0) {
+    CpuWertFehlt(zyklen, CpuStatusAusErrno(c1), "read(perf-fd)"c);
+    CpuWertFehlt(hz, CpuStatusAusErrno(c1), "read(perf-fd)"c);
+    return;
+  }
+  CpuWertSetzen(zyklen, dz, "perf HW_CPU_CYCLES"c);
+  if (da <= 0) {
+    // Kein messbarer aktiver Anteil: keine Division, kein geschaetzter Wert.
+    CpuWertFehlt(hz, CPU_ST_UNSUPPORTED, "aktive Zeit == 0 (Fenster zu kurz)"c);
+    return;
+  }
+  // zyklen * 1e9 / aktive_ns, ohne Ueberlauf: erst durch 1000 teilen (ns ->
+  // us), dann mit 1e6 multiplizieren. Bei 3,4 GHz und einer Sekunde sind das
+  // 3,4e9 Zyklen — `zyklen * 1e9` waere 3,4e18 und damit knapp am Rand von
+  // int64; die Reihenfolge hier bleibt weit darunter.
+  var us: int64 := da / 1000;
+  if (us <= 0) {
+    CpuWertFehlt(hz, CPU_ST_UNSUPPORTED, "aktive Zeit unter 1 us"c);
+    return;
+  }
+  CpuWertSetzen(hz, (dz * 1000000) / us, "perf HW_CPU_CYCLES (user+kernel) / CLOCK_THREAD_CPUTIME_ID"c);
+}
+
+// Takt unter LAST messen: rechnet `dauer_ns` lang und misst dabei. Das ist die
+// Zahl, die ein Benchmark braucht ("welchen Takt bekomme ich, waehrend ich
+// rechne"), nicht der Leerlauftakt.
+pub fn CpuSample(dauer_ns: int64, hz: int64, fenster: int64, zyklen: int64, aktiv: int64): void {
+  var st: int64 := CpuWertNeu();
+  var h: int64 := CpuMessStart(st);
+  if (h == 0) {
+    CpuWertFehlt(hz, CpuStatus(st), CpuQuelle(st));
+    CpuWertFehlt(fenster, CpuStatus(st), CpuQuelle(st));
+    CpuWertFehlt(zyklen, CpuStatus(st), CpuQuelle(st));
+    CpuWertFehlt(aktiv, CpuStatus(st), CpuQuelle(st));
+    return;
+  }
+  var ende: int64 := GetTimeNs(CLOCK_MONOTONIC) + dauer_ns;
+  var summe: int64 := 0;
+  var i: int64 := 0;
+  while (GetTimeNs(CLOCK_MONOTONIC) < ende) {
+    // Eine Rechnung, die der Compiler nicht wegnehmen kann (die Summe wird
+    // unten gelesen) und die keinen Speicher anfasst.
+    i := i + 1;
+    summe := summe + (i * 2654435761) % 1000003;
+  }
+  if (summe == 0) {
+    // Nur damit die Schleife beobachtbar bleibt; tritt praktisch nicht ein.
+    CpuWertFehlt(hz, CPU_ST_NOT_IMPLEMENTED, "Messschleife ohne Wirkung"c);
+  }
+  CpuMessStop(h, hz, fenster, zyklen, aktiv);
+}
+
+// APERF/MPERF als ZWEITE Quelle. Auf dieser Maschine liefert sie
+// permission_denied (Lockdown `integrity` bei Secure Boot) — das ist ein
+// Ergebnis, kein Fehlschlag, und steht als eigener Status im Bericht.
+pub fn CpuMsrAperfMperf(cpu: int64, t: int64): void {
+  var pfad: int64 := alloc(64);
+  var vor: pchar := "/dev/cpu/"c;
+  var pos: int64 := 0;
+  var i: int64 := 0;
+  while (peek8((vor as int64) + i) != 0) { poke8(pfad + pos, peek8((vor as int64) + i)); pos := pos + 1; i := i + 1; }
+  if (cpu >= 10) { poke8(pfad + pos, 48 + (cpu / 10) % 10); pos := pos + 1; }
+  poke8(pfad + pos, 48 + cpu % 10); pos := pos + 1;
+  var nach: pchar := "/msr"c;
+  i := 0;
+  while (peek8((nach as int64) + i) != 0) { poke8(pfad + pos, peek8((nach as int64) + i)); pos := pos + 1; i := i + 1; }
+  poke8(pfad + pos, 0);
+  var fd: int64 := open(pfad as pchar, 0, 0);
+  if (fd < 0) {
+    CpuWertFehlt(t, CpuStatusAusErrno(fd), "msr.aperf_mperf (/dev/cpu/N/msr)"c);
+    return;
+  }
+  close(fd);
+  // Lesbar waere der naechste Schritt (pread auf 0xE8/0xE7). Solange kein
+  // Ziel das erlaubt, bleibt es bei der Auskunft "Quelle da, Weg nicht
+  // umgesetzt" — ausdruecklich NICHT bei einem geschaetzten Wert.
+  CpuWertFehlt(t, CPU_ST_NOT_IMPLEMENTED, "msr.aperf_mperf (Geraet lesbar, Weg nicht umgesetzt)"c);
+}

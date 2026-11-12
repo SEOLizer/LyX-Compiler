@@ -1,0 +1,186 @@
+// ============================================================================
+// src/emit_write.lyx — Ausgabedatei schreiben, oder laut scheitern (#1682)
+//
+// Bis 1.1.3I hat JEDER Backend-Writer den Fehlschlag fuer sich behandelt, und
+// alle zwoelf endeten gleich: Meldung ausgeben, zurueckkehren — und lyxc
+// beendete sich mit Status 0. Ein Makefile oder eine CI, die den Status
+// auswertet, hielt den Lauf fuer erfolgreich und arbeitete mit dem ALTEN
+// Binary weiter.
+//
+// Der Anlass ist kein Sonderfall: liegt die Zieldatei gerade in Ausfuehrung,
+// liefert open() ETXTBSY. Wer nebenher einen Testlauf hat, uebersetzt neu,
+// bekommt "OK" — und sucht danach einen Fehler in Code, der laengst behoben
+// ist, weil auf der Platte das alte Binary liegt.
+//
+// Deshalb hier EINE Stelle, die schreibt, und die nicht zurueckkehren kann,
+// ohne dass die Datei vollstaendig geschrieben ist.
+// ============================================================================
+
+@description("Ausgabedatei schreiben oder mit Status 74 scheitern")
+@version("1.0.0")
+
+unit src.emit_write;
+
+import src.std.io;
+import src.std.alloc;   // #2227: _irGlobalsAnhaengen
+
+// sysexits(3): EX_IOERR. Ungleich 0 ist das, worauf sich Makefiles verlassen;
+// ein eigener Wert trennt den Schreibfehler von den uebrigen Abbruechen (70).
+pub con EMIT_EX_IOERR: int64 := 74;
+
+fn _melde(path: pchar, was: pchar) {
+  EPrintStr("error: codegen: "c);
+  EPrintStr(was);
+  EPrintStr(": "c);
+  EPrintStrLn(path);
+}
+
+// Schreibt `size` Bytes aus `buf` nach `path` (0755) und kehrt nur zurueck,
+// wenn ALLES angekommen ist. Sonst: Meldung auf stderr und Ende mit 74.
+//
+// write() kann kurz schreiben, ohne dass etwas kaputt ist — deshalb die
+// Schleife. Ein ungeprueftes write() haette ein abgeschnittenes Binary
+// hinterlassen, und zwar wieder still.
+pub fn EmitWriteFile(path: pchar, buf: int64, size: int64) {
+  var fd: int64 := open(path, 577, 493);
+  if (fd < 0) {
+    // ETXTBSY ist der haeufigste Anlass und von aussen nicht offensichtlich.
+    if (fd == 0 - 26) {
+      _melde(path, "Ausgabedatei laeuft gerade (ETXTBSY), nicht ueberschreibbar"c);
+    } else {
+      _melde(path, "Ausgabedatei laesst sich nicht oeffnen"c);
+    }
+    exit(EMIT_EX_IOERR);
+  }
+  var ab: int64 := 0;
+  while (ab < size) {
+    var n: int64 := write(fd, (buf + ab) as pchar, size - ab);
+    if (n <= 0) {
+      close(fd);
+      _melde(path, "Ausgabedatei nicht vollstaendig geschrieben"c);
+      exit(EMIT_EX_IOERR);
+    }
+    ab := ab + n;
+  }
+  close(fd);
+}
+
+// ============================================================================
+// #1968: Laenge einer IR-Zeichenkette aus ihrem VORSPANN
+//
+// Die IR-Zeichenkettentabelle war bis 1.2.2D allein nullterminiert, und jedes
+// Backend mass beim Ausgeben mit StrLen. Ein Nullbyte im INHALT schnitt damit
+// alles Weitere ab: unter qemu-aarch64 wurden aus den fuenf Bytes `AB\0CD` die
+// drei Bytes `AB\0` plus zwei FREMDE aus dem anschliessenden Speicher. Das traf
+// jedes Literal mit `\0`, nicht nur eingebettete Dateien (#1961).
+//
+// irAddString legt jetzt acht Byte mit der Laenge VOR die Zeichen; der Offset
+// zeigt weiter auf das erste Zeichen, die abschliessende Null bleibt ebenfalls
+// (die Laufzeit erwartet sie bei pchar) — sie ist nur nicht mehr das Mass.
+//
+// Diese Funktion steht hier und nicht viermal in den Backends: vier Abschriften
+// derselben Rechnung waeren genau die Doppelung, aus der spaeter eine
+// Divergenz wird.
+pub fn _irStrLenVorspann(strBuf: int64, off: int64): int64 {
+  if (off < 8) { return 0; }
+  var v: int64 := 0;
+  var i: int64 := 0;
+  while (i < 8) {
+    v := v | ((peek8(strBuf + off - 8 + i) & 255) << (i * 8));
+    i := i + 1;
+  }
+  return v;
+}
+
+// #2227: n namenlose Modulvariablen (Anfangswert 0) hinten an die Globals des
+// IR-Moduls haengen; Rueckgabe ist der Index der ersten.
+//
+// Die IR-Backends brauchen fuer den Bump-Block (Zeiger, Ende) zwei Worte im
+// Datenbereich, die das Programm selbst nicht kennt. Hinten angehaengt laufen
+// sie durch dieselben Writer und dieselben Adressslots wie jede Modulvariable
+// (globalRelocBuf, .data) — kein eigener Abschnitt, keine eigene Relocation.
+// Aufgerufen wird erst beim Emittieren, also nachdem ir_lower alle Units
+// abgeschlossen hat; globalNameCnt in ir_lower erfaehrt davon nichts mehr und
+// braucht es auch nicht.
+//
+// Die Offsets sind IR_MOD_OFF_GLOBALBUF/-CAP/-LEN aus src/ir.lyx (104/112/120);
+// das Wachsen ist dieselbe Rechnung wie in ir_lower beim Anlegen eines
+// Globals — die beiden muessen uebereinstimmen.
+pub fn _irGlobalsAnhaengen(irMod: int64, n: int64): int64 {
+  var gBuf: int64 := peek64(irMod + 104);
+  var gCap: int64 := peek64(irMod + 112);
+  var gLen: int64 := peek64(irMod + 120);
+  if ((gLen + n) * 8 > gCap) {
+    var neuCap: int64 := gCap * 2;
+    if (neuCap < (gLen + n) * 8) { neuCap := (gLen + n) * 8 + 64; }
+    var nb: int64 := alloc(neuCap);
+    if (gLen > 0) { memcpy(nb, gBuf, gLen * 8); }
+    gBuf := nb;
+    poke64(irMod + 104, gBuf);
+    poke64(irMod + 112, neuCap);
+  }
+  var i: int64 := 0;
+  while (i < n) { poke64(gBuf + (gLen + i) * 8, 0); i := i + 1; }
+  poke64(irMod + 120, gLen + n);
+  return gLen;
+}
+
+// #2239: Passt v in ein 32-Bit-Wort? Dieselbe Regel wie cm_LI (arm-cm, #2237)
+// und xt_li (esp32, #2149) — die drei muessen uebereinstimmen: zulaessig ist,
+// was vorzeichenbehaftet ODER vorzeichenlos in 32 Bit passt, denn int64 ist
+// auf diesen Zielen ein Wort.
+pub fn _wort32Darstellbar(v: int64): int64 {
+  var v32: int64 := v & 0xFFFFFFFF;
+  if ((v32 & 0x80000000) != 0) { v32 := v32 - 4294967296; }
+  if (v32 == v) { return 1; }
+  if (v == (v & 0xFFFFFFFF)) { return 1; }
+  return 0;
+}
+
+// #2239: Merkerworte fuer Modulvariablen, deren Anfangswert nicht in ein Wort
+// passt (32-Bit-Ziele). Liefert 0, wenn es keine gibt, sonst eine Tabelle mit
+// einem Eintrag je urspruenglichem Global: -1 = darstellbar, sonst der Index
+// seines Merkers (Anfangswert 0, angehaengt ueber _irGlobalsAnhaengen).
+//
+// Warum kein Abbruch beim Uebersetzen: die IR-Backends erzeugen jede Funktion
+// und jeden Anfangswert einer importierten Unit, auch ungenutzte — ein Fehler
+// je solcher Konstante machte `import std.hash` auf arm-cm4 unbenutzbar, auch
+// fuer DJB2. Stattdessen setzt jeder Schreibzugriff den Merker, und LESEN bei
+// ungesetztem Merker bricht ab (esp32 ILL, arm-cm BKPT): eine `con` mit
+// 64-Bit-Wert scheitert laut, eine Variable, die vorher beschrieben wurde,
+// arbeitet normal.
+pub fn _irWort32Merker(irMod: int64): int64 {
+  var gBuf: int64 := peek64(irMod + 104);
+  var gLen: int64 := peek64(irMod + 120);
+  var n: int64 := 0;
+  var i: int64 := 0;
+  while (i < gLen) {
+    if (_wort32Darstellbar(peek64(gBuf + i * 8)) == 0) { n := n + 1; }
+    i := i + 1;
+  }
+  if (n == 0) { return 0; }
+  var tab: int64 := alloc(gLen * 8 + 8);
+  poke64(tab, gLen);                       // Eintrag 0: Zahl der Globals davor
+  var erster: int64 := _irGlobalsAnhaengen(irMod, n);
+  gBuf := peek64(irMod + 104);             // kann gewachsen sein
+  var k: int64 := 0;
+  i := 0;
+  while (i < gLen) {
+    if (_wort32Darstellbar(peek64(gBuf + i * 8)) == 0) {
+      poke64(tab + 8 + i * 8, erster + k);
+      k := k + 1;
+    } else {
+      poke64(tab + 8 + i * 8, 0 - 1);
+    }
+    i := i + 1;
+  }
+  return tab;
+}
+
+// #2239: Merker-Index zu Global gi, -1 = keiner (gi darstellbar oder selbst
+// ein Merker).
+pub fn _irWort32MerkerFuer(tab: int64, gi: int64): int64 {
+  if (tab == 0) { return 0 - 1; }
+  if (gi < 0 || gi >= peek64(tab)) { return 0 - 1; }
+  return peek64(tab + 8 + gi * 8);
+}

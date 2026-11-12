@@ -1,0 +1,457 @@
+// std.unicode — opt-in Unicode-aware operations on Text (codepoints)
+//
+// Per the string-encoding decision, Unicode correctness lives in a SEPARATE
+// opt-in unit — not baked into the base String/Text. Provides:
+//   - case folding for ASCII + Latin-1 Supplement (rule-based, no table)
+//   - Unicode whitespace / ASCII digit-letter classification
+//   - Text-level TextToUpper / TextToLower (decode -> fold -> re-encode)
+//   - normalisation NFC / NFD — full canonical decomposition + composition,
+//     backed by the generated std.unicode_data table + algorithmic Hangul
+//
+// NOT here yet (follow-up): full case folding beyond Latin-1, compatibility
+// normalisation (NFKC / NFKD), grapheme-cluster segmentation.
+
+@description("Opt-in Unicode-aware operations (case folding, classification) on Text")
+@author("Andreas Röne")
+@copyright("2024-2026 Andreas Röne")
+unit std.unicode;
+
+import std.text;
+import std.unicode_data;
+
+// #2127: mmap-Konstanten dieser Unit. Sie wurden bis 1.2.14B benutzt, ohne
+// definiert oder importiert zu sein — x86 fand sie zufaellig in einer anderen
+// Unit, der IR-Weg setzte einen Zufallswert ein (sichtbar seit #2122).
+con PROT_RW: int64 := 3;
+con MAP_ANON: int64 := 34;
+con FD_NONE: int64 := -1;
+
+// ---- codepoint case folding (ASCII + Latin-1 Supplement) -------------------
+
+pub fn UnicodeToLower(cp: int64): int64 {
+  if (cp >= 65 && cp <= 90) { return cp + 32; }                    // A-Z -> a-z
+  if (cp >= 192 && cp <= 222 && cp != 215) { return cp + 32; }     // À-Þ -> à-þ (except × U+00D7)
+  return cp;
+}
+
+pub fn UnicodeToUpper(cp: int64): int64 {
+  if (cp >= 97 && cp <= 122) { return cp - 32; }                   // a-z -> A-Z
+  if (cp >= 224 && cp <= 254 && cp != 247) { return cp - 32; }     // à-þ -> À-Þ (except ÷ U+00F7; ÿ U+00FF not covered)
+  return cp;
+}
+
+// ---- classification --------------------------------------------------------
+
+// Unicode White_Space property.
+pub fn UnicodeIsWhitespace(cp: int64): int64 {
+  if (cp >= 9 && cp <= 13) { return 1; }                           // TAB LF VT FF CR
+  if (cp == 32 || cp == 133 || cp == 160 || cp == 5760) { return 1; }  // SP NEL NBSP OGHAM
+  if (cp >= 8192 && cp <= 8202) { return 1; }                      // EN QUAD .. HAIR SPACE
+  if (cp == 8232 || cp == 8233 || cp == 8239 || cp == 8287 || cp == 12288) { return 1; }  // LS PS NNBSP MMSP IDEO
+  return 0;
+}
+
+pub fn UnicodeIsAsciiDigit(cp: int64): int64 {
+  if (cp >= 48 && cp <= 57) { return 1; }
+  return 0;
+}
+
+pub fn UnicodeIsAsciiLetter(cp: int64): int64 {
+  if (cp >= 65 && cp <= 90) { return 1; }
+  if (cp >= 97 && cp <= 122) { return 1; }
+  return 0;
+}
+
+// ---- Text-level case transforms (Unicode-aware, decode -> fold -> encode) ---
+
+// Decode the codepoint at byte offset `off` in `t`; returns the codepoint and
+// writes its UTF-8 byte length to *lenOut.
+fn _decodeAt(t: Text, off: int64, lenOut: int64): int64 {
+  var d: int64 := TextData(t);
+  var b: int64 := peek8(d + off) & 255;
+  if (b < 128) { poke64(lenOut, 1); return b; }
+  if (b < 224) {
+    poke64(lenOut, 2);
+    return ((b & 31) << 6) | (peek8(d + off + 1) & 63);
+  }
+  if (b < 240) {
+    poke64(lenOut, 3);
+    return ((b & 15) << 12) | ((peek8(d + off + 1) & 63) << 6) | (peek8(d + off + 2) & 63);
+  }
+  poke64(lenOut, 4);
+  return ((b & 7) << 18) | ((peek8(d + off + 1) & 63) << 12) | ((peek8(d + off + 2) & 63) << 6) | (peek8(d + off + 3) & 63);
+}
+
+// Apply a per-codepoint transform (0 = ToLower, 1 = ToUpper) across `t`,
+// returning a new Text. Requires valid UTF-8 input.
+fn _caseMap(t: Text, toUpper: int64): Text {
+  var byteLen: int64 := TextByteLength(t);
+  var sz: int64 := byteLen * 4 + 4;
+  var buf: int64 := mmap(0, sz, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (buf < 0) { return TextFromUtf8(TextData(t), byteLen); }
+  var lenCell: int64 := mmap(0, 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  var w: int64 := 0;
+  var i: int64 := 0;
+  while (i < byteLen) {
+    var cp: int64 := _decodeAt(t, i, lenCell);
+    var clen: int64 := peek64(lenCell);
+    var folded: int64 := cp;
+    if (toUpper != 0) { folded := UnicodeToUpper(cp); }
+    else { folded := UnicodeToLower(cp); }
+    w += CodepointToUtf8(folded, buf + w);
+    i += clen;
+  }
+  var r: Text := TextFromUtf8(buf, w);
+  munmap(buf, sz);
+  munmap(lenCell, 8);
+  return r;
+}
+
+pub fn TextToLower(t: Text): Text { return _caseMap(t, 0); }
+pub fn TextToUpper(t: Text): Text { return _caseMap(t, 1); }
+
+// ============================================================================
+// Normalisation NFD / NFC — full canonical decomposition + composition
+// ============================================================================
+//
+// Backed by the generated table in std.unicode_data (all canonical
+// decompositions, combining classes and composition pairs from UnicodeData.txt)
+// plus algorithmic Hangul (Unicode §3.12). NFD applies canonical decomposition
+// and canonical ordering; NFC then runs the canonical composition algorithm
+// with proper blocking.
+//
+// NOT covered: compatibility decomposition (NFKC / NFKD) and grapheme-cluster
+// segmentation.
+
+// ---- full Unicode table lookups (binary search over the generated data) -----
+
+// Full canonical decomposition of `cp` written to the int64 array `out`;
+// returns the length (0 if `cp` has no canonical decomposition in the table).
+fn _ucdDecomp(cp: int64, out: int64): int64 {
+  _ucdEnsure();
+  var lo: int64 := 0;
+  var hi: int64 := _dn - 1;
+  while (lo <= hi) {
+    var mid: int64 := (lo + hi) / 2;
+    var mk: int64 := peek64(_dk + mid * 8);
+    if (mk == cp) {
+      var off: int64 := peek64(_do + mid * 8);
+      var ln: int64 := peek64(_dl + mid * 8);
+      var j: int64 := 0;
+      while (j < ln) { poke64(out + j * 8, peek64(_dd + (off + j) * 8)); j += 1; }
+      return ln;
+    }
+    if (mk < cp) { lo := mid + 1; } else { hi := mid - 1; }
+  }
+  return 0;
+}
+
+// Canonical combining class of `cp` (0 if not in the table).
+fn _ucdCCC(cp: int64): int64 {
+  _ucdEnsure();
+  var lo: int64 := 0;
+  var hi: int64 := _cn - 1;
+  while (lo <= hi) {
+    var mid: int64 := (lo + hi) / 2;
+    var mk: int64 := peek64(_ck + mid * 8);
+    if (mk == cp) { return peek64(_cv + mid * 8); }
+    if (mk < cp) { lo := mid + 1; } else { hi := mid - 1; }
+  }
+  return 0;
+}
+
+// Canonical composition of starter `a` + `b` -> codepoint, or -1.
+fn _ucdCompose(a: int64, b: int64): int64 {
+  _ucdEnsure();
+  var key: int64 := (a << 21) | b;
+  var lo: int64 := 0;
+  var hi: int64 := _pn - 1;
+  while (lo <= hi) {
+    var mid: int64 := (lo + hi) / 2;
+    var mk: int64 := peek64(_pk + mid * 8);
+    if (mk == key) { return peek64(_pr + mid * 8); }
+    if (mk < key) { lo := mid + 1; } else { hi := mid - 1; }
+  }
+  return 0 - 1;
+}
+
+// Full compatibility decomposition of `cp` (for NFKC/NFKD) written to `out`;
+// returns the length (0 if none). This is the recursive expansion applying both
+// canonical and compatibility mappings.
+fn _ucdCompatDecomp(cp: int64, out: int64): int64 {
+  _ucdEnsure();
+  var lo: int64 := 0;
+  var hi: int64 := _kn - 1;
+  while (lo <= hi) {
+    var mid: int64 := (lo + hi) / 2;
+    var mk: int64 := peek64(_kk + mid * 8);
+    if (mk == cp) {
+      var off: int64 := peek64(_ko + mid * 8);
+      var ln: int64 := peek64(_kl + mid * 8);
+      var j: int64 := 0;
+      while (j < ln) { poke64(out + j * 8, peek64(_kd + (off + j) * 8)); j += 1; }
+      return ln;
+    }
+    if (mk < cp) { lo := mid + 1; } else { hi := mid - 1; }
+  }
+  return 0;
+}
+
+// Decode all codepoints of `t` into the int64 array `out`; returns the count.
+fn _decodeToArray(t: Text, out: int64): int64 {
+  var byteLen: int64 := TextByteLength(t);
+  var lc: int64 := mmap(0, 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  var n: int64 := 0;
+  var i: int64 := 0;
+  while (i < byteLen) {
+    poke64(out + n * 8, _decodeAt(t, i, lc));
+    n += 1;
+    i += peek64(lc);
+  }
+  munmap(lc, 8);
+  return n;
+}
+
+// Canonical ordering: stable-sort each run of combining marks by combining class
+// (adjacent swaps — a bubble pass repeated until stable).
+fn _canonOrder(arr: int64, n: int64) {
+  var changed: int64 := 1;
+  while (changed != 0) {
+    changed := 0;
+    var i: int64 := 0;
+    while (i + 1 < n) {
+      var c1: int64 := _ucdCCC(peek64(arr + i * 8));
+      var c2: int64 := _ucdCCC(peek64(arr + (i + 1) * 8));
+      if (c1 > 0 && c2 > 0 && c1 > c2) {
+        var tmp: int64 := peek64(arr + i * 8);
+        poke64(arr + i * 8, peek64(arr + (i + 1) * 8));
+        poke64(arr + (i + 1) * 8, tmp);
+        changed := 1;
+      }
+      i += 1;
+    }
+  }
+}
+
+// ---- Hangul syllable composition/decomposition (algorithmic; Unicode §3.12) --
+// Covers all 11,172 modern Hangul syllables (U+AC00..U+D7A3) with no table.
+// L 0x1100.., V 0x1161.., T 0x11A7..; LCount 19, VCount 21, TCount 28.
+
+// Decompose Hangul syllable `cp` into 2 (LV) or 3 (LVT) jamo, written to the
+// int64 array `out`. Returns the count (0 if `cp` is not a Hangul syllable).
+fn _hangulDecompose(cp: int64, out: int64): int64 {
+  if (cp < 44032 || cp > 55203) { return 0; }
+  var si: int64 := cp - 44032;
+  var l: int64 := 4352 + si / 588;
+  var vt: int64 := si - (si / 588) * 588;
+  var v: int64 := 4449 + vt / 28;
+  var tmod: int64 := vt - (vt / 28) * 28;
+  poke64(out + 0, l);
+  poke64(out + 8, v);
+  if (tmod > 0) { poke64(out + 16, 4519 + tmod); return 3; }
+  return 2;
+}
+
+// Compose leading consonant `l` + vowel `v` into an LV syllable, or -1.
+fn _hangulComposeLV(l: int64, v: int64): int64 {
+  if (l < 4352 || l >= 4371) { return 0 - 1; }
+  if (v < 4449 || v >= 4470) { return 0 - 1; }
+  return 44032 + ((l - 4352) * 21 + (v - 4449)) * 28;
+}
+
+// Compose an LV syllable + trailing consonant `t` into an LVT syllable, or -1.
+fn _hangulComposeLVT(lv: int64, t: int64): int64 {
+  if (lv < 44032 || lv > 55203) { return 0 - 1; }
+  if (((lv - 44032) - (((lv - 44032) / 28) * 28)) != 0) { return 0 - 1; }  // must be an LV (T-index 0)
+  if (t <= 4519 || t >= 4547) { return 0 - 1; }
+  return lv + (t - 4519);
+}
+
+// Decompose `t` into a new Text: canonical (useCompat == 0) or compatibility
+// (useCompat != 0) decomposition + algorithmic Hangul, then canonical ordering.
+// Shared by NFD (canonical) and NFKD (compatibility).
+fn _nfDecompose(t: Text, useCompat: int64): Text {
+  var byteLen: int64 := TextByteLength(t);
+  var srcCap: int64 := byteLen + 4;
+  var src: int64 := mmap(0, srcCap * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (src < 0) { return TextFromUtf8(TextData(t), byteLen); }
+  var srcN: int64 := _decodeToArray(t, src);
+  var dstCap: int64 := byteLen * 18 + 8;   // compat decomposition can expand a lot
+  var dst: int64 := mmap(0, dstCap * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  var hCell: int64 := mmap(0, 24, PROT_RW, MAP_ANON, FD_NONE, 0);
+  var tmp: int64 := mmap(0, 256, PROT_RW, MAP_ANON, FD_NONE, 0);
+  var dn: int64 := 0;
+  var i: int64 := 0;
+  while (i < srcN) {
+    var cp: int64 := peek64(src + i * 8);
+    var hn: int64 := _hangulDecompose(cp, hCell);
+    if (hn > 0) {
+      poke64(dst + dn * 8, peek64(hCell + 0)); dn += 1;
+      poke64(dst + dn * 8, peek64(hCell + 8)); dn += 1;
+      if (hn == 3) { poke64(dst + dn * 8, peek64(hCell + 16)); dn += 1; }
+    } else {
+      var dl: int64 := 0;
+      if (useCompat != 0) { dl := _ucdCompatDecomp(cp, tmp); }
+      else { dl := _ucdDecomp(cp, tmp); }
+      if (dl > 0) {
+        var j: int64 := 0;
+        while (j < dl) { poke64(dst + dn * 8, peek64(tmp + j * 8)); dn += 1; j += 1; }
+      } else {
+        poke64(dst + dn * 8, cp); dn += 1;
+      }
+    }
+    i += 1;
+  }
+  _canonOrder(dst, dn);
+  var bufSz: int64 := dn * 4 + 8;
+  var buf: int64 := mmap(0, bufSz, PROT_RW, MAP_ANON, FD_NONE, 0);
+  var w: int64 := 0;
+  var k: int64 := 0;
+  while (k < dn) { w += CodepointToUtf8(peek64(dst + k * 8), buf + w); k += 1; }
+  var r: Text := TextFromUtf8(buf, w);
+  munmap(src, srcCap * 8); munmap(dst, dstCap * 8); munmap(hCell, 24);
+  munmap(tmp, 256); munmap(buf, bufSz);
+  return r;
+}
+
+// Canonical composition of an already-decomposed Text (Hangul + table, with
+// blocking). The caller owns `nfd`. Shared by NFC and NFKC.
+fn _nfCompose(nfd: Text): Text {
+  var byteLen: int64 := TextByteLength(nfd);
+  var cap: int64 := byteLen + 4;
+  var arr: int64 := mmap(0, cap * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (arr < 0) { return TextFromUtf8(TextData(nfd), byteLen); }
+  var n: int64 := _decodeToArray(nfd, arr);
+  var out: int64 := mmap(0, cap * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  var outN: int64 := 0;
+  var starterIdx: int64 := 0 - 1;
+  var lastCC: int64 := 0;
+  var i: int64 := 0;
+  while (i < n) {
+    var cp: int64 := peek64(arr + i * 8);
+    var cc: int64 := _ucdCCC(cp);
+    var composed: int64 := 0 - 1;
+    // not blocked from the last starter iff immediately after it (lastCC==0) or
+    // the intervening mark has a strictly lower combining class (lastCC < cc)
+    if (starterIdx >= 0 && (lastCC == 0 || lastCC < cc)) {
+      var starter: int64 := peek64(out + starterIdx * 8);
+      composed := _hangulComposeLV(starter, cp);
+      if (composed < 0) { composed := _hangulComposeLVT(starter, cp); }
+      if (composed < 0) { composed := _ucdCompose(starter, cp); }
+    }
+    if (composed >= 0) {
+      poke64(out + starterIdx * 8, composed);   // fold into the starter; lastCC unchanged
+    } else {
+      poke64(out + outN * 8, cp);
+      if (cc == 0) { starterIdx := outN; }
+      lastCC := cc;
+      outN += 1;
+    }
+    i += 1;
+  }
+  var bufSz: int64 := outN * 4 + 8;
+  var buf: int64 := mmap(0, bufSz, PROT_RW, MAP_ANON, FD_NONE, 0);
+  var w: int64 := 0;
+  var k: int64 := 0;
+  while (k < outN) { w += CodepointToUtf8(peek64(out + k * 8), buf + w); k += 1; }
+  var r: Text := TextFromUtf8(buf, w);
+  munmap(arr, cap * 8); munmap(out, cap * 8); munmap(buf, bufSz);
+  return r;
+}
+
+// NFD — canonical decomposition (+ canonical ordering).
+pub fn TextToNFD(t: Text): Text { return _nfDecompose(t, 0); }
+
+// NFC — canonical decomposition then canonical composition.
+pub fn TextToNFC(t: Text): Text {
+  var d: Text := _nfDecompose(t, 0);
+  var r: Text := _nfCompose(d);
+  TextFree(d);
+  return r;
+}
+
+// NFKD — compatibility decomposition (+ canonical ordering).
+pub fn TextToNFKD(t: Text): Text { return _nfDecompose(t, 1); }
+
+// NFKC — compatibility decomposition then canonical composition.
+pub fn TextToNFKC(t: Text): Text {
+  var d: Text := _nfDecompose(t, 1);
+  var r: Text := _nfCompose(d);
+  TextFree(d);
+  return r;
+}
+
+// Normalisation-insensitive equality: compares NFC forms.
+pub fn TextEqualsNormalized(a: Text, b: Text): int64 {
+  var na: Text := TextToNFC(a);
+  var nb: Text := TextToNFC(b);
+  var eq: int64 := TextEquals(na, nb);
+  TextFree(na); TextFree(nb);
+  return eq;
+}
+
+// Normalisation-insensitive ordering: compares NFC forms, -1/0/1. The
+// counterpart to TextEqualsNormalized for sorting — Text's own `<` compares raw
+// bytes, so "é" composed and decomposed sort apart without this.
+// Still a codepoint ordering, NOT a locale collation.
+pub fn TextCompareNormalized(a: Text, b: Text): int64 {
+  var na: Text := TextToNFC(a);
+  var nb: Text := TextToNFC(b);
+  var c: int64 := TextCompare(na, nb);
+  TextFree(na); TextFree(nb);
+  return c;
+}
+
+// Normalisation-insensitive prefix test (NFC forms). Note this is a prefix in
+// the normalised form — which is the meaningful question, since the raw bytes of
+// a decomposed prefix need not be a byte prefix of a composed string.
+pub fn TextStartsWithNormalized(t: Text, prefix: Text): int64 {
+  var nt: Text := TextToNFC(t);
+  var np: Text := TextToNFC(prefix);
+  var r: int64 := TextStartsWith(nt, np);
+  TextFree(nt); TextFree(np);
+  return r;
+}
+
+// ---- Unicode whitespace trimming -------------------------------------------
+
+// Trim by the Unicode White_Space property, not just ASCII. `mode`: 0 = both
+// ends, 1 = leading only, 2 = trailing only.
+//
+// Text.Trim() only strips space/TAB/LF/CR, so NBSP (U+00A0), the EN/EM spaces
+// (U+2000..U+200A), the line/paragraph separators (U+2028/U+2029) and the
+// ideographic space (U+3000) survive it — the usual source of "why does this
+// still not match" after trimming pasted or CJK text.
+fn _trimUnicode(t: Text, mode: int64): Text {
+  var byteLen: int64 := TextByteLength(t);
+  var lc: int64 := mmap(0, 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (lc < 0) { return TextFromUtf8(TextData(t), byteLen); }
+  var start: int64 := 0;
+  var end: int64 := 0;
+  var seen: int64 := 0;
+  var i: int64 := 0;
+  // One forward pass: remember the first and the last non-whitespace codepoint.
+  // Scanning backwards would mean re-syncing to a UTF-8 lead byte; forward is
+  // both simpler and linear.
+  while (i < byteLen) {
+    var cp: int64 := _decodeAt(t, i, lc);
+    var clen: int64 := peek64(lc);
+    if (UnicodeIsWhitespace(cp) == 0) {
+      if (seen == 0) { start := i; seen := 1; }
+      end := i + clen;
+    }
+    i += clen;
+  }
+  munmap(lc, 8);
+  if (seen == 0) {                       // all whitespace (or empty)
+    if (mode == 0) { return TextFromUtf8(0, 0); }
+    return TextFromUtf8(0, 0);
+  }
+  if (mode == 1) { end := byteLen; }     // leading only
+  if (mode == 2) { start := 0; }         // trailing only
+  return TextFromUtf8(TextData(t) + start, end - start);
+}
+
+pub fn TextTrimUnicode(t: Text): Text { return _trimUnicode(t, 0); }
+pub fn TextTrimStartUnicode(t: Text): Text { return _trimUnicode(t, 1); }
+pub fn TextTrimEndUnicode(t: Text): Text { return _trimUnicode(t, 2); }

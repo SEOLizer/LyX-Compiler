@@ -67,6 +67,134 @@ Print(s);                // "Hi"
 StrFree(s);
 ```
 
+#### 5.1 Bibliotheks-String-Typen: `String` und `Text`
+
+Über den Builtins liegen zwei stdlib-Typen. Beide sind Klassen, libc-frei
+(mmap/munmap) und besitzen ihre Bytes; beide nehmen am Operator-Overloading teil
+(siehe `ebnf.md` §15.3).
+
+| Typ | Unit | Ebene | Bedeutung |
+|-----|------|-------|-----------|
+| `String` | `std.strtype` | **Bytes** | Rohe, uninterpretierte Bytes mit expliziter Länge + Kapazität. Embedded NUL erlaubt, kein NUL-Scan. `CharAt`/`Get` = **Byte**. |
+| `Text` | `std.text` | **UTF-8** | Bei Konstruktion als UTF-8 validiert, codepoint-orientiert. `CodepointAt`/`Get` = **Codepoint**, `ByteAt` = Rohbyte. |
+
+Das entspricht dem Encoding-Beschluss: UTF-8 ist das kanonische interne Encoding,
+und der Bytes/Text-Split trennt „rohe Bytes" von „garantiert gültigem UTF-8".
+Volle Unicode-Korrektheit (Normalisierung, Grapheme, volles Case-Mapping) liegt
+bewusst in opt-in-Units (`std.unicode`, `std.unicode_case`, `std.grapheme`),
+nicht im Basistyp — die Tabellen sind MB-groß.
+
+**Operatoren** (beide Typen definieren die Methoden, auf die der Compiler abbildet):
+
+| Operator | Methode | `String` | `Text` |
+|----------|---------|----------|--------|
+| `a + b` | `Add` | Byte-Konkatenation | UTF-8-Konkatenation |
+| `a == b` / `a != b` | `Eq` / `Ne` | inhaltsgleich (Bytes) | inhaltsgleich (Bytes) |
+| `a < b` `<=` `>` `>=` | `Lt`/`Le`/`Gt`/`Ge` über `Compare` | lexikografisch nach Bytes | lexikografisch nach UTF-8-Bytes = **Codepoint-Ordnung** |
+| `a[i]` | `Get` | `i`-tes **Byte** | `i`-ter **Codepoint** |
+
+`==` vergleicht Bytes, ist also **nicht** normalisierungs-insensitiv: „é" als ein
+Codepoint und als `e`+kombinierender Akut sind ungleich. `Compare` ist
+Codepoint-Ordnung, **keine** Locale-Collation. Ebenso trimmt `Trim()` nur
+ASCII-Whitespace — NBSP, EN/EM-Space und das ideographische Leerzeichen bleiben
+stehen. Für beides gibt es opt-in-Funktionen:
+
+| Frage | Funktion | Unit |
+|-------|----------|------|
+| Gleich trotz unterschiedlicher Normalisierung? | `TextEqualsNormalized(a, b)` | `std.unicode` |
+| Sortierung trotz unterschiedlicher Normalisierung? | `TextCompareNormalized(a, b)` | `std.unicode` |
+| Präfix trotz unterschiedlicher Normalisierung? | `TextStartsWithNormalized(t, p)` | `std.unicode` |
+| Unicode-Whitespace trimmen | `TextTrimUnicode` / `TextTrimStartUnicode` / `TextTrimEndUnicode` | `std.unicode` |
+| Gleich ohne Rücksicht auf Groß/Klein? | `TextEqualsFold(a, b)` | `std.unicode_case` |
+| Sortierung ohne Rücksicht auf Groß/Klein? | `TextCompareFold(a, b)` | `std.unicode_case` |
+| Enthält, ohne Rücksicht auf Groß/Klein? | `TextContainsFold(t, needle)` | `std.unicode_case` |
+| Vergleichsschlüssel einmal berechnen | `TextFoldFull(t)` | `std.unicode_case` |
+
+Die beiden Achsen sind **getrennt**: `TextEqualsFold` ist nicht
+normalisierungs-insensitiv und `TextEqualsNormalized` nicht case-insensitiv. Wer
+beides braucht, normalisiert erst (`TextToNFC`) und faltet dann
+(`TextEqualsFold`). Grund für die Trennung ist keine Designvorliebe, sondern eine
+Compiler-Grenze: die Normalisierungs- und die Case-Tabelle zusammen in einer
+Kompilierungseinheit sprengen das Größenlimit von `lyxc`.
+
+`TextEqualsFold` faltet **simple** (1:1) — inklusive des griechischen
+Schluss-Sigma (ς→σ), das reines Kleinschreiben nicht erwischt. Volles Folding mit
+1:n-Expansion (ß→ss, ﬁ→fi) ist nicht abgedeckt, „STRASSE" und „Straße" bleiben
+also ungleich.
+
+```lyx
+import std.text;
+
+var a: Text := TextFromPchar("héllo");
+var b: Text := TextFromPchar(" wörld");
+
+a.ByteLength();        // 6  — Bytes
+a.CodepointCount();    // 5  — Codepoints
+a[1];                  // 233 (U+00E9) — Codepoint, nicht das Lead-Byte
+a.ByteAt(1);           // 195 — Rohbyte
+
+var joined: Text := a + b;
+if (a == TextFromPchar("héllo")) { /* inhaltsgleich */ }
+
+a.Free();              // Referenzsemantik: leert wirklich das Objekt
+```
+
+`Text` trägt neben den Operatoren die volle Methoden-API: `IsValid`, `Data`,
+`ByteAt`, `CodepointCount`, `CodepointAt`, `ByteOffsetOfCodepoint`,
+`SubstringCp` (codepoint-korrekt, zerteilt nie eine Multibyte-Sequenz),
+`StartsWith`, `Find`/`FindCp`/`Contains`, `Trim`, `Replace`, `SplitCount`/`PartAt`,
+`AsciiUpper`/`AsciiLower`, `ToPchar`, `Free`. Jede dieser Methoden existiert
+zusätzlich als freie Funktion (`TextCodepointCount(t)` usw.).
+
+**Lebensdauer:** beide Typen sind Klassen, also Referenzen — `Free()` wirkt auf
+das Objekt des Aufrufers. Speicher wird manuell freigegeben (kein Refcount, kein
+GC); das ist bewusst so, solange Lyx kein globales RC/COW hat.
+
+#### 5.2 UTF-16 an der Grenze
+
+UTF-16 ist ausschließlich **Boundary-Format** (Windows-FFI, UTF-16-Dateien), nie
+internes Format — innerhalb von Lyx bleibt alles UTF-8. Die Konverter liegen in
+`std.text`, brauchen keine Tabellen und arbeiten auf reinen Bytemustern:
+
+| Funktion | Bedeutung |
+|----------|-----------|
+| `TextFromUtf16(ptr, byteLen, endian)` | UTF-16 → `Text`, Byte-Reihenfolge explizit |
+| `TextFromUtf16Bom(ptr, byteLen)` | Byte-Reihenfolge aus dem BOM, BOM wird entfernt |
+| `TextUtf16Length(t)` | Bytes, die die UTF-16-Kodierung braucht (ohne BOM) |
+| `TextToUtf16(t, dest, endian)` | `Text` → UTF-16, ohne BOM; liefert geschriebene Bytes |
+| `TextToUtf16Bom(t, dest, endian)` | dito mit vorangestelltem U+FEFF |
+
+Byte-Reihenfolge über die Konstanten `UTF16_BE` / `UTF16_LE`.
+
+**Puffergröße:** immer über `TextUtf16Length(t)` bestimmen (plus 2 für ein BOM) —
+sie lässt sich **nicht** aus `ByteLength()` ableiten. UTF-8 und UTF-16 sind pro
+Codepoint in beide Richtungen unterschiedlich groß: ASCII ist 1 vs. 2 Bytes,
+U+0800..U+FFFF dagegen 3 vs. 2.
+
+**Surrogate-Paare:** Codepoints über U+FFFF werden als Paar kodiert bzw. beim
+Dekodieren wieder zusammengesetzt. Genau das ist der Grund, warum UTF-16 kein
+Fixed-Width-Format ist und Indizierung nach Code-Unit eine Falle bleibt — `Text`
+indiziert deshalb nach Codepoint.
+
+**Fehlerhafte Eingabe bricht nicht ab**, sondern wird zu U+FFFD (`UNICODE_REPLACEMENT`),
+je ein Ersatzzeichen pro fehlerhafter Code-Unit: unpaariges High-Surrogate,
+verirrtes Low-Surrogate, abgeschnittenes Paar am Puffer-Ende, ungerades
+Rest-Byte. Das Ergebnis ist damit garantiert gültiges UTF-8. Wer schlechte
+Eingabe ablehnen statt ersetzen will, prüft das Resultat auf U+FFFD.
+
+**Ohne BOM liest `TextFromUtf16Bom` big-endian** — so schreibt es RFC 2781 für
+schlichtes „UTF-16" vor. Das ist das Gegenteil dessen, was BOM-lose Dateien aus
+der Windows-Welt üblicherweise sind: wenn die Byte-Reihenfolge bekannt ist, lieber
+`TextFromUtf16` mit explizitem `UTF16_LE` verwenden.
+
+```lyx
+var t: Text := TextFromUtf16Bom(fileBytes, fileLen);
+
+var need: int64 := TextUtf16Length(t) + 2;              // + BOM
+var out: int64 := mmap(0, need, PROT_RW, MAP_ANON, FD_NONE, 0);
+var written: int64 := TextToUtf16Bom(t, out, UTF16_LE);
+```
+
 ### 6. Enum-Typen (v0.5.7)
 
 Enums definieren eine benannte Menge von Integer-Konstanten.

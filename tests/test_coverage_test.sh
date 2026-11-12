@@ -1,0 +1,267 @@
+#!/usr/bin/env bash
+# tests/test_coverage_test.sh — jede Testdatei muss in einem Ziel auftauchen.
+#
+# Der Anlass (Issue #1004): in `tests/` lagen rund 200 Dateien, die von keinem
+# Make-Ziel aufgerufen wurden. Darunter waren vier Suiten, die eine
+# Compiler-Regression aus PR #988 gefunden hätten — sie lief zwei PRs lang
+# unbemerkt, weil die Tests nicht liefen.
+#
+# Ein Test, der nicht läuft, ist schlimmer als kein Test: er erweckt den
+# Eindruck einer Absicherung, die es nicht gibt. Dieselbe Falle gab es schon
+# zweimal — `examples/thread_test.lyx` meldete „All tests passed!", ohne je
+# einen Thread zu starten (#992), und zwei Suiten fehlten im Ziel, weshalb ein
+# Stale-Binary-Drift durchging (PR #841).
+#
+# Der zweite Anlass (Issue #1112): diese Prüfung selbst sah nur `tests/*.sh`
+# und `tests/*.lyx` — flach. Die 621 Dateien in den Unterverzeichnissen waren
+# für sie unsichtbar, und sie meldete trotzdem „alle Testdateien sind
+# zugeordnet". Eine Abdeckungsprüfung, die nicht überall hinsieht, meldet
+# Vollständigkeit über den Ausschnitt, den sie kennt — und sieht dabei genauso
+# grün aus wie eine vollständige. Gesucht wird deshalb rekursiv.
+#
+# Zugeordnet ist eine Datei, wenn eine der vier Aussagen gilt:
+#   1. Das Makefile nennt sie beim Namen.
+#   2. Sie steht in einer der Suite-Listen `tests/suite-*.txt`.
+#   3. Sie steht in `tests/known-red.txt` — läuft also mit, ist bekannt rot und
+#      trägt ein Issue.
+#   4. Sie liegt unter einem Verzeichnis, das ein Runner vollständig abläuft,
+#      und dieser Runner hängt an einem Make-Ziel. Beides wird hier geprüft:
+#      ein Runner, der aus dem Makefile verschwindet, macht sein Verzeichnis
+#      wieder unzugeordnet — sonst wäre genau die Lücke zurück, die #1112 war.
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+# Dateien, die keine Tests sind. Pfad relativ zu tests/.
+is_exempt() {
+  case "$1" in
+    ppas.sh)                 return 0 ;;  # Artefakt des FPC-Assemblers
+    run_lyx_tests.sh)        return 0 ;;  # Runner fuer tests/lyx/
+    run_lyx_suite.sh)        return 0 ;;  # Runner der Suiten
+    run_snapshot_tests.sh)   return 0 ;;  # Runner fuer tests/snapshot/
+    run_external_compile.sh) return 0 ;;  # Runner der externen Suite
+    test_coverage_test.sh)   return 0 ;;  # dieses Skript
+    data/ns/eins.lyx)        return 0 ;;  # #1262: Pruefdaten, kein Test. Zwei
+    data/ns/zwei.lyx)        return 0 ;;  # Units mit gleichnamigen Funktionen,
+                                          # die import_namensraum_test.sh
+                                          # importiert — allein uebersetzt
+                                          # haetten sie kein main und nichts
+                                          # zu melden.
+    data/runde12/m/a.lyx)    return 0 ;;  # #1655: Pruefdaten, kein Test. Vier
+    data/runde12/m/b.lyx)    return 0 ;;  # Units mit je einer gleichnamigen
+    data/runde12/n/a.lyx)    return 0 ;;  # PRIVATEN Funktion, die
+    data/runde12/n/b.lyx)    return 0 ;;  # stille_fehlfunktion_runde12_test.sh
+                                          # in beiden Import-Reihenfolgen
+                                          # einbindet — allein uebersetzt haben
+                                          # sie kein main.
+    data/runde12/q/a.lyx)    return 0 ;;  # #1655: dasselbe eine Ebene tiefer —
+    data/runde12/q/b.lyx)    return 0 ;;  # geschachtelte private Funktionen.
+    data/runde13/enums.lyx)  return 0 ;;  # #1647: Pruefdaten — eine importierte
+                                          # Unit mit Enum, kein Test.
+    data/runde14/argsum.c)   return 0 ;;  # #1640: C-Quelle der Testbibliothek
+                                          # fuer den FFI-Nachweis, kein Test.
+    data/runde16/basis.lyx)  return 0 ;;  # #1666: importierte Basisklasse als
+                                          # Pruefdaten, kein Test.
+    data/runde17/ctrl.lyx)   return 0 ;;  # #1670: importierte Klassen als
+                                          # Pruefdaten, kein Test.
+    data/erbfeld/main.lyx)      return 0 ;;  # #1985: Pruefdaten, kein Test. Eine
+    data/erbfeld/rp/basis.lyx)  return 0 ;;  # Basisklasse in eigener Unit und
+                                          # zwei Ableitungen, die
+                                          # erbfeld_ir_test.sh auf drei Zielen
+                                          # ausfuehrt. basis hat kein main.
+    # #2447: rp/a.lyx stand nur im Kommentar darunter, nicht als Eintrag. Es
+    # galt trotzdem als abgedeckt, weil die Pruefung den Dateinamen UNGEANKERT
+    # im Makefile sucht: "a.lyx" ist als Regex "a" + ein beliebiges Zeichen +
+    # "lyx" und traf irgendeine Zeile, die mit #2447 wegfiel. Die Luecke war
+    # also die ganze Zeit da und nur verdeckt.
+    # #2451: Pruefdaten fuer tests/dce_ir_import_test.sh, keine Tests. helfer.lyx
+    # ist eine Unit ohne main; prog.lyx und prog_gross.lyx sind zwei
+    # Verbraucher, die der Test gegeneinander haelt (gleicher Wert, aber
+    # unterschiedlich viel benutzt -- daran wird gemessen, dass Unerreichbares
+    # wegfaellt).
+    data/dce2451/dce2451/helfer.lyx) return 0 ;;
+    data/dce2451/prog.lyx)           return 0 ;;
+    data/dce2451/prog_gross.lyx)     return 0 ;;
+    data/erbevmt/rp/a.lyx)   return 0 ;;  # #1998: Ableitung ohne main, von
+                                          # erbe_vmt_ir_test.sh mitgenutzt.
+    data/erbevmt/main.lyx)   return 0 ;;  # #1998: Pruefdaten, kein Test. Eine
+                                          # Basis mit VIRTUELLER Methode in
+                                          # eigener Unit; erst die VMT und die
+                                          # Modulgrenze zusammen erzeugten den
+                                          # Layoutversatz. erbe_vmt_ir_test.sh
+                                          # uebersetzt und fuehrt sie auf drei
+                                          # Zielen aus (rp/a.lyx hat kein main).
+    data/erbe/main.lyx)      return 0 ;;  # #1976: Pruefdaten, kein Test. Eine
+    data/erbe/rp/basis.lyx)  return 0 ;;  # zweistufige Vererbung ueber ZWEI
+    data/erbe/rp/mitte.lyx)  return 0 ;;  # Modulgrenzen, die erbe_ir_test.sh
+                                          # auf drei Zielen uebersetzt und
+                                          # ausfuehrt. basis/mitte haben kein
+                                          # main; main.lyx allein uebersetzt
+                                          # braucht die beiden ueber -I.
+    part_test.lyx)           return 0 ;;  # std.fs.part: braucht zwei Abbilder
+                                          # (GPT und MBR) als Argumente, die
+                                          # tests/part_test.sh mit sgdisk und
+                                          # sfdisk anlegt und mit echten
+                                          # Dateisystemen bestueckt.
+    ntfs_test.lyx)           return 0 ;;  # std.fs.ntfs: braucht Abbild UND
+                                          # Namensliste als Argumente, beide
+                                          # von tests/ntfs_test.sh erzeugt
+                                          # (mkntfs/ntfscp/ntfsls).
+    ext4_test.lyx)           return 0 ;;  # std.fs.ext4: wie fat_test.lyx —
+                                          # braucht ein Abbild als Argument,
+                                          # das tests/ext4_test.sh mit
+                                          # mkfs.ext4 anlegt, mit debugfs
+                                          # befuellt und von e2fsck pruefen
+                                          # laesst.
+    exfat_test.lyx)          return 0 ;;  # std.fs.exfat: wie fat_test.lyx —
+                                          # braucht ein Abbild als Argument,
+                                          # das tests/exfat_test.sh erst mit
+                                          # mkfs.exfat anlegt, befuellt und von
+                                          # fsck.exfat pruefen laesst.
+    lib/exfat_fuellen.py)    return 0 ;;  # Befuellskript fuer exfat_test.sh,
+                                          # kein Test — es gibt fuer exFAT kein
+                                          # mtools-Gegenstueck.
+    fat_test.lyx)            return 0 ;;  # std.fs.fat: braucht ein Abbild-
+                                          # verzeichnis als Argument und wird
+                                          # deshalb von tests/fat_test.sh
+                                          # aufgerufen, das die Abbilder erst
+                                          # mit mkfs.vfat erzeugt. Allein
+                                          # gestartet haette es nichts zu lesen.
+                                          # Der Runner haengt am `test`-Ziel.
+    lib/qemu.sh)             return 0 ;;  # #2048: Bibliothek, kein Test — sucht
+                                          # den Emulator unter beiden Paketnamen;
+                                          # geprueft von qemu_name_test.sh
+    lib/lyxc_guard.sh)       return 0 ;;  # #1294: Bibliothek, kein Test — wird
+                                          # von den Scripts eingebunden und vom
+                                          # Waechter lyxc_guard_coverage_test.sh
+                                          # selbst geprueft
+    lib/vektorzahl.sh)       return 0 ;;  # #2335: Bibliothek, kein Test — zaehlt
+                                          # Vektorbefehle ueber Befehlsgrenzen fuer
+                                          # autovektor_2194/vektor_hilfsindex_2334/
+                                          # vektor_reduktion_2335
+    *)                       return 1 ;;
+  esac
+}
+
+# Verzeichnisse, die ein Runner vollstaendig ablaeuft: <verzeichnis>|<runner>
+# Der Runner muss (a) das Verzeichnis selbst nennen und (b) im Makefile
+# aufgerufen werden — beides wird unten geprueft.
+DIR_RUNNERS="lyx|tests/run_lyx_tests.sh
+snapshot|tests/run_snapshot_tests.sh
+lyx-units-fuzz|tests/lyx_units_fuzz_test.sh
+fma_2403|tests/fma_2403_test.sh
+memcpy_2353|tests/memcpy_2353_test.sh
+sha_ni_2391|tests/sha_ni_2391_test.sh
+vektor_suche_2360|tests/vektor_suche_2360_test.sh
+semarti|tests/semarti_mvp_test.sh
+semarti/attr|tests/semarti_attribut_test.sh
+record_2421|tests/record_2421_test.sh"
+
+covered_dirs=""
+runner_problems=""
+while IFS='|' read -r dir runner; do
+  [ -z "$dir" ] && continue
+  if [ ! -f "$ROOT/$runner" ]; then
+    runner_problems="$runner_problems
+    $runner fehlt (deckt tests/$dir/ ab)"
+    continue
+  fi
+  if ! grep -q "tests/$dir" "$ROOT/$runner"; then
+    runner_problems="$runner_problems
+    $runner nennt tests/$dir nicht mehr — laeuft er das Verzeichnis noch ab?"
+    continue
+  fi
+  if ! grep -q "$runner" "$ROOT/Makefile"; then
+    runner_problems="$runner_problems
+    $runner haengt an keinem Make-Ziel — tests/$dir/ laeuft damit nirgends"
+    continue
+  fi
+  covered_dirs="$covered_dirs $dir"
+done <<EOF
+$DIR_RUNNERS
+EOF
+
+is_dir_covered() {
+  for d in $covered_dirs; do
+    case "$1" in "$d"/*) return 0 ;; esac
+  done
+  return 1
+}
+
+# known-red.txt einlesen. Jeder Eintrag braucht ein Issue: die Abschnitts-
+# ueberschrift darueber muss eine Nummer der Form #1234 tragen. Ohne diese
+# Regel wird die Liste zur Ablage fuer alles, was gerade stoert.
+KNOWN_RED_FILE="$ROOT/tests/known-red.txt"
+known_red_paths=""
+known_red_no_issue=""
+if [ -f "$KNOWN_RED_FILE" ]; then
+  section_issue=""
+  while IFS= read -r line; do
+    case "$line" in
+      \#*|"") case "$line" in *\#[0-9][0-9][0-9]*) section_issue="$line" ;; esac; continue ;;
+    esac
+    entry="${line%%#*}"
+    entry="$(printf '%s' "$entry" | sed -e 's/[[:space:]]*$//' -e 's/[[:space:]]*!flaky$//')"
+    [ -z "$entry" ] && continue
+    known_red_paths="$known_red_paths
+$entry"
+    [ -z "$section_issue" ] && known_red_no_issue="$known_red_no_issue $entry"
+  done < "$KNOWN_RED_FILE"
+fi
+
+is_known_red() {
+  printf '%s\n' "$known_red_paths" | grep -qxF "$1"
+}
+
+missing=""
+count=0
+
+while IFS= read -r f; do
+  rel="${f#"$ROOT"/tests/}"
+  is_exempt "$rel" && continue
+  count=$((count+1))
+
+  is_dir_covered "$rel" && continue
+  is_known_red "tests/$rel" && continue
+
+  b="$(basename "$rel")"
+  grep -q "$b" "$ROOT/Makefile" && continue
+  # Suite-Listen: Pfad relativ zu tests/ ohne Endung, am Zeilenanfang,
+  # evtl. mit Optionen oder Kommentar dahinter.
+  stem="${rel%.*}"
+  grep -qE "^$stem([[:space:]]|$)" "$ROOT"/tests/suite-*.txt 2>/dev/null && continue
+
+  missing="$missing $rel"
+done <<EOF
+$(find "$ROOT/tests" \( -name '*.sh' -o -name '*.lyx' \) | sort)
+EOF
+
+rc=0
+
+if [ -n "$runner_problems" ]; then
+  echo "FAIL Verzeichnis-Runner nicht mehr verdrahtet:$runner_problems"
+  echo
+  rc=1
+fi
+
+if [ -n "$known_red_no_issue" ]; then
+  echo "FAIL Eintraege in tests/known-red.txt ohne Issue-Nummer im Abschnitt:"
+  for m in $known_red_no_issue; do echo "    $m"; done
+  echo
+  rc=1
+fi
+
+if [ -n "$missing" ]; then
+  n=$(echo $missing | wc -w)
+  echo "FAIL $n Testdatei(en) in keinem Ziel und in keiner Suite-Liste:"
+  for m in $missing; do echo "    $m"; done
+  echo
+  echo "Entweder ins Makefile aufnehmen, in eine der Listen tests/suite-*.txt"
+  echo "eintragen (Pfad relativ zu tests/, ohne Endung), bei bekanntem Defekt"
+  echo "mit Issue in tests/known-red.txt fuehren — oder, wenn es kein Test ist,"
+  echo "in is_exempt() dieses Skripts vermerken."
+  rc=1
+fi
+
+[ "$rc" -ne 0 ] && exit 1
+
+echo "PASS alle $count Testdateien sind einem Ziel, einer Suite oder einem Runner zugeordnet"

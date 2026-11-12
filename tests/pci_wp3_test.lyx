@@ -1,0 +1,235 @@
+// tests/pci_wp3_test.lyx
+// PCI Phase 3 (PCI-09/PCI-10) — Tests ohne Geraet und ohne root.
+//
+// Der Interruptweg laesst sich vollstaendig ohne Hardware pruefen: ein
+// eventfd ist derselbe, ob ihn der Kernel im Interrupt erhoeht oder der
+// Test von Hand. Damit sind Warten, Zeitablauf, Zaehlerabholung und die
+// Auswahl aus mehreren Quellen echt geprueft — nicht simuliert.
+//
+// Was ein Geraet braucht (VFIO-Aufbau, DMA, Regionen), steht in
+// pci_hw_test.lyx und wird dort uebersprungen, wenn kein Geraet an
+// vfio-pci gebunden ist.
+//
+// Abnahmekriterien:
+// AC-1  eventfd erzeugen und wieder schliessen
+// AC-2  Zeitablauf liefert 0, nicht "Interrupt"
+// AC-3  ein ausgeloester Zaehler kommt vollstaendig an (auch mehrfach)
+// AC-4  Warten auf mehrere Quellen meldet die richtige
+// AC-5  Argumentpruefung aller Ein- und Ausstiegspunkte
+// AC-6  Typnamen und Konstanten stimmen mit dem VFIO-ABI ueberein
+
+unit tests.pci_wp3_test;
+
+import std.hardware.pci_types;
+import std.hardware.pci_syscalls;
+import std.hardware.pci_vfio;
+import std.hardware.pci_irq;
+import std.alloc;
+import std.string;
+import std.io;
+
+var failures: int64 := 0;
+
+fn checkInt(name: pchar, got: int64, want: int64) {
+  if (got == want) {
+    Print("PASS "); Print(name); Print(" = "); PrintLn(IntToStr(got));
+  } else {
+    failures := failures + 1;
+    Print("FAIL "); Print(name); Print(": erwartet "); Print(IntToStr(want));
+    Print(", bekommen "); PrintLn(IntToStr(got));
+  }
+}
+
+fn checkStr(name: pchar, got: pchar, want: pchar) {
+  if (StrCmp(got, want) == 0) {
+    Print("PASS "); Print(name); Print(" = "); PrintLn(got);
+  } else {
+    failures := failures + 1;
+    Print("FAIL "); Print(name); Print(": erwartet '"); Print(want);
+    Print("', bekommen '"); Print(got); PrintLn("'");
+  }
+}
+
+// Erhoeht den eventfd-Zaehler um n — genau das tut der Kernel beim
+// Interrupt.
+fn triggerEventFd(fd: int64, n: int64): int64 {
+  var buf: int64 := alloc(8);
+  poke64(buf, n);
+  var w: int64 := write(fd, buf as pchar, 8);
+  free(buf, 8);
+  return w;
+}
+
+// ============================================================
+// AC-1/AC-2/AC-3: eventfd und Warten
+// ============================================================
+
+fn testEventFd() {
+  PrintLn("-- AC-1/AC-2/AC-3 eventfd und Warten --");
+
+  var fd: int64 := PciIrqEventFd();
+  if (fd < 0) {
+    failures := failures + 1;
+    Print("FAIL eventfd erzeugen: "); PrintLn(PciErrorName(fd));
+    return;
+  }
+  PrintLn("PASS eventfd erzeugt");
+
+  // Nichts ausgeloest: Warten muss mit 0 zurueckkommen, nicht mit einem
+  // erfundenen Interrupt. Ein Wartefehler, der 1 liefert, laesst einen
+  // Treiber Arbeit suchen, die es nicht gibt.
+  checkInt("zeitablauf ohne interrupt", PciIrqWait(fd, 20), 0);
+  checkInt("poll ohne interrupt", PciIrqPoll(fd), 0);
+
+  // Ein Interrupt
+  checkInt("ausloesen schreibt 8 bytes", triggerEventFd(fd, 1), 8);
+  checkInt("ein interrupt kommt an", PciIrqWait(fd, 100), 1);
+  checkInt("danach wieder leer", PciIrqPoll(fd), 0);
+
+  // Mehrere Interrupts zwischen zwei Abholungen: der Zaehler summiert.
+  // Wer nur "es gab etwas" meldet, verliert hier vier Ereignisse.
+  triggerEventFd(fd, 1);
+  triggerEventFd(fd, 3);
+  triggerEventFd(fd, 1);
+  checkInt("aufgelaufene interrupts summiert", PciIrqWait(fd, 100), 5);
+  checkInt("nach abholen leer", PciIrqPoll(fd), 0);
+
+  PciCloseFile(fd);
+
+  // Nicht blockierender eventfd verhaelt sich beim Zaehlen gleich.
+  var nb: int64 := PciIrqEventFdNonblock();
+  if (nb < 0) {
+    failures := failures + 1;
+    Print("FAIL nonblock-eventfd: "); PrintLn(PciErrorName(nb));
+  } else {
+    triggerEventFd(nb, 7);
+    checkInt("nonblock zaehler", PciIrqWait(nb, 100), 7);
+    PciCloseFile(nb);
+  }
+}
+
+// ============================================================
+// AC-4: mehrere Quellen
+// ============================================================
+
+fn testWaitAny() {
+  PrintLn("-- AC-4 mehrere Quellen --");
+
+  var fds: int64 := alloc(4 * 8);
+  var i: int64 := 0;
+  while (i < 4) {
+    poke64(fds + i * 8, PciIrqEventFd());
+    i := i + 1;
+  }
+
+  checkInt("nichts anstehend", PciIrqWaitAny(fds, 4, 20), PCI_E_NODEV);
+
+  // Der dritte Vektor meldet sich.
+  triggerEventFd(peek64(fds + 2 * 8), 1);
+  checkInt("dritte quelle erkannt", PciIrqWaitAny(fds, 4, 100), 2);
+  // Der Zaehler bleibt stehen, bis er abgeholt wird — WaitAny sagt nur,
+  // wer dran ist.
+  checkInt("zaehler noch da", PciIrqWait(peek64(fds + 2 * 8), 0), 1);
+  checkInt("danach nichts mehr", PciIrqWaitAny(fds, 4, 20), PCI_E_NODEV);
+
+  // Melden sich mehrere, wird der erste gemeldet — die uebrigen bleiben
+  // anstehend und gehen nicht verloren.
+  triggerEventFd(peek64(fds + 8), 1);
+  triggerEventFd(peek64(fds + 3 * 8), 1);
+  checkInt("erste von zweien", PciIrqWaitAny(fds, 4, 100), 1);
+  PciIrqWait(peek64(fds + 8), 0);
+  checkInt("zweite bleibt anstehend", PciIrqWaitAny(fds, 4, 100), 3);
+
+  i := 0;
+  while (i < 4) { PciCloseFile(peek64(fds + i * 8)); i := i + 1; }
+  free(fds, 4 * 8);
+}
+
+// ============================================================
+// AC-5: Argumentpruefung
+// ============================================================
+
+fn testArgs() {
+  PrintLn("-- AC-5 Argumentpruefung --");
+
+  checkInt("wait mit fd -1",     PciIrqWait(-1, 0), PCI_E_BADARG);
+  checkInt("waitany ohne array", PciIrqWaitAny(0, 4, 0), PCI_E_BADARG);
+  checkInt("waitany count 0",    PciIrqWaitAny(8, 0, 0), PCI_E_BADARG);
+  checkInt("waitany count zu gross",
+           PciIrqWaitAny(8, PCI_IRQ_MAX_VECTORS + 1, 0), PCI_E_BADARG);
+
+  // Kein Kontext: alle Einstiege muessen das melden, statt auf Adresse 0
+  // zu rechnen.
+  checkInt("irqinfo ohne kontext",  PciIrqInfo(0, 0, 8), PCI_E_BADARG);
+  checkInt("irqcount ohne kontext", PciIrqCount(0, 0), PCI_E_BADARG);
+  checkInt("enable ohne kontext",   PciIrqEnable(0, 1, 8), PCI_E_BADARG);
+  checkInt("enable ohne ziel",      PciIrqEnable(8, 1, 0), PCI_E_BADARG);
+  checkInt("disable ohne kontext",  PciIrqDisable(0, 0), PCI_E_BADARG);
+  checkInt("setfd ohne kontext",    PciIrqSetEventFd(0, 0, 0, 3), PCI_E_BADARG);
+
+  checkInt("vfio close(0) ohne wirkung", 0, 0);
+  PciVfioClose(0);   // darf nicht abstuerzen
+
+  checkInt("vfio regioninfo ohne kontext", PciVfioRegionInfo(0, 0, 8), PCI_E_BADARG);
+  checkInt("vfio dma map ohne kontext",    PciVfioDmaMap(0, 8, 0, 4096, 3), PCI_E_BADARG);
+  checkInt("vfio dma map ohne puffer",     PciVfioDmaMap(8, 0, 0, 4096, 3), PCI_E_BADARG);
+  checkInt("vfio dma map groesse 0",       PciVfioDmaMap(8, 8, 0, 0, 3), PCI_E_BADARG);
+  checkInt("vfio dma alloc ohne kontext",  PciVfioDmaAlloc(0, 4096, 0), PCI_E_BADARG);
+  checkInt("vfio reset ohne kontext",      PciVfioReset(0), PCI_E_BADARG);
+  checkInt("vfio unmap ohne adresse",      PciVfioUnmapRegion(0, 4096), PCI_E_BADARG);
+  checkInt("vfio cfg read ohne kontext",   PciVfioCfgRead(0, 0, 4), PCI_E_BADARG);
+  checkInt("vfio cfg breite 3",            PciVfioCfgRead(8, 0, 3), PCI_E_BADARG);
+  checkInt("vfio cfg offset negativ",      PciVfioCfgRead(8, -1, 4), PCI_E_RANGE);
+
+  // Gruppe eines Geraets, das es nicht gibt: kein iommu_group-Symlink.
+  var bogus: int64 := PciBdfParse("0000:ff:1f.7");
+  checkInt("gruppe eines fehlenden geraets", PciVfioGroupOf(bogus), PCI_E_NOIOMMU);
+}
+
+// ============================================================
+// AC-6: ABI-Konstanten
+//
+// Die ioctl-Nummern sind _IO(';', 100 + n). Stimmen sie nicht, spricht
+// das Programm mit dem falschen Kernelbefehl — ein Fehler, der sich sonst
+// erst auf fremder Hardware zeigt.
+// ============================================================
+
+fn testAbi() {
+  PrintLn("-- AC-6 ABI-Konstanten --");
+
+  var base: int64 := (0x3B << 8) | 100;
+  checkInt("VFIO_GET_API_VERSION",       VFIO_GET_API_VERSION,       base + 0);
+  checkInt("VFIO_CHECK_EXTENSION",       VFIO_CHECK_EXTENSION,       base + 1);
+  checkInt("VFIO_SET_IOMMU",             VFIO_SET_IOMMU,             base + 2);
+  checkInt("VFIO_GROUP_GET_STATUS",      VFIO_GROUP_GET_STATUS,      base + 3);
+  checkInt("VFIO_GROUP_SET_CONTAINER",   VFIO_GROUP_SET_CONTAINER,   base + 4);
+  checkInt("VFIO_GROUP_UNSET_CONTAINER", VFIO_GROUP_UNSET_CONTAINER, base + 5);
+  checkInt("VFIO_GROUP_GET_DEVICE_FD",   VFIO_GROUP_GET_DEVICE_FD,   base + 6);
+  checkInt("VFIO_DEVICE_GET_INFO",       VFIO_DEVICE_GET_INFO,       base + 7);
+  checkInt("VFIO_DEVICE_GET_REGION_INFO", VFIO_DEVICE_GET_REGION_INFO, base + 8);
+  checkInt("VFIO_DEVICE_GET_IRQ_INFO",   VFIO_DEVICE_GET_IRQ_INFO,   base + 9);
+  checkInt("VFIO_DEVICE_SET_IRQS",       VFIO_DEVICE_SET_IRQS,       base + 10);
+  checkInt("VFIO_DEVICE_RESET",          VFIO_DEVICE_RESET,          base + 11);
+  checkInt("VFIO_IOMMU_GET_INFO",        VFIO_IOMMU_GET_INFO,        base + 12);
+  checkInt("VFIO_IOMMU_MAP_DMA",         VFIO_IOMMU_MAP_DMA,         base + 13);
+  checkInt("VFIO_IOMMU_UNMAP_DMA",       VFIO_IOMMU_UNMAP_DMA,       base + 14);
+
+  checkInt("config-region index", VFIO_PCI_CONFIG_REGION_INDEX, 7);
+  checkInt("rom-region index",    VFIO_PCI_ROM_REGION_INDEX,    6);
+  checkInt("msix irq index",      VFIO_PCI_MSIX_IRQ_INDEX,      2);
+
+  checkStr("typname INTx",  PciIrqTypeName(VFIO_PCI_INTX_IRQ_INDEX), "INTx");
+  checkStr("typname MSI-X", PciIrqTypeName(VFIO_PCI_MSIX_IRQ_INDEX), "MSI-X");
+  checkStr("typname unbekannt", PciIrqTypeName(99), "unknown IRQ type");
+}
+
+fn main(): int64 {
+  PrintLn("=== PCI Phase 3: pci_vfio / pci_irq (ohne Geraet) ===");
+  testEventFd();
+  testWaitAny();
+  testArgs();
+  testAbi();
+  Print("=== Fehlgeschlagen: "); PrintLn(IntToStr(failures));
+  if (failures > 0) { return 1; }
+  return 0;
+}

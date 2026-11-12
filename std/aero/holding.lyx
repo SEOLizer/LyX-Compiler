@@ -1,0 +1,210 @@
+// std/aero/holding.lyx — Warteschleifen: Einflugverfahren, Zeiten, Verbrauch
+//
+// Eine Warteschleife ist ein Rechteck mit zwei Halbkreisen, an einem Punkt
+// festgemacht. Was daran gerechnet werden muss, sind drei Dinge: WIE man
+// hineinkommt, WIE LANGE eine Runde dauert, und WAS sie kostet.
+//
+// DAS EINFLUGVERFAHREN ist die einzige Stelle, an der es wirklich knifflig
+// wird, und zwar weil die Antwort von der Anflugrichtung abhängt und die
+// Sektorgrenzen nicht symmetrisch sind: 180° direkt, 110° parallel, 70°
+// versetzt. Wer die 110 und die 70 vertauscht, bekommt in einem schmalen
+// Bereich das falsche Verfahren — und merkt es nicht, weil die anderen
+// Richtungen weiterhin stimmen.
+//
+// KONVENTION dieser Unit, ausdrücklich hingeschrieben, weil die Literatur sie
+// mal auf den Einflugkurs und mal auf den Gegenkurs bezieht:
+//
+//   `einflugkursGrad` ist der Kurs, den das Flugzeug auf dem ANFLUGSCHENKEL
+//   ZUM Fix fliegt. Bei Rechtskurven liegt die Schleife rechts davon.
+//   Gemessen wird die Anflugrichtung relativ dazu:
+//
+//     direkt   : 0° bis 180°   (die Schleifenseite)
+//     parallel : 180° bis 290°
+//     versetzt : 290° bis 360°
+//
+// Zwei Proben, an denen sich die Zuordnung prüfen lässt und die im Test
+// stehen: bei Einflugkurs 090° und Anflug auf 090° ist es DIREKT (man
+// überfliegt und dreht rechts ab); bei Anflug auf 270° ist es PARALLEL.
+//
+// GESCHWINDIGKEITEN UND ZEITEN kommen aus den ICAO-Verfahren und hängen an
+// der Höhe. Sie stehen hier als Funktion und nicht als Konstante, weil sie
+// sprunghaft wechseln — wer den Wert für 14000 ft nimmt und in FL200 fliegt,
+// hält eine Schleife, die zu klein ist.
+
+@description("Warteschleifen: Einflugverfahren, Standardzeiten, Geschwindigkeiten, Verbrauch")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+@capabilities([])
+
+unit std.aero.holding;
+
+import std.math;
+import std.aero.atmos;
+import std.aero.perf;
+
+// ── Einflugverfahren ──────────────────────────────────────────────────────
+
+pub con AV_EINFLUG_DIREKT:   int64 := 1;
+pub con AV_EINFLUG_PARALLEL: int64 := 2;
+pub con AV_EINFLUG_VERSETZT: int64 := 3;
+pub con AV_EINFLUG_FEHLER:   int64 := 0 - 1;
+
+// Winkel auf [0,360) bringen. Auch für negative Eingaben.
+fn _norm360(g: f64): f64 {
+  if (g != g) { return g; }
+  var x: f64 := g;
+  while (x < 0.0) { x := x + 360.0; }
+  while (x >= 360.0) { x := x - 360.0; }
+  return x;
+}
+
+pub fn AvNormKursGrad(g: f64): f64 { return _norm360(g); }
+
+// Welches Einflugverfahren gilt?
+//
+// `rechtskurven` unterscheidet die Standardschleife (rechts) von der
+// gespiegelten. Bei Linkskurven liegen die Sektoren spiegelbildlich — deshalb
+// wird der Winkel dort gespiegelt und dieselbe Zuordnung benutzt, statt die
+// Grenzen ein zweites Mal hinzuschreiben. Zwei Aufzählungen derselben Sache
+// laufen auseinander.
+pub fn AvEinflugverfahren(einflugkursGrad: f64, anflugrichtungGrad: f64,
+                           rechtskurven: bool): int64 {
+  if (einflugkursGrad != einflugkursGrad) { return AV_EINFLUG_FEHLER; }
+  if (anflugrichtungGrad != anflugrichtungGrad) { return AV_EINFLUG_FEHLER; }
+  var rel: f64 := _norm360(anflugrichtungGrad - einflugkursGrad);
+  if (rechtskurven == false) { rel := _norm360(0.0 - rel); }
+  if (rel < 180.0) { return AV_EINFLUG_DIREKT; }
+  if (rel < 290.0) { return AV_EINFLUG_PARALLEL; }
+  return AV_EINFLUG_VERSETZT;
+}
+
+pub fn AvEinflugName(verfahren: int64): pchar {
+  if (verfahren == AV_EINFLUG_DIREKT)   { return "direkt"c; }
+  if (verfahren == AV_EINFLUG_PARALLEL) { return "parallel"c; }
+  if (verfahren == AV_EINFLUG_VERSETZT) { return "versetzt"c; }
+  return "unbestimmt"c;
+}
+
+// ── Geschwindigkeiten und Zeiten ──────────────────────────────────────────
+//
+// Höchstgeschwindigkeiten nach ICAO für Strahlflugzeuge, als angezeigte
+// Geschwindigkeit. Oberhalb FL340 gilt eine Machzahl statt einer IAS —
+// deshalb gibt es dafür eine eigene Funktion, statt eine Zahl zu liefern, die
+// in der falschen Einheit gelesen würde.
+
+pub fn AvMaxWartegeschwindigkeitKt(druckhoeheFt: f64): f64 {
+  if (druckhoeheFt != druckhoeheFt) { return AvError(); }
+  if (druckhoeheFt <= 14000.0) { return 230.0; }
+  if (druckhoeheFt <= 20000.0) { return 240.0; }
+  if (druckhoeheFt <= 34000.0) { return 265.0; }
+  // Darüber ist die Grenze eine Machzahl, keine angezeigte Geschwindigkeit.
+  return AvError();
+}
+
+pub fn AvMaxWarteMach(druckhoeheFt: f64): f64 {
+  if (druckhoeheFt != druckhoeheFt) { return AvError(); }
+  if (druckhoeheFt <= 34000.0) { return AvError(); }
+  return 0.83;
+}
+
+// Standardzeit des Anflugschenkels: eine Minute bis 14000 ft, darüber
+// anderthalb. Die Grenze ist dieselbe wie bei der Geschwindigkeit, aber das
+// ist Zufall der Vorschrift und keine Ableitung — deshalb steht sie hier noch
+// einmal und wird nicht aus der anderen Funktion abgeleitet.
+pub fn AvSchenkelzeitMin(druckhoeheFt: f64): f64 {
+  if (druckhoeheFt != druckhoeheFt) { return AvError(); }
+  if (druckhoeheFt <= 14000.0) { return 1.0; }
+  return 1.5;
+}
+
+// ── Rundenzeit und Verbrauch ──────────────────────────────────────────────
+//
+// Eine Runde besteht aus zwei geraden Schenkeln und zwei 180°-Kurven. Die
+// Kurven dauern bei Standardrate je eine Minute — aber nur, wenn das
+// Flugzeug die Standardrate überhaupt fliegen kann; oben herum wird mit
+// fester Querneigung gekurvt und die Kurve dauert länger. Deshalb wird die
+// Kurvenzeit gerechnet und nicht mit einer Minute angesetzt.
+
+pub fn AvRundenzeitMin(druckhoeheFt: f64, tasKt: f64,
+                        querneigungGrad: f64): f64 {
+  var schenkel: f64 := AvSchenkelzeitMin(druckhoeheFt);
+  if (AvIsError(schenkel)) { return AvError(); }
+  var kurveS: f64 := AvKurvendauerS(tasKt, querneigungGrad, 180.0);
+  if (AvIsError(kurveS)) { return AvError(); }
+  // Zwei Schenkel, zwei Kurven.
+  return 2.0 * schenkel + 2.0 * kurveS / 60.0;
+}
+
+pub fn AvRundenverbrauchKg(druckhoeheFt: f64, tasKt: f64,
+                            querneigungGrad: f64, verbrauchKgProH: f64): f64 {
+  var min: f64 := AvRundenzeitMin(druckhoeheFt, tasKt, querneigungGrad);
+  if (AvIsError(min)) { return AvError(); }
+  if (verbrauchKgProH != verbrauchKgProH || verbrauchKgProH < 0.0) { return AvError(); }
+  return verbrauchKgProH * min / 60.0;
+}
+
+// Wie viele volle Runden erlaubt der verfügbare Treibstoff?
+pub fn AvMoeglicheRunden(verfuegbarKg: f64, druckhoeheFt: f64, tasKt: f64,
+                          querneigungGrad: f64, verbrauchKgProH: f64): int64 {
+  var proRunde: f64 := AvRundenverbrauchKg(druckhoeheFt, tasKt, querneigungGrad,
+                                           verbrauchKgProH);
+  if (AvIsError(proRunde) || proRunde <= 0.0) { return 0 - 1; }
+  if (verfuegbarKg != verfuegbarKg || verfuegbarKg < 0.0) { return 0 - 1; }
+  return FloorF64(verfuegbarKg / proRunde) as int64;
+}
+
+// ── Ausdehnung der Schleife ───────────────────────────────────────────────
+//
+// Wie viel Luftraum braucht die Schleife? Länge ergibt sich aus Schenkelzeit
+// und Geschwindigkeit, Breite aus dem doppelten Kurvenradius. Beides zusammen
+// ist der Platz, der freizuhalten ist.
+
+pub fn AvSchleifenlaengeNm(druckhoeheFt: f64, grundgeschwKt: f64,
+                            querneigungGrad: f64, tasKt: f64): f64 {
+  var schenkel: f64 := AvSchenkelzeitMin(druckhoeheFt);
+  if (AvIsError(schenkel)) { return AvError(); }
+  if (grundgeschwKt != grundgeschwKt || grundgeschwKt < 0.0) { return AvError(); }
+  var gerade: f64 := grundgeschwKt * schenkel / 60.0;
+  var r: f64 := AvKurvenradiusNm(tasKt, querneigungGrad);
+  if (AvIsError(r)) { return AvError(); }
+  // Die Kurven verlängern das Rechteck um je einen Radius.
+  return gerade + 2.0 * r;
+}
+
+pub fn AvSchleifenbreiteNm(tasKt: f64, querneigungGrad: f64): f64 {
+  var r: f64 := AvKurvenradiusNm(tasKt, querneigungGrad);
+  if (AvIsError(r)) { return AvError(); }
+  return 2.0 * r;
+}
+
+// ── Wind in der Schleife ──────────────────────────────────────────────────
+//
+// Der Wind verschiebt die Schleife und macht die Schenkel ungleich lang. Die
+// gebräuchliche Regel lautet: den Vorhaltewinkel des Anflugschenkels auf dem
+// Gegenschenkel VERDREIFACHEN, damit das Flugzeug am Ende der Kurve wieder
+// auf dem Anflugkurs herauskommt.
+pub fn AvGegenschenkelVorhaltGrad(kursGrad: f64, tasKt: f64,
+                                   windRichtungGrad: f64,
+                                   windStaerkeKt: f64): f64 {
+  var wca: f64 := AvVorhaltewinkelGrad(kursGrad, tasKt, windRichtungGrad,
+                                       windStaerkeKt);
+  if (AvIsError(wca)) { return AvError(); }
+  return 3.0 * wca;
+}
+
+// Zeit des Gegenschenkels, damit der Anflugschenkel die Sollzeit erreicht:
+// bei Gegenwind auf dem Anflug wird der Gegenschenkel kürzer geflogen.
+pub fn AvGegenschenkelzeitMin(sollAnflugMin: f64, tasKt: f64,
+                               windKomponenteAnflugKt: f64): f64 {
+  if (sollAnflugMin != sollAnflugMin || sollAnflugMin <= 0.0) { return AvError(); }
+  if (tasKt != tasKt || tasKt <= 0.0) { return AvError(); }
+  if (windKomponenteAnflugKt != windKomponenteAnflugKt) { return AvError(); }
+  // Auf dem Anflugschenkel wirkt die Komponente so, auf dem Gegenschenkel
+  // umgekehrt.
+  var vAnflug: f64 := tasKt + windKomponenteAnflugKt;
+  var vGegen: f64 := tasKt - windKomponenteAnflugKt;
+  if (vAnflug <= 0.0 || vGegen <= 0.0) { return AvError(); }
+  // Gleiche Strecke über Grund in beiden Richtungen.
+  var streckeNm: f64 := vAnflug * sollAnflugMin / 60.0;
+  return 60.0 * streckeNm / vGegen;
+}

@@ -1,0 +1,318 @@
+// examples/ml/nn_auto_mpg.lyx
+// Probetraining: Verbrauch eines Autos aus seinen Kenndaten vorhersagen.
+//
+// Aufruf:
+//   nn_auto_mpg <datei> [modell.lyxnn]
+//
+// <datei> ist eine Tabelle im Format des Datensatzes "Auto MPG" (UCI):
+// Spalten mit Leerraum getrennt, fehlende Werte als "?", die Spalten
+//
+//   0 mpg   1 Zylinder   2 Hubraum   3 Leistung
+//   4 Gewicht   5 Beschleunigung   6 Baujahr   7 Herkunft   8 Name
+//
+// Vorhergesagt wird Spalte 0 aus den Spalten 1 bis 6. Der Datensatz selbst
+// gehoert nicht zum Repository -- darum der Pfad als Argument.
+//
+// Was das Programm zeigt:
+//   std.csv       Tabelle lesen, Luecken sichtbar halten
+//   std.nn_data   skalieren mit den Kennwerten des TRAININGSTEILS, mischen,
+//                 aufteilen, Guete messen
+//   std.nn        Netz bauen, trainieren, mit Abbruchkriterium stoppen
+//   std.nn_io     Netz sichern und zurueckholen
+//
+// Gemessen wird gegen eine VERGLEICHSZAHL: ein Modell, das immer den
+// Mittelwert des Trainingsteils vorhersagt. Ohne sie saehe jede Zahl
+// irgendwie gut aus.
+
+unit main;
+
+import std.csv;
+import std.nn;
+import std.nn_data;
+import std.nn_io;
+import std.math;
+import std.string;
+import std.alloc;
+import std.io;
+
+fn NEG(x: f64): f64 { return 0.0 - x; }
+
+fn PV(p: int64, i: int64): f64 {
+  var v: f64 := peekf64(p + i * 8);
+  return v;
+}
+
+fn SV(p: int64, i: int64, v: f64): void {
+  pokef64(p + i * 8, v);
+}
+
+fn ZeigeF(name: pchar, v: f64, stellen: int64): void {
+  PrintStr(name);
+  var s: pchar := FloatToStr(v, stellen);
+  PrintStr(s);
+  PrintStr("\n"c);
+}
+
+// Mittlerer absoluter Fehler zweier Spalten
+fn MAE(pred: int64, truth: int64, n: int64): f64 {
+  var sum: f64 := 0.0;
+  var i: int64 := 0;
+  while (i < n) {
+    sum := sum + AbsF64(PV(pred, i) - PV(truth, i));
+    i := i + 1;
+  }
+  return sum / (n as f64);
+}
+
+con NFEAT: int64 := 6;      // Spalten 1..6
+con NCOL: int64 := 7;       // Zielspalte mitgelesen
+
+fn main(): int64 {
+  var argc: int64 := GetArgC();
+  if (argc < 2) {
+    PrintStr("Aufruf: nn_auto_mpg <auto-mpg.data> [modell.lyxnn]\n"c);
+    PrintStr("Der Datensatz gehoert nicht zum Repository.\n"c);
+    return 1;
+  }
+  var argv: int64 := GetArgV() as int64;
+  var pfad: pchar := peek64(argv + 8) as pchar;
+  var modellPfad: pchar := "/tmp/auto_mpg_netz.lyxnn"c;
+  if (argc > 2) { modellPfad := peek64(argv + 16) as pchar; }
+
+  // ── 1. Tabelle lesen ──────────────────────────────────────────────────────
+
+  var t: int64 := CsvOpenWhitespace(pfad, false);
+  if (t == 0) {
+    PrintStr("Datei nicht lesbar, Fehler "c);
+    PrintInt(CsvError());
+    PrintStr("\n"c);
+    return 2;
+  }
+  var okm: bool := CsvSetMissing(t, "?"c);
+  PrintStr("=== Auto MPG ===\n"c);
+  PrintStr("Zeilen in der Datei: "c);
+  PrintInt(CsvRowCount(t));
+  PrintStr(", Spalten: "c);
+  PrintInt(CsvColCount(t));
+  PrintStr("\n"c);
+
+  var cols: int64 := alloc(NCOL * 8);
+  var i: int64 := 0;
+  while (i < NCOL) {
+    poke64(cols + i * 8, i);
+    i := i + 1;
+  }
+  var brauchbar: int64 := CsvUsableRowCount(t, cols, NCOL);
+  PrintStr("Zeilen mit vollstaendigen Werten: "c);
+  PrintInt(brauchbar);
+  PrintStr(" (uebersprungen: "c);
+  PrintInt(CsvRowCount(t) - brauchbar);
+  PrintStr(")\n"c);
+  if (brauchbar < 20) {
+    PrintStr("Zu wenige brauchbare Zeilen.\n"c);
+    CsvFree(t);
+    return 3;
+  }
+
+  var roh: int64 := alloc(brauchbar * NCOL * 8);
+  var skipBox: int64 := alloc(8);
+  var n: int64 := CsvToMatrixSkip(t, cols, NCOL, roh, brauchbar, skipBox);
+  if (n < 1) {
+    PrintStr("Matrix nicht gelesen, Fehler "c);
+    PrintInt(CsvError());
+    PrintStr("\n"c);
+    CsvFree(t);
+    return 4;
+  }
+  CsvFree(t);
+
+  // ── 2. Mischen und in Merkmale und Ziel trennen ───────────────────────────
+  //
+  // Der Datensatz steht nach Baujahr sortiert; ohne Mischen waere der
+  // Testteil ausschliesslich die jungen Jahrgaenge.
+
+  var state: int64 := alloc(8);
+  poke64(state, 20261024);
+  var order: int64 := alloc(n * 8);
+  var okp: bool := NnDataPermutation(order, n, state);
+  var gem: int64 := alloc(n * NCOL * 8);
+  okp := NnDataGather(roh, 0, n, NCOL, 0, order, gem, 0);
+
+  var X: int64 := alloc(n * NFEAT * 8);
+  var Y: int64 := alloc(n * 8);
+  i := 0;
+  while (i < n) {
+    var j: int64 := 0;
+    while (j < NFEAT) {
+      SV(X, i * NFEAT + j, PV(gem, i * NCOL + 1 + j));
+      j := j + 1;
+    }
+    SV(Y, i, PV(gem, i * NCOL));
+    i := i + 1;
+  }
+
+  // ── 3. Aufteilen: Training, Pruefung, Test ────────────────────────────────
+  //
+  // Der Testteil wird NUR am Ende angesehen. Das Abbruchkriterium braucht
+  // einen eigenen Pruefteil -- wer dafuer den Testteil nimmt, waehlt sein
+  // Modell nach den Daten aus, mit denen er es hinterher beurteilt.
+
+  var nTrainVal: int64 := NnDataSplitCount(n, 0.2);
+  if (nTrainVal < 1) {
+    PrintStr("Aufteilung unbrauchbar.\n"c);
+    return 5;
+  }
+  var nTest: int64 := n - nTrainVal;
+  var nTrain: int64 := NnDataSplitCount(nTrainVal, 0.2);
+  var nVal: int64 := nTrainVal - nTrain;
+  PrintStr("Training: "c);
+  PrintInt(nTrain);
+  PrintStr(", Pruefung: "c);
+  PrintInt(nVal);
+  PrintStr(", Test: "c);
+  PrintInt(nTest);
+  PrintStr("\n"c);
+
+  // ── 4. Skalieren mit den Kennwerten des Trainingsteils ────────────────────
+
+  var mean: int64 := alloc(NFEAT * 8);
+  var sd: int64 := alloc(NFEAT * 8);
+  var oks: bool := NnDataFitStandard(X, nTrain, NFEAT, mean, sd);
+  // dieselben Kennwerte auf ALLE Zeilen -- auch auf Pruefung und Test
+  oks := NnDataApplyStandard(X, n, NFEAT, mean, sd);
+
+  // Das Ziel ebenfalls skalieren, damit der Anfangsfehler nicht in der
+  // Groessenordnung von 20 liegt; gemessen wird hinterher in mpg
+  var yMean: int64 := alloc(8);
+  var ySd: int64 := alloc(8);
+  oks := NnDataFitStandard(Y, nTrain, 1, yMean, ySd);
+  var yM: f64 := PV(yMean, 0);
+  var yS: f64 := PV(ySd, 0);
+  var Ys: int64 := alloc(n * 8);
+  i := 0;
+  while (i < n) {
+    SV(Ys, i, (PV(Y, i) - yM) / yS);
+    i := i + 1;
+  }
+  ZeigeF("Mittlerer Verbrauch im Training (mpg): "c, yM, 2);
+
+  // ── 5. Netz bauen ─────────────────────────────────────────────────────────
+
+  var net: int64 := NnNew(NFEAT, 3);
+  NnSeed(net, 4711);
+  var okn: bool := NnAddDense(net, 16, NN_ACT_TANH);
+  okn := NnAddDense(net, 8, NN_ACT_TANH);
+  okn := NnAddDense(net, 1, NN_ACT_LINEAR);
+  okn := NnInitXavier(net);
+  okn := NnSetLoss(net, NN_LOSS_MSE);
+  okn := NnSetOptimizer(net, NN_OPT_ADAM);
+  NnSetLearningRate(net, 0.01);
+  okn := NnSetWeightDecay(net, 0.0005);
+  okn := NnSetGradClip(net, 5.0);
+  okn := NnSetDropout(net, 0, 0.1);
+  okn := NnSetLrSchedule(net, NN_LR_COSINE, 0.001, 300.0);
+  PrintStr("Netz: 6 -> 16 tanh -> 8 tanh -> 1, Adam, "c);
+  PrintInt(NnParamCount(net));
+  PrintStr(" Parameter\n"c);
+
+  // ── 6. Trainieren, Abbruch ueber den Pruefteil ────────────────────────────
+
+  var Xtrain: int64 := X;
+  var Ytrain: int64 := Ys;
+  var Xval: int64 := X + nTrain * NFEAT * 8;
+  var Yval: int64 := Ys + nTrain * 8;
+  var Xtest: int64 := X + nTrainVal * NFEAT * 8;
+  var Ytest: int64 := Y + nTrainVal * 8;          // Test in mpg, nicht skaliert
+
+  var vorher: f64 := NnEvaluate(net, Xtrain, Ytrain, nTrain);
+  var bestVal: f64 := NnTrainEarlyStop(net, Xtrain, Ytrain, nTrain,
+                                       Xval, Yval, nVal,
+                                       16, 300, 25);
+  if (bestVal < 0.0) {
+    PrintStr("Training abgelehnt.\n"c);
+    return 6;
+  }
+  ZeigeF("Verlust vor dem Training (skaliert): "c, vorher, 4);
+  ZeigeF("Bester Pruefverlust (skaliert):      "c, bestVal, 4);
+  PrintStr("Epochen gelaufen: "c);
+  PrintInt(NnEpoch(net));
+  PrintStr("\n"c);
+
+  // ── 7. Test: gegen die Vergleichszahl ─────────────────────────────────────
+
+  NnSetTraining(net, false);     // ohne Dropout vorhersagen
+  var pred: int64 := alloc(nTest * 8);
+  var mittelw: int64 := alloc(nTest * 8);
+  i := 0;
+  while (i < nTest) {
+    var o: int64 := NnForward(net, Xtest + i * NFEAT * 8);
+    SV(pred, i, NnOutputAt(net, 0) * yS + yM);    // zurueck in mpg
+    SV(mittelw, i, yM);
+    i := i + 1;
+  }
+  PrintStr("\n--- Test ("c);
+  PrintInt(nTest);
+  PrintStr(" Autos, Angaben in mpg) ---\n"c);
+  ZeigeF("Netz      MAE: "c, MAE(pred, Ytest, nTest), 3);
+  ZeigeF("Netz      R2:  "c, NnDataR2(pred, Ytest, nTest), 4);
+  ZeigeF("Mittelwert MAE: "c, MAE(mittelw, Ytest, nTest), 3);
+  ZeigeF("Mittelwert R2:  "c, NnDataR2(mittelw, Ytest, nTest), 4);
+
+  // Drei Beispiele
+  PrintStr("\nDrei Vorhersagen (gemessen / vorhergesagt):\n"c);
+  i := 0;
+  while (i < 3) {
+    PrintStr("  "c);
+    var s1: pchar := FloatToStr(PV(Ytest, i), 1);
+    PrintStr(s1);
+    PrintStr(" / "c);
+    var s2: pchar := FloatToStr(PV(pred, i), 1);
+    PrintStr(s2);
+    PrintStr("\n"c);
+    i := i + 1;
+  }
+
+  // ── 8. Sichern und zurueckholen ───────────────────────────────────────────
+
+  var bytes: int64 := NnIoSaveFile(net, modellPfad, true);
+  if (bytes < 1) {
+    PrintStr("Sichern fehlgeschlagen, Fehler "c);
+    PrintInt(NnIoLoadError());
+    PrintStr("\n"c);
+    return 7;
+  }
+  PrintStr("\nModell gesichert: "c);
+  PrintStr(modellPfad);
+  PrintStr(" ("c);
+  PrintInt(bytes);
+  PrintStr(" Byte)\n"c);
+  var zurueck: int64 := NnIoLoadFile(modellPfad);
+  if (zurueck == 0) {
+    PrintStr("Zurueckholen fehlgeschlagen, Fehler "c);
+    PrintInt(NnIoLoadError());
+    PrintStr("\n"c);
+    return 8;
+  }
+  // Gleiche Vorhersagen? Geprueft wird die groesste Abweichung, nicht eine
+  // Stichprobe
+  var schlimmste: f64 := 0.0;
+  i := 0;
+  while (i < nTest) {
+    var o2: int64 := NnForward(zurueck, Xtest + i * NFEAT * 8);
+    var v2: f64 := NnOutputAt(zurueck, 0) * yS + yM;
+    var d: f64 := AbsF64(v2 - PV(pred, i));
+    if (d > schlimmste) { schlimmste := d; }
+    i := i + 1;
+  }
+  ZeigeF("Groesste Abweichung nach dem Zurueckholen: "c, schlimmste, 12);
+  if (schlimmste > 0.0) {
+    PrintStr("FEHLER: zurueckgeholtes Netz rechnet anders.\n"c);
+    NnFree(net);
+    NnFree(zurueck);
+    return 9;
+  }
+  PrintStr("Zurueckgeholtes Netz rechnet bitgleich.\n"c);
+  NnFree(net);
+  NnFree(zurueck);
+  return 0;
+}

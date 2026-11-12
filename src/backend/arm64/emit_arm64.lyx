@@ -22,6 +22,8 @@
 
 
 import src.std.alloc;
+import src.emit_write;   // #1968: _irStrLenVorspann
+import src.backend.linux_syscalls;   // #2021
 pub con ARM64_X0:  int64 := 0;
 pub con ARM64_X1:  int64 := 1;
 pub con ARM64_X2:  int64 := 2;
@@ -33,6 +35,18 @@ pub con ARM64_X7:  int64 := 7;
 pub con ARM64_X8:  int64 := 8;   // indirect result / syscall number
 pub con ARM64_X9:  int64 := 9;   // scratch
 pub con ARM64_X10: int64 := 10;  // scratch
+pub con ARM64_X11: int64 := 11;  // #1776: scratch
+// #1776: x19..x24 sind nach AAPCS64 callee-saved. Der erzeugte Code benutzt
+// sonst nur x0..x11. Der Formatierer (a64FloatToStr) benutzt sie und rettet
+// sie seit #2149 selbst — vorher verlor ein C-Aufrufer einer Lyx-.so dort
+// seine Werte.
+pub con ARM64_X19: int64 := 19;
+pub con ARM64_X20: int64 := 20;
+pub con ARM64_X21: int64 := 21;
+pub con ARM64_X22: int64 := 22;
+pub con ARM64_X23: int64 := 23;
+pub con ARM64_X24: int64 := 24;
+pub con ARM64_X28: int64 := 28;   // #2110: argv ab main; #2149: dort gerettet
 pub con ARM64_X29: int64 := 29;  // frame pointer (FP)
 pub con ARM64_X30: int64 := 30;  // link register (LR)
 pub con ARM64_XZR: int64 := 31;  // zero register / SP
@@ -42,6 +56,7 @@ pub con ARM64_D7:  int64 := 7;
 
 // Linux ARM64 syscall numbers
 pub con SYS_WRITE:  int64 := 64;
+pub con SYS_READ:   int64 := 63;   // #1769: arm64 zaehlt wie riscv64, nicht wie x86-64 (dort 0/1)
 pub con SYS_EXIT:   int64 := 93;
 pub con SYS_MMAP:   int64 := 222;
 pub con SYS_MUNMAP: int64 := 215;
@@ -57,6 +72,10 @@ pub con PATCH_B:    int64 := 0;
 pub con PATCH_CBZ:  int64 := 1;
 pub con PATCH_CBNZ: int64 := 2;
 pub con PATCH_BL:   int64 := 3;
+// #1806: Adresse einer Funktion als WERT (fn-Zeiger). ADR laedt PC-relativ,
+// Reichweite +/-1 MB — reicht fuer ein Modul; darueber meldet applyPatches
+// (#2112: bis dahin behauptete das nur dieser Kommentar).
+pub con PATCH_ADR:  int64 := 4;
 
 // ============================================================================
 // EmitARM64 Class
@@ -70,18 +89,23 @@ pub type EmitARM64 = class {
   ir:              int64;
 
   stackSize:       int64;
+  // #2149: Versatz (zu x29) der Sicherung von x28 in main, 0 = keine.
+  x28Sicherung:    int64;
 
   // label address table: labelId -> byte offset in codeBuf
   labelAddrs:      int64;
   labelCount:      int64;
+  labelCap:        int64;   // #2112: Eintraege in labelAddrs, waechst
 
   // pending branch patches: {codeOff, labelId, type, reg}
   patchBuf:        int64;
   patchCount:      int64;
+  patchCap:        int64;   // #2112: Kapazitaet in Eintraegen, waechst
 
   // function table: funcId -> start offset (for BL patching)
   funcAddrs:       int64;
   funcCount:       int64;
+  funcCap:         int64;   // #2112: Eintraege in funcAddrs/funcPrologueLen
 
   // WP-AND-03: per-function prologue length in bytes. The DWARF CFI generator
   // uses this to advance_loc over the prologue before declaring CFA = fp+16.
@@ -116,14 +140,30 @@ pub type EmitARM64 = class {
   externCount: int64;
   externCap:   int64;
 
+  // #2117: Aufrufstellen externer Funktionen in einer .so — 16-Byte-Saetze
+  // {instrOff, externIdx}. Statt des GOT-Platzes MITTEN IM CODE (eine
+  // Text-Relocation: bionic lehnt sie ab API 23 ab, und ohne DT_TEXTREL
+  // schreibt der Lader in ein R-X-Segment) steht hier ADRP+LDR auf einen
+  // GOT-Platz im RW-Segment; writeELFSharedLib traegt die Distanz nach.
+  gotCallBuf:   int64;
+  gotCallCount: int64;
+  gotCallCap:   int64;
+
   // WP-D2: Windows target mode — replaces Linux syscalls with BL placeholders
   // that WinARM64Backend resolves to Windows API helper stubs after emit().
   // winPatchBuf holds 16-byte records: {codeOffset:i64, helperId:i64}.
   // Helper IDs: 1=PrintStr, 2=PrintInt, 3=Exit, 4=Alloc, 5=Free.
   winMode:       int64;
+  // #2451: Puffer mit einem Byte je Funktion (1 = erreichbar), 0 = kein
+  // Weglassen. Gesetzt wird er nur fuer ein PROGRAMM: eine Shared Library
+  // haelt ihre Exporte bereit, auch wenn sie niemand im eigenen Erzeugnis
+  // ruft, und ein ET_REL-Objekt erst recht.
+  lebendBuf:     int64;
   winPatchBuf:   int64;
   winPatchCount: int64;
   winPatchCap:   int64;
+  bumpGIdx:        int64;   // #2227: erstes der zwei Bump-Globals (Zeiger, Ende), -1 = noch keins
+  slotRecCur:      int64;   // #2270: Slot-Satz der Funktion, die gerade entsteht (0 = keiner)
 
 
   // -------------------------------------------------------------------------
@@ -132,18 +172,37 @@ pub type EmitARM64 = class {
 
   fn init(irMod: int64) {
     self.ir          := irMod;
+    self.bumpGIdx    := -1;
     self.codeBuf     := alloc(131072);
     self.codeCap     := 131072;
     self.codeLen     := 0;
     self.stackSize   := 0;
-    self.labelAddrs  := alloc(1024 * 8);
+    // #2112: Alle drei Tabellen waren fest (1024 Marken, 1024 Patches, 256
+    // Funktionen) und schnitten still ab: ein Patch jenseits der Grenze fiel
+    // weg und sein Sprung blieb auf dem Platzhalter stehen (BL +0 — das
+    // Programm rief sich endlos selbst), eine Funktion jenseits von 256 bekam
+    // keine Adresse. riscv hatte die Patchliste schon in #1740 wachsen lassen.
+    self.labelCap    := 1024;
+    self.labelAddrs  := alloc(self.labelCap * 8);
     self.labelCount  := 0;
-    self.patchBuf    := alloc(1024 * 32);
+    self.patchCap    := 1024;
+    self.patchBuf    := alloc(self.patchCap * 32);
     self.patchCount  := 0;
-    self.funcAddrs   := alloc(256 * 8);
+    self.funcCap     := self.getFuncCount() + 1;
+    if self.funcCap < 256 { self.funcCap := 256; }
+    self.funcAddrs   := alloc(self.funcCap * 8);
+    // #2451: -1 heisst "nicht emittiert". Vorher kam der Puffer aus alloc und
+    // war null, und applyPatches rechnete damit, dass Funktion 0 die ZUERST
+    // emittierte ist -- nur fuer sie war die Adresse 0 echt. Sobald der Schnitt
+    // aus #2451 Funktion 0 weglaesst, liegt eine ANDERE bei Offset 0, und ihre
+    // richtige Adresse galt als ungesetzt: "Sprungziel nie aufgeloest" fuer
+    // einen Aufruf, der stimmte. Mit dem Kennzeichen haengt nichts mehr an der
+    // Reihenfolge.
+    var faz: int64 := 0;
+    while faz < self.funcCap { poke64(self.funcAddrs + faz * 8, 0 - 1); faz := faz + 1; }
     self.funcCount   := 0;
-    // WP-AND-03: 256 slots, parallel to funcAddrs.
-    self.funcPrologueLen := alloc(256 * 8);
+    // WP-AND-03: parallel to funcAddrs.
+    self.funcPrologueLen := alloc(self.funcCap * 8);
 
     // WP-AND-02 Phase C: dynamic-reloc state. Buffer grows on demand.
     self.isSharedLib := 0;
@@ -155,6 +214,9 @@ pub type EmitARM64 = class {
     self.globalRelocCap   := 32;
     self.globalRelocBuf   := alloc(self.globalRelocCap * 16);
     self.globalRelocCount := 0;
+    self.gotCallCap   := 16;                    // #2117
+    self.gotCallBuf   := alloc(self.gotCallCap * 16);
+    self.gotCallCount := 0;
 
     self.externCap   := 64;
     self.externBuf   := alloc(self.externCap * 32);
@@ -162,6 +224,7 @@ pub type EmitARM64 = class {
 
     // WP-D2: Windows mode — off by default
     self.winMode       := 0;
+    self.lebendBuf     := 0;   // #2451: ohne Angabe wird nichts weggelassen
     self.winPatchCap   := 64;
     self.winPatchBuf   := alloc(self.winPatchCap * 16);
     self.winPatchCount := 0;
@@ -176,6 +239,8 @@ pub type EmitARM64 = class {
 
   // WP-D2: Windows mode helpers
   pub fn setWinMode(m: int64) { self.winMode := m; }
+  // #2451: siehe IrErreichbare in src/ir.lyx.
+  pub fn setLebend(buf: int64) { self.lebendBuf := buf; }
   pub fn getWinPatchBuf(): int64 { return self.winPatchBuf; }
   pub fn getWinPatchCount(): int64 { return self.winPatchCount; }
 
@@ -203,6 +268,8 @@ pub type EmitARM64 = class {
   }
 
   fn getRelocBuf(): int64   { return self.relocBuf; }
+  fn getGotCallBuf(): int64   { return self.gotCallBuf; }     // #2117
+  fn getGotCallCount(): int64 { return self.gotCallCount; }   // #2117
   fn getRelocCount(): int64 { return self.relocCount; }
 
   // WP-AND-02 Phase C: append an Elf64_Rela record. r_info packs (sym_idx<<32)|type.
@@ -235,22 +302,42 @@ pub type EmitARM64 = class {
     var n: int64 := self.getFuncCount();
     var i: int64 := 0;
     while i < n {
-      self.emitFunc(i);
+      // #2451: Eine Funktion, die niemand erreicht, wird nicht emittiert. Das
+      // ist nicht nur Platz: eine Luecke im Backend in totem Code machte bis
+      // hierher das ganze Programm unuebersetzbar (gemessen an
+      // `import std.fs; return SEEK_END` -> "Builtin-ID 236 wird im
+      // Linux-Zweig nicht behandelt", obwohl keine fs-Funktion gerufen wird).
+      //
+      // Der Index bleibt unberuehrt -- uebersprungen wird die EMISSION, nicht
+      // der Platz in der Tabelle. Damit zeigen funcAddrs und jede Relokation
+      // weiter auf dieselbe Funktion wie vorher. Haette die Erreichbarkeit
+      // etwas uebersehen, bleibt der zugehoerige Sprung unaufgeloest, und
+      // _checkNoOpenPatches bricht laut ab (#2112) statt still ins Leere zu
+      // springen.
+      var ueberspringen: int64 := 0;
+      if (self.lebendBuf != 0 && peek8(self.lebendBuf + i) == 0) { ueberspringen := 1; }
+      if ueberspringen == 0 { self.emitFunc(i); }
       i := i + 1;
     }
     // WP-AND-upstream-fix v9: final patch pass for forward references.
     // funcAddrs is now fully populated, so any BL patch that was skipped
     // earlier (callee not yet emitted) resolves here.
     self.applyPatches();
+    // #2112: Was jetzt noch offen ist, bleibt fuer immer auf dem Platzhalter
+    // stehen — laut scheitern statt einen Sprung auf sich selbst auszuliefern.
+    self._checkNoOpenPatches(0);
     return self.codeLen;
   }
 
   fn emitFunc(funcId: int64) {
     // Record start address
-    if funcId < 256 {
-      poke64(self.funcAddrs + funcId * 8, self.codeLen);
-      self.funcCount := self.funcCount + 1;
+    if funcId >= self.funcCap {
+      EPrintStr("error: arm64: Funktion "c); EPrintInt(funcId);
+      EPrintStrLn(" liegt jenseits der Funktionstabelle (#2112)."c);
+      exit(1);
     }
+    poke64(self.funcAddrs + funcId * 8, self.codeLen);
+    self.funcCount := self.funcCount + 1;
 
     self.stackSize   := 0;
     self.labelCount  := 0;
@@ -262,14 +349,24 @@ pub type EmitARM64 = class {
 
     // Zero out label table
     var li: int64 := 0;
-    while li < 1024 {
+    while li < self.labelCap {
       poke64(self.labelAddrs + li * 8, -1);
       li := li + 1;
     }
 
+    self.slotRecCur := self._slotRecVon(funcId);   // #2270
     self.calcStackFrame(funcId);
     var prologueStart: int64 := self.codeLen;
     self.emitPrologue();
+    // #2110: argv fuer GetArgC/GetArgV sichern. Beide Startruempfe (statisch
+    // und ueber __libc_start_main) uebergeben argv in x1 an main; x28 ist
+    // callee-saved, der erzeugte Code benutzt es nie (s. emitPrologue), und
+    // C-Code erhaelt es nach AAPCS64. Am Startrumpf selbst ginge es nicht:
+    // glibc ruft main mit eigenen Werten in x19..x28.
+    if self.isMainFunc(funcId) != 0 {
+      self.emitStur(ARM64_X28, ARM64_X29, self.x28Sicherung);      // #2149: x28 retten
+      self.emit32(0xAA0103FC);                                     // MOV x28, x1
+    }
     // WP-AND-upstream-fix v7: spill incoming register args (x0..x7 per
     // AAPCS64) into stack slots 0..paramCount-1 so subsequent
     // IRO_LOAD_LOCAL of a parameter actually reads its value. Without
@@ -279,14 +376,26 @@ pub type EmitARM64 = class {
     var pSpillI: int64 := 0;
     while pSpillI < pSpillCount {
       if pSpillI < 8 {
-        self.emitStur(pSpillI, ARM64_X29, self.slotOff(pSpillI));
+        // #1388: Die Parameter liegen hinter dem Kratzstreifen, nicht ab Slot 0.
+        self.emitStur(pSpillI, ARM64_X29, self.slotOff(IR_BARG_SLOTS + pSpillI));
+      } else {
+        // #2132: Parameter ab dem neunten liegen nach AAPCS64 beim Aufrufer
+        // auf dem Stapel, in 8-Byte-Plaetzen ab dessen sp — hier [x29+16],
+        // ueber dem geretteten x29/x30. Bis 1.2.15A blieben diese Slots
+        // unbeschrieben, der Parameter las fremden Stapel.
+        var pStOff: int64 := 16 + (pSpillI - 8) * 8;
+        if pStOff > 32760 {
+          EPrintStr("error: arm64: Parameter "c); EPrintInt(pSpillI + 1);
+          EPrintStrLn(" liegt jenseits der Reichweite von LDR [x29, #imm] (#2132)."c);
+          exit(1);
+        }
+        self.emit32(0xF9400000 | ((pStOff / 8) << 10) | (ARM64_X29 << 5) | ARM64_X9);   // LDR x9, [x29, #off]
+        self.emitStur(ARM64_X9, ARM64_X29, self.slotOff(IR_BARG_SLOTS + pSpillI));
       }
       pSpillI := pSpillI + 1;
     }
     // WP-AND-03: stash prologue length for DWARF CFI advance_loc.
-    if funcId < 256 {
-      poke64(self.funcPrologueLen + funcId * 8, self.codeLen - prologueStart);
-    }
+    poke64(self.funcPrologueLen + funcId * 8, self.codeLen - prologueStart);
 
     var instrStart: int64 := self.getFuncInstrStart(funcId);
     var instrCount: int64 := self.getFuncInstrCount(funcId);
@@ -298,6 +407,11 @@ pub type EmitARM64 = class {
 
     self.emitEpilogue();
     self.applyPatches();
+    // #2112: Marken gelten nur innerhalb der Funktion — ein hier offener
+    // Sprung wuerde sonst von der gleichnamigen Marke der NAECHSTEN Funktion
+    // aufgeloest.
+    self._checkNoOpenPatches(1);
+    self.slotRecCur := 0;   // #2270: ausserhalb einer Funktion keine Abbildung
   }
 
   // -------------------------------------------------------------------------
@@ -305,19 +419,65 @@ pub type EmitARM64 = class {
   // -------------------------------------------------------------------------
 
   fn calcStackFrame(funcId: int64) {
-    var locals: int64 := self.getFuncLocalCount(funcId);
+    var locals: int64 := self._rahmenSlots(funcId);   // #2270
     // Each local: 8 bytes; round up to 16-byte alignment
     var sz: int64 := locals * 8;
     if (sz & 15) != 0 {
       sz := (sz + 16) & -16;
+    }
+    // #2149: main haelt argv in x28 (#2110) — x28 ist nach AAPCS64
+    // callee-saved, der Aufrufer von main darf es zurueck erwarten. Bis
+    // 1.2.16E wurde es ueberschrieben, ohne es zu retten (dieselbe Klasse wie
+    // s11 auf riscv, #2140). Die Sicherung liegt am UNTEREN Ende des Rahmens,
+    // unterhalb aller Slots; Aufrufe mit Stapelargumenten verschieben sp
+    // vorher und lassen sie unberuehrt.
+    self.x28Sicherung := 0;
+    if self.isMainFunc(funcId) != 0 {
+      sz := sz + 16;
+      self.x28Sicherung := 0 - sz;
     }
     self.stackSize := sz;
   }
 
   // local slot offset from x29: slot 0 → -8, slot 1 → -16, ...
   fn slotOff(slot: int64): int64 {
-    return -(slot + 1) * 8;
+    return -(self._physSlot(slot) + 1) * 8;   // #2270
   }
+
+  // #2270: virtueller Slot -> physischer Slot ueber den Satz aus ir_lower
+  // (_slotRecNeu). Temps, deren Anweisung vorbei ist, teilen sich Slots; der
+  // Rahmen schrumpft damit auf die groesste gleichzeitig lebende Menge. Ohne
+  // Satz (Funktion aus einer .lyu, Code ausserhalb einer Funktion) bleibt
+  // jeder Slot er selbst. Ein Slot jenseits der Tabelle kommt HINTER den
+  // physischen Bereich, nicht auf seine eigene Nummer — dort laege ein
+  // wiederverwendeter. Dieselbe Abbildung in riscv_linux.lyx und
+  // emit_arm64.lyx — die beiden muessen uebereinstimmen.
+  fn _physSlot(slot: int64): int64 {
+    var r: int64 := self.slotRecCur;
+    if r == 0 || slot < 0 { return slot; }
+    var n: int64 := peek64(r + IR_SLOT_OFF_VIRT);
+    if slot < n { return peek64(peek64(r + IR_SLOT_OFF_MAP) + slot * 8); }
+    return peek64(r + IR_SLOT_OFF_ANZ) + (slot - n);
+  }
+
+  // Satz der Funktion funcId (0 = keiner).
+  fn _slotRecVon(funcId: int64): int64 {
+    var pc: int64 := peek64(self.ir + IR_MOD_OFF_PHYSCAP);
+    if funcId < 0 || funcId >= pc { return 0; }
+    return peek64(peek64(self.ir + IR_MOD_OFF_PHYSBUF) + funcId * 8);
+  }
+
+  // Slots des Rahmens: physisch belegte plus die jenseits der Tabelle.
+  fn _rahmenSlots(funcId: int64): int64 {
+    var locals: int64 := self.getFuncLocalCount(funcId);
+    var r: int64 := self.slotRecCur;
+    if r == 0 { return locals; }
+    var n: int64 := peek64(r + IR_SLOT_OFF_VIRT);
+    var mehr: int64 := 0;
+    if locals > n { mehr := locals - n; }
+    return peek64(r + IR_SLOT_OFF_ANZ) + mehr;
+  }
+
 
   // -------------------------------------------------------------------------
   // Prologue / Epilogue
@@ -330,10 +490,23 @@ pub type EmitARM64 = class {
   //    TLS / shadow call stack) is never touched.
   //  - No MRS/MSR system-register access; TPIDR_EL0 and other system regs are
   //    untouched.
-  //  - Callee-saved regs (x19..x28) are not used, so we do not need to save them.
+  //  - Callee-saved regs (x19..x28): x19..x24 benutzt nur der Formatierer und
+  //    rettet sie selbst (#2149). x28 traegt ab dem Eingang von main argv
+  //    (#2110); main rettet es im Rahmen und setzt es im Epilog zurueck (#2149).
   //  - DWARF CFI for stack unwinding is emitted by writeELFSharedLib via the
   //    .eh_frame section using funcAddrs + funcPrologueLen records.
   // -------------------------------------------------------------------------
+
+  // #2110: heisst die Funktion "main"? Dieselbe Pruefung wie isMainFunc in
+  // riscv_linux.lyx (#1740).
+  fn isMainFunc(funcId: int64): int64 {
+    var funcBuf: int64 := peek64(self.ir + 80);
+    var rec:     int64 := funcBuf + funcId * IR_FUNC_SIZE;
+    if peek64(rec + IR_FUNC_OFF_NAMELEN) != 4 { return 0; }
+    var p: int64 := peek64(self.ir + 32) + peek64(rec + 0);
+    if peek8(p) != 109 || peek8(p + 1) != 97 || peek8(p + 2) != 105 || peek8(p + 3) != 110 { return 0; }
+    return 1;
+  }
 
   fn emitPrologue() {
     // STP x29, x30, [sp, #-16]!
@@ -345,15 +518,34 @@ pub type EmitARM64 = class {
       if self.stackSize <= 4095 {
         self.emit32(0xD10003FF | (self.stackSize << 10));
       } else {
-        // Large frame: MOVZ x9, #sz; SUB sp, sp, x9
-        self.emitMovImmReg(ARM64_X9, self.stackSize);
-        // SUB sp, sp, x9
-        self.emit32(0xCB09C3FF);  // SUB sp, sp, x9
+        // #2062: grosser Rahmen in zwei Schritten — erst die oberen zwoelf Bit
+        // (SUB mit LSL #12), dann der Rest. Reicht bis 16 MB.
+        //
+        // Hier stand `MOVZ x9, #sz; SUB sp, sp, x9` mit dem Befehlswort
+        // 0xCB09C3FF. Das ist die Form mit GESCHOBENEM Register, und in der
+        // heisst Register 31 nicht SP, sondern XZR: der Befehl schrieb ins
+        // Nullregister und legte keinen Rahmen an. Aufgefallen ist es nie,
+        // weil _emitFarAddr jede Funktion mit so grossem Rahmen vorher
+        // abwies — mit dem Wegfall jener Grenze waere es der naechste stille
+        // Fehler gewesen. In der Direktwert-Form unten ist 31 der
+        // Stapelzeiger.
+        if self.stackSize > 0xFFFFFF {
+          EPrintStr("error: arm64: Rahmen von "c);
+          EPrintInt(self.stackSize);
+          EPrintStrLn(" Byte ueberschreitet 16 MB (#2062)."c);
+          exit(1);
+        }
+        var rhHoch: int64 := (self.stackSize >> 12) & 0xFFF;
+        var rhTief: int64 := self.stackSize & 0xFFF;
+        self.emit32(0xD14003FF | (rhHoch << 10));                  // SUB sp, sp, #hoch, LSL #12
+        if rhTief != 0 { self.emit32(0xD10003FF | (rhTief << 10)); }  // SUB sp, sp, #tief
       }
     }
   }
 
   fn emitEpilogue() {
+    // #2149: x28 in main zuruecksetzen (gerettet im Prolog).
+    if self.x28Sicherung != 0 { self.emitLdur(ARM64_X28, ARM64_X29, self.x28Sicherung); }
     // MOV sp, x29  (= ADD sp, x29, #0)  — 0x91000000|(29<<5)|31 = 0x910003BF
     self.emit32(0x910003BF);
     // LDP x29, x30, [sp], #16
@@ -366,7 +558,68 @@ pub type EmitARM64 = class {
   // Instruction dispatch
   // -------------------------------------------------------------------------
 
+    // #1339: Der Dispatcher unten ist eine flache Liste aus `if op == X`
+  // ohne else und ohne Default. Ein Opcode, den keine Zeile trifft, erzeugte
+  // damit GAR NICHTS und verschwand lautlos aus dem Programm — bei
+  // IRO_PANIC hiess das: nach einer erkannten Verletzung laeuft es weiter.
+  //
+  // Diese Liste nennt die Opcodes, die arm64 tatsaechlich behandelt. Sie ist
+  // aus dem Dispatcher erhoben und wird gegen ihn geprueft. Weicht sie ab,
+  // scheitert der Lauf LAUT — die Abweichung faellt damit beim Uebersetzen
+  // auf und nicht erst im erzeugten Programm.
+  fn a64_opBehandelt(op: int64): int64 {
+    // #1339: die vier Zusicherungen — ir_lower erzeugt sie (ASSERT_NOT_ZERO
+    // steht vor jeder Division), und bis 1.0.18B behandelte sie ausser lyxos
+    // kein Backend.
+    if (op == IRO_ASSERT_NOT_NULL || op == IRO_ASSERT_NOT_ZERO) { return 1; }
+    if (op == IRO_ASSERT_TRUE || op == IRO_ASSERT_BOUNDS) { return 1; }
+    if (op == 167 || op == IRO_ADD || op == IRO_ALLOC || op == IRO_AND) { return 1; }
+    if (op == IRO_BR_FALSE || op == IRO_BR_TRUE || op == IRO_CALL || op == IRO_CALL_BUILTIN) { return 1; }
+    if (op == IRO_CALL_EXTERN || op == IRO_CALL_INDIRECT || op == IRO_CMP_EQ || op == IRO_CMP_GE) { return 1; }
+    if (op == IRO_FUNC_ADDR) { return 1; }   // #1806
+    if (op == IRO_F64_ZU_F32 || op == IRO_F32_ZU_F64) { return 1; }   // #2160
+    if (op == IRO_LOAD_LOCAL_ADDR || op == IRO_LOAD_GLOBAL_ADDR) { return 1; }   // #2116
+    if (op == IRO_CMP_GT || op == IRO_CMP_LE || op == IRO_CMP_LT || op == IRO_CMP_NEQ) { return 1; }
+    if (op == IRO_CONST_FLOAT || op == IRO_CONST_INT || op == IRO_CONST_STR || op == IRO_DIV) { return 1; }
+    if (op == IRO_FADD || op == IRO_FDIV || op == IRO_FMUL || op == IRO_FNEG) { return 1; }
+    // #1339: die FCMP-Familie — ohne sie gibt es keine Gleitkomma-Verzweigung.
+    if (op == IRO_FCMP_EQ || op == IRO_FCMP_NEQ || op == IRO_FCMP_LT) { return 1; }
+    if (op == IRO_FCMP_LE || op == IRO_FCMP_GT || op == IRO_FCMP_GE) { return 1; }
+    if (op == IRO_FREE || op == IRO_FSQRT || op == IRO_FSUB || op == IRO_FTOI) { return 1; }
+    if (op == IRO_FUNC_EXIT || op == IRO_INSPECT || op == IRO_ITOF || op == IRO_ITOP) { return 1; }
+    if (op == IRO_JMP || op == IRO_LABEL || op == IRO_LOAD_FIELD || op == IRO_LOAD_GLOBAL) { return 1; }
+    if (op == IRO_LOAD_IDX || op == IRO_LOAD_LOCAL || op == IRO_MOD || op == IRO_MUL) { return 1; }
+    if (op == IRO_NEG || op == IRO_OR || op == IRO_PANIC || op == IRO_SHL) { return 1; }
+    // #1769: NOT und die BIT-Familie fehlten. std/io rechnet damit, also
+    // scheiterte `PrintLn` auf arm64 an IRO_NOT (Opcode 50), bevor es
+    // ueberhaupt zur Ausgabe kam. IRO_AND/OR/XOR waren da, ihre BIT-Zwillinge
+    // nicht — ir_lower erzeugt beide Formen.
+    if (op == IRO_NOT || op == IRO_BITNOT || op == IRO_BITAND) { return 1; }
+    if (op == IRO_BITOR || op == IRO_BITXOR) { return 1; }
+    // #1769: Breitenwechsel. riscv behandelt sie als reine Kopie — die Slots
+    // sind ohnehin 64 Bit breit —, arm64 kannte sie gar nicht.
+    if (op == IRO_CAST || op == IRO_SEXT || op == IRO_ZEXT || op == IRO_TRUNC) { return 1; }
+    if (op == IRO_SHR || op == IRO_SAR || op == IRO_SIMD_ADD || op == IRO_SIMD_DIV || op == IRO_SIMD_MUL) { return 1; }
+    // #2185: ohne IRO_SIMD_NEW kam kein Programm bis zu den Binops — die
+    // Anlage ist der erste Opcode, den `parallel Array<f32>(n)` erzeugt.
+    // Element-Zugriff gehoert dazu, sonst ist der Vektor nicht beschreibbar.
+    if (op == IRO_SIMD_NEW || op == IRO_SIMD_LOAD_ELEM || op == IRO_SIMD_STORE_ELEM) { return 1; }
+    if (op == IRO_SIMD_NEG) { return 1; }   // #2222
+    if (op == IRO_SIMD_SUB || op == IRO_STORE_FIELD || op == IRO_STORE_GLOBAL || op == IRO_STORE_IDX) { return 1; }
+    if (op == IRO_STORE_LOCAL || op == IRO_SUB || op == IRO_THROW || op == IRO_XOR) { return 1; }
+    return 0;
+  }
+
   fn emitInstr(funcId: int64, idx: int64) {
+    var opRoh: int64 := self.getInstrOp(idx);
+    if (self.a64_opBehandelt(opRoh) == 0) {
+      EPrintStr("error: arm64-Backend kennt Opcode "c);
+      EPrintInt(opRoh);
+      EPrintStrLn(" nicht -- er wuerde stillschweigend verschwinden (#1339)."c);
+      EPrintStrLn("  Entweder den Opcode hier umsetzen oder ihn in ir_lower fuer dieses Ziel abweisen."c);
+      exit(1);
+    }
+
     var op:   int64 := self.getInstrOp(idx);
     var dest: int64 := self.getInstrDest(idx);
     var src1: int64 := self.getInstrSrc1(idx);
@@ -395,11 +648,25 @@ pub type EmitARM64 = class {
     if op == IRO_NEG { self.emitNeg(src1, dest); }
 
     // --- Bitwise ---
-    if op == IRO_AND { self.emitBinopRR(0x8A000000, src1, src2, dest); }
-    if op == IRO_OR  { self.emitBinopRR(0xAA000000, src1, src2, dest); }
-    if op == IRO_XOR { self.emitBinopRR(0xCA000000, src1, src2, dest); }
+    if op == IRO_AND || op == IRO_BITAND { self.emitBinopRR(0x8A000000, src1, src2, dest); }
+    if op == IRO_OR  || op == IRO_BITOR  { self.emitBinopRR(0xAA000000, src1, src2, dest); }
+    if op == IRO_XOR || op == IRO_BITXOR { self.emitBinopRR(0xCA000000, src1, src2, dest); }
+    // #1769: MVN x0, x0 (= ORN x0, xzr, x0). Dieselbe Lesart wie im
+    // riscv-Backend, das NOT und BITNOT beide als bitweises Komplement
+    // ausfuehrt.
+    if op == IRO_NOT || op == IRO_BITNOT {
+      self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(src1));
+      self.emit32(0xAA2003E0);
+      self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
+    }
+    // #1769: Breitenwechsel — die Slots sind 64 Bit, also genuegt die Kopie.
+    if op == IRO_CAST || op == IRO_SEXT || op == IRO_ZEXT || op == IRO_TRUNC {
+      self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(src1));
+      self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
+    }
     if op == IRO_SHL { self.emitShift(0, src1, src2, dest); }
-    if op == IRO_SHR { self.emitShift(1, src1, src2, dest); }
+    if op == IRO_SHR { self.emitShift(1, src1, src2, dest); }   // #2236: logisch (LSRV)
+    if op == IRO_SAR { self.emitShift(2, src1, src2, dest); }   // #2236: arithmetisch (ASRV)
 
     // --- Float arithmetic ---
     if op == IRO_FADD { self.emitFBinop(0x1E602800, src1, src2, dest); }
@@ -410,6 +677,12 @@ pub type EmitARM64 = class {
     if op == IRO_FSQRT { self.emitFSqrt(src1, dest); }
 
     // --- Comparisons ---
+    if op == IRO_FCMP_EQ  { self.emitFCmp(0, src1, src2, dest); }   // #1339
+    if op == IRO_FCMP_NEQ { self.emitFCmp(1, src1, src2, dest); }
+    if op == IRO_FCMP_LT  { self.emitFCmp(2, src1, src2, dest); }
+    if op == IRO_FCMP_LE  { self.emitFCmp(3, src1, src2, dest); }
+    if op == IRO_FCMP_GT  { self.emitFCmp(4, src1, src2, dest); }
+    if op == IRO_FCMP_GE  { self.emitFCmp(5, src1, src2, dest); }
     if op == IRO_CMP_EQ  { self.emitCmp(0, src1, src2, dest); }
     if op == IRO_CMP_NEQ { self.emitCmp(1, src1, src2, dest); }
     if op == IRO_CMP_LT  { self.emitCmp(2, src1, src2, dest); }
@@ -421,19 +694,22 @@ pub type EmitARM64 = class {
     if op == IRO_LOAD_LOCAL  { self.emitLoadLocal(src1, dest); }
     if op == IRO_STORE_LOCAL { self.emitStoreLocal(src1, dest); }
     if op == IRO_LOAD_GLOBAL  { self.emitLoadGlobal(src1, dest); }
+    if op == IRO_LOAD_LOCAL_ADDR  { self.emitLoadLocalAddr(src1, dest); }    // #2116: @x
+    if op == IRO_LOAD_GLOBAL_ADDR { self.emitLoadGlobalAddr(src1, dest); }   // #2116: @g
     if op == IRO_STORE_GLOBAL { self.emitStoreGlobal(src1, dest); }
 
     // --- Pointer / struct ---
-    if op == IRO_LOAD_FIELD  { self.emitLoadField(src1, src2, dest); }
-    if op == IRO_STORE_FIELD { self.emitStoreField(src1, src2, dest); }
+    if op == IRO_LOAD_FIELD  { self.emitLoadFieldArt(src1, src2, dest, imm); }
+    if op == IRO_STORE_FIELD { self.emitStoreFieldArt(src1, src2, dest, imm); }
     if op == IRO_LOAD_IDX    { self.emitLoadIdx(src1, src2, dest); }
     if op == IRO_STORE_IDX   { self.emitStoreIdx(src1, src2, dest); }
 
     // --- Calls ---
-    if op == IRO_CALL         { self.emitCall(src1, imm, dest); }
-    if op == IRO_CALL_BUILTIN { self.emitBuiltinCall(imm, dest); }
-    if op == IRO_CALL_INDIRECT { self.emitCallIndirect(src1, imm, dest); }
-    if op == IRO_CALL_EXTERN  { self.emitCallExtern(src1, src2, imm, dest); }
+    if op == IRO_CALL         { self.emitCall(src1, src2, imm, dest); }
+    if op == IRO_CALL_BUILTIN { self.emitBuiltinCall(imm, src1, dest); }
+    if op == IRO_CALL_INDIRECT { self.emitCallIndirect(src1, src2, imm, dest); }   // #2132: src2 = argBase
+    if op == IRO_FUNC_ADDR { self.emitFuncAddr(src1, dest); }
+    if op == IRO_CALL_EXTERN  { self.emitCallExtern(src1, src2, imm, dest, self.getInstrField(idx, IR_INSTR_OFF_SRC3), self.getInstrField(idx, IR_INSTR_OFF_IMMFLOAT)); }   // #2132: src3 = argBase; #2140: immFloat = Signatur
     if op == IRO_CONST_STR    { self.emitConstStr(imm, dest); }
 
     // --- Control flow ---
@@ -445,21 +721,122 @@ pub type EmitARM64 = class {
 
     // --- Alloc ---
     if op == IRO_ALLOC { self.emitAlloc(src1, dest); }
-    if op == IRO_FREE  { self.emitFree(src1); }
+    if op == IRO_FREE  { self.emitFree(src1, src2, dest); }
 
     // --- Type conversions ---
     if op == IRO_ITOF { self.emitItof(src1, dest); }
     if op == IRO_FTOI { self.emitFtoi(src1, dest); }
+    if op == IRO_F64_ZU_F32 { self.emitF64ZuF32(src1, dest); }   // #2160
+    if op == IRO_F32_ZU_F64 { self.emitF32ZuF64(src1, dest); }
     if op == IRO_ITOP { self.emitLoadSlot(src1, dest); }
 
     // --- SIMD (NEON) ---
-    if op == IRO_SIMD_ADD { self.emitNeon(0x4E608400, src1, src2, dest); }
-    if op == IRO_SIMD_SUB { self.emitNeon(0x4EE08400, src1, src2, dest); }
-    if op == IRO_SIMD_MUL { self.emitNeon(0x6E609C00, src1, src2, dest); }
-    if op == IRO_SIMD_DIV { self.emitNeon(0x6E60FC00, src1, src2, dest); }
+    // #2185: FADD/FSUB/FMUL/FDIV auf v.4s, dazu die skalare Form fuer den Rest.
+    // Jedes Wort einzeln mit llvm-mc gegengelesen — die alte Tabelle war in
+    // allen vier Zeilen falsch.
+    //
+    // #2199: `imm` traegt die Elementbreite (4 oder 8). Ohne sie waere `f64`
+    // weiter als f32 gerechnet — still und nur an der Genauigkeit erkennbar.
+    if op == IRO_SIMD_ADD { self.emitNeonBinOp(0x4E21D400, 0x1E212800, src1, src2, dest, imm, IRO_SIMD_ADD); }
+    if op == IRO_SIMD_SUB { self.emitNeonBinOp(0x4EA1D400, 0x1E213800, src1, src2, dest, imm, IRO_SIMD_SUB); }
+    if op == IRO_SIMD_MUL { self.emitNeonBinOp(0x6E21DC00, 0x1E210800, src1, src2, dest, imm, IRO_SIMD_MUL); }
+    if op == IRO_SIMD_DIV { self.emitNeonBinOp(0x6E21FC00, 0x1E211800, src1, src2, dest, imm, IRO_SIMD_DIV); }
+    // #2222: `-a` — FNEG je Lane. Dieselbe Schleife wie die Binops; FNEG
+    // liest nur v0 bzw. s0/d0, der zweite Operand ist deshalb die Quelle
+    // selbst (geladen, aber nicht benutzt). `fneg v0.4s, v0.4s` = 0x6EA0F800,
+    // `fneg s0, s0` = 0x1E214000; die f64-Form setzt wie bei den Binops Bit 22
+    // (`fneg v0.2d` 0x6EE0F800, `fneg d0` 0x1E614000). Gegengelesen mit
+    // llvm-mc. Dieselbe Rechnung wie cg_emitSSE2Neg (x86) und
+    // emitSimdNeg (lyxos) — die drei muessen uebereinstimmen.
+    if op == IRO_SIMD_NEG { self.emitNeonBinOp(0x6EA0F800, 0x1E214000, src1, src1, dest, imm, IRO_SIMD_NEG); }
+    if op == IRO_SIMD_NEW { self.emitSimdNew(src1, dest, imm); }
+    if op == IRO_SIMD_LOAD_ELEM  { self.emitSimdLoadElem(dest, src1, src2, imm); }
+    if op == IRO_SIMD_STORE_ELEM { self.emitSimdStoreElem(dest, src1, src2, imm); }
 
     // --- Debug ---
     if op == IRO_INSPECT { self.emitInspect(src1, idx); }
+
+    // #1281: IRO_THROW → exit(1). Fangen kann ihn hier niemand, denn ir_lower
+    // weist try/catch fuer dieses Ziel ab; ein unbehandelter throw beendet das
+    // Programm mit 1, wie im x86-Pfad ohne installierten Handler. Bis 1.0.16G
+    // erzeugte `throw` fuer dieses Backend gar nichts und war ein No-op.
+    if op == IRO_THROW {
+      self.emitMovImmReg(ARM64_X0, 1);
+      self.emitMovImmReg(ARM64_X8, SYS_EXIT);
+      self.emit32(0xD4000001);  // SVC #0
+    }
+
+    // --- WSP-05: Inline-Assembly (imm = arch-Mnemonic-Id aus ir_lower ARM64-Tabelle) ---
+    // #1339: Die Zusicherungen. ir_lower setzt ASSERT_NOT_ZERO vor jede
+    // Division, damit eine Null zu einem kontrollierten Abbruch fuehrt statt
+    // zu SIGFPE — bis 1.0.18B behandelte sie ausser lyxos kein Backend, der
+    // Opcode verschwand, und die Division lief ungeprueft.
+    //
+    // CBNZ springt ueber die drei Abbruchbefehle (3 * 4 Byte = 12 → imm19 = 4).
+    if op == IRO_ASSERT_NOT_NULL || op == IRO_ASSERT_NOT_ZERO || op == IRO_ASSERT_TRUE {
+      self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(src1));
+      self.emit32(0xB5000080);                 // CBNZ x0, +16
+      self.emitMovImmReg(ARM64_X0, 1);
+      self.emitMovImmReg(ARM64_X8, SYS_EXIT);
+      self.emit32(0xD4000001);                 // SVC #0
+    }
+
+    // ASSERT_BOUNDS: src1 = Index, src2 = Laenge. Vorzeichenlos verglichen
+    // (B.LO), damit ein negativer Index als sehr grosse Zahl auffaellt.
+    if op == IRO_ASSERT_BOUNDS {
+      self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(src1));
+      self.emitLdur(ARM64_X1, ARM64_X29, self.slotOff(src2));
+      self.emit32(0xEB01001F);                 // CMP x0, x1
+      self.emit32(0x54000083);                 // B.LO +16 (Index < Laenge)
+      self.emitMovImmReg(ARM64_X0, 1);
+      self.emitMovImmReg(ARM64_X8, SYS_EXIT);
+      self.emit32(0xD4000001);                 // SVC #0
+    }
+
+    // #1339: IRO_PANIC (121) fehlte — `panic("...")` war ein No-op, das Programm
+    // lief nach der erkannten Verletzung weiter. Verhalten wie IRO_THROW.
+    //
+    // #2141: Die MELDUNG fehlte — `panic("kaputt")` endete mit rc 1 und
+    // stumm. Jetzt wie cg_emitPanicBody auf x86 (die beiden muessen
+    // uebereinstimmen): src1 ist der Zeiger auf den Text, er geht bis zum
+    // Nullbyte und OHNE angehaengtes Zeilenende nach stderr. Ein Nullzeiger
+    // (ir_lower erzeugt ihn fuer Abbrueche ohne Text) schreibt nichts — wie
+    // die Nullpruefung in _lyx_strlen.
+    if op == IRO_PANIC && src1 >= 0 && self.winMode == 0 {
+      self.emitLdur(ARM64_X1, ARM64_X29, self.slotOff(src1));   // x1 = Text
+      self.emit32(0xB4000121);  // CBZ x1, +9 Befehle (→ Abbruch, ohne Ausgabe)
+      self.emit32(0xD2800002);  // MOVZ x2, #0            (Laenge)
+      self.emit32(0x38626823);  // [LOOP] LDRB w3,[x1,x2]
+      self.emit32(0x34000063);  // CBZ w3, +3  (→ WRITE)
+      self.emit32(0x91000442);  // ADD x2,x2,#1
+      self.emit32(0x17FFFFFD);  // B -3        (→ LOOP)
+      self.emit32(0xD2800040);  // [WRITE] MOVZ x0,#2      (fd=stderr)
+      self.emit32(0xD2800808);  // MOVZ x8,#64             (SYS_write)
+      self.emit32(0xD4000001);  // SVC #0
+    }
+    if op == IRO_PANIC {
+      self.emitMovImmReg(ARM64_X0, 1);
+      self.emitMovImmReg(ARM64_X8, SYS_EXIT);
+      self.emit32(0xD4000001);  // SVC #0
+    }
+
+    if op == 167 {
+      if      imm == 0  { self.emit32(0xD503201F); }  // nop
+      else if imm == 1  { self.emit32(0xD503207F); }  // wfi
+      else if imm == 2  { self.emit32(0xD503205F); }  // wfe
+      else if imm == 3  { self.emit32(0xD503209F); }  // sev
+      else if imm == 4  { self.emit32(0xD50320BF); }  // sevl
+      else if imm == 5  { self.emit32(0xD503203F); }  // yield
+      else if imm == 6  { self.emit32(0xD5033FDF); }  // isb (sy)
+      else if imm == 7  { self.emit32(0xD5033F9F); }  // dsb sy
+      else if imm == 8  { self.emit32(0xD5033FBF); }  // dmb sy
+      else if imm == 9  { self.emit32(0xD4000001); }  // svc #0
+      else if imm == 10 { self.emit32(0xD4200000); }  // brk #0
+      else if imm == 11 { self.emit32(0xD4400000); }  // hlt #0
+      else if imm == 12 { self.emit32(0xD65F03C0); }  // ret
+      else if imm == 13 { self.emit32(0xD69F03E0); }  // eret
+      else              { self.emit32(0xD4200000); }  // fail-closed: brk #0 (unerreichbar, ir_lower validiert)
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -511,12 +888,21 @@ pub type EmitARM64 = class {
   fn emitShift(isRight: int64, src1: int64, src2: int64, dest: int64) {
     self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(src1));
     self.emitLdur(ARM64_X1, ARM64_X29, self.slotOff(src2));
+    // #2236: 0 = links, 1 = logisch rechts (IRO_SHR), 2 = arithmetisch rechts
+    // (IRO_SAR). Bis 1.2.19N war "rechts" immer ASRV — auch fuer IRO_SHR, das
+    // die anderen Backends logisch ausfuehrten.
     if isRight == 0 {
       // LSLV x0, x0, x1
       self.emit32(0x9AC02000 | (ARM64_X1 << 16) | (ARM64_X0 << 5) | ARM64_X0);
-    } else {
+    } else if isRight == 1 {
+      // LSRV x0, x0, x1
+      self.emit32(0x9AC02400 | (ARM64_X1 << 16) | (ARM64_X0 << 5) | ARM64_X0);
+    } else if isRight == 2 {
       // ASRV x0, x0, x1
       self.emit32(0x9AC02800 | (ARM64_X1 << 16) | (ARM64_X0 << 5) | ARM64_X0);
+    } else {
+      EPrintStrLn("lyxc: interner Fehler (#2236): emitShift mit unbekannter Art"c);
+      exit(70);
     }
     self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
   }
@@ -563,6 +949,39 @@ pub type EmitARM64 = class {
     self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
   }
 
+  // #1339: Gleitkommavergleich. Bis hierher behandelte KEIN IR-Backend die
+  // FCMP-Familie (40..45) — `if (a < b)` mit f64 erzeugte auf arm64 gar keinen
+  // Code, das Ergebnisregister blieb stehen, was zufaellig drinstand. Ohne sie
+  // gibt es auf diesen Zielen keine Gleitkomma-Verzweigung.
+  //
+  // FCMP d0, d1 setzt die Flags; danach dasselbe CSET wie beim
+  // Ganzzahlvergleich. Bei ungeordneten Operanden (NaN) setzt FCMP C und V —
+  // die vorzeichenlosen Bedingungen HI/HS treffen dann nicht zu, ein Vergleich
+  // mit NaN ist also falsch. Genau das verlangt IEEE 754.
+  fn emitFCmp(kind: int64, src1: int64, src2: int64, dest: int64) {
+    self.emitFLdur(ARM64_D0, ARM64_X29, self.slotOff(src1));
+    self.emitFLdur(ARM64_D1, ARM64_X29, self.slotOff(src2));
+    // FCMP d0, d1  — 0x1E602000 | (Dm << 16) | (Dn << 5)
+    self.emit32(0x1E602000 | (ARM64_D1 << 16) | (ARM64_D0 << 5));
+    self.emit32(self.fcsetEnc(kind));
+    self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
+  }
+
+  // Wie csetEnc, aber mit den Bedingungen fuer Gleitkomma: LT/LE/GT/GE
+  // brauchen MI/LS/GT/GE, damit NaN nicht als "kleiner" durchgeht.
+  //   EQ=0  NE=1  MI=4(LT)  LS=9(LE)  GT=12  GE=10
+  // CSET Xd, cond = CSINC Xd, XZR, XZR, ~cond — eingetragen wird die INVERSE.
+  fn fcsetEnc(kind: int64): int64 {
+    var invCond: int64 := 0;
+    if kind == 0 { invCond := 1; }    // EQ  -> inv NE
+    if kind == 1 { invCond := 0; }    // NE  -> inv EQ
+    if kind == 2 { invCond := 5; }    // LT (MI=4)  -> inv PL=5
+    if kind == 3 { invCond := 8; }    // LE (LS=9)  -> inv HI=8
+    if kind == 4 { invCond := 13; }   // GT (12)    -> inv LE=13
+    if kind == 5 { invCond := 11; }   // GE (10)    -> inv LT=11
+    return 0x9A9F07E0 | ((invCond & 15) << 12) | ARM64_X0;
+  }
+
   fn csetEnc(kind: int64): int64 {
     // CSET Xd, cond = CSINC Xd, XZR, XZR, ~cond
     // Encoding: 0x9A9F07E0 | ((~cond & 0xF) << 12) | Rd
@@ -597,87 +1016,82 @@ pub type EmitARM64 = class {
   }
 
   fn emitLoadGlobal(addr: int64, dest: int64) {
-    if self.isSharedLib != 0 {
-      // WP-AND-upstream-fix v5: in shared-lib mode IRO_LOAD_GLOBAL now
-      // carries a globalIdx, not an absolute VA. Emit the literal-pool
-      // sequence with a placeholder slot value and record the slot's
-      // code-buffer offset + globalIdx into globalRelocBuf — writeELFSharedLib
-      // patches the slot to (dataOff + globalIdx*8) at link time and adds
-      // the matching R_AARCH64_RELATIVE entry.
-      var slotOff: int64 := self.codeLen + 8;
-      self.emit32(0x58000040 | 9);     // LDR x9, [pc+8]
-      self.emit32(0x14000003);         // B +12
-      self.emit64(0);                   // placeholder slot
-      self.emit32(0xF9400120 | ARM64_X0);  // LDR x0, [x9]
-      self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
-
-      if (self.globalRelocCount >= self.globalRelocCap) {
-        var newCap: int64 := self.globalRelocCap * 2;
-        var nb: int64 := alloc(newCap * 16);
-        var i: int64 := 0;
-        while i < self.globalRelocCount * 16 {
-          poke8(nb + i, peek8(self.globalRelocBuf + i));
-          i := i + 1;
-        }
-        self.globalRelocBuf := nb;
-        self.globalRelocCap := newCap;
-      }
-      var rec: int64 := self.globalRelocBuf + self.globalRelocCount * 16;
-      poke64(rec + 0, slotOff);
-      poke64(rec + 8, addr);   // addr field carries globalIdx in this path
-      self.globalRelocCount := self.globalRelocCount + 1;
-      return;
-    }
-    // addr is an absolute VA; load via MOVZ/MOVK sequence then LDR
-    self.emitMovImmReg(ARM64_X9, addr);
-    // LDR x0, [x9]
+    // IRO_LOAD_GLOBAL trägt einen globalIdx (NICHT eine VA).
+    // ARM64-FIX: vorher MOVte der static-Pfad globalIdx als VA → LDR [0] → SIGSEGV.
+    self._emitGlobalAddrX9(addr);
     self.emit32(0xF9400120 | ARM64_X0);  // LDR x0, [x9]
     self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
   }
 
-  fn emitStoreGlobal(src: int64, addr: int64) {
+  // x9 := Adresse der Modulvariable gIdx. Die eine Stelle fuer Lesen, Schreiben
+  // und `@g` (#2116) — die drei muessen dieselbe Adresse treffen.
+  //
+  // Statisch: Literal-Pool-Platz (LDR x9,[pc+8]; B +12; .quad), writeELF baeckt
+  // die absolute VA hinein; globalRelocBuf merkt {Platz-Offset, gIdx}.
+  //
+  // #2117, .so: ADRP x9 + ADD x9,x9,#lo12 — PC-relativ, writeELFSharedLib
+  // traegt die Distanz ein, und es bleibt KEINE Relocation. Vorher stand auch
+  // hier ein Pool-Platz im Code, den eine R_AARCH64_RELATIVE beim Laden
+  // umschreiben sollte: eine Text-Relocation im R-X-Segment, die bionic ab
+  // API 23 abweist. Der Schreibzugriff (_emitStoreGlobalPIC) gab dazu als
+  // Addend den INDEX statt der Adresse an — `g := 1` schrieb nach
+  // Ladeadresse+8*0, in den ELF-Kopf. globalRelocBuf merkt hier
+  // {ADRP-Offset, gIdx}; die Bedeutung des ersten Felds haengt am Modus.
+  fn _emitGlobalAddrX9(gIdx: int64) {
     if self.isSharedLib != 0 {
-      self._emitStoreGlobalPIC(src, addr);
+      var instrOff: int64 := self.codeLen;
+      self.emit32(0x90000009);         // ADRP x9, 0          (nachgetragen)
+      self.emit32(0x91000129);         // ADD  x9, x9, #0     (nachgetragen)
+      self._recordGlobalReloc(instrOff, gIdx);
       return;
     }
-    self.emitMovImmReg(ARM64_X9, addr);
-    self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(src));
-    // STR x0, [x9]
-    self.emit32(0xF9000120);  // STR x0, [x9]
+    var slotOff: int64 := self.codeLen + 8;
+    self.emit32(0x58000040 | 9);     // LDR x9, [pc+8]
+    self.emit32(0x14000003);         // B +12
+    self.emit64(0);                   // placeholder slot (gebacken in writeELF)
+    self._recordGlobalReloc(slotOff, gIdx);
   }
 
-  // WP-AND-02 Phase C: PIC-friendly global load using an inline literal pool.
-  // Layout (24 bytes total, identical size to the MOVZ/MOVK variant):
-  //   +0  LDR x9, [pc + 8]   ; loads the 8-byte slot at +8
-  //   +4  B  +12             ; jump past the slot
-  //   +8  .quad <addr>       ; slot, patched by R_AARCH64_RELATIVE at load time
-  //  +16  LDR x0, [x9]       ; dereference
-  //  +20  STUR x0, [fp, -slot]
-  fn _emitLoadGlobalPIC(addr: int64, dest: int64) {
-    var slotOff: int64 := self.codeLen + 8;   // slot's offset within codeBuf
-    // LDR x9 (=9), literal at +8: imm19 = 2 → 2<<5 = 0x40
-    self.emit32(0x58000040 | 9);
-    // B +12 (3 instructions ahead): imm26 = 3
-    self.emit32(0x14000003);
-    // 8-byte slot for the resolved address. The dynamic loader rewrites this
-    // to (load_base + addend) via R_AARCH64_RELATIVE; we store `addr` as the
-    // addend AND as the initial slot value (the loader overwrites anyway).
-    self.emit64(addr);
-    self._recordRelocation(slotOff, 1027, addr);  // 1027 = R_AARCH64_RELATIVE
-    // LDR x0, [x9]
-    self.emit32(0xF9400120 | ARM64_X0);
+  // #2116: `@x` auf ein Local/Param — die Adresse des Slots, x29 + slotOff.
+  // _emitFarAddr rechnet sie in x16 (auch jenseits von simm9/#1388); vor dem
+  // Ablegen nach x0, weil emitStur bei fernem Ziel-Slot selbst x16 braucht.
+  fn emitLoadLocalAddr(slot: int64, dest: int64) {
+    self._emitFarAddr(ARM64_X29, self.slotOff(slot));
+    self.emit32(0xAA1003E0 | ARM64_X0);   // MOV x0, x16  (ORR x0, xzr, x16)
     self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
   }
 
-  fn _emitStoreGlobalPIC(src: int64, addr: int64) {
-    var slotOff: int64 := self.codeLen + 8;
-    self.emit32(0x58000040 | 9);    // LDR x9, [pc+8]
-    self.emit32(0x14000003);        // B +12
-    self.emit64(addr);
-    self._recordRelocation(slotOff, 1027, addr);
-    self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(src));
-    // STR x0, [x9]
-    self.emit32(0xF9000120);
+  // #2116: `@g` auf eine Modulvariable — dieselbe Adressfolge wie
+  // emitLoadGlobal (_emitGlobalAddrX9), nur ohne den Ladebefehl.
+  fn emitLoadGlobalAddr(addr: int64, dest: int64) {
+    self._emitGlobalAddrX9(addr);
+    self.emitStur(9, ARM64_X29, self.slotOff(dest));
+  }
+
+  // Merkt (slotCodeOff, globalIdx) für späteres Backen durch writeELF*/writeELFSharedLib.
+  fn _recordGlobalReloc(slotOff: int64, gIdx: int64) {
+    if (self.globalRelocCount >= self.globalRelocCap) {
+      var newCap: int64 := self.globalRelocCap * 2;
+      var nb: int64 := alloc(newCap * 16);
+      var i: int64 := 0;
+      while i < self.globalRelocCount * 16 {
+        poke8(nb + i, peek8(self.globalRelocBuf + i));
+        i := i + 1;
+      }
+      self.globalRelocBuf := nb;
+      self.globalRelocCap := newCap;
+    }
+    var rec: int64 := self.globalRelocBuf + self.globalRelocCount * 16;
+    poke64(rec + 0, slotOff);
+    poke64(rec + 8, gIdx);
+    self.globalRelocCount := self.globalRelocCount + 1;
+  }
+
+  fn emitStoreGlobal(src: int64, addr: int64) {
+    // ARM64-FIX (static): Vorher MOVte addr(=gIdx) als VA → STR [0] → SIGSEGV.
+    self._emitGlobalAddrX9(addr);
+    self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(src));  // x0 = value (fern: x16, nie x9)
+    self.emit32(0xF9000120);          // STR x0, [x9]
   }
 
   fn emitLoadField(base: int64, fieldOff: int64, dest: int64) {
@@ -694,6 +1108,46 @@ pub type EmitARM64 = class {
     // STR x0, [x1, #fieldOff]
     var enc: int64 := 0xF9000000 | (((fieldOff >> 3) & 4095) << 10) | (ARM64_X1 << 5) | ARM64_X0;
     self.emit32(enc);
+  }
+
+  // #2147: Feldzugriff mit Breite. art = Breite | (vorzeichenbehaftet << 8)
+  // aus ir_lower (_feldArtVon), 0 = acht Byte. Bis 1.2.16C las und schrieb
+  // jeder Feldzugriff acht Byte mit `fieldOff >> 3` als Direktwert — ein
+  // int8-Feld ueberschrieb seine Nachbarn, und ein Versatz, der kein
+  // Vielfaches von 8 ist, wurde abgerundet. Acht Byte auf ausgerichtetem
+  // Versatz bleiben beim bisherigen Befehl; alles andere geht ueber die
+  // Registerform [x, x2] mit dem Versatz in x2.
+  fn emitLoadFieldArt(base: int64, fieldOff: int64, dest: int64, art: int64) {
+    var w: int64 := art & 255;
+    if (w == 0 || w == 8) && (fieldOff & 7) == 0 && fieldOff >= 0 && fieldOff < 32768 {
+      self.emitLoadField(base, fieldOff, dest);
+      return;
+    }
+    var vz: int64 := (art >> 8) & 1;
+    self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(base));
+    self.emitMovImmReg(ARM64_X2, fieldOff);
+    var enc: int64 := 0xF8606800;                      // LDR  x0,[x0,x2]
+    if w == 1 { if vz != 0 { enc := 0x38A06800; } else { enc := 0x38606800; } }   // LDRSB x0 / LDRB w0
+    if w == 2 { if vz != 0 { enc := 0x78A06800; } else { enc := 0x78606800; } }   // LDRSH x0 / LDRH w0
+    if w == 4 { if vz != 0 { enc := 0xB8A06800; } else { enc := 0xB8606800; } }   // LDRSW x0 / LDR  w0
+    self.emit32(enc | (ARM64_X2 << 16) | (ARM64_X0 << 5) | ARM64_X0);
+    self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
+  }
+
+  fn emitStoreFieldArt(src: int64, base: int64, fieldOff: int64, art: int64) {
+    var w: int64 := art & 255;
+    if (w == 0 || w == 8) && (fieldOff & 7) == 0 && fieldOff >= 0 && fieldOff < 32768 {
+      self.emitStoreField(src, base, fieldOff);
+      return;
+    }
+    self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(src));
+    self.emitLdur(ARM64_X1, ARM64_X29, self.slotOff(base));
+    self.emitMovImmReg(ARM64_X2, fieldOff);
+    var enc: int64 := 0xF8206800;                      // STR  x0,[x1,x2]
+    if w == 1 { enc := 0x38206800; }                   // STRB w0
+    if w == 2 { enc := 0x78206800; }                   // STRH w0
+    if w == 4 { enc := 0xB8206800; }                   // STR  w0
+    self.emit32(enc | (ARM64_X2 << 16) | (ARM64_X1 << 5) | ARM64_X0);
   }
 
   fn emitLoadIdx(base: int64, idx: int64, dest: int64) {
@@ -716,33 +1170,93 @@ pub type EmitARM64 = class {
   // Function calls
   // -------------------------------------------------------------------------
 
-  fn emitCall(funcId: int64, argCount: int64, dest: int64) {
-    // Set up args from slots (caller passes args in slots 0..argCount-1)
-    var ai: int64 := 0;
-    while ai < argCount && ai < 8 {
-      self.emitLdur(ai, ARM64_X29, self.slotOff(ai));
-      ai := ai + 1;
-    }
+  fn emitCall(funcId: int64, argBase: int64, argCount: int64, dest: int64) {
+    // ARM64-FIX: Args liegen im reservierten Block argBase..argBase+N-1 (NICHT 0..N-1,
+    // die die Caller-Params aliasen würden). Lade argBase+ai → x[ai].
+    // #2132: ab dem neunten ueber den Stapel (_a64StapelArgs).
+    var stBytes: int64 := self._a64StapelArgs(argBase, argCount);
+    self._a64RegArgs(argBase, argCount);
     // BL funcId  — record patch
     var patchOff: int64 := self.codeLen;
     self.emit32(0x94000000);  // placeholder BL
     self.addPatch(patchOff, funcId, PATCH_BL, 0);
+    if stBytes > 0 { self.emit32(0x910003FF | (stBytes << 10)); }   // ADD sp, sp, #stBytes
     // Move result from x0 to dest slot
     self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
+  }
+
+  // #2132: Argumente ab dem neunten nach AAPCS64 auf den Stapel — 8-Byte-
+  // Plaetze ab sp, sp bleibt 16-ausgerichtet. Der Platz wird am Stueck
+  // unter dem Rahmen angelegt (SUB sp) und nach dem Aufruf wieder
+  // freigegeben; die Slots liest dieser Weg x29-relativ, sie sehen die
+  // Verschiebung also nicht. Liefert die Byte-Zahl fuer das ADD danach.
+  //
+  // Bis 1.2.15A wurde alles ab dem neunten Argument still verworfen
+  // (`while ai < 8`) — der Aufgerufene las in seinem Slot fremden Stapel.
+  // Dieselbe Rechnung steht in riscv_linux.lyx (IRO_CALL) — die beiden
+  // muessen uebereinstimmen.
+  fn _a64StapelArgs(argBase: int64, argCount: int64): int64 {
+    if argCount <= 8 { return 0; }
+    if argBase < 0 {
+      // Alte Konvention (Argumente im Kratzstreifen 0..7): dort ist fuer ein
+      // neuntes kein Platz. Erzeugt ir_lower seit #2132 nicht mehr.
+      EPrintStr("error: arm64: Aufruf mit "c); EPrintInt(argCount);
+      EPrintStrLn(" Argumenten ohne Argumentblock -- mehr als acht gehen so nicht (#2132)."c);
+      exit(1);
+    }
+    var stBytes: int64 := (argCount - 8) * 8;
+    if (stBytes & 15) != 0 { stBytes := stBytes + 8; }
+    if stBytes > 4095 {
+      EPrintStr("error: arm64: Aufruf mit "c); EPrintInt(argCount);
+      EPrintStrLn(" Argumenten -- mehr als 4 KB Stapelargumente werden nicht erzeugt (#2132)."c);
+      exit(1);
+    }
+    self.emit32(0xD10003FF | (stBytes << 10));                     // SUB sp, sp, #stBytes
+    var si: int64 := 8;
+    while si < argCount {
+      self.emitLdur(ARM64_X9, ARM64_X29, self.slotOff(argBase + si));
+      self.emit32(0xF9000000 | ((si - 8) << 10) | (31 << 5) | ARM64_X9);   // STR x9, [sp, #(si-8)*8]
+      si := si + 1;
+    }
+    return stBytes;
+  }
+
+  // #2132: die ersten acht Argumente in x0..x7. argBase < 0 ist die alte
+  // Konvention mit den Argumenten im Kratzstreifen ab Slot 0.
+  fn _a64RegArgs(argBase: int64, argCount: int64) {
+    var rb: int64 := argBase;
+    if rb < 0 { rb := 0; }
+    var ai: int64 := 0;
+    while ai < argCount && ai < 8 {
+      self.emitLdur(ai, ARM64_X29, self.slotOff(rb + ai));
+      ai := ai + 1;
+    }
   }
 
   // Indirect call. Args follow the same convention as emitCall: caller stores
   // args 0..argCount-1 in stack slots 0..argCount-1, this routine loads them
   // into x0..x7 per AAPCS64 before branching through x9.
-  fn emitCallIndirect(ptrSlot: int64, argCount: int64, dest: int64) {
-    var ai: int64 := 0;
-    while ai < argCount && ai < 8 {
-      self.emitLdur(ai, ARM64_X29, self.slotOff(ai));
-      ai := ai + 1;
-    }
+  // #1806: IRO_FUNC_ADDR — die Adresse einer Funktion als Wert in einen Slot.
+  // Braucht jeder Aufruf ueber einen Funktionszeiger: erst muss `add` als ZAHL
+  // entstehen, bevor `f(a, b)` sie indirekt rufen kann. Bis 1.1.10G fehlte der
+  // Opcode hier; der Aufruf kam nur deshalb nie so weit, weil die
+  // Namensaufloesung vorher scheiterte (#1806).
+  fn emitFuncAddr(funcId: int64, dest: int64) {
+    var patchOff: int64 := self.codeLen;
+    self.emit32(0x10000009);        // ADR x9, #0 — Platzhalter, wird nachgetragen
+    self.addPatch(patchOff, funcId, PATCH_ADR, 9);
+    self.emitStur(9, ARM64_X29, self.slotOff(dest));
+  }
+
+  // #2132: die Argumente liegen im Block ab argBase (src2), wie beim
+  // direkten Aufruf; ab dem neunten ueber den Stapel.
+  fn emitCallIndirect(ptrSlot: int64, argBase: int64, argCount: int64, dest: int64) {
+    var stBytes: int64 := self._a64StapelArgs(argBase, argCount);
+    self._a64RegArgs(argBase, argCount);
     self.emitLdur(ARM64_X9, ARM64_X29, self.slotOff(ptrSlot));
     // BLR x9
     self.emit32(0xD63F0120);
+    if stBytes > 0 { self.emit32(0x910003FF | (stBytes << 10)); }   // ADD sp, sp, #stBytes
     self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
   }
 
@@ -750,15 +1264,35 @@ pub type EmitARM64 = class {
   // resolved function address from an inline GOT slot the loader fills via
   // R_AARCH64_GLOB_DAT, and BLR. nameStrOff/libStrOff index the IR string
   // table; the symbol is deduped into externBuf (dynsym index = idx+1).
-  fn emitCallExtern(argCount: int64, libStrOff: int64, nameStrOff: int64, dest: int64) {
-    var ai: int64 := 0;
-    while ai < argCount && ai < 8 {
-      self.emitLdur(ai, ARM64_X29, self.slotOff(ai));
-      ai := ai + 1;
-    }
+  //
+  // #2132: argBase (src3) ist der Argumentblock; ab dem neunten Argument
+  // nach AAPCS64 ueber den Stapel, wie beim direkten Aufruf.
+  //
+  // #2140: sig ist das iVal der extern-Deklaration (ir_lower legt es in
+  // immFloat). Bis 1.2.16A trug IRO_CALL_EXTERN keinen Typ, und alle
+  // Argumente gingen nach x0..x7 — fuer Lyx-eigene Aufrufe richtig (sie
+  // fuehren f64 als Bitmuster in den Ganzzahlregistern), fuer AAPCS64 nicht:
+  // dort zaehlen Ganzzahlen und Gleitkommawerte getrennt, x0..x7 und d0..d7.
+  // `pow(2.0, 10.0)` bekam in d0/d1, was zufaellig darin lag, und das
+  // Ergebnis wurde aus x0 statt d0 gelesen.
+  fn emitCallExtern(argCount: int64, libStrOff: int64, nameStrOff: int64, dest: int64, argBase: int64, sig: int64) {
     var strBuf: int64 := peek64(self.ir + 32);
     var namePtr: int64 := strBuf + nameStrOff;
     var nameLen: int64 := StrLen(namePtr as pchar);
+    var stBytes: int64 := 0;
+    if ((sig >> 53) & 1) != 0 {
+      EPrintStr("error: arm64: extern fn '"c); sys_write(2, namePtr, nameLen);
+      EPrintStrLn("': Gleitkommaparameter ab dem neunten sind nicht umgesetzt (#2140)."c);
+      EPrintStrLn("  Die Signaturmaske der Deklaration reicht ueber acht Parameter; dahinter ist die Klasse unbekannt."c);
+      exit(1);
+    }
+    if ((sig >> 32) & 0xFFFF) == 0 {
+      // Nur Ganzzahlen und Zeiger: die Lyx-Reihe IST die AAPCS64-Reihe.
+      stBytes := self._a64StapelArgs(argBase, argCount);
+      self._a64RegArgs(argBase, argCount);
+    } else {
+      stBytes := self._a64FfiArgs(argBase, argCount, (sig >> 32) & 0xFFFF);
+    }
     // Dedup by name.
     var externIdx: int64 := -1;
     var ei: int64 := 0;
@@ -795,6 +1329,28 @@ pub type EmitARM64 = class {
       externIdx := self.externCount;
       self.externCount := self.externCount + 1;
     }
+    // #2117, .so: ADRP x9 + LDR x9,[x9,#lo12] auf den GOT-Platz im
+    // RW-Segment; writeELFSharedLib legt ihn an, setzt R_AARCH64_GLOB_DAT
+    // darauf und traegt die Distanz hier nach. Kein Platz im Code.
+    if self.isSharedLib != 0 {
+      if self.gotCallCount >= self.gotCallCap {
+        var gnc: int64 := self.gotCallCap * 2;
+        var gnb: int64 := alloc(gnc * 16);
+        memcpy(gnb, self.gotCallBuf, self.gotCallCount * 16);
+        self.gotCallBuf := gnb; self.gotCallCap := gnc;
+      }
+      var grec: int64 := self.gotCallBuf + self.gotCallCount * 16;
+      poke64(grec + 0, self.codeLen);
+      poke64(grec + 8, externIdx);
+      self.gotCallCount := self.gotCallCount + 1;
+      self.emit32(0x90000009);        // ADRP x9, 0             (nachgetragen)
+      self.emit32(0xF9400129);        // LDR  x9, [x9, #0]      (nachgetragen)
+      self.emit32(0xD63F0120);        // BLR x9
+      if stBytes > 0 { self.emit32(0x910003FF | (stBytes << 10)); }   // #2132: ADD sp, sp, #stBytes
+      self._a64FfiRueckgabe(sig);     // #2140
+      self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
+      return;
+    }
     // Inline GOT slot: LDR x9,[pc+8]; B +12; .quad 0; BLR x9
     // ld.so writes the resolved symbol address into the .quad (GLOB_DAT).
     var slotOff: int64 := self.codeLen + 8;
@@ -803,7 +1359,98 @@ pub type EmitARM64 = class {
     self.emit64(0);                  // GOT slot (filled by loader)
     self._recordRelocation(slotOff, ((externIdx + 1) << 32) | 1025, 0);  // R_AARCH64_GLOB_DAT
     self.emit32(0xD63F0120);        // BLR x9
+    if stBytes > 0 { self.emit32(0x910003FF | (stBytes << 10)); }   // #2132: ADD sp, sp, #stBytes
+    self._a64FfiRueckgabe(sig);     // #2140
     self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
+  }
+
+  // #2140: Argumente eines FFI-Aufrufs mit Gleitkommaparametern nach AAPCS64.
+  // Zwei getrennt gezaehlte Reihen: Ganzzahlen/Zeiger in x0..x7, f64 in
+  // d0..d7, f32 in s0..s7 (Lyx fuehrt f32 intern als f64-Bits, #1127 — also
+  // FCVT auf single). Was in seiner Reihe keinen Platz mehr hat, geht in
+  // Parameterreihenfolge auf den Stapel, 8-Byte-Plaetze ab sp.
+  //
+  // Die Klasse steht in fmask (2 Bit je Parameter, die ersten acht); dass
+  // dahinter kein Gleitkommawert steht, hat emitCallExtern ueber Bit 53
+  // geprueft. Ein Gleitkommawert auf dem Stapel braeuchte also neun
+  // Gleitkommaparameter unter den ersten acht — den Fall gibt es nicht.
+  //
+  // Dieselbe Einteilung wie der SysV-Weg in codegen_x86.lyx (#1486/#1640,
+  // dort 6 GP + 8 xmm) — die beiden muessen uebereinstimmen.
+  fn _a64FfiArgs(argBase: int64, argCount: int64, fmask: int64): int64 {
+    var rb: int64 := argBase;
+    if rb < 0 { rb := 0; }
+    var nI: int64 := 0;
+    var nSt: int64 := 0;
+    var i: int64 := 0;
+    while i < argCount {
+      var c0: int64 := 0;
+      if i < 8 { c0 := (fmask >> (i * 2)) & 3; }
+      if c0 == 0 {
+        if nI < 8 { nI := nI + 1; } else { nSt := nSt + 1; }
+      }
+      i := i + 1;
+    }
+    var stBytes: int64 := nSt * 8;
+    if (stBytes & 15) != 0 { stBytes := stBytes + 8; }
+    if stBytes > 0 {
+      if argBase < 0 {
+        EPrintStrLn("error: arm64: FFI-Aufruf mit Stapelargumenten ohne Argumentblock (#2132, #2140)."c);
+        exit(1);
+      }
+      if stBytes > 4095 {
+        EPrintStrLn("error: arm64: FFI-Aufruf mit mehr als 4 KB Stapelargumenten (#2140)."c);
+        exit(1);
+      }
+      self.emit32(0xD10003FF | (stBytes << 10));                     // SUB sp, sp, #stBytes
+    }
+    nI := 0;
+    var nF: int64 := 0;
+    var si: int64 := 0;
+    i := 0;
+    while i < argCount {
+      var c: int64 := 0;
+      if i < 8 { c := (fmask >> (i * 2)) & 3; }
+      if c == 0 {
+        if nI < 8 {
+          self.emitLdur(nI, ARM64_X29, self.slotOff(rb + i));        // x_nI
+          nI := nI + 1;
+        } else {
+          self.emitLdur(ARM64_X9, ARM64_X29, self.slotOff(rb + i));
+          self.emit32(0xF9000000 | (si << 10) | (31 << 5) | ARM64_X9);   // STR x9, [sp, #si*8]
+          si := si + 1;
+        }
+      } else {
+        self.emitLdur(ARM64_X9, ARM64_X29, self.slotOff(rb + i));
+        self.emit32(0x9E670000 | (ARM64_X9 << 5) | nF);              // FMOV d_nF, x9
+        if c == 2 {
+          self.emit32(0x1E624000 | (nF << 5) | nF);                  // FCVT s_nF, d_nF
+        }
+        nF := nF + 1;
+      }
+      i := i + 1;
+    }
+    return stBytes;
+  }
+
+  // #2140: Rueckgabe eines FFI-Aufrufs in die Lyx-Form (Wert in x0).
+  //   f64  kommt in d0       -> FMOV x0, d0
+  //   f32  kommt in s0       -> FCVT d0, s0; FMOV x0, d0
+  //   int8..uint32: AAPCS64 laesst die oberen Bits von x0 offen — clang
+  //   schreibt w0, aus -1 wird also 4294967295. Dieselbe Erweiterung wie
+  //   #1607 in codegen_x86.lyx (Breite in Bits 50-52; die beiden muessen
+  //   uebereinstimmen).
+  fn _a64FfiRueckgabe(sig: int64) {
+    var fret: int64 := (sig >> 48) & 3;
+    if fret == 2 { self.emit32(0x1E22C000); }                  // FCVT d0, s0
+    if fret != 0 { self.emit32(0x9E660000); return; }          // FMOV x0, d0
+    var iw: int64 := (sig >> 50) & 7;
+    if iw == 1 { self.emit32(0x93401C00); }                    // SXTB x0, w0
+    if iw == 2 { self.emit32(0x93403C00); }                    // SXTH x0, w0
+    if iw == 3 { self.emit32(0x93407C00); }                    // SXTW x0, w0
+    if iw == 4 { self.emit32(0x53001C00); }                    // UXTB w0, w0
+    if iw == 5 { self.emit32(0x53003C00); }                    // UXTH w0, w0
+    if iw == 6 { self.emit32(0x2A0003E0); }                    // MOV  w0, w0
   }
 
   // IRO_CONST_STR: load the runtime address of a string literal into `dest`.
@@ -814,7 +1461,13 @@ pub type EmitARM64 = class {
   fn emitConstStr(strOff: int64, dest: int64) {
     var strBuf: int64 := peek64(self.ir + 32);
     var sp: int64 := strBuf + strOff;
-    var len: int64 := StrLen(sp as pchar);
+    // #1968: Die Laenge steht im VORSPANN vor der Zeichenkette (acht Byte bei
+    // off-8, von irAddString gelegt), nicht in der Nullterminierung. `StrLen`
+    // schnitt hier alles ab dem ersten Nullbyte im INHALT ab — bei einer
+    // eingebetteten Datei (#1961) blieb davon ein Bruchstueck plus Fremdbytes
+    // aus dem anschliessenden Speicher. Die Null wird weiterhin MITgeschrieben,
+    // die Laufzeit erwartet sie bei pchar; sie ist nur nicht mehr das Mass.
+    var len: int64 := _irStrLenVorspann(strBuf, strOff);
     var total: int64 := len + 1;                 // include NUL
     var pad: int64 := (4 - (total & 3)) & 3;     // pad to 4-byte boundary
     var padded: int64 := total + pad;
@@ -831,7 +1484,7 @@ pub type EmitARM64 = class {
     self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
   }
 
-  fn emitBuiltinCall(id: int64, dest: int64) {
+  fn emitBuiltinCall(id: int64, argBase: int64, dest: int64) {
     // WP-D2: Windows mode — emit BL placeholder to helper stubs instead of syscalls
     if self.winMode != 0 {
       if id == 1 {
@@ -873,32 +1526,170 @@ pub type EmitARM64 = class {
         self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(0));
         self.addWinPatch(self.codeLen, 9);
         self.emit32(0x94000000);
-      } else if id == 10 {
-        // WP-08: Printf(fmt, a1, a2, a3) → wab_printf_full helper
+      } else if id == 12 {
+        // WP-08: Printf(fmt, a1, a2, a3) → wab_printf_full helper.
+        // #1037: vorher id=10 — dieselbe Nummer wie mem_barrier(), das damit
+        // hier im Printf-Helfer landete. Der Helfer-Index bleibt 10, nur die
+        // Builtin-ID wandert auf 12.
         self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(0));
         self.emitLdur(ARM64_X1, ARM64_X29, self.slotOff(1));
         self.emitLdur(ARM64_X2, ARM64_X29, self.slotOff(2));
         self.emitLdur(ARM64_X3, ARM64_X29, self.slotOff(3));
         self.addWinPatch(self.codeLen, 10);
         self.emit32(0x94000000);
+      } else if id == 10 || id == 11 {
+        // WP-GPIO-1: mem_barrier()/inst_barrier(). Auf Windows-ARM64 gibt es
+        // keine Barrieren-Emission; ausdruecklich als No-op fuehren, statt in
+        // den Fehlerzweig zu fallen.
+      } else if id == 200 || id == 208 || id == 201 || id == 202
+             || id == 203 || id == 209 || id == 204 || id == 205 {
+        // #1388: Speicherzugriffe brauchen kein Betriebssystem und gelten
+        // deshalb auch im Windows-Zweig.
+        self._emitPeekPoke(id);
+      } else {
+        self._builtinUnsupported(id, 1);
       }
       self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
       return;
     }
     // Linux path — emit inline syscalls
     if id == 1 {
-      // PrintStr: write(1, x0, x1)  — args already in x0,x1 by convention
-      self.emitMovImmReg(ARM64_X0, 1);   // fd=stdout
-      // x1=buf, x2=len come from caller convention — load from slots 0,1
-      self.emitLdur(ARM64_X1, ARM64_X29, self.slotOff(0));
-      self.emitLdur(ARM64_X2, ARM64_X29, self.slotOff(1));
+      // PrintStr: write(1, buf, len) — buf und len stehen in den Slots 0 und 1.
+      //
+      // #1769: Eine NEGATIVE Laenge ist ein Sentinel und heisst „bis zum
+      // Nullbyte zaehlen". ir_lower setzt ihn fuer `Print`/`PrintLn` mit einer
+      // pchar-VARIABLEN, weil die Laenge erst zur Laufzeit feststeht (dort
+      // steht -1 im Laengen-Slot). arm64 reichte den Wert roh an write weiter:
+      // der Aufruf scheiterte, und `PrintLn(s)` schwieg, waehrend
+      // `PrintLn("literal")` schrieb. Das lyxos-Backend kennt den Sentinel
+      // laengst, riscv seit #1764 — hier ist er nachgezogen.
+      //
+      // Der Zaehlblock ist derselbe wie bei ID 13 (EPrintStr) darunter.
+      self.emitLdur(ARM64_X1, ARM64_X29, self.slotOff(0));   // x1 = buf
+      self.emitLdur(ARM64_X2, ARM64_X29, self.slotOff(1));   // x2 = len
+      self.emit32(0xB6F800C2);  // TBZ x2, #63, +6  → Laenge >= 0: Zaehlblock ueberspringen
+      self.emit32(0xD2800002);  // MOVZ x2, #0            (Laenge)
+      self.emit32(0x38626823);  // [LOOP] LDRB w3,[x1,x2]
+      self.emit32(0x34000063);  // CBZ w3, +3  (→ WRITE)
+      self.emit32(0x91000442);  // ADD x2,x2,#1
+      self.emit32(0x17FFFFFD);  // B -3        (→ LOOP)
+      self.emitMovImmReg(ARM64_X0, 1);   // [WRITE] fd = stdout
       self.emitMovImmReg(ARM64_X8, SYS_WRITE);
       self.emit32(0xD4000001);  // SVC #0
     } else if id == 2 {
-      // PrintInt: same but with string conversion via builtin thunk
-      self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(0));
-      self.emitMovImmReg(ARM64_X8, SYS_WRITE);
-      self.emit32(0xD4000001);
+      // PrintInt(n): int64 → Dezimal-ASCII nach stdout, OHNE Newline (PrintIntLn macht \n).
+      // ARM64-FIX: vorher write(x0=intwert, müll, müll) → EBADF, leer. Jetzt inline itoa+write
+      // (gespiegelt von der inspect-Routine; fd=1=stdout statt 2, Länge ohne '\n' = sp+31).
+      // Wert kommt in slot0 (PrintInt-Lowering: STORE_LOCAL 0). 32-Byte-Stack-Buffer:
+      // x9=write_ptr, x10=value, x11=neg, x12=10, x13=quot, x14=digit.
+      // Identische Instr-Anzahl/-Layout wie inspect-itoa (Branch-Offsets bleiben gültig);
+      // NUR instr28 (Ende sp+31 statt +32 → '\n' ausgeschlossen) + instr31 (fd=1) geändert.
+      self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(0));  // x0 = value
+      self.emit32(0xD10083FF);  // instr0: SUB sp,sp,#32
+      self.emit32(0x91007BE9);  // instr1: ADD x9,sp,#30
+      self.emit32(0x5280014A);  // instr2: MOVZ w10,#10  ('\n' in Buffer, NICHT ausgegeben)
+      self.emit32(0x39007FEA);  // instr3: STRB w10,[sp,#31]
+      self.emit32(0xAA0003EA);  // instr4: MOV x10,x0
+      self.emit32(0xD280000B);  // instr5: MOVZ x11,#0
+      self.emit32(0xB400024A);  // instr6: CBZ x10,+18 (→ instr24 ZERO_CASE)
+      self.emit32(0xF100015F);  // instr7: CMP x10,#0
+      self.emit32(0x5400006A);  // instr8: B.GE +3 (→ instr11 POS_LOOP)
+      self.emit32(0xCB0A03EA);  // instr9: NEG x10,x10
+      self.emit32(0xD280002B);  // instr10: MOVZ x11,#1
+      self.emit32(0xD280014C);  // instr11: [POS_LOOP] MOVZ x12,#10
+      self.emit32(0x9ACC094D);  // instr12: UDIV x13,x10,x12
+      self.emit32(0x9B0CA9AE);  // instr13: MSUB x14,x13,x12,x10
+      self.emit32(0x1100C1CE);  // instr14: ADD w14,w14,#48
+      self.emit32(0x3900012E);  // instr15: STRB w14,[x9]
+      self.emit32(0xD1000529);  // instr16: SUB x9,x9,#1
+      self.emit32(0xAA0D03EA);  // instr17: MOV x10,x13
+      self.emit32(0xB5FFFF2A);  // instr18: CBNZ x10,-7 (→ instr11)
+      self.emit32(0xB400008B);  // instr19: CBZ x11,+4 (→ instr23)
+      self.emit32(0x528005AE);  // instr20: MOVZ w14,#45 ('-')
+      self.emit32(0x3900012E);  // instr21: STRB w14,[x9]
+      self.emit32(0xD1000529);  // instr22: SUB x9,x9,#1
+      self.emit32(0x14000004);  // instr23: B +4 (→ instr27 EMIT_OUT)
+      self.emit32(0x5280060E);  // instr24: [ZERO_CASE] MOVZ w14,#48 ('0')
+      self.emit32(0x3900012E);  // instr25: STRB w14,[x9]
+      self.emit32(0xD1000529);  // instr26: SUB x9,x9,#1
+      self.emit32(0x91000529);  // instr27: [EMIT_OUT] ADD x9,x9,#1
+      self.emit32(0x91007FEA);  // instr28: ADD x10,sp,#31  (Ende OHNE '\n')
+      self.emit32(0xCB090142);  // instr29: SUB x2,x10,x9  (len)
+      self.emit32(0xAA0903E1);  // instr30: MOV x1,x9
+      self.emit32(0xD2800020);  // instr31: MOVZ x0,#1  (fd=stdout)
+      self.emit32(0xD2800808);  // instr32: MOVZ x8,#64 (SYS_WRITE)
+      self.emit32(0xD4000001);  // instr33: SVC #0
+      self.emit32(0x910083FF);  // instr34: ADD sp,sp,#32
+    } else if id == 210 {
+      // #1769: memcpy(dst, src, len) — byteweise, Rueckgabe ist dst (bleibt in
+      // x0 stehen). std/io setzt damit seine Ausgabepuffer zusammen; ohne die
+      // ID kommt `PrintLn` nicht durch. Wortweise zu kopieren braeuchte eine
+      // Ausrichtungspruefung und brachte hier nichts — die Puffer sind kurz.
+      var mcB: int64 := argBase;
+      if (mcB < 0) { mcB := 0; }
+      self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(mcB));      // x0 = dst
+      self.emitLdur(ARM64_X1, ARM64_X29, self.slotOff(mcB + 1));  // x1 = src
+      self.emitLdur(ARM64_X2, ARM64_X29, self.slotOff(mcB + 2));  // x2 = len
+      self.emit32(0xD2800003);  // MOVZ x3, #0        (Zaehler)
+      self.emit32(0xEB02007F);  // [LOOP] CMP x3, x2
+      self.emit32(0x540000A0);  // B.EQ +5            (fertig)
+      self.emit32(0x38636824);  // LDRB w4,[x1,x3]
+      self.emit32(0x38236804);  // STRB w4,[x0,x3]
+      self.emit32(0x91000463);  // ADD x3,x3,#1
+      self.emit32(0x17FFFFFB);  // B -5               (→ LOOP)
+    } else if id == 216 {
+      // #1842: memset(ptr, byte, len) — byteweise, Rueckgabe ist ptr (bleibt in
+      // x0 stehen). Dieselbe Rechnung wie 210 darueber, die beiden muessen
+      // uebereinstimmen; gemeldet war die Luecke als lyxos-Problem, sie traf
+      // aber jedes Ziel am gemeinsamen IR-Weg.
+      var msB: int64 := argBase;
+      if (msB < 0) { msB := 0; }
+      self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(msB));      // x0 = ptr
+      self.emitLdur(ARM64_X1, ARM64_X29, self.slotOff(msB + 1));  // x1 = Bytewert
+      self.emitLdur(ARM64_X2, ARM64_X29, self.slotOff(msB + 2));  // x2 = len
+      self.emit32(0xD2800003);  // MOVZ x3, #0        (Zaehler)
+      self.emit32(0xEB02007F);  // [LOOP] CMP x3, x2
+      self.emit32(0x54000080);  // B.EQ +4            (fertig)
+      self.emit32(0x38236801);  // STRB w1,[x0,x3]
+      self.emit32(0x91000463);  // ADD x3,x3,#1
+      self.emit32(0x17FFFFFC);  // B -4               (→ LOOP)
+    } else if id == 222 || id == 223 {
+      // #1769: read(fd, buf, len) / write(fd, buf, len). Beide fehlten im
+      // Linux-Zweig, und weil std/io seine Ausgabe darueber schickt, scheiterte
+      // `PrintLn` auf arm64 schon beim Uebersetzen — laut immerhin. Die drei
+      // Argumente stehen ab argBase, das Ergebnis kommt ueber x0 zurueck.
+      // `open` bleibt bewusst offen: arm64 kennt wie riscv64 nur openat(56)
+      // mit vier Argumenten, eine geratene Nummer waere der naechste stille
+      // Fehler (dieselbe Ueberlegung wie in #1740/#1764).
+      var rwB: int64 := argBase;
+      if (rwB < 0) { rwB := 0; }
+      self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(rwB));      // fd
+      self.emitLdur(ARM64_X1, ARM64_X29, self.slotOff(rwB + 1));  // buf
+      self.emitLdur(ARM64_X2, ARM64_X29, self.slotOff(rwB + 2));  // len
+      if (id == 222) { self.emitMovImmReg(ARM64_X8, SYS_READ); }
+      if (id == 223) { self.emitMovImmReg(ARM64_X8, SYS_WRITE); }
+      self.emit32(0xD4000001);  // SVC #0
+    } else if id == 228 || id == 231 || id == 232 {
+      // #2260: lseek(fd, off, whence) / pipe(fds) / truncate(pfad, laenge) —
+      // ir_lower legt sie als 228/231/232 ab (Gruppe fxId). Fehlten im
+      // Linux-Zweig; der Compiler selbst liest seine Units mit lseek, der
+      // Selbstbau fuer arm64 brach daran ab. Generische Linux-Nummern (wie
+      // riscv64): lseek 62, truncate 45, pipe ueber pipe2(fds, 0) = 59.
+      var fxB: int64 := argBase;
+      if (fxB < 0) { fxB := 0; }
+      self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(fxB));
+      if (id == 228) {
+        self.emitLdur(ARM64_X1, ARM64_X29, self.slotOff(fxB + 1));
+        self.emitLdur(ARM64_X2, ARM64_X29, self.slotOff(fxB + 2));
+        self.emitMovImmReg(ARM64_X8, 62);
+      } else if (id == 232) {
+        self.emitLdur(ARM64_X1, ARM64_X29, self.slotOff(fxB + 1));
+        self.emitMovImmReg(ARM64_X8, 45);
+      } else {
+        self.emitMovImmReg(ARM64_X1, 0);
+        self.emitMovImmReg(ARM64_X8, 59);
+      }
+      self.emit32(0xD4000001);  // SVC #0
     } else if id == 3 {
       // Exit
       self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(0));
@@ -912,11 +1703,487 @@ pub type EmitARM64 = class {
       // WP-GPIO-1: inst_barrier() → ISB SY
       // Encoding: D5 03 3F DF (little-endian uint32 = 0xDF3F03D5)
       self.emit32(0xDF3F03D5);
-    } else if id == 9 {
-      // WP-08: PrintFloat — Linux ARM64 fallback (load float bits, no-op print)
-      self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(0));
+    } else if id == 8 {
+      // #2037: StrCopy(s) — Kette in frischen Speicher kopieren.
+      //
+      // Stand nur im WINDOWS-Zweig (wab_strcopy). Genau daran ist die
+      // Abdeckungsmessung zuerst gescheitert: `id == 8` kommt in der Datei
+      // vor, aber im falschen Zweig — die Zahl allein sagt nichts darueber,
+      // WO sie steht. Der Waechter in tests/backend_abdeckung_test.sh
+      // vergleicht deshalb je Zweig.
+      //
+      // Puffer aus dem Bump-Block wie bei StrSub (6) und StrConcat (7), #2227.
+      var scB: int64 := argBase;
+      if (scB < 0) { scB := 0; }
+      self.emitLdur(ARM64_X9, ARM64_X29, self.slotOff(scB));   // x9 = s
+      // Laenge zaehlen
+      self.emit32(0xD280000B);  // MOVZ x11, #0
+      self.emit32(0x386B6923);  // [L1] LDRB w3,[x9,x11]
+      self.emit32(0x34000063);  // CBZ w3, +3
+      self.emit32(0x9100056B);  // ADD x11,x11,#1
+      self.emit32(0x17FFFFFD);  // B -3
+      // Puffer: Laenge + 16
+      self.emit32(0x91004161);  // ADD x1, x11, #16
+      self.emitBumpAlloc();     // #2227: x0 = Puffer
+      // Kopieren, Nullbyte eingeschlossen
+      self.emit32(0xD280000D);  // MOVZ x13, #0
+      self.emit32(0x386D6923);  // [L2] LDRB w3,[x9,x13]
+      self.emit32(0x8B0D0002);  // ADD x2, x0, x13
+      self.emit32(0x39000043);  // STRB w3,[x2]
+      self.emit32(0x34000063);  // CBZ w3, +3 (fertig)
+      self.emit32(0x910005AD);  // ADD x13,x13,#1
+      self.emit32(0x17FFFFFB);  // B -5
+    } else if id == 220 {
+      // #2037: open(path, flags, mode). Die generische Linux-ABI kennt kein
+      // `open` — Nummer 56 ist dort openat(dirfd, path, flags, mode). dirfd =
+      // AT_FDCWD (-100), damit relative Pfade wie bei open wirken.
+      //
+      // Das riscv-Backend hat die Umsetzung seit #1764; hier fehlte sie ganz,
+      // und damit war JEDES Programm, das eine Datei oeffnet, fuer arm64
+      // unbaubar. Beide Ziele gehen nach derselben ABI — es ist dieselbe
+      // Rechnung, und die beiden muessen uebereinstimmen.
+      var opB: int64 := argBase;
+      if (opB < 0) { opB := 0; }
+      self.emitMovImmReg(ARM64_X0, 0 - 100);                        // AT_FDCWD
+      self.emitLdur(ARM64_X1, ARM64_X29, self.slotOff(opB));        // path
+      self.emitLdur(ARM64_X2, ARM64_X29, self.slotOff(opB + 1));    // flags
+      self.emitLdur(ARM64_X3, ARM64_X29, self.slotOff(opB + 2));    // mode
+      self.emitMovImmReg(ARM64_X8, SYS_OPEN);                       // 56 = openat
+      self.emit32(0xD4000001);                                      // SVC #0
+    } else if id == 17 {
+      // #2110: GetArgC — die argv-Zeiger ab x28 bis zum abschliessenden NULL
+      // zaehlen (argv[argc] ist NULL). Dieselbe Rechnung wie in
+      // riscv_linux.lyx, die beiden muessen uebereinstimmen.
+      self.emit32(0xAA1C03E9);   // MOV x9, x28
+      self.emit32(0xD2800000);   // MOVZ x0, #0
+      self.emit32(0xF940012A);   // [L] LDR x10, [x9]
+      self.emit32(0xB400008A);   // CBZ x10, +16 → hinter die Schleife
+      self.emit32(0x91000400);   // ADD x0, x0, #1
+      self.emit32(0x91002129);   // ADD x9, x9, #8
+      self.emit32(0x17FFFFFC);   // B L
+    } else if id == 18 {
+      self.emit32(0xAA1C03E0);   // #2110: GetArgV — MOV x0, x28
+    } else if id == 19 {
+      // #2264: GetEnvBlock. Unter Linux gibt es keinen zusammenhaengenden
+      // Umgebungsblock — envp steht als Zeigervektor hinter argv, und
+      // std.env/lyx_getEnvVar gehen bei 0 genau diesen SysV-Weg. 0 heisst
+      // hier "kein Block", nicht "leerer Block". Dieselbe Antwort wie
+      // emitNullArg in emit_lyxos.lyx und der Linux-Zweig auf x86; die drei
+      // muessen uebereinstimmen (src/backend/_builtin_ids.md, Zeile zu ID 19).
+      // Ohne diesen Zweig scheiterte der arm64-Selbstbau laut, sobald der
+      // Compiler selbst GetEnvBlock aufruft (#2266 hatte ihn gerade gruen
+      // gemacht).
+      self.emitMovImmReg(ARM64_X0, 0);
+    } else if id == 235 {
+      // #2110: ArgvGet(argv, i) — argv[i], aber nur, solange vorher kein NULL
+      // kommt: ein Index ausserhalb liefert 0 statt eines Umgebungseintrags
+      // (dieselbe Absicht wie #1460 auf x86; ein negativer Index laeuft bis
+      // zum NULL und liefert ebenfalls 0). Dieselbe Rechnung wie in
+      // riscv_linux.lyx.
+      var avB: int64 := argBase;
+      if (avB < 0) { avB := 0; }
+      self.emitLdur(ARM64_X9, ARM64_X29, self.slotOff(avB));        // argv
+      self.emitLdur(ARM64_X10, ARM64_X29, self.slotOff(avB + 1));   // i
+      self.emit32(0xB40000CA);   // [L] CBZ x10, +24 → nehmen
+      self.emit32(0xF940012B);   // LDR x11, [x9]
+      self.emit32(0xB40000CB);   // CBZ x11, +24 → 0
+      self.emit32(0x91002129);   // ADD x9, x9, #8
+      self.emit32(0xD100054A);   // SUB x10, x10, #1
+      self.emit32(0x17FFFFFB);   // B L
+      self.emit32(0xF9400120);   // nehmen: LDR x0, [x9]
+      self.emit32(0x14000002);   // B +8
+      self.emit32(0xD2800000);   // 0: MOVZ x0, #0
+    } else if id == 65 {
+      // #2343: getpid. Kein Argument, Ergebnis in x0 (generische Linux-ABI:
+      // getpid 172). ir_lower vergibt die ID fuer ALLE IR-Ziele, der
+      // Linux-Zweig kannte sie nicht -- damit war jede Unit mit getpid auf
+      // arm64 unuebersetzbar, auch src/std/os.lyx. Aufgefallen ist es erst,
+      // als lyxc selbst getpid benutzte. Dieselbe Rechnung wie in
+      // riscv_linux.lyx -- die beiden muessen uebereinstimmen.
+      self.emitMovImmReg(ARM64_X8, 172);                             // getpid
+      self.emit32(0xD4000001);                                       // SVC #0
+    } else if id == 221 || id == 224 || id == 225 || id == 226 || id == 227 {
+      // #2104: close / rename / unlink / mkdir / exit. ir_lower vergibt die
+      // IDs seit der LyxOS-Gruppe A fuer ALLE IR-Ziele; der Linux-Zweig kannte
+      // keine davon — `exit(3)` war fuer arm64 unuebersetzbar. Die generische
+      // Linux-ABI hat nur die *at-Formen: unlinkat(35), mkdirat(34),
+      // renameat2(276, riscv64 kennt kein renameat), dazu close(57) und
+      // exit_group(94; #1487: exit(93) beendet nur den Thread). dirfd =
+      // AT_FDCWD (-100), wie bei open (220). Dieselbe Rechnung wie in
+      // riscv_linux.lyx — die beiden muessen uebereinstimmen.
+      var fsB: int64 := argBase;
+      if (fsB < 0) { fsB := 0; }
+      if (id == 221 || id == 227) {
+        self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(fsB));      // fd / Code
+        if (id == 221) { self.emitMovImmReg(ARM64_X8, SYS_CLOSE); }
+        else           { self.emitMovImmReg(ARM64_X8, 94); }       // exit_group
+      } else if (id == 224) {
+        self.emitMovImmReg(ARM64_X0, 0 - 100);                       // AT_FDCWD
+        self.emitLdur(ARM64_X1, ARM64_X29, self.slotOff(fsB));      // alt
+        self.emitMovImmReg(ARM64_X2, 0 - 100);                       // AT_FDCWD
+        self.emitLdur(ARM64_X3, ARM64_X29, self.slotOff(fsB + 1));  // neu
+        self.emitMovImmReg(ARM64_X4, 0);                             // flags
+        self.emitMovImmReg(ARM64_X8, 276);                           // renameat2
+      } else {
+        self.emitMovImmReg(ARM64_X0, 0 - 100);                       // AT_FDCWD
+        self.emitLdur(ARM64_X1, ARM64_X29, self.slotOff(fsB));      // path
+        if (id == 225) {
+          self.emitMovImmReg(ARM64_X2, 0);                           // flags
+          self.emitMovImmReg(ARM64_X8, 35);                          // unlinkat
+        } else {
+          self.emitLdur(ARM64_X2, ARM64_X29, self.slotOff(fsB + 1)); // mode
+          self.emitMovImmReg(ARM64_X8, 34);                          // mkdirat
+        }
+      }
+      self.emit32(0xD4000001);                                       // SVC #0
+    } else if id == 400 || id == 401 || id == 402 {
+      // #2037: fFloor / fCeil / fRound. arm64 hat dafuer eigene Befehle —
+      // FRINTM (gegen minus unendlich), FRINTP (gegen plus unendlich) und
+      // FRINTN (kaufmaennisch, "round half to even"). Das riscv-Backend loest
+      // es ueber seine eigenen Rundungsmodi; das Ergebnis muss dasselbe sein.
+      var frB: int64 := argBase;
+      if (frB < 0) { frB := 0; }
+      self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(frB));
+      self.emit32(0x9E670000);   // FMOV d0, x0
+      if (id == 400) { self.emit32(0x1E654000); }   // FRINTM d0, d0
+      if (id == 401) { self.emit32(0x1E64C000); }   // FRINTP d0, d0
+      if (id == 402) { self.emit32(0x1E644000); }   // FRINTN d0, d0
+      self.emit32(0x9E660000);   // FMOV x0, d0
+    } else if (IstLinuxSys(id) != 0) {   // #2122
+      // #2021: Linux-Syscall aus der gemeinsamen Tabelle.
+      //
+      // EIN Zweig statt siebzehn handgeschriebener Bloecke: Nummer und
+      // Stelligkeit stehen in src/backend/linux_syscalls.lyx, und riscv liest
+      // dieselbe Tabelle. Zwei Backends mit je einer eigenen Abschrift waeren
+      // genau die Klasse "zwei Stellen, die auseinanderlaufen".
+      var lscN: int64 := LinuxSysArgc(id);
+      var lscB: int64 := argBase;
+      if (lscB < 0) { lscB := 0; }
+      // Argumente nach x0..x5 — nur so viele, wie die ABI liest.
+      var lscI: int64 := 0;
+      while (lscI < lscN && lscI < 6) {
+        self.emitLdur(ARM64_X0 + lscI, ARM64_X29, self.slotOff(lscB + lscI));
+        lscI := lscI + 1;
+      }
+      self.emitMovImmReg(ARM64_X8, LinuxSysNr(id));
+      self.emit32(0xD4000001);   // SVC #0
+    } else if id == 403 {
+      // #1776: FloatToStr(v) — Zeiger auf den Text.
+      var fsB: int64 := argBase;
+      if (fsB < 0) { fsB := 0; }
+      self.a64FloatToStr(fsB);
+    } else if id == 9 || id == 545 {
+      // #1776: PrintFloat(v). Hier stand ein No-op — der Wert wurde geladen
+      // und nichts damit getan. Jetzt derselbe Formatierer wie bei 403,
+      // danach write(fd, ptr, len); die Laenge zaehlt der Code bis zum Nullbyte.
+      //
+      // #2042: EPrintFloat (545) ist derselbe Rumpf mit fd = 2. Bewusst KEIN
+      // zweiter Zweig daneben: eine Kopie, die sich in einer einzigen Zahl
+      // unterscheidet, laeuft frueher oder spaeter auseinander — genau das
+      // Muster aus #1799/#1803.
+      var pfB: int64 := argBase;
+      if (pfB < 0) { pfB := 0; }
+      self.a64FloatToStr(pfB);
+      self.emit32(0xAA0003E1);                   // MOV x1, x0   (Puffer)
+      self.emit32(0xD2800002);                   // MOVZ x2, #0  (Laenge)
+      self.emit32(0x38626823);                   // [LOOP] LDRB w3,[x1,x2]
+      self.emit32(0x34000063);                   // CBZ w3, +3
+      self.emit32(0x91000442);                   // ADD x2,x2,#1
+      self.emit32(0x17FFFFFD);                   // B -3
+      var pfFd: int64 := 1;                      // stdout
+      if id == 545 { pfFd := 2; }                // #2042: EPrintFloat -> stderr
+      self.emitMovImmReg(ARM64_X0, pfFd);
+      self.emitMovImmReg(ARM64_X8, SYS_WRITE);
+      self.emit32(0xD4000001);                   // SVC #0
+    } else if id >= 255 && id <= 262 {
+      self.emitBitBuiltin(id, argBase);   // #2190, #2177
+    // #2460: mulhi/umulhi. AArch64 hat beide als eigene Befehle (SMULH/UMULH),
+    // sie gehoeren zum Grundbestand — keine Faehigkeitsfrage, kein
+    // Software-Zweig. MUL liefert die unteren 64 Bit, diese hier die oberen;
+    // zusammen sind sie das 128-Bit-Produkt. Dieselbe Bedeutung wie
+    // `imul rsi`/`mul rsi` auf x86 (codegen_x86.lyx:21171 ff.) — die beiden
+    // muessen uebereinstimmen.
+    } else if id == 569 || id == 570 {
+      var mhB: int64 := argBase;
+      if (mhB < 0) { mhB := 0; }
+      self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(mhB));
+      self.emitLdur(ARM64_X1, ARM64_X29, self.slotOff(mhB + 1));
+      if id == 569 { self.emit32(0x9B417C00); }   // SMULH x0, x0, x1
+      else         { self.emit32(0x9BC17C00); }   // UMULH x0, x0, x1
+    } else if id == 200 || id == 208 || id == 201 || id == 202
+           || id == 203 || id == 209 || id == 204 || id == 205 {
+      self._emitPeekPoke(id, argBase);      // #1388
+    } else if id == 206 {
+      // #1388: StrCharAt(s, i) — Byte an Position i, ohne Vorzeichen.
+      // Dieselbe argBase-Ablage wie peek/poke.
+      var b6: int64 := argBase;
+      if (b6 < 0) { b6 := 0; }
+      self.emitLdur(ARM64_X1, ARM64_X29, self.slotOff(b6));      // x1 = s
+      self.emitLdur(ARM64_X2, ARM64_X29, self.slotOff(b6 + 1));  // x2 = i
+      self.emit32(0x38626820);  // LDRB w0, [x1, x2]
+    } else if id == 207 {
+      // #1388: StrSetChar(s, i, c) — Byte an Position i setzen.
+      var b7: int64 := argBase;
+      if (b7 < 0) { b7 := 0; }
+      self.emitLdur(ARM64_X1, ARM64_X29, self.slotOff(b7));      // x1 = s
+      self.emitLdur(ARM64_X2, ARM64_X29, self.slotOff(b7 + 1));  // x2 = i
+      self.emitLdur(ARM64_X3, ARM64_X29, self.slotOff(b7 + 2));  // x3 = c
+      self.emit32(0x38226823);  // STRB w3, [x1, x2]
+      self.emit32(0xD2800000);  // MOVZ x0, #0
+    } else if id == 13 {
+      // #1388: EPrintStr — write(2, buf, strlen(buf)). Die Laenge rechnet der
+      // Code selbst aus; die Aufrufkonvention reicht fuer Zeichenketten nur
+      // einen Sentinel (-1) durch, weil sie zur Uebersetzungszeit unbekannt
+      // ist. Ohne diesen Zweig scheiterte JEDES Programm, das std.alloc
+      // importiert — malloc_orpanic meldet dort auf stderr.
+      self.emitLdur(ARM64_X1, ARM64_X29, self.slotOff(0));  // x1 = buf
+      self.emit32(0xD2800002);  // MOVZ x2, #0            (Laenge)
+      self.emit32(0x38626823);  // [LOOP] LDRB w3,[x1,x2]
+      self.emit32(0x34000063);  // CBZ w3, +3  (→ WRITE)
+      self.emit32(0x91000442);  // ADD x2,x2,#1
+      self.emit32(0x17FFFFFD);  // B -3        (→ LOOP)
+      self.emit32(0xD2800040);  // [WRITE] MOVZ x0,#2      (fd=stderr)
+      self.emit32(0xD2800808);  // MOVZ x8,#64             (SYS_write)
+      self.emit32(0xD4000001);  // SVC #0
+    } else if id == 407 {
+      // #2103: StrTrim — an Ort und Stelle, wie emitStrTrim auf lyxos (die
+      // beiden muessen uebereinstimmen): Leerraum (' ', \t, \r, \n) vorn
+      // ueberspringen, hinten durch ein Nullbyte abschneiden, Zeiger auf den
+      // Anfang zurueck. Geschrieben wird NUR, wenn hinten wirklich Leerraum
+      // stand — ein Literal liegt im Codesegment und ist nicht beschreibbar.
+      // Bis 1.2.14C fehlte die ID hier; `StrTrim` ging nur, weil eine
+      // importierte std-Fassung den Builtin verdeckte (#2103).
+      self.emitLdur(ARM64_X1, ARM64_X29, self.slotOff(0));  // x1 = s
+      self.emit32(0x39400023);  // a0  LDRB w3,[x1]
+      self.emit32(0x7100807F);  // a1  CMP w3,#' '
+      self.emit32(0x540000E0);  // a2  B.EQ a9
+      self.emit32(0x7100247F);  // a3  CMP w3,#'\t'
+      self.emit32(0x540000A0);  // a4  B.EQ a9
+      self.emit32(0x7100347F);  // a5  CMP w3,#'\r'
+      self.emit32(0x54000060);  // a6  B.EQ a9
+      self.emit32(0x7100287F);  // a7  CMP w3,#'\n'
+      self.emit32(0x54000061);  // a8  B.NE a11
+      self.emit32(0x91000421);  // a9  ADD x1,x1,#1
+      self.emit32(0x17FFFFF6);  // a10 B a0
+      self.emit32(0x91000022);  // a11 MOV x2,x1
+      self.emit32(0x39400043);  // a12 LDRB w3,[x2]
+      self.emit32(0x34000063);  // a13 CBZ w3,a16
+      self.emit32(0x91000442);  // a14 ADD x2,x2,#1
+      self.emit32(0x17FFFFFD);  // a15 B a12
+      self.emit32(0x91000044);  // a16 MOV x4,x2   (Ende vor dem Abschneiden)
+      self.emit32(0xEB01005F);  // a17 CMP x2,x1
+      self.emit32(0x54000189);  // a18 B.LS a30
+      self.emit32(0x385FF043);  // a19 LDURB w3,[x2,#-1]
+      self.emit32(0x7100807F);  // a20
+      self.emit32(0x540000E0);  // a21 B.EQ a28
+      self.emit32(0x7100247F);  // a22
+      self.emit32(0x540000A0);  // a23 B.EQ a28
+      self.emit32(0x7100347F);  // a24
+      self.emit32(0x54000060);  // a25 B.EQ a28
+      self.emit32(0x7100287F);  // a26
+      self.emit32(0x54000061);  // a27 B.NE a30
+      self.emit32(0xD1000442);  // a28 SUB x2,x2,#1
+      self.emit32(0x17FFFFF4);  // a29 B a17
+      self.emit32(0xEB04005F);  // a30 CMP x2,x4
+      self.emit32(0x54000040);  // a31 B.EQ a33
+      self.emit32(0x3900005F);  // a32 STRB wzr,[x2]
+      self.emit32(0xAA0103E0);  // a33 MOV x0,x1
+    } else if id == 15 {
+      // #1388: StrLen — Zeichen bis zur Null zaehlen, Ergebnis nach x0.
+      self.emitLdur(ARM64_X1, ARM64_X29, self.slotOff(0));  // x1 = buf
+      self.emit32(0xD2800000);  // MOVZ x0, #0
+      self.emit32(0x38606823);  // [LOOP] LDRB w3,[x1,x0]
+      self.emit32(0x34000063);  // CBZ w3, +3 (→ ENDE)
+      self.emit32(0x91000400);  // ADD x0,x0,#1
+      self.emit32(0x17FFFFFD);  // B -3 (→ LOOP)
+    } else if id == 7 {
+      // #2028: StrConcat(a, b) — beide Ketten in frischen Speicher kopieren.
+      //
+      // Fehlte im LINUX-Zweig ganz; der Windows-Zweig daneben hat sie seit
+      // WP-01 (wab_strconcat). Jedes Programm mit Zeichenkettenverkettung war
+      // damit fuer arm64 unbaubar — nach PrintLn das meistbenutzte Builtin.
+      //
+      // Der Puffer kommt aus dem Bump-Block (emitBumpAlloc, #2227): der
+      // Zeiger muss den Aufruf ueberleben. Bis 1.2.20B war es ein mmap je
+      // Verkettung — eine SEITE fuer elf Zeichen, nie zurueckgegeben.
+      // #2028: aus dem HOHEN Argumentblock lesen (argBase), nicht aus den
+      // festen Slots 0/1. Mit festen Slots ueberschrieb ein verschachtelter
+      // Aufruf die Argumente des aeusseren — `StrConcat(StrConcat("a","b"),
+      // StrConcat("c","d"))` ergab "ccd" statt "abcd".
+      var cnB: int64 := argBase;
+      if (cnB < 0) { cnB := 0; }
+      self.emitLdur(ARM64_X9,  ARM64_X29, self.slotOff(cnB));       // x9  = a
+      self.emitLdur(ARM64_X10, ARM64_X29, self.slotOff(cnB + 1));   // x10 = b
+      // Laenge von a → x11
+      self.emit32(0xD280000B);  // MOVZ x11, #0
+      self.emit32(0x386B6923);  // [L1] LDRB w3,[x9,x11]
+      self.emit32(0x34000063);  // CBZ w3, +3 (→ L1ENDE)
+      self.emit32(0x9100056B);  // ADD x11,x11,#1
+      self.emit32(0x17FFFFFD);  // B -3 (→ L1)
+      // Laenge von b → x12
+      self.emit32(0xD280000C);  // [L1ENDE] MOVZ x12, #0
+      self.emit32(0x386C6943);  // [L2] LDRB w3,[x10,x12]
+      self.emit32(0x34000063);  // CBZ w3, +3 (→ L2ENDE)
+      self.emit32(0x9100058C);  // ADD x12,x12,#1
+      self.emit32(0x17FFFFFD);  // B -3 (→ L2)
+      // Groesse = la + lb + 16 (Reserve wie bei StrSub) → x1
+      self.emit32(0x8B0C0161);  // [L2ENDE] ADD x1, x11, x12
+      self.emit32(0x91004021);  // ADD x1, x1, #16
+      self.emitBumpAlloc();     // #2227: x0 = Puffer
+      // a kopieren: bis zum Nullbyte, Ziel = Puffer + i
+      self.emit32(0xD280000D);  // MOVZ x13, #0
+      self.emit32(0x386D6923);  // [L3] LDRB w3,[x9,x13]
+      self.emit32(0x340000A3);  // CBZ w3, +5 (→ L3ENDE)
+      self.emit32(0x8B0D0002);  // ADD x2, x0, x13
+      self.emit32(0x39000043);  // STRB w3,[x2]
+      self.emit32(0x910005AD);  // ADD x13,x13,#1
+      self.emit32(0x17FFFFFB);  // B -5 (→ L3)
+      // b kopieren: Ziel = Puffer + la + j
+      self.emit32(0xD280000E);  // [L3ENDE] MOVZ x14, #0
+      self.emit32(0x386E6943);  // [L4] LDRB w3,[x10,x14]
+      self.emit32(0x340000C3);  // CBZ w3, +6 (→ L4ENDE)
+      self.emit32(0x8B0B0002);  // ADD x2, x0, x11
+      self.emit32(0x8B0E0042);  // ADD x2, x2, x14
+      self.emit32(0x39000043);  // STRB w3,[x2]
+      self.emit32(0x910005CE);  // ADD x14,x14,#1
+      self.emit32(0x17FFFFFA);  // B -6 (→ L4)
+      // Nullbyte hinter das Ergebnis
+      self.emit32(0x8B0B0002);  // [L4ENDE] ADD x2, x0, x11
+      self.emit32(0x8B0C0042);  // ADD x2, x2, x12
+      self.emit32(0x3900005F);  // STRB wzr,[x2]
+    } else if id == 6 {
+      // #1388: StrSub(s, start, len) — Teilkette in frischen Speicher kopieren.
+      //
+      // Der Puffer kommt aus dem Bump-Block (emitBumpAlloc, #2227): der
+      // Zeiger muss den Aufruf ueberleben.
+      //
+      // Bei negativem oder zu grossem `start` kaeme sonst ein Lesezugriff
+      // ausserhalb der Kette heraus. Deshalb wird `len` hier nur kopiert,
+      // solange ein Zeichen ungleich Null kommt — die Kette endet also
+      // spaetestens an ihrem eigenen Ende, auch wenn der Aufrufer zu viel
+      // verlangt.
+      self.emitLdur(ARM64_X9, ARM64_X29, self.slotOff(0));      // x9  = s
+      self.emitLdur(ARM64_X10, ARM64_X29, self.slotOff(1));     // x10 = start
+      self.emitLdur(ARM64_X7, ARM64_X29, self.slotOff(2));      // x7  = len
+      self.emit32(0x8B0700E1);                                  // ADD x1, x7, x7  (2*len ...)
+      self.emit32(0x91004021);                                  // ADD x1, x1, #16 (... + 16 Reserve)
+      self.emitBumpAlloc();                                     // #2227: x0 = Puffer
+      self.emit32(0x8B0A0129);                                  // ADD x9, x9, x10  (Quelle = s + start)
+      self.emit32(0xAA0003E2);                                  // MOV x2, x0       (Schreibmarke)
+      self.emit32(0xD2800003);                                  // MOVZ x3, #0      (Zaehler)
+      var ssLoop: int64 := self.codeLen;
+      self.emit32(0xEB07007F);                                  // CMP x3, x7
+      self.emit32(0x540000C2);                                  // B.CS +6  (fertig: hinter die Schleife)
+      self.emit32(0x38636926);                                  // LDRB w6, [x9, x3]
+      self.emit32(0x34000086);                                  // CBZ w6, +4 (Kette zu Ende)
+      self.emit32(0x38236846);                                  // STRB w6, [x2, x3]
+      self.emit32(0x91000463);                                  // ADD x3, x3, #1
+      var ssRel: int64 := (ssLoop - self.codeLen) / 4;
+      self.emit32(0x14000000 | (ssRel & 0x3FFFFFF));            // B Schleifenanfang
+      self.emit32(0x3823685F);                                  // STRB wzr, [x2, x3]  (Nullbyte)
+    } else if id == 16 {
+      // #1388: IntToStr(n) — Dezimaltext, Zeiger nach x0.
+      //
+      // Der Puffer kommt aus dem Bump-Block (#2227), nicht vom Stapel: der Zeiger muss den
+      // Aufruf ueberleben (dieselbe Ueberlegung wie im lyxos-Backend).
+      // Gerechnet wird von hinten nach vorn, weil die niedrigste Stelle
+      // zuerst herausfaellt; zurueck kommt ein Zeiger auf die erste Ziffer,
+      // nicht auf den Pufferanfang.
+      //
+      // Benutzt werden nur x0-x6, x8, x9 und x10 — die Register, die dieses
+      // Backend ohnehin als fluechtig behandelt. Ein erster Anlauf rechnete in
+      // x11-x15 und brachte laengere Programme zum Absturz.
+      self.emitLdur(ARM64_X9, ARM64_X29, self.slotOff(0));      // x9 = n
+      self.emitMovImmReg(ARM64_X1, 64);
+      self.emitBumpAlloc();                                     // #2227: x0 = Puffer
+      self.emit32(0xAA0003EA);                                  // MOV x10, x0
+      self.emit32(0x9100FD42);                                  // ADD x2, x10, #63   (Schreibmarke)
+      self.emit32(0x3900005F);                                  // STRB wzr, [x2]     (Nullbyte)
+      // Vorzeichen merken, dann mit dem Betrag rechnen.
+      self.emitMovImmReg(ARM64_X3, 0);                          // x3 = Vorzeichenmerker
+      self.emit32(0xF100013F);                                  // CMP x9, #0
+      self.emit32(0x5400006A);                                  // B.GE +3
+      self.emit32(0xCB0903E9);                                  // NEG x9, x9
+      self.emitMovImmReg(ARM64_X3, 1);
+      self.emitMovImmReg(ARM64_X5, 10);                         // x5 = Teiler
+      // Ziffernschleife. Sie laeuft mindestens einmal, damit aus der 0 eine
+      // "0" wird und nicht eine leere Zeichenkette.
+      var itsLoop: int64 := self.codeLen;
+      self.emit32(0x9AC50924);                                  // UDIV x4, x9, x5
+      self.emit32(0x9B05A486);                                  // MSUB x6, x4, x5, x9  (Bit 15 unterscheidet MSUB von MADD)
+      self.emit32(0x9100C0C6);                                  // ADD x6, x6, #48
+      self.emit32(0xD1000442);                                  // SUB x2, x2, #1
+      self.emit32(0x39000046);                                  // STRB w6, [x2]
+      self.emit32(0xAA0403E9);                                  // MOV x9, x4
+      var itsRel: int64 := (itsLoop - self.codeLen) / 4;
+      self.emit32(0xB5000009 | ((itsRel & 0x7FFFF) << 5));      // CBNZ x9, Schleifenanfang
+      // Minuszeichen, falls es eins gab.
+      self.emit32(0xB4000083);                                  // CBZ x3, +4
+      self.emit32(0xD1000442);                                  // SUB x2, x2, #1
+      self.emit32(0x528005A6);                                  // MOVZ w6, #45  ('-')
+      self.emit32(0x39000046);                                  // STRB w6, [x2]
+      self.emit32(0xAA0203E0);                                  // MOV x0, x2
+    } else if id == 14 {
+      // #1388: Zeilenumbruch auf stderr (EPrintStrLn/EPrintLn).
+      self.emit32(0xD10043FF);  // SUB sp,sp,#16
+      self.emit32(0x52800143);  // MOVZ w3,#10
+      self.emit32(0x390003E3);  // STRB w3,[sp]
+      self.emit32(0x910003E1);  // MOV x1,sp
+      self.emit32(0xD2800022);  // MOVZ x2,#1
+      self.emit32(0xD2800040);  // MOVZ x0,#2
+      self.emit32(0xD2800808);  // MOVZ x8,#64
+      self.emit32(0xD4000001);  // SVC #0
+      self.emit32(0x910043FF);  // ADD sp,sp,#16
+    } else {
+      // #1037: bis hierher fiel jede nicht behandelte ID STILL durch — es wurde
+      // kein Code erzeugt, keine Meldung ausgegeben. Genau so verschwand Printf
+      // (id 12) auf Linux-ARM64 spurlos, nachdem es vorher den Barrieren-Handler
+      // getroffen hatte.
+      self._builtinUnsupported(id, 0);
     }
     self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
+  }
+
+  // #1037: unbehandelte Builtin-ID laut melden statt still nichts zu erzeugen.
+  // winMode: 1 = Windows-Zweig, 0 = Linux-Zweig.
+  // #1388: peek8/16/32/64 und poke8/16/32/64. Bis 1.1.0A meldete arm64 sie als
+  // unbehandelt — richtig gemeldet, aber eben nicht umgesetzt, und damit war
+  // jede Unit unbrauchbar, die Speicher direkt anfasst (also fast die ganze
+  // Standardbibliothek). Adresse steht in Slot 0, der Wert (beim Schreiben) in
+  // Slot 1; das Ergebnis geht wie ueberall ueber x0 zurueck.
+  fn _emitPeekPoke(id: int64, argBase: int64) {
+    // #1388: Die Adresse steht NICHT in Slot 0, sondern in einem hohen Block,
+    // dessen erster Slot als src1 mitkommt (argBase). ir_lower spillt seit dem
+    // Misdispatch-Fix (#839) absichtlich dorthin, weil die festen Slots 0..2
+    // die Locals des Aufrufers ueberschreiben. Bis 1.1.5C lasen die drei
+    // IR-Backends trotzdem Slot 0 und 1 — sie bekamen also irgendeinen Wert
+    // des Aufrufers als Adresse. Auf arm64 war das ein Segfault bei jedem
+    // peek8; gemessen wurde damals nur, ob die BYTES entstehen, nicht, ob das
+    // Programm laeuft.
+    var sBase: int64 := argBase;
+    if (sBase < 0) { sBase := 0; }
+    self.emitLdur(ARM64_X1, ARM64_X29, self.slotOff(sBase));    // x1 = Adresse
+    if (id == 200) { self.emitLdrb0(ARM64_X0, ARM64_X1); return; }
+    if (id == 208) { self.emitLdrh0(ARM64_X0, ARM64_X1); return; }
+    if (id == 201) { self.emitLdrsw0(ARM64_X0, ARM64_X1); return; }   // #2300
+    if (id == 202) { self.emitLdrx0(ARM64_X0, ARM64_X1); return; }
+    self.emitLdur(ARM64_X2, ARM64_X29, self.slotOff(sBase + 1));    // x2 = Wert
+    if (id == 203) { self.emitStrb0(ARM64_X2, ARM64_X1); }
+    if (id == 209) { self.emitStrh0(ARM64_X2, ARM64_X1); }
+    if (id == 204) { self.emitStrw0(ARM64_X2, ARM64_X1); }
+    if (id == 205) { self.emitStrx0(ARM64_X2, ARM64_X1); }
+    self.emitMovImmReg(ARM64_X0, 0);
+  }
+
+  fn _builtinUnsupported(id: int64, isWin: int64) {
+    EPrintStr("error: arm64: Builtin-ID "c);
+    EPrintInt(id);
+    if isWin != 0 { EPrintStr(" wird im Windows-Zweig nicht behandelt"c); }
+    else          { EPrintStr(" wird im Linux-Zweig nicht behandelt"c); }
+    EPrintStrLn(""c);
+    EPrintStrLn("  Die IDs sind ein globaler Namensraum ueber alle Backends."c);
+    EPrintStrLn("  Vergabe und Belegung stehen in src/backend/_builtin_ids.md."c);
+    exit(1);
   }
 
   // -------------------------------------------------------------------------
@@ -924,9 +2191,26 @@ pub type EmitARM64 = class {
   // -------------------------------------------------------------------------
 
   fn emitLabelDef(labelId: int64) {
-    if labelId < 1024 {
-      poke64(self.labelAddrs + labelId * 8, self.codeLen);
+    // #2112: Die Tabelle war fest bei 1024; eine Marke jenseits davon wurde
+    // still verworfen und ihr Sprung nie nachgetragen.
+    if labelId < 0 {
+      EPrintStr("error: arm64: negative Marke "c); EPrintInt(labelId); EPrintStrLn(" (#2112)."c);
+      exit(1);
     }
+    if labelId >= self.labelCap {
+      var nc: int64 := self.labelCap * 2;
+      while labelId >= nc { nc := nc * 2; }
+      var nb: int64 := alloc(nc * 8);
+      var ci: int64 := 0;
+      while ci < nc {
+        if ci < self.labelCap { poke64(nb + ci * 8, peek64(self.labelAddrs + ci * 8)); }
+        else                  { poke64(nb + ci * 8, -1); }
+        ci := ci + 1;
+      }
+      self.labelAddrs := nb;
+      self.labelCap   := nc;
+    }
+    poke64(self.labelAddrs + labelId * 8, self.codeLen);
   }
 
   fn emitBranch(labelId: int64) {
@@ -948,14 +2232,63 @@ pub type EmitARM64 = class {
     }
   }
 
+  // #2112: Die Liste wuchs nicht — jenseits von 1024 Eintraegen fiel jeder
+  // weitere Patch still weg. Weil die Aufruf-Patches ueber alle Funktionen
+  // hinweg stehenbleiben (siehe emitFunc), reichten dafuer gut tausend Aufrufe
+  // im ganzen Programm. Dieselbe Rechnung wie addPatch in riscv_linux.lyx
+  // (#1740) — die beiden muessen uebereinstimmen.
   fn addPatch(codeOff: int64, labelId: int64, ptype: int64, reg: int64) {
-    if self.patchCount < 1024 {
-      var base: int64 := self.patchBuf + self.patchCount * 32;
-      poke64(base,      codeOff);
-      poke64(base + 8,  labelId);
-      poke64(base + 16, ptype);
-      poke64(base + 24, reg);
-      self.patchCount := self.patchCount + 1;
+    if self.patchCount >= self.patchCap {
+      var nc: int64 := self.patchCap * 2;
+      var nb: int64 := alloc(nc * 32);
+      var ci: int64 := 0;
+      while ci < self.patchCount * 4 {
+        poke64(nb + ci * 8, peek64(self.patchBuf + ci * 8));
+        ci := ci + 1;
+      }
+      self.patchBuf := nb;
+      self.patchCap := nc;
+    }
+    var base: int64 := self.patchBuf + self.patchCount * 32;
+    poke64(base,      codeOff);
+    poke64(base + 8,  labelId);
+    poke64(base + 16, ptype);
+    poke64(base + 24, reg);
+    self.patchCount := self.patchCount + 1;
+  }
+
+  // #2112: Abstand passt nicht ins Befehlsfeld — vorher wurde er still auf
+  // die Feldbreite maskiert und der Sprung landete irgendwo.
+  fn _patchRangeError(what: pchar, dist: int64, limit: int64) {
+    EPrintStr("error: arm64: "c); EPrintStr(what);
+    EPrintStr(": Abstand "c); EPrintInt(dist);
+    EPrintStr(" Byte ueberschreitet die Reichweite von +/-"c); EPrintInt(limit);
+    EPrintStrLn(" Byte (#2112)."c);
+    exit(1);
+  }
+
+  // #2112: mode 1 = Ende einer Funktion (offene Marken-Patches sind ein
+  // Fehler), mode 0 = Ende von emit() (auch offene Aufrufe/Adressen).
+  fn _checkNoOpenPatches(mode: int64) {
+    var i: int64 := 0;
+    while i < self.patchCount {
+      var base:  int64 := self.patchBuf + i * 32;
+      var lid:   int64 := peek64(base + 8);
+      var ptype: int64 := peek64(base + 16);
+      if lid != -2 {
+        var isFn: int64 := 0;
+        if ptype == PATCH_BL || ptype == PATCH_ADR { isFn := 1; }
+        if mode == 0 || isFn == 0 {
+          EPrintStr("error: arm64: Sprungziel nie aufgeloest -- "c);
+          if isFn != 0 { EPrintStr("Funktion "c); } else { EPrintStr("Marke "c); }
+          EPrintInt(lid);
+          EPrintStr(" (Patchtyp "c); EPrintInt(ptype);
+          EPrintStr(", Code-Offset "c); EPrintInt(peek64(base));
+          EPrintStrLn(") (#2112)."c);
+          exit(1);
+        }
+      }
+      i := i + 1;
     }
   }
 
@@ -975,28 +2308,55 @@ pub type EmitARM64 = class {
         // on the pre-init pass in calcStackFrame for labelAddrs and on the
         // funcAddrs writes in emitFunc.
         var target: int64 := -1;
-        if ptype == PATCH_BL {
-          if labelId < 256 {
+        if ptype == PATCH_BL || ptype == PATCH_ADR {
+          if labelId >= 0 && labelId < self.funcCap {
+            // #2451: funcAddrs ist auf -1 vorbelegt, ein Offset 0 ist deshalb
+            // eine echte Adresse. Hier stand die Regel "0 gilt nur fuer
+            // Funktion 0" -- sie band die Pruefung an die Annahme, dass
+            // Funktion 0 zuerst emittiert wird, und die gilt mit dem Schnitt
+            // aus #2451 nicht mehr.
             target := peek64(self.funcAddrs + labelId * 8);
-            // A funcAddrs[i] of 0 is valid only for the FIRST emitted
-            // function (labelId 0). Any other 0 means "not yet emitted".
-            if target == 0 {
-              if labelId != 0 { target := -1; }
-            }
           }
         } else {
-          if labelId < 1024 {
+          if labelId >= 0 && labelId < self.labelCap {
             target := peek64(self.labelAddrs + labelId * 8);
           }
         }
 
         if target >= 0 {
           var delta: int64 := (target - codeOff) >> 2;
+          // #2112: Reichweiten — B/BL imm26 (+/-128 MiB), CBZ/CBNZ imm19
+          // (+/-1 MiB), ADR imm21 in Byte (+/-1 MiB). Vorher wurde der Abstand
+          // still auf die Feldbreite maskiert.
+          var dist: int64 := target - codeOff;
+          if ptype == PATCH_B || ptype == PATCH_BL {
+            if dist < 0 - 0x8000000 || dist >= 0x8000000 {
+              self._patchRangeError("B/BL"c, dist, 0x8000000);
+            }
+          } else if ptype == PATCH_ADR {
+            if dist < 0 - 0x100000 || dist >= 0x100000 {
+              self._patchRangeError("ADR (Funktionsadresse)"c, dist, 0x100000);
+            }
+          } else if ptype == PATCH_CBZ || ptype == PATCH_CBNZ {
+            if dist < 0 - 0x100000 || dist >= 0x100000 {
+              self._patchRangeError("CBZ/CBNZ (bedingter Sprung, Funktion zu gross)"c, dist, 0x100000);
+            }
+          } else {
+            EPrintStr("error: arm64: unbekannter Patchtyp "c); EPrintInt(ptype); EPrintStrLn(" (#2112)."c);
+            exit(1);
+          }
           if ptype == PATCH_B || ptype == PATCH_BL {
             var opc: int64 := 0x14000000;
             if ptype == PATCH_BL { opc := 0x94000000; }
             var enc: int64 := opc | (delta & 0x3FFFFFF);
             self.poke32at(codeOff, enc);
+          } else if ptype == PATCH_ADR {
+            // #1806: ADR traegt den Abstand in BYTE (nicht in Befehlen), 21 Bit,
+            // aufgeteilt in immlo (Bits 30:29) und immhi (Bits 23:5).
+            var dByte: int64 := target - codeOff;
+            var immlo: int64 := dByte & 3;
+            var immhi: int64 := (dByte >> 2) & 0x7FFFF;
+            self.poke32at(codeOff, 0x10000000 | (immlo << 29) | (immhi << 5) | reg);
           } else if ptype == PATCH_CBZ {
             var enc: int64 := 0xB4000000 | ((delta & 0x7FFFF) << 5) | reg;
             self.poke32at(codeOff, enc);
@@ -1016,6 +2376,89 @@ pub type EmitARM64 = class {
   // Allocation
   // -------------------------------------------------------------------------
 
+  // #2144: Rueckgabewert von mmap pruefen, statt ihn als Zeiger zu benutzen.
+  // Dieselbe Pruefung wie cg_emitMmapGeprueft im x86-Weg (#1947) und
+  // rv_mmapGeprueft (riscv_linux.lyx) — die drei muessen uebereinstimmen:
+  // Fehlerbereich [-4095, -1], Meldung "Speicheranforderung fehlgeschlagen
+  // (mmap)" auf stderr, exit_group(1). Bis 1.2.16A lief -ENOMEM als Adresse
+  // weiter und der naechste Zugriff faultete ohne Aussage.
+  // Erwartet x0 direkt nach dem SVC. Die Meldung steht im Code (wie
+  // emitConstStr), ADR adressiert sie. Ueberschreibt im Fehlerfall x0-x2, x8.
+  fn emitMmapGeprueft() {
+    if self.winMode != 0 { return; }   // VirtualAlloc-Weg, kein mmap
+    self.emit32(0xB13FFC1F);   // CMN x0, #4095   (C=1 genau fuer x0 in [-4095,-1])
+    self.emit32(0x54000283);   // B.LO +20 Befehle (hinter die Meldung)
+    self.emit32(0x10000101);   // ADR x1, +32 (Meldung)
+    self.emit32(0xD2800040);   // MOVZ x0, #2 (stderr)
+    self.emit32(0xD2800542);   // MOVZ x2, #42
+    self.emit32(0xD2800808);   // MOVZ x8, #64 (write)
+    self.emit32(0xD4000001);   // SVC #0
+    self.emit32(0xD2800020);   // MOVZ x0, #1
+    self.emit32(0xD2800BC8);   // MOVZ x8, #94 (exit_group)
+    self.emit32(0xD4000001);   // SVC #0
+    // "Speicheranforderung fehlgeschlagen (mmap)\n" + 2 Byte Fuellung = 11 Worte
+    var m: pchar := "Speicheranforderung fehlgeschlagen (mmap)\n";
+    var i: int64 := 0;
+    while i < 42 { self.emit8(StrCharAt(m, i)); i := i + 1; }
+    self.emit8(0); self.emit8(0);
+  }
+
+  // #2227: x0 := Puffer mit x1 Byte aus dem Bump-Block. Dieselbe Rechnung wie
+  // cg_emitBumpAtomarIn im x86-Weg (src/codegen_x86.lyx): Zeiger und Ende im
+  // Datenbereich, Bloecke von 64 KiB oder der Anforderung selbst auf ganze
+  // Seiten aufgerundet, mmap geprueft (#2144). Vorher holte JEDER Aufruf von
+  // StrConcat/StrSub/IntToStr ein eigenes mmap — eine Seite, ein Mapping,
+  // nie freigegeben; nach rund einer Million war vm.max_map_count erschoepft.
+  //
+  // NICHT atomar: dieses Backend kennt keine Threads (kein clone). Kommen sie
+  // dazu, muss der schnelle Weg LDAXR/STLXR werden und der langsame eine
+  // Sperre bekommen, wie x86 sie mit `lock cmpxchg` hat.
+  //
+  // Register: nur x0-x6, x8, x16, x17. StrConcat haelt x9-x12, StrSub x7,
+  // x9 und x10 ueber die Anforderung hinweg. x1 ist danach die auf 16
+  // aufgerundete Groesse.
+  fn emitBumpAlloc() {
+    if self.bumpGIdx < 0 { self.bumpGIdx := _irGlobalsAnhaengen(self.ir, 2); }
+    self.emit32(0x91003C21);   // ADD x1, x1, #15
+    self.emit32(0x927CEC21);   // AND x1, x1, #~15
+    // Adresse der Globals nach x16. _emitGlobalAddrX9 schreibt fest x9 (auch
+    // der ADRP-Nachtrag fuer .so), x9 ist hier aber belegt: retten in x17.
+    self.emit32(0xAA0903F1);   // MOV x17, x9
+    self._emitGlobalAddrX9(self.bumpGIdx);
+    self.emit32(0xAA0903F0);   // MOV x16, x9
+    self.emit32(0xAA1103E9);   // MOV x9, x17
+    self.emit32(0xF9400200);   // LDR x0, [x16]       (Zeiger)
+    self.emit32(0xF9400602);   // LDR x2, [x16, #8]   (Ende)
+    self.emit32(0x8B010003);   // ADD x3, x0, x1
+    self.emit32(0xEB02007F);   // CMP x3, x2
+    self.emit32(0x54000068);   // B.HI +3 (langsam)
+    self.emit32(0xF9000203);   // STR x3, [x16]
+    var pFertig: int64 := self.codeLen;
+    self.emit32(0x14000000);   // B fertig (nachgetragen)
+    // langsam: Blockgroesse = max(64 KiB, Anforderung auf Seiten aufgerundet)
+    self.emit32(0x913FFC31);   // ADD x17, x1, #4095
+    self.emit32(0x9274CE31);   // AND x17, x17, #~4095
+    self.emit32(0xD2A00022);   // MOVZ x2, #1, LSL #16   (65536)
+    self.emit32(0xEB02023F);   // CMP x17, x2
+    self.emit32(0x9A828231);   // CSEL x17, x17, x2, HI
+    self.emit32(0xAA0103E6);   // MOV x6, x1   (Groesse; SVC laesst x1..x17 stehen)
+    self.emit32(0xD2800000);   // MOVZ x0, #0
+    self.emit32(0xAA1103E1);   // MOV x1, x17
+    self.emit32(0xD2800062);   // MOVZ x2, #3      PROT_READ|PROT_WRITE
+    self.emit32(0xD2800443);   // MOVZ x3, #0x22   MAP_PRIVATE|MAP_ANON
+    self.emit32(0x92800004);   // MOVN x4, #0      fd = -1
+    self.emit32(0xD2800005);   // MOVZ x5, #0
+    self.emitMovImmReg(ARM64_X8, SYS_MMAP);
+    self.emit32(0xD4000001);   // SVC #0 -> x0 = Blockanfang
+    self.emitMmapGeprueft();
+    self.emit32(0x8B110002);   // ADD x2, x0, x17
+    self.emit32(0xF9000602);   // STR x2, [x16, #8]  (Ende)
+    self.emit32(0x8B060003);   // ADD x3, x0, x6
+    self.emit32(0xF9000203);   // STR x3, [x16]      (Zeiger)
+    var rel: int64 := (self.codeLen - pFertig) / 4;
+    poke32(self.codeBuf + pFertig, 0x14000000 | (rel & 0x3FFFFFF));
+  }
+
   fn emitAlloc(sizeSlot: int64, dest: int64) {
     // WP-D2: Windows mode — call wab_alloc helper (VirtualAlloc)
     if self.winMode != 0 {
@@ -1034,10 +2477,13 @@ pub type EmitARM64 = class {
     self.emitMovImmReg(ARM64_X5, 0);   // offset=0
     self.emitMovImmReg(ARM64_X8, SYS_MMAP);
     self.emit32(0xD4000001);           // SVC #0
+    self.emitMmapGeprueft();   // #2144
     self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
   }
 
-  fn emitFree(ptrSlot: int64) {
+  // #2052: lenSlot ist die Laenge aus `munmap(p, n)`, destSlot nimmt den
+  // Rueckgabewert auf. lenSlot == -1 heisst "Laenge unbekannt" (dispose).
+  fn emitFree(ptrSlot: int64, lenSlot: int64, destSlot: int64) {
     // WP-D2: Windows mode — call wab_free helper (VirtualFree)
     if self.winMode != 0 {
       self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(ptrSlot));
@@ -1045,11 +2491,20 @@ pub type EmitARM64 = class {
       self.emit32(0x94000000);  // BL placeholder → wab_free
       return;
     }
-    // Linux: munmap
+    // Linux: munmap(ptr, len)
+    //
+    // #2052: Hier stand `x1 = 0`. munmap mit Laenge 0 ist unter Linux immer
+    // EINVAL — der Aufruf gab nie etwas frei.
+    //
+    // Ohne bekannte Laenge wird deshalb gar nichts erzeugt, statt einen
+    // Systemaufruf abzusetzen, der nur scheitern kann. Dieselbe Entscheidung
+    // steht in riscv_linux.lyx — die beiden muessen uebereinstimmen.
+    if lenSlot < 0 { return; }
     self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(ptrSlot));
-    self.emitMovImmReg(ARM64_X1, 0);
+    self.emitLdur(ARM64_X1, ARM64_X29, self.slotOff(lenSlot));
     self.emitMovImmReg(ARM64_X8, SYS_MUNMAP);
     self.emit32(0xD4000001);
+    if destSlot >= 0 { self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(destSlot)); }
   }
 
   // -------------------------------------------------------------------------
@@ -1060,6 +2515,21 @@ pub type EmitARM64 = class {
     self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(src));
     // SCVTF d0, x0  (int64 → double)
     self.emit32(0x9E620000 | (ARM64_X0 << 5) | ARM64_D0);
+    self.emitFStur(ARM64_D0, ARM64_X29, self.slotOff(dest));
+  }
+
+  // #2160: f32-Feld <-> double im Slot.
+  fn emitF64ZuF32(src: int64, dest: int64) {
+    self.emitFLdur(ARM64_D0, ARM64_X29, self.slotOff(src));
+    self.emit32(0x1E624000);   // FCVT s0, d0
+    self.emit32(0x1E260000);   // FMOV w0, s0 (obere 32 Bit von x0 = 0)
+    self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
+  }
+
+  fn emitF32ZuF64(src: int64, dest: int64) {
+    self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(src));
+    self.emit32(0x1E270000);   // FMOV s0, w0
+    self.emit32(0x1E22C000);   // FCVT d0, s0
     self.emitFStur(ARM64_D0, ARM64_X29, self.slotOff(dest));
   }
 
@@ -1074,36 +2544,551 @@ pub type EmitARM64 = class {
   // NEON SIMD
   // -------------------------------------------------------------------------
 
-  fn emitNeon(base: int64, src1: int64, src2: int64, dest: int64) {
-    // Use v0.2d and v1.2d as scratch SIMD regs, result in v0.2d
-    self.emitFLdur(ARM64_D0, ARM64_X29, self.slotOff(src1));
-    self.emitFLdur(ARM64_D1, ARM64_X29, self.slotOff(src2));
-    self.emit32(base | (1 << 16) | (0 << 5) | 0);
+  // #2185: Hier stand eine Fassung, die beide Operanden als 64-Bit-SKALAR aus
+  // einem Stack-Slot lud (D0/D1) und ein festes Befehlswort anhaengte. Ein
+  // `parallel Array<f32>` ist aber ein ZEIGER auf einen ausgerichteten Block
+  // mit der Elementzahl bei ptr-8; der x86-Weg laeuft deshalb eine Schleife.
+  // Die vier Befehlswoerter waren zudem alle falsch — mit llvm-mc dekodiert:
+  // SIMD_ADD ergab `add v0.8h` (Integer, 16-Bit-Lanes), SIMD_SUB `add v0.2d`
+  // (Addition statt Subtraktion), SIMD_MUL war gar kein gueltiger Befehl und
+  // SIMD_DIV `fdiv v0.2d` (f64-Lanes statt f32). Aufgefallen ist nichts davon,
+  // weil IRO_SIMD_NEW auf arm64 fehlte: kein Programm kam bis hierher.
+  //
+  // Jetzt: Zeiger plus Schleife wie in codegen_x86.cg_emitSSE2BinOp — Vektorteil
+  // in 16-Byte-Schritten, danach ein skalarer Rest-Durchgang. Die drei Stellen
+  // (x86-ELF, lyxos, arm64) muessen uebereinstimmen.
+  //
+  // `vecWort`/`skalarWort` sind die fertigen Befehlswoerter fuer v0 = v0 OP v1
+  // bzw. s0 = s0 OP s1, jedes einzeln mit llvm-mc gegengelesen.
+  //
+  // #2199: `bytes` ist die Elementbreite. Zwischen der f32- und der
+  // f64-Form unterscheidet in BEIDEN Befehlswoertern genau Bit 22
+  // (0x00400000) — `fadd v0.4s` ist 0x4E21D400, `fadd v0.2d` 0x4E61D400;
+  // skalar `fadd s0` 0x1E212800, `fadd d0` 0x1E612800. Deshalb ein ODER
+  // statt acht weiterer Konstanten. Alle Woerter mit llvm-mc assembliert.
+  //
+  // Der Vektorteil bleibt bei 16 Byte je Durchlauf (ein q-Register fasst vier
+  // f32 oder zwei f64); nur der skalare Rest zaehlt in Elementen.
+  // #2247: Ganzzahl-Vektorwort je Breite. Das Groessenfeld sitzt in Bit 23:22
+  // (00 = .16B, 01 = .8H, 10 = .4S, 11 = .2D); das Grundwort traegt schon
+  // Rm = v1, Rn = v0, Rd = v0.
+  //
+  //   ADD  Vd.16B, Vn.16B, Vm.16B   0x4E218400
+  //   SUB  Vd.16B, ...              0x6E218400
+  //   MUL  Vd.16B, ...              0x4E219C00   (kein .2D — ARM64 hat kein
+  //                                               64-Bit-MUL als Vektor)
+  //
+  // Dieselbe Einschraenkung wie auf x86 (dort fehlt PMULLQ) — sema weist das
+  // vorher ab (_pruefeVektorOpArt), hier wird es nur nicht still erzeugt.
+  fn neonGanzWort(grund: int64, bytes: int64): int64 {
+    var gr: int64 := 0;
+    if bytes == 2 { gr := 1; }
+    if bytes == 4 { gr := 2; }
+    if bytes == 8 { gr := 3; }
+    return grund | (gr * 0x00400000);
+  }
+
+  // #2247: Ein Element des Restes in Allzweckregistern. Geladen wird
+  // VORZEICHENERWEITERT (x6 = links, x7 = rechts), gerechnet in 64 Bit und
+  // nur die Breite selbst zurueckgeschrieben — dieselbe Bedeutung wie der
+  // x86-Rest (cg_emitGanzRestOp) und wie peek8/16/32 (#2300).
+  //
+  // Adressform ist "Register-Offset mit LSL #0", x5 ist also ein BYTE-Offset
+  // — wie im Vektorteil darueber. x6 und x7 sind frei: der Rumpf benutzt
+  // x0 (Ziel), x2 (Zahl), x3/x4 (Quellen) und x5 (Offset).
+  fn emitNeonGanzRest(op: int64, bytes: int64) {
+    var ldL: int64 := 0;
+    var ldR: int64 := 0;
+    var st:  int64 := 0;
+    // Rm = x5 steht in Bit 20:16 (0x50000). Ohne dieses Feld laeuft der
+    // Zugriff ueber x0 statt ueber den Offset — bei der ersten Fassung
+    // faultete deshalb jedes Feld mit einem REST (ab 5 Elementen bei 4 Byte;
+    // 4 Elemente sind genau ein Vektorblock und gingen gut).
+    if bytes == 1 {
+      ldL := 0x38A56866; ldR := 0x38A56887; st := 0x38256806;   // LDRSB x6/x7, STRB w6
+    } else if bytes == 2 {
+      ldL := 0x78A56866; ldR := 0x78A56887; st := 0x78256806;   // LDRSH, STRH
+    } else if bytes == 4 {
+      ldL := 0xB8A56866; ldR := 0xB8A56887; st := 0xB8256806;   // LDRSW, STR w6
+    } else {
+      ldL := 0xF8656866; ldR := 0xF8656887; st := 0xF8256806;   // LDR x6/x7, STR x6
+    }
+    self.emit32(ldL);          // x6 = [x3, x5]
+    self.emit32(ldR);          // x7 = [x4, x5]
+    if op == IRO_SIMD_ADD      { self.emit32(0x8B0700C6); }      // ADD x6, x6, x7
+    else if op == IRO_SIMD_SUB { self.emit32(0xCB0700C6); }      // SUB x6, x6, x7
+    else if op == IRO_SIMD_MUL { self.emit32(0x9B077CC6); }      // MUL x6, x6, x7
+    else {
+      EPrintStrLn("interner fehler (#2247): emitNeonGanzRest mit einer Operation ohne Ganzzahlform."c);
+      exit(1);
+    }
+    self.emit32(st);           // [x0, x5] = x6  (nur die Breite)
+  }
+
+  fn emitNeonBinOp(vecWort: int64, skalarWort: int64, src1: int64, src2: int64, dest: int64, bytes: int64, ganzOp: int64) {
+        // #2199: Schutz gegen eine 0 aus einem nicht versorgten IR-Pfad. Als
+        // Schrittweite waere sie eine Endlosschleife (`add rax, 0`) — genau
+        // das ist beim unaeren Pfad passiert. Hier wird NICHT stillschweigend
+        // 4 angenommen, sondern laut gemeldet: eine 0 heisst, dass eine
+        // Stelle in ir_lower die Breite nicht mitgibt, und das gehoert
+        // behoben, nicht geraten.
+    // #2247: `bytes` ist jetzt eine KENNUNG — Breite unten, Art in Bit 4
+    // (IR_SIMD_GANZ). Gleitkomma traegt weiter die nackte Breite, die
+    // Pruefung unten bleibt fuer sie also unveraendert.
+    var ganz: int64 := 0;
+    if (bytes & 16) != 0 { ganz := 1; }
+    var breite: int64 := bytes & 15;
+        if breite != 1 && breite != 2 && breite != 4 && breite != 8 {
+            EPrintStrLn("interner fehler: SIMD-Elementbreite ist keine von 1, 2, 4, 8 (#2199/#2247) -- eine IR-Stelle gibt sie nicht mit."c);
+            exit(1);
+        }
+        if ganz == 0 && breite != 4 && breite != 8 {
+            EPrintStrLn("interner fehler (#2247): Gleitkomma-Vektor mit einer Breite ausser 4 und 8."c);
+            exit(1);
+        }
+    var vw: int64 := vecWort;
+    var sw: int64 := skalarWort;
+    if ganz != 0 {
+      // Ganzzahl: eigenes Grundwort, Groesse im Feld 23:22. `skalarWort`
+      // bleibt ungenutzt — der Rest rechnet in Allzweckregistern.
+      var grund: int64 := 0;
+      if ganzOp == IRO_SIMD_ADD      { grund := 0x4E218400; }
+      else if ganzOp == IRO_SIMD_SUB { grund := 0x6E218400; }
+      else if ganzOp == IRO_SIMD_MUL { grund := 0x4E219C00; }
+      else {
+        EPrintStrLn("interner fehler (#2247): Ganzzahl-Vektoroperation ohne NEON-Befehl -- sema haette das abweisen muessen."c);
+        exit(1);
+      }
+      if ganzOp == IRO_SIMD_MUL && breite == 8 {
+        EPrintStrLn("interner fehler (#2247): 64-Bit-Multiplikation hat auf ARM64 keine Vektorform -- sema haette das abweisen muessen."c);
+        exit(1);
+      }
+      vw := self.neonGanzWort(grund, breite);
+    } else if breite == 8 { vw := vecWort | 0x00400000; sw := skalarWort | 0x00400000; }
+    // x0 = Zeiger auf lhs, x2 = Elementzahl aus [x0-8]
+    self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(src1));
+    self.emitLdur(ARM64_X2, ARM64_X0, 0 - 8);
+    // Die Elementzahl im Ziel-Slot parken: mmap unten braucht x0..x5 und x8,
+    // und die Quellzeiger stehen ohnehin in Rahmen-Slots.
+    self.emitStur(ARM64_X2, ARM64_X29, self.slotOff(dest));
+    // Ergebnispuffer anlegen: n*4 + 24 Byte, 16-Byte ausgerichtet, Zaehler bei ptr-8
+    // #2247: Bytezahl der Ablage je Breite; bei 1 Byte keine Schiebung.
+    if breite == 8      { self.emit32(0xD37DF042); }   // LSL x2, x2, #3   (#2199)
+    else if breite == 4 { self.emit32(0xD37EF442); }   // LSL x2, x2, #2
+    else if breite == 2 { self.emit32(0xD37FF842); }   // LSL x2, x2, #1
+    self.emit32(0x91006042);   // ADD x2, x2, #24
+    self.emitMovImmReg(ARM64_X0, 0);    // addr = 0
+    self.emit32(0xAA0203E1);            // MOV x1, x2  (Laenge)
+    self.emitMovImmReg(ARM64_X2, 3);    // PROT_READ|PROT_WRITE
+    self.emitMovImmReg(ARM64_X3, 34);   // MAP_PRIVATE|MAP_ANON
+    self.emitMovImmReg(ARM64_X4, -1);   // fd
+    self.emitMovImmReg(ARM64_X5, 0);    // offset
+    self.emitMovImmReg(ARM64_X8, SYS_MMAP);
+    self.emit32(0xD4000001);            // SVC #0
+    self.emitMmapGeprueft();            // #2144
+    self.emit32(0x91005C00);   // ADD x0, x0, #23
+    self.emit32(0x927CEC00);   // AND x0, x0, #0xfffffffffffffff0
+    // Elementzahl zurueckholen und bei ptr-8 ablegen
+    self.emitLdur(ARM64_X2, ARM64_X29, self.slotOff(dest));
+    self.emitStur(ARM64_X2, ARM64_X0, 0 - 8);
+    // Quellzeiger neu laden: x3 = lhs, x4 = rhs
+    self.emitLdur(ARM64_X3, ARM64_X29, self.slotOff(src1));
+    self.emitLdur(ARM64_X4, ARM64_X29, self.slotOff(src2));
+    // #2247: dieselbe Rechnung wie oben — die beiden muessen uebereinstimmen.
+    if breite == 8      { self.emit32(0xD37DF042); }   // LSL x2, x2, #3  (Bytezahl, #2199)
+    else if breite == 4 { self.emit32(0xD37EF442); }   // LSL x2, x2, #2
+    else if breite == 2 { self.emit32(0xD37FF842); }   // LSL x2, x2, #1
+    self.emit32(0xD1004042);   // SUB x2, x2, #16  (letzter voller Block; darf negativ werden)
+    self.emitMovImmReg(ARM64_X5, 0);   // Byte-Offset
+
+    // ---- Vektorteil: while (x5 <= x2) ----
+    var vecStart: int64 := self.codeLen;
+    self.emit32(0xEB0200BF);   // CMP x5, x2
+    var jgPos: int64 := self.codeLen;
+    self.emit32(0x5400000C);   // B.GT .tail  (Weite wird nachgetragen)
+    self.emit32(0x3CE56860);   // LDR q0, [x3, x5]
+    self.emit32(0x3CE56881);   // LDR q1, [x4, x5]
+    self.emit32(vw);           // v0 = v0 OP v1  (.4s bzw. .2d)
+    self.emit32(0x3CA56800);   // STR q0, [x0, x5]
+    self.emit32(0x910040A5);   // ADD x5, x5, #16
+    var vecBack: int64 := self.codeLen;
+    self.emit32(0x14000000 | (((vecStart - vecBack) / 4) & 0x03FFFFFF));   // B .vecStart
+    var tailStart: int64 := self.codeLen;
+    self.poke32at(jgPos, 0x5400000C | ((((tailStart - jgPos) / 4) & 0x7FFFF) << 5));
+
+    // ---- Rest: x2 zurueck auf die volle Bytezahl, dann 4 Byte je Schritt ----
+    self.emit32(0x91004042);   // ADD x2, x2, #16
+    var scalarStart: int64 := self.codeLen;
+    self.emit32(0xEB0200BF);   // CMP x5, x2
+    var jgePos: int64 := self.codeLen;
+    self.emit32(0x5400000A);   // B.GE .done  (Weite wird nachgetragen)
+    if ganz != 0 {
+      self.emitNeonGanzRest(ganzOp, breite);   // #2247
+      if breite == 1      { self.emit32(0x910004A5); }   // ADD x5, x5, #1
+      else if breite == 2 { self.emit32(0x910008A5); }   // ADD x5, x5, #2
+      else if breite == 4 { self.emit32(0x910010A5); }   // ADD x5, x5, #4
+      else                { self.emit32(0x910020A5); }   // ADD x5, x5, #8
+    } else if breite == 8 {
+      self.emit32(0xFC656860);   // LDR d0, [x3, x5]
+      self.emit32(0xFC656881);   // LDR d1, [x4, x5]
+      self.emit32(sw);           // d0 = d0 OP d1
+      self.emit32(0xFC256800);   // STR d0, [x0, x5]
+      self.emit32(0x910020A5);   // ADD x5, x5, #8
+    } else {
+      self.emit32(0xBC656860);   // LDR s0, [x3, x5]
+      self.emit32(0xBC656881);   // LDR s1, [x4, x5]
+      self.emit32(sw);           // s0 = s0 OP s1
+      self.emit32(0xBC256800);   // STR s0, [x0, x5]
+      self.emit32(0x910010A5);   // ADD x5, x5, #4
+    }
+    var scalarBack: int64 := self.codeLen;
+    self.emit32(0x14000000 | (((scalarStart - scalarBack) / 4) & 0x03FFFFFF));   // B .scalarStart
+    var donePos: int64 := self.codeLen;
+    self.poke32at(jgePos, 0x5400000A | ((((donePos - jgePos) / 4) & 0x7FFFF) << 5));
+
+    // Ergebniszeiger in den Ziel-Slot
+    self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
+  }
+
+  // #2190: Bit-Rechenwerke. arm64 hat sie alle als eigene Befehle, es gibt
+  // also keinen Grund fuer einen Software-Zweig und keine Faehigkeitsfrage:
+  // CLZ, RBIT, REV und ROR gehoeren zum Grundbestand von AArch64.
+  //
+  // popcount geht ueber NEON: eine Ganzzahl in ein d-Register, CNT zaehlt die
+  // Bits JE BYTE, ADDV summiert die acht Byte-Zaehler zu einem Wert. CNT
+  // allein waere die halbe Antwort — es liefert acht Teilsummen, nicht eine.
+  //
+  // clz(0) == 64 und ctz(0) == 64 ergeben sich hier von selbst: CLZ eines
+  // Nullworts ist 64, und RBIT+CLZ auf 0 ebenso. Damit stimmen die Werte mit
+  // dem x86-Weg ueberein, wo sie eigens abgefangen werden mussten.
+  fn emitBitBuiltin(id: int64, argBase: int64) {
+    // Das Ergebnis bleibt in x0; emitBuiltinCall legt es am Ende selbst im
+    // Ziel-Slot ab (wie bei jedem anderen Builtin).
+    if (id == 255) {                                   // popcount(x)
+      self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(argBase));
+      self.emit32(0x9E670000);   // FMOV d0, x0
+      self.emit32(0x0E205800);   // CNT v0.8b, v0.8b
+      self.emit32(0x0E31B800);   // ADDV b0, v0.8b
+      self.emit32(0x9E660000);   // FMOV x0, d0
+      return;
+    }
+    if (id == 256) {                                   // clz(x)
+      self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(argBase));
+      self.emit32(0xDAC01000);   // CLZ x0, x0
+      return;
+    }
+    if (id == 257) {                                   // ctz(x) = clz(rbit(x))
+      self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(argBase));
+      self.emit32(0xDAC00000);   // RBIT x0, x0
+      self.emit32(0xDAC01000);   // CLZ x0, x0
+      return;
+    }
+    if (id == 258) {                                   // bswap64(x)
+      self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(argBase));
+      self.emit32(0xDAC00C00);   // REV x0, x0
+      return;
+    }
+    if (id == 259) {                                   // rotl(x, n) = ror(x, 64-n)
+      // AArch64 kennt nur ROR. Die Linksrotation ist die Rechtsrotation um
+      // den Gegenwert; NEG liefert ihn, und weil die Hardware die Weite auf
+      // 6 Bit beschneidet, trifft das auch n = 0 richtig (NEG 0 = 0).
+      self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(argBase));
+      self.emitLdur(ARM64_X1, ARM64_X29, self.slotOff(argBase + 1));
+      self.emit32(0xCB0103E1);   // NEG x1, x1
+      self.emit32(0x9AC12C00);   // ROR x0, x0, x1
+      return;
+    }
+    if (id == 260) {                                   // rotr(x, n)
+      self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(argBase));
+      self.emitLdur(ARM64_X1, ARM64_X29, self.slotOff(argBase + 1));
+      self.emit32(0x9AC12C00);   // ROR x0, x0, x1
+      return;
+    }
+    // #2177: 32-Bit-Rotation. Die W-Form arbeitet auf den unteren 32 Bit,
+    // beschneidet die Weite auf 5 Bit und nullt beim Schreiben die oberen 32
+    // Bit von x0 — dieselben Werte wie rol/ror eax auf x86.
+    if (id == 261) {                                   // rotl32(x, n) = ror32(x, 32-n)
+      self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(argBase));
+      self.emitLdur(ARM64_X1, ARM64_X29, self.slotOff(argBase + 1));
+      self.emit32(0x4B0103E1);   // NEG w1, w1
+      self.emit32(0x1AC12C00);   // ROR w0, w0, w1
+      return;
+    }
+    if (id == 262) {                                   // rotr32(x, n)
+      self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(argBase));
+      self.emitLdur(ARM64_X1, ARM64_X29, self.slotOff(argBase + 1));
+      self.emit32(0x1AC12C00);   // ROR w0, w0, w1
+      return;
+    }
+  }
+
+  // #2185: `parallel Array<f32>(n)` — ausgerichtete Anlage mit Zaehler bei
+  // ptr-8, dieselbe Ablage wie CGN_SIMD_NEW auf x86 und emit_lyxos. Ohne diese
+  // Umsetzung brach arm64 mit "kennt Opcode 165 nicht" ab.
+  fn emitSimdNew(countSlot: int64, dest: int64, bytes: int64) {
+        // #2199: Schutz gegen eine 0 aus einem nicht versorgten IR-Pfad. Als
+        // Schrittweite waere sie eine Endlosschleife (`add rax, 0`) — genau
+        // das ist beim unaeren Pfad passiert. Hier wird NICHT stillschweigend
+        // 4 angenommen, sondern laut gemeldet: eine 0 heisst, dass eine
+        // Stelle in ir_lower die Breite nicht mitgibt, und das gehoert
+        // behoben, nicht geraten.
+        // #2247: `bytes` ist eine KENNUNG — Breite unten, Art in Bit 4.
+        var ganz: int64 := 0;
+        if (bytes & 16) != 0 { ganz := 1; }
+        var breite: int64 := bytes & 15;
+        if breite != 1 && breite != 2 && breite != 4 && breite != 8 {
+            EPrintStrLn("interner fehler: SIMD-Elementbreite ist keine von 1, 2, 4, 8 (#2199/#2247) -- eine IR-Stelle gibt sie nicht mit."c);
+            exit(1);
+        }
+        if ganz == 0 && breite != 4 && breite != 8 {
+            EPrintStrLn("interner fehler (#2247): Gleitkomma-Vektor mit einer Breite ausser 4 und 8."c);
+            exit(1);
+        }
+    self.emitLdur(ARM64_X2, ARM64_X29, self.slotOff(countSlot));
+    self.emitStur(ARM64_X2, ARM64_X29, self.slotOff(dest));   // Zahl parken
+    // #2199: n*4 fuer f32, n*8 fuer f64. Beide Woerter mit llvm-mc
+    // assembliert, nicht getippt.
+    // #2247: Groesse je Breite. Bei 1 Byte entfaellt die Schiebung ganz.
+    if breite == 8      { self.emit32(0xD37DF042); }   // LSL x2, x2, #3
+    else if breite == 4 { self.emit32(0xD37EF442); }   // LSL x2, x2, #2
+    else if breite == 2 { self.emit32(0xD37FF842); }   // LSL x2, x2, #1
+    self.emit32(0x91006042);   // ADD x2, x2, #24
+    self.emitMovImmReg(ARM64_X0, 0);
+    self.emit32(0xAA0203E1);            // MOV x1, x2
+    self.emitMovImmReg(ARM64_X2, 3);
+    self.emitMovImmReg(ARM64_X3, 34);
+    self.emitMovImmReg(ARM64_X4, -1);
+    self.emitMovImmReg(ARM64_X5, 0);
+    self.emitMovImmReg(ARM64_X8, SYS_MMAP);
+    self.emit32(0xD4000001);            // SVC #0
+    self.emitMmapGeprueft();
+    self.emit32(0x91005C00);   // ADD x0, x0, #23
+    self.emit32(0x927CEC00);   // AND x0, x0, #0xfffffffffffffff0
+    self.emitLdur(ARM64_X2, ARM64_X29, self.slotOff(dest));
+    self.emitStur(ARM64_X2, ARM64_X0, 0 - 8);
+    self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
+  }
+
+  // #2185: `v[i]` auf einem f32-Vektor — 4 Byte Schrittweite, Ergebnis als
+  // f64-WERT (nicht als Bitmuster). Gegenstueck zu emitSimdStoreElem; die
+  // beiden muessen uebereinstimmen, sonst liest man anders, als man schreibt.
+  fn emitSimdLoadElem(dest: int64, ptrSlot: int64, idxSlot: int64, bytes: int64) {
+        // #2199: Schutz gegen eine 0 aus einem nicht versorgten IR-Pfad. Als
+        // Schrittweite waere sie eine Endlosschleife (`add rax, 0`) — genau
+        // das ist beim unaeren Pfad passiert. Hier wird NICHT stillschweigend
+        // 4 angenommen, sondern laut gemeldet: eine 0 heisst, dass eine
+        // Stelle in ir_lower die Breite nicht mitgibt, und das gehoert
+        // behoben, nicht geraten.
+        // #2247: `bytes` ist eine KENNUNG — Breite unten, Art in Bit 4.
+        var ganz: int64 := 0;
+        if (bytes & 16) != 0 { ganz := 1; }
+        var breite: int64 := bytes & 15;
+        if breite != 1 && breite != 2 && breite != 4 && breite != 8 {
+            EPrintStrLn("interner fehler: SIMD-Elementbreite ist keine von 1, 2, 4, 8 (#2199/#2247) -- eine IR-Stelle gibt sie nicht mit."c);
+            exit(1);
+        }
+        if ganz == 0 && breite != 4 && breite != 8 {
+            EPrintStrLn("interner fehler (#2247): Gleitkomma-Vektor mit einer Breite ausser 4 und 8."c);
+            exit(1);
+        }
+    self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(ptrSlot));
+    self.emitLdur(ARM64_X1, ARM64_X29, self.slotOff(idxSlot));
+    // #2247: Ganzzahl-Element — Index auf die eigene Breite skalieren und
+    // VORZEICHENERWEITERT laden. Das Ergebnis ist eine Ganzzahl und gehoert
+    // in einen Allzweck-Slot, nicht in d0.
+    if ganz != 0 {
+      if breite == 2      { self.emit32(0xD37FF821); }   // LSL x1, x1, #1
+      else if breite == 4 { self.emit32(0xD37EF421); }   // LSL x1, x1, #2
+      else if breite == 8 { self.emit32(0xD37DF021); }   // LSL x1, x1, #3
+      if breite == 1      { self.emit32(0x38A16800); }   // LDRSB x0, [x0, x1]
+      else if breite == 2 { self.emit32(0x78A16800); }   // LDRSH x0, [x0, x1]
+      else if breite == 4 { self.emit32(0xB8A16800); }   // LDRSW x0, [x0, x1]
+      else                { self.emit32(0xF8616800); }   // LDR   x0, [x0, x1]
+      self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
+      return;
+    }
+    // #2199: bei f64 acht Byte Schrittweite, `ldr d0` — und KEIN FCVT, der
+    // Wert ist schon f64. Die Wandlung gehoert nur zum f32-Fall (#2183).
+    if breite == 8 {
+      self.emit32(0xD37DF021);   // LSL x1, x1, #3
+      self.emit32(0xFC616800);   // LDR d0, [x0, x1]
+    } else {
+      self.emit32(0xD37EF421);   // LSL x1, x1, #2
+      self.emit32(0xBC616800);   // LDR s0, [x0, x1]
+      self.emit32(0x1E22C000);   // FCVT d0, s0
+    }
     self.emitFStur(ARM64_D0, ARM64_X29, self.slotOff(dest));
+  }
+
+  // #2185: `v[i] := x` — f64-Wert nach f32 wandeln, dann ablegen.
+  fn emitSimdStoreElem(idxSlot: int64, valSlot: int64, ptrSlot: int64, bytes: int64) {
+        // #2199: Schutz gegen eine 0 aus einem nicht versorgten IR-Pfad. Als
+        // Schrittweite waere sie eine Endlosschleife (`add rax, 0`) — genau
+        // das ist beim unaeren Pfad passiert. Hier wird NICHT stillschweigend
+        // 4 angenommen, sondern laut gemeldet: eine 0 heisst, dass eine
+        // Stelle in ir_lower die Breite nicht mitgibt, und das gehoert
+        // behoben, nicht geraten.
+        // #2247: `bytes` ist eine KENNUNG — Breite unten, Art in Bit 4.
+        var ganz: int64 := 0;
+        if (bytes & 16) != 0 { ganz := 1; }
+        var breite: int64 := bytes & 15;
+        if breite != 1 && breite != 2 && breite != 4 && breite != 8 {
+            EPrintStrLn("interner fehler: SIMD-Elementbreite ist keine von 1, 2, 4, 8 (#2199/#2247) -- eine IR-Stelle gibt sie nicht mit."c);
+            exit(1);
+        }
+        if ganz == 0 && breite != 4 && breite != 8 {
+            EPrintStrLn("interner fehler (#2247): Gleitkomma-Vektor mit einer Breite ausser 4 und 8."c);
+            exit(1);
+        }
+    // #2247: Ganzzahl-Element — der Wert kommt aus einem Allzweck-Slot, und
+    // geschrieben wird nur die Breite selbst. Gegenstueck zum Lesen oben.
+    if ganz != 0 {
+      self.emitLdur(ARM64_X2, ARM64_X29, self.slotOff(valSlot));
+      self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(ptrSlot));
+      self.emitLdur(ARM64_X1, ARM64_X29, self.slotOff(idxSlot));
+      if breite == 2      { self.emit32(0xD37FF821); }   // LSL x1, x1, #1
+      else if breite == 4 { self.emit32(0xD37EF421); }   // LSL x1, x1, #2
+      else if breite == 8 { self.emit32(0xD37DF021); }   // LSL x1, x1, #3
+      if breite == 1      { self.emit32(0x38216802); }   // STRB w2, [x0, x1]
+      else if breite == 2 { self.emit32(0x78216802); }   // STRH w2, [x0, x1]
+      else if breite == 4 { self.emit32(0xB8216802); }   // STR  w2, [x0, x1]
+      else                { self.emit32(0xF8216802); }   // STR  x2, [x0, x1]
+      return;
+    }
+    self.emitFLdur(ARM64_D0, ARM64_X29, self.slotOff(valSlot));
+    if breite != 8 { self.emit32(0x1E624000); }   // FCVT s0, d0  (nur f32)
+    self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(ptrSlot));
+    self.emitLdur(ARM64_X1, ARM64_X29, self.slotOff(idxSlot));
+    if breite == 8 {
+      self.emit32(0xD37DF021);   // LSL x1, x1, #3
+      self.emit32(0xFC216800);   // STR d0, [x0, x1]
+    } else {
+      self.emit32(0xD37EF421);   // LSL x1, x1, #2
+      self.emit32(0xBC216800);   // STR s0, [x0, x1]
+    }
   }
 
   // -------------------------------------------------------------------------
   // Low-level LDUR/STUR (simm9: -256..255)
   // -------------------------------------------------------------------------
 
+  // #1388: schmale und unskalierte Zugriffe fuer die Speicher-Builtins
+  // (peek8/16/32/64, poke8/16/32/64). Offset ist hier immer 0 — die Adresse
+  // steht bereits im Register.
+  fn emitLdrb0(rt: int64, rn: int64) {   // LDRB Wt, [Xn]
+    self.emit32(0x39400000 | (rn << 5) | rt);
+  }
+  fn emitLdrh0(rt: int64, rn: int64) {   // LDRH Wt, [Xn]
+    self.emit32(0x79400000 | (rn << 5) | rt);
+  }
+  // #2300: LDRSW Xt, [Xn] — VORZEICHENERWEITERND. peek32 lud bis 1.2.24C mit
+  // LDR Wt und nullte damit die oberen 32 Bit; auf x86 erzeugt derselbe
+  // Builtin `movsxd`. Gleiche Quelle, verschiedener Wert (-1 gegen
+  // 4294967295). Die Null-Erweiterung bleibt fuer peek8/peek16 richtig, dort
+  // ist sie die festgelegte Bedeutung.
+  fn emitLdrsw0(rt: int64, rn: int64) {  // LDRSW Xt, [Xn]
+    self.emit32(0xB9800000 | (rn << 5) | rt);
+  }
+  fn emitLdrw0(rt: int64, rn: int64) {   // LDR Wt, [Xn]  (nullt die oberen 32 Bit)
+    self.emit32(0xB9400000 | (rn << 5) | rt);
+  }
+  fn emitLdrx0(rt: int64, rn: int64) {   // LDR Xt, [Xn]
+    self.emit32(0xF9400000 | (rn << 5) | rt);
+  }
+  fn emitStrb0(rt: int64, rn: int64) {   // STRB Wt, [Xn]
+    self.emit32(0x39000000 | (rn << 5) | rt);
+  }
+  fn emitStrh0(rt: int64, rn: int64) {   // STRH Wt, [Xn]
+    self.emit32(0x79000000 | (rn << 5) | rt);
+  }
+  fn emitStrw0(rt: int64, rn: int64) {   // STR Wt, [Xn]
+    self.emit32(0xB9000000 | (rn << 5) | rt);
+  }
+  fn emitStrx0(rt: int64, rn: int64) {   // STR Xt, [Xn]
+    self.emit32(0xF9000000 | (rn << 5) | rt);
+  }
+
   fn emitLdur(rt: int64, rn: int64, off: int64) {
-    // LDUR Xt, [Xn, #simm9]
-    // 1111 1000 010 imm9 00 Rn Rt
-    self.emit32(0xF8400000 | ((off & 0x1FF) << 12) | (rn << 5) | rt);
+    // LDUR Xt, [Xn, #simm9] — Bereichsgrenze wie bei emitStur (#1388).
+    if (off >= (0 - 256) && off <= 255) {
+      self.emit32(0xF8400000 | ((off & 0x1FF) << 12) | (rn << 5) | rt);
+      return;
+    }
+    self._emitFarAddr(rn, off);
+    self.emit32(0xF9400000 | (16 << 5) | rt);          // LDR Xt, [x16]
   }
 
   fn emitStur(rt: int64, rn: int64, off: int64) {
     // STUR Xt, [Xn, #simm9]
-    self.emit32(0xF8000000 | ((off & 0x1FF) << 12) | (rn << 5) | rt);
+    //
+    // #1388: simm9 reicht von -256 bis 255. Ein groesserer Offset wurde bis
+    // 1.1.5C stillschweigend auf neun Bit gekuerzt: Slot 32 liegt bei -264 und
+    // landete damit bei +248 — ein Schreibzugriff mitten in fremde Daten. Das
+    // fiel nicht auf, solange Funktionen klein blieben; der Kratzstreifen aus
+    // diesem Ticket schiebt jede Funktion um acht Slots weiter, und damit
+    // wurde aus der Enge ein Absturz.
+    //
+    // Passt es nicht, wird die Adresse erst gerechnet: x16 ist nach AAPCS64
+    // Kratzregister (IP0) und wird von diesem Backend sonst nicht benutzt.
+    if (off >= (0 - 256) && off <= 255) {
+      self.emit32(0xF8000000 | ((off & 0x1FF) << 12) | (rn << 5) | rt);
+      return;
+    }
+    self._emitFarAddr(rn, off);
+    self.emit32(0xF9000000 | (16 << 5) | rt);          // STR Xt, [x16]
+  }
+
+  // #1388: x16 := Xn + off, fuer Offsets ausserhalb von simm9. off ist hier
+  // immer negativ (Slots liegen unter dem Rahmenzeiger).
+  //
+  // #2062: Bis 1.2.11G endete die Reichweite bei 4095 — der Direktwert von SUB
+  // fasst zwoelf Bit —, und darueber wurde gemeldet: eine Funktion mit mehr als
+  // 512 Slots war fuer arm64 nicht uebersetzbar (examples/test_zlib.lyx). SUB
+  // kennt dieselben zwoelf Bit auch um zwoelf geschoben; in zwei Schritten
+  // reicht es damit bis 16 MB. Der haeufige Fall bleibt ein Befehl.
+  //
+  // Das Gegenstueck auf riscv ist _rvWeit (#2061).
+  fn _emitFarAddr(rn: int64, off: int64) {
+    var betrag: int64 := 0 - off;
+    if (off > 0) {
+      EPrintStrLn("error: arm64: positiver Rahmen-Offset ausserhalb simm9 (#1388)"c);
+      exit(1);
+    }
+    if (betrag > 0xFFFFFF) {
+      EPrintStr("error: arm64: Rahmen zu gross -- Slot-Offset "c);
+      EPrintInt(betrag);
+      EPrintStrLn(" ueberschreitet 16 MB (#2062)."c);
+      exit(1);
+    }
+    if (betrag <= 4095) {
+      self.emit32(0xD1000000 | (betrag << 10) | (rn << 5) | 16);   // SUB x16, Xn, #betrag
+      return;
+    }
+    var hoch: int64 := (betrag >> 12) & 0xFFF;
+    var tief: int64 := betrag & 0xFFF;
+    self.emit32(0xD1400000 | (hoch << 10) | (rn << 5) | 16);       // SUB x16, Xn, #hoch, LSL #12
+    if (tief != 0) {
+      self.emit32(0xD1000000 | (tief << 10) | (16 << 5) | 16);     // SUB x16, x16, #tief
+    }
   }
 
   fn emitFLdur(rt: int64, rn: int64, off: int64) {
-    // LDUR Dt, [Xn, #simm9]  (64-bit FP/SIMD)
-    self.emit32(0xFC400000 | ((off & 0x1FF) << 12) | (rn << 5) | rt);
+    // LDUR Dt, [Xn, #simm9]  (64-bit FP/SIMD) — Bereichsgrenze wie oben (#1388).
+    if (off >= (0 - 256) && off <= 255) {
+      self.emit32(0xFC400000 | ((off & 0x1FF) << 12) | (rn << 5) | rt);
+      return;
+    }
+    self._emitFarAddr(rn, off);
+    self.emit32(0xFD400000 | (16 << 5) | rt);          // LDR Dt, [x16]
   }
 
   fn emitFStur(rt: int64, rn: int64, off: int64) {
-    // STUR Dt, [Xn, #simm9]
+    // STUR Dt, [Xn, #simm9] — Bereichsgrenze wie oben (#1388).
+    if (off < (0 - 256) || off > 255) {
+      self._emitFarAddr(rn, off);
+      self.emit32(0xFD000000 | (16 << 5) | rt);        // STR Dt, [x16]
+      return;
+    }
     self.emit32(0xFC000000 | ((off & 0x1FF) << 12) | (rn << 5) | rt);
   }
 
@@ -1187,7 +3172,210 @@ pub type EmitARM64 = class {
 
   fn getCodeBuf(): int64 { return self.codeBuf; }
   fn getCodeLen(): int64 { return self.codeLen; }
+  // ==================================================================
+  // #1776: Gleitkomma als Text (Builtin 403 FloatToStr, Builtin 9 PrintFloat).
+  //
+  // Bis 1.1.9G war ID 9 auf dem Linux-Zweig ein No-op („load float bits, no-op
+  // print") und ID 403 fehlte ganz. Ausgegeben hat stattdessen eine
+  // gleichnamige Lyx-Funktion aus std/io — die auf x86 vom Builtin verdeckt
+  // wurde. Derselbe Quelltext gab damit je nach Ziel etwas anderes aus.
+  //
+  // Umgesetzt wie im riscv-Backend (#1770) und zeichengleich mit dem x86-Weg:
+  // Vorzeichen, ganzer Teil, Punkt, GENAU sechs Nachkommastellen,
+  // abgeschnitten statt gerundet. nan und inf werden an den Bits erkannt, ein
+  // zu grosser Wert meldet sich als "overflow" statt eine Zahl zu erfinden.
+  //
+  // Alle Spruenge werden NACHGETRAGEN. Gezaehlte Weiten waren in #1770 zweimal
+  // falsch, weil emitMovImmReg je nach Wert unterschiedlich viele Befehle
+  // erzeugt — auf arm64 gilt dasselbe.
+  // ==================================================================
+
+  // Ziffern einer nichtnegativen Zahl schreiben. x19 = Wert, x20 = Schreibmarke.
+  // stellen > 0: feste Stellenzahl mit fuehrenden Nullen; 0: so viele wie noetig.
+  fn a64Ziffern(stellen: int64) {
+    if stellen > 0 {
+      var teiler: int64 := 1;
+      var si: int64 := 1;
+      while si < stellen { teiler := teiler * 10; si := si + 1; }
+      self.emitMovImmReg(ARM64_X21, teiler);
+    } else {
+      self.emitMovImmReg(ARM64_X21, 1);
+      self.emitMovImmReg(ARM64_X22, 10);
+      var gLoop: int64 := self.codeLen;
+      self.emit32(0x9AD50E77);                 // SDIV x23, x19, x21
+      self.emit32(0xEB1602FF);                 // CMP  x23, x22
+      var gRaus: int64 := self.codeLen; self.emit32(0);   // B.LT -> fertig
+      self.emit32(0x9B167EB5);                 // MUL  x21, x21, x22
+      self.emit32(0x14000000 | (((gLoop - self.codeLen) / 4) & 0x3FFFFFF));
+      self.poke32at(gRaus, 0x5400000B | ((((self.codeLen - gRaus) / 4) & 0x7FFFF) << 5));
+    }
+    self.emitMovImmReg(ARM64_X22, 10);
+    var zLoop: int64 := self.codeLen;
+    self.emit32(0x9AD50E77);                   // SDIV x23, x19, x21
+    self.emit32(0x9AD60EF8);                   // SDIV x24, x23, x22
+    self.emit32(0x9B16DF17);                   // MSUB x23, x24, x22, x23   (x23 %= 10)
+    self.emit32(0x9100C2F7);                   // ADD  x23, x23, #48  ('0')
+    self.emit32(0x39000297);                   // STRB w23, [x20]
+    self.emit32(0x91000694);                   // ADD  x20, x20, #1
+    self.emit32(0x9AD60EB5);                   // SDIV x21, x21, x22
+    self.emit32(0xF10002BF);                   // CMP  x21, #0
+    var zRaus: int64 := self.codeLen; self.emit32(0);   // B.EQ -> fertig
+    self.emit32(0x14000000 | (((zLoop - self.codeLen) / 4) & 0x3FFFFFF));
+    self.poke32at(zRaus, 0x54000000 | ((((self.codeLen - zRaus) / 4) & 0x7FFFF) << 5));
+  }
+
+  // f64 als Text in einen frischen Puffer; Zeiger nach x0.
+  fn a64FloatToStr(bitsSlot: int64) {
+    // #2149: x19..x24 sind callee-saved. Der Formatierer benutzt sie, bis
+    // 1.2.16E ohne sie zu retten — unter Lyx-Aufrufern faellt das nicht auf
+    // (keiner haelt darin etwas), ein C-Aufrufer einer Lyx-.so verliert aber
+    // seine Werte. Gesichert unterhalb von sp, zurueck am Ende (lEnde).
+    self.emit32(0xA9BD53F3);                   // STP x19, x20, [sp, #-48]!
+    self.emit32(0xA9015BF5);                   // STP x21, x22, [sp, #16]
+    self.emit32(0xA90263F7);                   // STP x23, x24, [sp, #32]
+    // Puffer: 48 Byte aus dem Bump-Block (#2227, vorher ein mmap je Aufruf)
+    self.emitMovImmReg(ARM64_X1, 48);
+    self.emitBumpAlloc();
+    self.emit32(0xAA0003F4);                   // MOV x20, x0   (Schreibmarke)
+    self.emitLdur(ARM64_X9, ARM64_X29, self.slotOff(bitsSlot));   // x9 = Bitmuster
+
+    // Sonderfaelle: nach dem Verdoppeln faellt das Vorzeichen heraus.
+    self.emit32(0x8B090129);                   // ADD  x9, x9, x9
+    self.emitMovImmReg(ARM64_X10, 0 - 9007199254740992);          // 0xFFE0000000000000
+    self.emit32(0xEB0A013F);                   // CMP  x9, x10
+    var bKeinNan: int64 := self.codeLen; self.emit32(0);          // B.LS -> kein NaN
+    self.emitMovImmReg(ARM64_X11, 7233902);    // 'n','a','n',0
+    self.emit32(0xB900028B);                   // STR  w11, [x20]
+    self.emit32(0x91000E94);                   // ADD  x20, x20, #3
+    var jNan: int64 := self.codeLen; self.emit32(0);
+    var lKeinNan: int64 := self.codeLen;
+    self.emit32(0xEB0A013F);                   // CMP  x9, x10
+    var bKeinInf: int64 := self.codeLen; self.emit32(0);          // B.NE -> Zahl
+    self.emitMovImmReg(ARM64_X11, 6712937);    // 'i','n','f',0
+    self.emit32(0xB900028B);                   // STR  w11, [x20]
+    self.emit32(0x91000E94);                   // ADD  x20, x20, #3
+    var jInf: int64 := self.codeLen; self.emit32(0);
+
+    // Endlicher Wert: d0 = Zahl, d1 = 0.0
+    var lZahl: int64 := self.codeLen;
+    self.emitLdur(ARM64_X9, ARM64_X29, self.slotOff(bitsSlot));
+    self.emit32(0x9E670120);                   // FMOV d0, x9
+    self.emit32(0x9E6703E1);                   // FMOV d1, xzr
+    self.emit32(0x1E612000);                   // FCMP d0, d1
+    var bNichtNeg: int64 := self.codeLen; self.emit32(0);         // B.GE
+    self.emitMovImmReg(ARM64_X11, 45);         // '-'
+    self.emit32(0x3900028B);                   // STRB w11, [x20]
+    self.emit32(0x91000694);                   // ADD  x20, x20, #1
+    self.emit32(0x1E614000);                   // FNEG d0, d0
+
+    // Passt der ganze Teil in eine 64-Bit-Zahl?
+    var lPositiv: int64 := self.codeLen;
+    self.emit32(0x9E780013);                   // FCVTZS x19, d0
+    self.emitMovImmReg(ARM64_X10, 0 - 9223372036854775807 - 1);
+    self.emit32(0xEB0A027F);                   // CMP  x19, x10
+    var bPasst: int64 := self.codeLen; self.emit32(0);            // B.NE -> Ziffern
+    self.emitMovImmReg(ARM64_X11, 1919252079); // 'o','v','e','r'
+    self.emit32(0xB900028B);                   // STR  w11, [x20]
+    self.emitMovImmReg(ARM64_X11, 2003790950); // 'f','l','o','w'
+    self.emit32(0xB900068B);                   // STR  w11, [x20, #4]
+    self.emit32(0x91002294);                   // ADD  x20, x20, #8
+    var jBig: int64 := self.codeLen; self.emit32(0);
+
+    var lZiffern: int64 := self.codeLen;
+    self.a64Ziffern(0);
+    self.emitMovImmReg(ARM64_X11, 46);         // '.'
+    self.emit32(0x3900028B);                   // STRB w11, [x20]
+    self.emit32(0x91000694);                   // ADD  x20, x20, #1
+    self.emit32(0x9E620261);                   // SCVTF d1, x19
+    self.emit32(0x1E613800);                   // FSUB d0, d0, d1
+    self.emitMovImmReg(ARM64_X11, 4696837146684686336);   // 1e6
+    self.emit32(0x9E670161);                   // FMOV d1, x11
+    self.emit32(0x1E610800);                   // FMUL d0, d0, d1
+    self.emit32(0x9E780013);                   // FCVTZS x19, d0
+    self.a64Ziffern(6);
+
+    var lEnde: int64 := self.codeLen;
+    self.emit32(0x3900029F);                   // STRB wzr, [x20]
+    self.emit32(0xA94263F7);                   // #2149: LDP x23, x24, [sp, #32]
+    self.emit32(0xA9415BF5);                   //        LDP x21, x22, [sp, #16]
+    self.emit32(0xA8C353F3);                   //        LDP x19, x20, [sp], #48
+
+    self.poke32at(bKeinNan,  0x54000009 | ((((lKeinNan - bKeinNan) / 4) & 0x7FFFF) << 5));   // B.LS
+    self.poke32at(bKeinInf,  0x54000001 | ((((lZahl - bKeinInf) / 4) & 0x7FFFF) << 5));      // B.NE
+    self.poke32at(bNichtNeg, 0x5400000A | ((((lPositiv - bNichtNeg) / 4) & 0x7FFFF) << 5));  // B.GE
+    self.poke32at(bPasst,    0x54000001 | ((((lZiffern - bPasst) / 4) & 0x7FFFF) << 5));     // B.NE
+    self.poke32at(jNan, 0x14000000 | ((((lEnde - jNan) / 4) & 0x3FFFFFF)));
+    self.poke32at(jInf, 0x14000000 | ((((lEnde - jInf) / 4) & 0x3FFFFFF)));
+    self.poke32at(jBig, 0x14000000 | ((((lEnde - jBig) / 4) & 0x3FFFFFF)));
+  }
+
   fn getFuncAddrs(): int64 { return self.funcAddrs; }   // WP-AND-02 Phase B: expose for export-table
+
+  // #2149: Huelle fuer eine exportierte Funktion mit Gleitkomma an der
+  // C-Schnittstelle (Gegenstueck zu cg_soEmitHuellen auf x86, #2124).
+  //
+  // Lyx uebergibt JEDES Argument der Reihe nach in x0..x7 (ein f64 als
+  // Bitmuster), C nach AAPCS64 Ganzzahlen in x0..x7 und Gleitkomma GETRENNT
+  // gezaehlt in d0..d7 (f32 in s0..s7). Bis 1.2.16E sprang das Symbol direkt
+  // in den Rumpf: C legte den Wert in d0, Lyx las x0 — still falsch.
+  //
+  // arten: zwei Bit je Parameter (0 Ganzzahl, 1 f64, 2 f32), rueck ebenso.
+  // Die Ganzzahlen ruecken von hinten nach vorn auf ihre Lyx-Position (das
+  // Ziel liegt nie vor der Quelle, also ueberschreibt keine Verschiebung eine
+  // noch ungelesene), danach kommen die Gleitkommawerte aus d/s in die Luecken.
+  // Liefert den Codeversatz der Huelle (das Symbol zeigt dorthin).
+  fn emitSoHuelle(funcId: int64, n: int64, arten: int64, rueck: int64): int64 {
+    if n > 8 {
+      EPrintStrLn("error: arm64 --shared: exportierte Funktion mit Gleitkomma und mehr als acht Parametern ist nicht umgesetzt (#2149)."c);
+      exit(1);
+    }
+    var start: int64 := self.codeLen;
+    self.emit32(0xA9BF7BFD);                   // STP x29, x30, [sp, #-16]!
+    self.emit32(0x910003FD);                   // MOV x29, sp
+    // Quellregister je Parameter bestimmen
+    var gi: int64 := 0;
+    var fi: int64 := 0;
+    var quelle: int64 := alloc(8 * 8);
+    var i: int64 := 0;
+    while i < n {
+      var a: int64 := (arten >> (i * 2)) & 3;
+      if a == 0 { poke64(quelle + i * 8, gi); gi := gi + 1; }
+      else { poke64(quelle + i * 8, fi); fi := fi + 1; }
+      i := i + 1;
+    }
+    // Ganzzahlen: von hinten nach vorn auf x_i
+    i := n - 1;
+    while i >= 0 {
+      if ((arten >> (i * 2)) & 3) == 0 {
+        var q: int64 := peek64(quelle + i * 8);
+        if q != i { self.emit32(0xAA0003E0 | (q << 16) | i); }   // MOV x_i, x_q
+      }
+      i := i - 1;
+    }
+    // Gleitkomma: d_q (bzw. s_q, erst nach double) nach x_i
+    i := 0;
+    while i < n {
+      var a2: int64 := (arten >> (i * 2)) & 3;
+      if a2 != 0 {
+        var q2: int64 := peek64(quelle + i * 8);
+        if a2 == 2 { self.emit32(0x1E22C000 | (q2 << 5) | q2); }   // FCVT d_q, s_q
+        self.emit32(0x9E660000 | (q2 << 5) | i);                    // FMOV x_i, d_q
+      }
+      i := i + 1;
+    }
+    free(quelle, 8 * 8);
+    // BL Rumpf
+    var ziel: int64 := peek64(self.funcAddrs + funcId * 8);
+    self.emit32(0x94000000 | (((ziel - self.codeLen) >> 2) & 0x3FFFFFF));
+    if rueck == 1 { self.emit32(0x9E670000); }                     // FMOV d0, x0
+    if rueck == 2 {
+      self.emit32(0x9E670000);                                     // FMOV d0, x0
+      self.emit32(0x1E624000);                                     // FCVT s0, d0
+    }
+    self.emit32(0xA8C17BFD);                   // LDP x29, x30, [sp], #16
+    self.emit32(0xD65F03C0);                   // RET
+    return start;
+  }
 
   // -------------------------------------------------------------------------
   // IR Module Helpers

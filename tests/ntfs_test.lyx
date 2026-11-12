@@ -1,0 +1,240 @@
+// tests/ntfs_test.lyx — std.fs.ntfs gegen ein Abbild von mkntfs
+//
+// Vorlage: `mkntfs` legt an, `ntfscp` schreibt die Dateien hinein — beides
+// aus ntfsprogs, beides ohne Wurzelrechte.
+//
+// DER NACHWEIS GEHT HIER EINEN SCHRITT WEITER als bei den Schwester-Units:
+// zusaetzlich zum fremden SCHREIBER gibt es einen fremden LESER. Der Runner
+// laesst `ntfsls` das Wurzelverzeichnis auflisten und legt die Namen in eine
+// Datei; dieser Test liest sie und muss JEDEN davon wiederfinden. Zwei
+// unabhaengige Umsetzungen muessen sich also ueber den Inhalt des
+// Verzeichnisses einig sein — das ist mehr, als ein Pruefprogramm sagen kann.
+//
+// Drei Eigenheiten tragen die Batterie, und alle drei gibt es nur hier:
+//
+//   1. FIXUPS. Die letzten zwei Byte jedes Sektors eines MFT- oder
+//      INDX-Satzes sind beim Schreiben durch eine Pruefzahl ersetzt worden.
+//      Der Schaden faellt bei KLEINEN Saetzen nicht auf — nur bei den
+//      grossen, und dort mitten in einer Laufwerksliste oder einem Namen.
+//   2. RESIDENTE $DATA. Eine kleine Datei hat gar keine Cluster; ihr Inhalt
+//      steht im MFT-Satz. Wer nur den nicht-residenten Fall kann, liest fuer
+//      sie Nullen — und die sehen aus wie eine leere Datei.
+//   3. DATENLAEUFE mit VORZEICHEN. Der Versatz eines Laufs baut auf dem
+//      vorigen auf und darf rueckwaerts zeigen.
+
+unit main;
+
+import std.io;
+import std.env;
+import std.alloc;
+import std.string;
+import std.fs.ntfs;
+
+var _fails: int64 := 0;
+var _checks: int64 := 0;
+
+fn Check(name: pchar, got: int64, want: int64): void {
+  _checks := _checks + 1;
+  if (got == want) { PrintStr("PASS "c); PrintStrLn(name); }
+  else {
+    PrintStr("FAIL "c); PrintStr(name);
+    PrintStr(": erhalten "c); PrintInt(got);
+    PrintStr(" erwartet "c); PrintInt(want); PrintLn(""c);
+    _fails := _fails + 1;
+  }
+}
+
+fn CheckWahr(name: pchar, got: bool): void {
+  _checks := _checks + 1;
+  if (got) { PrintStr("PASS "c); PrintStrLn(name); }
+  else { PrintStr("FAIL "c); PrintStr(name); PrintStrLn(" (erwartet: wahr)"c); _fails := _fails + 1; }
+}
+
+fn CheckFalsch(name: pchar, got: bool): void {
+  _checks := _checks + 1;
+  if (!got) { PrintStr("PASS "c); PrintStrLn(name); }
+  else { PrintStr("FAIL "c); PrintStr(name); PrintStrLn(" (erwartet: falsch)"c); _fails := _fails + 1; }
+}
+
+fn NameGleich(buf: int64, s: pchar): bool {
+  var i: int64 := 0;
+  while (i < 400) {
+    var a: int64 := peek8(buf + i) & 255;
+    var b: int64 := StrCharAt(s, i) & 255;
+    if (a != b) { return false; }
+    if (a == 0) { return true; }
+    i := i + 1;
+  }
+  return false;
+}
+
+fn main(): int64 {
+  if (GetArgC() < 3) {
+    PrintStrLn("FAIL: Aufruf: ntfs_test <abbild> <namensliste>"c);
+    return 1;
+  }
+  var pfad:  pchar := ArgvGet(GetArgV(), 1);
+  var liste: pchar := ArgvGet(GetArgV(), 2);
+
+  var fd: int64 := open(pfad, 0, 0);
+  _checks := _checks + 1;
+  if (fd < 0) { PrintStrLn("FAIL: Abbild nicht zu oeffnen"c); return 1; }
+  PrintStrLn("PASS Abbild geoeffnet"c);
+
+  var vol: NtfsVolume := NtfsMount(fd, 0);
+  CheckWahr("Volume ist gueltig"c, NtfsValid(vol));
+  Check("Sektorgroesse"c, vol.bytesPerSector, 512);
+  // Beide Groessenfelder sind VORZEICHENBEHAFTET: -10 heisst 1024 Byte, nicht
+  // 246 Cluster. Wer das Byte ohne Vorzeichen liest, rechnet ab hier alles
+  // falsch.
+  Check("MFT-Satzgroesse aus dem vorzeichenbehafteten Feld"c, vol.recordSize, 1024);
+  CheckWahr("Indexblockgroesse ist gesetzt"c, vol.indexSize >= 512);
+  CheckWahr("die MFT hat wenigstens einen Lauf"c, vol.mftRunCount >= 1);
+
+  var lbuf: int64 := alloc(128);
+  Check("Kennung hat sieben Zeichen"c, NtfsVolumeLabel(vol, lbuf, 128), 7);
+  CheckWahr("Kennung lautet PRUEFNT"c, NameGleich(lbuf, "PRUEFNT"c));
+  free(lbuf, 128);
+
+  // ── Kleine Datei: RESIDENTES $DATA ───────────────────────────────────
+  var e: NtfsEntry;
+  Check("HALLO.TXT gefunden"c, NtfsFindInDir(vol, NTFS_MFT_ROOT, "HALLO.TXT"c, e), 1);
+  CheckFalsch("HALLO.TXT ist kein Verzeichnis"c, e.isDir);
+  // Der Indexeintrag traegt BELEGTE und REALE Groesse nebeneinander. Wer die
+  // belegte nimmt, bekommt die auf Cluster aufgerundete Zahl — hier 4096
+  // statt 11, und das sieht wie eine gueltige Groesse aus.
+  Check("HALLO.TXT reale Groesse"c, e.size, 11);
+  var buf: int64 := alloc(64);
+  Check("HALLO.TXT gelesen"c, NtfsReadFile(vol, e.mftRef, buf, 64), 11);
+  poke8(buf + 11, 0);
+  CheckWahr("HALLO.TXT Inhalt"c, NameGleich(buf, "Hallo NTFS\n"c));
+  free(buf, 64);
+
+  // ── Grosse Datei: nicht-residentes $DATA ueber Datenlaeufe ───────────
+  var g: NtfsEntry;
+  Check("GROSS.BIN gefunden"c, NtfsFindInDir(vol, NTFS_MFT_ROOT, "GROSS.BIN"c, g), 1);
+  Check("GROSS.BIN Groesse"c, g.size, 200000);
+  Check("Groesse auch ueber den MFT-Satz"c, NtfsFileSize(vol, g.mftRef), 200000);
+  var gb: int64 := alloc(200000);
+  Check("GROSS.BIN vollstaendig gelesen"c, NtfsReadFile(vol, g.mftRef, gb, 200000), 200000);
+  var falsch: int64 := 0;
+  var ersterFehler: int64 := 0 - 1;
+  var i2: int64 := 0;
+  while (i2 < 200000) {
+    if ((peek8(gb + i2) & 255) != ((i2 * 7 + 3) & 255)) {
+      falsch := falsch + 1;
+      if (ersterFehler < 0) { ersterFehler := i2; }
+    }
+    i2 := i2 + 1;
+  }
+  _checks := _checks + 1;
+  if (falsch == 0) { PrintStrLn("PASS GROSS.BIN Inhalt Byte fuer Byte"c); }
+  else {
+    PrintStr("FAIL GROSS.BIN Inhalt: "c); PrintInt(falsch);
+    PrintStr(" Abweichungen, erste bei "c); PrintInt(ersterFehler); PrintLn(""c);
+    _fails := _fails + 1;
+  }
+  free(gb, 200000);
+
+  // ── Der lange Name ───────────────────────────────────────────────────
+  var l: NtfsEntry;
+  Check("langer Dateiname gefunden"c,
+        NtfsFindInDir(vol, NTFS_MFT_ROOT,
+                      "Ein-sehr-langer-Dateiname-mit-vielen-Zeichen-zum-Pruefen.txt"c, l), 1);
+
+  // ── Abgleich mit einem FREMDEN LESER ─────────────────────────────────
+  //
+  // Die Liste stammt von `ntfsls`. Jeder Name darin muss auch hier zu finden
+  // sein. Das ist der staerkste Teil dieser Batterie: zwei unabhaengige
+  // Umsetzungen muessen sich ueber den Inhalt des Verzeichnisses einig sein.
+  var lfd: int64 := open(liste, 0, 0);
+  _checks := _checks + 1;
+  if (lfd < 0) { PrintStrLn("FAIL: Namensliste nicht zu oeffnen"c); _fails := _fails + 1; }
+  else {
+    PrintStrLn("PASS Namensliste geoeffnet"c);
+    var groesse: int64 := lseek(lfd, 0, 2);
+    lseek(lfd, 0, 0);
+    var txt: int64 := alloc(groesse + 2);
+    read(lfd, txt as pchar, groesse);
+    close(lfd);
+    poke8(txt + groesse, 0);
+
+    var name: int64 := alloc(600);
+    var n: int64 := 0;
+    var gepruef: int64 := 0;
+    var fehlend: int64 := 0;
+    var erstesFehlende: int64 := 0;
+    var p: int64 := 0;
+    while (p <= groesse) {
+      var c: int64 := 0;
+      if (p < groesse) { c := peek8(txt + p) & 255; }
+      if (c == 10 || p == groesse) {
+        if (n > 0) {
+          poke8(name + n, 0);
+          var t: NtfsEntry;
+          if (NtfsFindInDir(vol, NTFS_MFT_ROOT, name as pchar, t) != 1) {
+            fehlend := fehlend + 1;
+            if (erstesFehlende == 0) { erstesFehlende := 1; PrintStr("  nicht gefunden: "c); PrintStrLn(name as pchar); }
+          }
+          gepruef := gepruef + 1;
+        }
+        n := 0;
+      } else {
+        if (n < 599) { poke8(name + n, c); n := n + 1; }
+      }
+      p := p + 1;
+    }
+    CheckWahr("die Liste war nicht leer"c, gepruef > 50);
+    Check("jeder Name von ntfsls ist auch hier zu finden"c, fehlend, 0);
+    PrintStr("  abgeglichen: "c); PrintInt(gepruef); PrintStrLn(" Namen"c);
+    free(name, 600);
+    free(txt, groesse + 2);
+  }
+
+  // Unsere Zaehlung liegt HOEHER als die von ntfsls: die Systemdateien
+  // ($MFT, $LogFile, $Bitmap, …) sind gewoehnliche Eintraege im
+  // Wurzelindex. Sie zu verbergen ist eine Entscheidung der Oberflaeche,
+  // nicht des Dateisystems — deshalb liefert diese Unit sie.
+  var anzahl: int64 := NtfsDirCount(vol, NTFS_MFT_ROOT);
+  CheckWahr("Zaehlung enthaelt zusaetzlich die Systemdateien"c, anzahl > 63);
+  var mft: NtfsEntry;
+  Check("$MFT ist ein sichtbarer Eintrag"c,
+        NtfsFindInDir(vol, NTFS_MFT_ROOT, "$MFT"c, mft), 1);
+  Check("$MFT ist Satz 0"c, mft.mftRef, NTFS_MFT_SELF);
+
+  // ── Pfade ────────────────────────────────────────────────────────────
+  Check("Pfad /HALLO.TXT"c, NtfsFindPath(vol, "/HALLO.TXT"c), e.mftRef);
+  Check("derselbe Pfad mit Rueckstrich"c, NtfsFindPath(vol, "\\HALLO.TXT"c), e.mftRef);
+  Check("ohne fuehrendes Trennzeichen"c, NtfsFindPath(vol, "HALLO.TXT"c), e.mftRef);
+
+  // ── Was es nicht gibt ────────────────────────────────────────────────
+  var x: NtfsEntry;
+  Check("fehlende Datei"c, NtfsFindInDir(vol, NTFS_MFT_ROOT, "GIBTESNICHT.XYZ"c, x), 0);
+  Check("fehlender Pfad"c, NtfsFindPath(vol, "/GIBTESNICHT.XYZ"c), 0);
+  // Das Wurzelverzeichnis ist keine Datei.
+  var b3: int64 := alloc(64);
+  Check("Verzeichnis lesen wird abgewiesen"c,
+        NtfsReadFile(vol, NTFS_MFT_ROOT, b3, 64), NTFS_ERR);
+  free(b3, 64);
+  var satz: int64 := alloc(vol.recordSize);
+  Check("Satz weit hinter dem Ende"c,
+        NtfsReadRecord(vol, 1000000, satz), NTFS_ERR);
+  free(satz, vol.recordSize);
+
+  NtfsUnmount(vol);
+  close(fd);
+
+  // Gegenprobe: ein ELF ist kein NTFS.
+  var selbst: int64 := open("/proc/self/exe"c, 0, 0);
+  if (selbst >= 0) {
+    var v2: NtfsVolume := NtfsMount(selbst, 0);
+    CheckFalsch("ein ELF ist kein NTFS-Volume"c, NtfsValid(v2));
+    close(selbst);
+  }
+
+  PrintStr("\n"c);
+  PrintInt(_checks); PrintStr(" Pruefungen, "c);
+  PrintInt(_fails); PrintStrLn(" FAIL"c);
+  if (_fails == 0) { PrintStrLn("OK: std.fs.ntfs"c); return 0; }
+  return 1;
+}

@@ -1,0 +1,599 @@
+// std/fs/ext4.lyx — ext2, ext3 und ext4 LESEN
+//
+// Dritte Unit der Dateisystem-Sammlung. Anders als FAT und exFAT hat diese
+// Familie eine INODE-Tabelle: der Verzeichniseintrag traegt nur einen Namen
+// und eine Nummer, alles Weitere steht im Inode. Das aendert den Aufbau
+// grundlegend, und deshalb ist es eine eigene Unit.
+//
+// ZWEI WEGE ZU DEN BLOECKEN einer Datei, und die Unit kann beide:
+//
+//   * EXTENTS (ext4, Flag 0x80000): ein Baum. Die Wurzel steht im Inode; bei
+//     Tiefe 0 zeigen die Eintraege direkt auf Bloecke, darueber auf weitere
+//     Baumknoten. Ein Extent umfasst bis zu 32768 Bloecke am Stueck — das ist
+//     der Grund, warum ext4 grosse Dateien mit wenigen Eintraegen beschreibt.
+//   * INDIREKTE BLOECKE (ext2/ext3): zwoelf direkte Verweise, dann ein
+//     einfach, ein zweifach und ein dreifach indirekter. Die dreifache Stufe
+//     ist hier NICHT umgesetzt und wird gemeldet — sie beginnt bei
+//     (12 + n + n^2) Bloecken, was bei 4 KiB Bloecken erst jenseits von 4 GiB
+//     eintritt; still das Falsche zu liefern waere schlimmer als die Meldung.
+//
+// ZUGANG wie in den Schwester-Units: Deskriptor und blockweise Lesezugriffe,
+// mit einem Byte-Versatz fuer den Anfang des Volumes.
+//
+// NUR LESEN. Schreiben verlangt hier zusaetzlich Journalpflege — ext3 und
+// ext4 sind Journaling-Dateisysteme, und ein Schreiber, der das Journal nicht
+// fuehrt, macht aus einem Absturz einen Datenverlust.
+//
+// NICHT enthalten: Journal-Wiedergabe (ein Abbild mit unsauberem Journal wird
+// so gelesen, wie es auf dem Datentraeger steht), erweiterte Attribute,
+// verschluesselte oder komprimierte Inodes, `inline_data` (Dateiinhalt im
+// Inode statt in Bloecken). Die drei letzten werden GEMELDET, nicht geraten.
+
+@description("ext2/ext3/ext4 lesen: Superblock, Inodes, Extents, indirekte Bloecke, Verzeichnisse")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+@capabilities([fs.read, fs.meta, system.memory.heap])
+
+unit std.fs.ext4;
+
+import std.alloc;
+import std.io;
+
+pub con EXT4_ERR: int64 := 0 - 1;
+
+// Inode-Nummern sind 1-basiert; 2 ist immer die Wurzel.
+pub con EXT4_ROOT_INO: int64 := 2;
+
+pub con EXT4_S_IFMT:   int64 := 0xF000;
+pub con EXT4_S_IFREG:  int64 := 0x8000;
+pub con EXT4_S_IFDIR:  int64 := 0x4000;
+pub con EXT4_S_IFLNK:  int64 := 0xA000;
+
+pub con EXT4_FL_EXTENTS:     int64 := 0x80000;
+pub con EXT4_FL_INLINE_DATA: int64 := 0x10000000;
+pub con EXT4_FL_ENCRYPT:     int64 := 0x800;
+
+// Dateiart im VERZEICHNISEINTRAG (nur mit der Eigenschaft `filetype`, die
+// jedes heutige Abbild hat). Ohne sie steht dort 0, und die Art muss aus dem
+// Inode kommen — deshalb liefert diese Unit sie aus BEIDEN Quellen.
+pub con EXT4_FT_REG:  int64 := 1;
+pub con EXT4_FT_DIR:  int64 := 2;
+pub con EXT4_FT_LNK:  int64 := 7;
+
+pub type Ext4Volume = struct {
+  fd:             int64;
+  partOffset:     int64;
+  blockSize:      int64;
+  inodeSize:      int64;
+  descSize:       int64;   // 32 oder 64 (Eigenschaft 64bit)
+  blocksPerGroup: int64;
+  inodesPerGroup: int64;
+  firstDataBlock: int64;
+  inodeCount:     int64;
+  blockCount:     int64;
+  featIncompat:   int64;
+  gdtBlock:       int64;   // erster Block der Gruppendeskriptoren
+  gueltig:        bool;
+}
+
+pub type Ext4Inode = struct {
+  ino:       int64;
+  mode:      int64;
+  size:      int64;
+  flags:     int64;
+  links:     int64;
+  isDir:     bool;
+  isFile:    bool;
+  isLink:    bool;
+  iblock:    int64;   // Kopie der 60 Byte aus i_block, vom Aufrufer freizugeben
+}
+
+// Der Inode steckt als KOPIE darin — sein `iblock`-Zeiger aber nicht: den
+// teilen beide. Wer den urspruenglichen Inode freigibt, waehrend das
+// Verzeichnis offen ist, zieht dem Durchlauf den Boden weg. Reihenfolge also
+// immer: Ext4DirClose, dann Ext4InodeFree.
+pub type Ext4Dir = struct {
+  inode:    Ext4Inode;
+  block:    int64;    // laufender logischer Block im Verzeichnis
+  offset:   int64;    // Versatz im Blockpuffer
+  puffer:   int64;
+  gueltig:  bool;
+  fertig:   bool;
+}
+
+pub type Ext4Entry = struct {
+  ino:      int64;
+  fileType: int64;
+  isDir:    bool;
+}
+
+// ── Kleine Helfer ─────────────────────────────────────────────────────────
+
+fn _u8(p: int64, off: int64): int64 { return peek8(p + off) & 255; }
+
+fn _u16(p: int64, off: int64): int64 {
+  return (peek8(p + off) & 255) | ((peek8(p + off + 1) & 255) << 8);
+}
+
+fn _u32(p: int64, off: int64): int64 {
+  return (peek8(p + off)     & 255)
+       | ((peek8(p + off + 1) & 255) << 8)
+       | ((peek8(p + off + 2) & 255) << 16)
+       | ((peek8(p + off + 3) & 255) << 24);
+}
+
+fn _leseBlock(vol: Ext4Volume, block: int64, puffer: int64): int64 {
+  if (block < 0) { return 0; }
+  var pos: int64 := vol.partOffset + block * vol.blockSize;
+  if (lseek(vol.fd, pos, 0) != pos) { return 0; }
+  if (read(vol.fd, puffer as pchar, vol.blockSize) != vol.blockSize) { return 0; }
+  return 1;
+}
+
+pub fn Ext4Valid(vol: Ext4Volume): bool { return vol.gueltig; }
+
+// ── Einhaengen ────────────────────────────────────────────────────────────
+//
+// Der Superblock steht IMMER bei Byte 1024, unabhaengig von der Blockgroesse.
+// Das ist die Stelle, an der ein Leser als erstes falsch liegt: bei 1024-Byte-
+// Bloecken ist er Block 1, bei 4096-Byte-Bloecken liegt er MITTEN in Block 0.
+pub fn Ext4Mount(fd: int64, byteOffset: int64): Ext4Volume {
+  var vol: Ext4Volume;
+  vol.fd := fd;
+  vol.partOffset := byteOffset;
+  vol.gueltig := false;
+  vol.blockSize := 0;
+
+  var sb: int64 := alloc(1024);
+  var pos: int64 := byteOffset + 1024;
+  if (lseek(fd, pos, 0) != pos) { free(sb, 1024); return vol; }
+  if (read(fd, sb as pchar, 1024) != 1024) { free(sb, 1024); return vol; }
+
+  // Kennung 0xEF53 bei Offset 56.
+  if (_u16(sb, 56) != 0xEF53) { free(sb, 1024); return vol; }
+
+  var logBs: int64 := _u32(sb, 24);
+  if (logBs < 0 || logBs > 6) { free(sb, 1024); return vol; }
+  var bs: int64 := 1024;
+  var i: int64 := 0;
+  while (i < logBs) { bs := bs * 2; i := i + 1; }
+
+  vol.blockSize      := bs;
+  vol.inodeCount     := _u32(sb, 0);
+  vol.blockCount     := _u32(sb, 4);
+  vol.firstDataBlock := _u32(sb, 20);
+  vol.blocksPerGroup := _u32(sb, 32);
+  vol.inodesPerGroup := _u32(sb, 40);
+  vol.featIncompat   := _u32(sb, 96);
+
+  // Die Inode-Groesse steht erst ab Version 1 des Superblocks im Feld; davor
+  // waren es immer 128 Byte. Wer das Feld ungeprueft liest, bekommt bei alten
+  // Abbildern 0 und rechnet jeden Inode an dieselbe Stelle.
+  var revLevel: int64 := _u32(sb, 76);
+  if (revLevel == 0) { vol.inodeSize := 128; }
+  else { vol.inodeSize := _u16(sb, 88); }
+
+  // Gruppendeskriptoren sind 32 Byte gross — ausser mit der Eigenschaft
+  // `64bit` (0x80), dann sagt s_desc_size, wie gross sie wirklich sind.
+  if ((vol.featIncompat & 0x80) != 0) { vol.descSize := _u16(sb, 254); }
+  else { vol.descSize := 32; }
+  if (vol.descSize < 32) { vol.descSize := 32; }
+
+  free(sb, 1024);
+
+  if (vol.blocksPerGroup == 0 || vol.inodesPerGroup == 0) { return vol; }
+  if (vol.inodeSize < 128 || vol.inodeSize > vol.blockSize) { return vol; }
+  if (vol.inodeCount == 0 || vol.blockCount == 0) { return vol; }
+
+  // Die Deskriptoren folgen dem Superblock. Bei 1024-Byte-Bloecken ist der
+  // Superblock Block 1, sonst Block 0 — deshalb firstDataBlock + 1.
+  vol.gdtBlock := vol.firstDataBlock + 1;
+  vol.gueltig := true;
+  return vol;
+}
+
+// Erster Block der Inode-Tabelle einer Gruppe.
+fn _inodeTabelle(vol: Ext4Volume, gruppe: int64): int64 {
+  var proBlock: int64 := vol.blockSize / vol.descSize;
+  var blk: int64 := vol.gdtBlock + gruppe / proBlock;
+  var idx: int64 := gruppe - (gruppe / proBlock) * proBlock;
+  var puf: int64 := alloc(vol.blockSize);
+  if (_leseBlock(vol, blk, puf) == 0) { free(puf, vol.blockSize); return EXT4_ERR; }
+  var d: int64 := puf + idx * vol.descSize;
+  var lo: int64 := _u32(d, 8);
+  var hi: int64 := 0;
+  // Die oberen 32 Bit stehen nur in einem 64-Byte-Deskriptor. Sie aus einem
+  // 32-Byte-Deskriptor zu lesen hiesse, den Anfang des naechsten zu lesen.
+  if (vol.descSize >= 64) { hi := _u32(d, 40); }
+  free(puf, vol.blockSize);
+  return lo | (hi << 32);
+}
+
+// ── Inodes ────────────────────────────────────────────────────────────────
+
+pub fn Ext4InodeFree(ino: Ext4Inode): void {
+  if (ino.iblock != 0) { free(ino.iblock, 60); }
+}
+
+pub fn Ext4ReadInode(vol: Ext4Volume, nr: int64, ref out: Ext4Inode): int64 {
+  out.iblock := 0;
+  if (!vol.gueltig) { return EXT4_ERR; }
+  if (nr < 1 || nr > vol.inodeCount) { return EXT4_ERR; }
+
+  var gruppe: int64 := (nr - 1) / vol.inodesPerGroup;
+  var idx: int64 := (nr - 1) - gruppe * vol.inodesPerGroup;
+  var tab: int64 := _inodeTabelle(vol, gruppe);
+  if (tab == EXT4_ERR) { return EXT4_ERR; }
+
+  var byteOff: int64 := tab * vol.blockSize + idx * vol.inodeSize;
+  var pos: int64 := vol.partOffset + byteOff;
+  var roh: int64 := alloc(vol.inodeSize);
+  if (lseek(vol.fd, pos, 0) != pos) { free(roh, vol.inodeSize); return EXT4_ERR; }
+  if (read(vol.fd, roh as pchar, vol.inodeSize) != vol.inodeSize) {
+    free(roh, vol.inodeSize); return EXT4_ERR;
+  }
+
+  out.ino   := nr;
+  out.mode  := _u16(roh, 0);
+  out.links := _u16(roh, 26);
+  out.flags := _u32(roh, 32);
+  // Die Groesse ist 64 Bit: die oberen 32 stehen bei 108. Wer nur die unteren
+  // liest, sieht jede Datei ueber 4 GiB verkuerzt — und zwar plausibel.
+  out.size  := _u32(roh, 4) | (_u32(roh, 108) << 32);
+
+  var art: int64 := out.mode & EXT4_S_IFMT;
+  out.isDir  := art == EXT4_S_IFDIR;
+  out.isFile := art == EXT4_S_IFREG;
+  out.isLink := art == EXT4_S_IFLNK;
+
+  out.iblock := alloc(60);
+  var k: int64 := 0;
+  while (k < 60) { poke8(out.iblock + k, peek8(roh + 40 + k)); k := k + 1; }
+
+  free(roh, vol.inodeSize);
+  return 1;
+}
+
+// ── Logischer Block → physischer Block ────────────────────────────────────
+
+// Im Extent-Baum suchen. `knoten` zeigt auf einen Extent-Header.
+fn _extentSuche(vol: Ext4Volume, knoten: int64, logisch: int64, tiefeRest: int64): int64 {
+  if (_u16(knoten, 0) != 0xF30A) { return EXT4_ERR; }   // Kennung
+  var anzahl: int64 := _u16(knoten, 2);
+  var tiefe:  int64 := _u16(knoten, 6);
+  if (tiefeRest <= 0) { return EXT4_ERR; }              // Baum zu tief — Schleifenschutz
+
+  if (tiefe == 0) {
+    var i: int64 := 0;
+    while (i < anzahl) {
+      var e: int64 := knoten + 12 + i * 12;
+      var eb: int64 := _u32(e, 0);
+      var len: int64 := _u16(e, 4);
+      // Laenge ueber 32768 heisst: der Bereich ist belegt, aber noch nie
+      // beschrieben worden. Er liest sich als Nullen — der Wert selbst muss
+      // um 32768 verringert werden, sonst ist die Laenge unsinnig gross.
+      var unbeschrieben: bool := false;
+      if (len > 32768) { len := len - 32768; unbeschrieben := true; }
+      if (logisch >= eb && logisch < eb + len) {
+        if (unbeschrieben) { return 0; }                // 0 = Loch, liest Nullen
+        var lo: int64 := _u32(e, 8);
+        var hi: int64 := _u16(e, 6);
+        return (lo | (hi << 32)) + (logisch - eb);
+      }
+      i := i + 1;
+    }
+    return 0;   // kein Extent deckt den Block: ein Loch
+  }
+
+  // Indexknoten: den letzten Eintrag nehmen, dessen Startblock nicht groesser
+  // als der gesuchte ist.
+  var wahl: int64 := EXT4_ERR;
+  var j: int64 := 0;
+  while (j < anzahl) {
+    var ix: int64 := knoten + 12 + j * 12;
+    if (_u32(ix, 0) <= logisch) { wahl := ix; } else { j := anzahl; }
+    j := j + 1;
+  }
+  if (wahl == EXT4_ERR) { return EXT4_ERR; }
+  var lo2: int64 := _u32(wahl, 4);
+  var hi2: int64 := _u16(wahl, 8);
+  var kind: int64 := lo2 | (hi2 << 32);
+
+  var puf: int64 := alloc(vol.blockSize);
+  if (_leseBlock(vol, kind, puf) == 0) { free(puf, vol.blockSize); return EXT4_ERR; }
+  var r: int64 := _extentSuche(vol, puf, logisch, tiefeRest - 1);
+  free(puf, vol.blockSize);
+  return r;
+}
+
+// Klassische indirekte Bloecke (ext2/ext3).
+fn _indirektSuche(vol: Ext4Volume, iblock: int64, logisch: int64): int64 {
+  var proBlock: int64 := vol.blockSize / 4;
+  if (logisch < 12) { return _u32(iblock, logisch * 4); }
+
+  var rest: int64 := logisch - 12;
+  var puf: int64 := alloc(vol.blockSize);
+
+  if (rest < proBlock) {
+    var b1: int64 := _u32(iblock, 12 * 4);
+    if (b1 == 0) { free(puf, vol.blockSize); return 0; }
+    if (_leseBlock(vol, b1, puf) == 0) { free(puf, vol.blockSize); return EXT4_ERR; }
+    var r1: int64 := _u32(puf, rest * 4);
+    free(puf, vol.blockSize);
+    return r1;
+  }
+
+  rest := rest - proBlock;
+  if (rest < proBlock * proBlock) {
+    var b2: int64 := _u32(iblock, 13 * 4);
+    if (b2 == 0) { free(puf, vol.blockSize); return 0; }
+    if (_leseBlock(vol, b2, puf) == 0) { free(puf, vol.blockSize); return EXT4_ERR; }
+    var mitte: int64 := _u32(puf, (rest / proBlock) * 4);
+    if (mitte == 0) { free(puf, vol.blockSize); return 0; }
+    if (_leseBlock(vol, mitte, puf) == 0) { free(puf, vol.blockSize); return EXT4_ERR; }
+    var r2: int64 := _u32(puf, (rest - (rest / proBlock) * proBlock) * 4);
+    free(puf, vol.blockSize);
+    return r2;
+  }
+
+  // Dreifach indirekt: nicht umgesetzt. Gemeldet statt geraten — bei 4-KiB-
+  // Bloecken beginnt dieser Bereich erst jenseits von 4 GiB.
+  free(puf, vol.blockSize);
+  return EXT4_ERR;
+}
+
+// Physischer Block zu einem logischen. 0 bedeutet LOCH (liest sich als
+// Nullen), EXT4_ERR ist ein Fehler — die beiden zu verwechseln macht aus
+// einer duennen Datei eine kaputte.
+pub fn Ext4BlockOf(vol: Ext4Volume, ino: Ext4Inode, logisch: int64): int64 {
+  if (!vol.gueltig || ino.iblock == 0) { return EXT4_ERR; }
+  if (logisch < 0) { return EXT4_ERR; }
+  if ((ino.flags & EXT4_FL_EXTENTS) != 0) {
+    return _extentSuche(vol, ino.iblock, logisch, 8);
+  }
+  return _indirektSuche(vol, ino.iblock, logisch);
+}
+
+// ── Lesen ─────────────────────────────────────────────────────────────────
+
+pub fn Ext4ReadFile(vol: Ext4Volume, ino: Ext4Inode, buf: int64, max: int64): int64 {
+  if (!vol.gueltig) { return EXT4_ERR; }
+  if (ino.isDir) { return EXT4_ERR; }
+  // Diese beiden Faelle liegen nicht in Bloecken. Sie stillschweigend als
+  // leer zu behandeln waere der schlimmere Ausgang.
+  if ((ino.flags & EXT4_FL_INLINE_DATA) != 0) { return EXT4_ERR; }
+  if ((ino.flags & EXT4_FL_ENCRYPT) != 0) { return EXT4_ERR; }
+
+  var wollen: int64 := ino.size;
+  if (wollen > max) { wollen := max; }
+  if (wollen <= 0) { return 0; }
+
+  var puf: int64 := alloc(vol.blockSize);
+  var geschrieben: int64 := 0;
+  var lb: int64 := 0;
+  while (geschrieben < wollen) {
+    var pb: int64 := Ext4BlockOf(vol, ino, lb);
+    if (pb == EXT4_ERR) { free(puf, vol.blockSize); return EXT4_ERR; }
+    var k: int64 := 0;
+    if (pb == 0) {
+      // Loch: der Bereich ist nie beschrieben worden und liest sich als
+      // Nullen. Das ist kein Fehler, sondern eine duenn belegte Datei.
+      while (k < vol.blockSize && geschrieben < wollen) {
+        poke8(buf + geschrieben, 0);
+        geschrieben := geschrieben + 1; k := k + 1;
+      }
+    } else {
+      if (_leseBlock(vol, pb, puf) == 0) { free(puf, vol.blockSize); return EXT4_ERR; }
+      while (k < vol.blockSize && geschrieben < wollen) {
+        poke8(buf + geschrieben, peek8(puf + k));
+        geschrieben := geschrieben + 1; k := k + 1;
+      }
+    }
+    lb := lb + 1;
+  }
+  free(puf, vol.blockSize);
+  return geschrieben;
+}
+
+// Das Ziel einer symbolischen Verknuepfung.
+//
+// Kurze Ziele (unter 60 Byte) stehen DIREKT in i_block, nicht in einem Block.
+// Wer immer ueber die Bloecke geht, liest dort eine Blocknummer als Text.
+pub fn Ext4ReadLink(vol: Ext4Volume, ino: Ext4Inode, buf: int64, max: int64): int64 {
+  if (!vol.gueltig || !ino.isLink) { return EXT4_ERR; }
+  var n: int64 := ino.size;
+  if (n > max - 1) { n := max - 1; }
+  if (ino.size < 60) {
+    var i: int64 := 0;
+    while (i < n) { poke8(buf + i, peek8(ino.iblock + i)); i := i + 1; }
+    poke8(buf + n, 0);
+    return n;
+  }
+  var r: int64 := Ext4ReadFile(vol, ino, buf, n);
+  if (r < 0) { return EXT4_ERR; }
+  poke8(buf + r, 0);
+  return r;
+}
+
+// ── Verzeichnisse ─────────────────────────────────────────────────────────
+
+pub fn Ext4DirOpen(vol: Ext4Volume, ino: Ext4Inode): Ext4Dir {
+  var d: Ext4Dir;
+  d.inode := ino;
+  d.block := 0;
+  d.offset := 0;
+  d.puffer := 0;
+  d.gueltig := false;
+  d.fertig := false;
+  if (!vol.gueltig || !ino.isDir) { d.fertig := true; return d; }
+  d.puffer := alloc(vol.blockSize);
+  d.gueltig := true;
+  return d;
+}
+
+pub fn Ext4DirClose(vol: Ext4Volume, ref d: Ext4Dir): void {
+  if (d.puffer != 0) { free(d.puffer, vol.blockSize); d.puffer := 0; }
+}
+
+// Naechsten Eintrag. 1 = geliefert, 0 = Ende, EXT4_ERR = Fehler.
+//
+// `.` und `..` werden UEBERGANGEN: sie sind kein Inhalt des Verzeichnisses,
+// sondern seine Verankerung, und wer sie mitliefert, laeuft bei jedem
+// rekursiven Durchlauf im Kreis.
+pub fn Ext4DirNext(vol: Ext4Volume, ref d: Ext4Dir, ref e: Ext4Entry,
+                   nameBuf: int64, nameMax: int64): int64 {
+  if (!d.gueltig || d.fertig) { return 0; }
+
+  while (true) {
+    var blockDa: bool := true;
+    if (d.offset == 0) {
+      if (d.block * vol.blockSize >= d.inode.size) { d.fertig := true; return 0; }
+      var pb: int64 := Ext4BlockOf(vol, d.inode, d.block);
+      if (pb == EXT4_ERR) { d.fertig := true; return EXT4_ERR; }
+      if (pb == 0) {
+        // Ein Loch im Verzeichnis: der Block ist leer. Er darf NICHT
+        // ausgewertet werden — im Puffer stuende sonst der vorige Block, und
+        // dessen Eintraege kaemen ein zweites Mal.
+        d.block := d.block + 1;
+        blockDa := false;
+      } else {
+        if (_leseBlock(vol, pb, d.puffer) == 0) { d.fertig := true; return EXT4_ERR; }
+      }
+    }
+
+    while (blockDa && d.offset + 8 <= vol.blockSize) {
+      var ep: int64 := d.puffer + d.offset;
+      var ino: int64 := _u32(ep, 0);
+      var recLen: int64 := _u16(ep, 4);
+      var nameLen: int64 := _u8(ep, 6);
+      var ftype: int64 := _u8(ep, 7);
+
+      // recLen 0 waere eine Endlosschleife — der haeufigste Schaden in einem
+      // beschaedigten Verzeichnisblock.
+      if (recLen < 8) { d.fertig := true; return EXT4_ERR; }
+      d.offset := d.offset + recLen;
+
+      if (ino != 0 && nameLen > 0) {
+        var istPunkt: bool := false;
+        if (nameLen == 1 && _u8(ep, 8) == 46) { istPunkt := true; }
+        if (nameLen == 2 && _u8(ep, 8) == 46 && _u8(ep, 9) == 46) { istPunkt := true; }
+        if (!istPunkt) {
+          var n: int64 := nameLen;
+          if (n > nameMax - 1) { n := nameMax - 1; }
+          var k: int64 := 0;
+          while (k < n) { poke8(nameBuf + k, peek8(ep + 8 + k)); k := k + 1; }
+          poke8(nameBuf + n, 0);
+          e.ino := ino;
+          e.fileType := ftype;
+          e.isDir := ftype == EXT4_FT_DIR;
+          return 1;
+        }
+      }
+    }
+
+    if (blockDa) { d.block := d.block + 1; }
+    d.offset := 0;
+    if (d.block * vol.blockSize >= d.inode.size) { d.fertig := true; return 0; }
+  }
+  return 0;
+}
+
+// ── Suchen ────────────────────────────────────────────────────────────────
+
+fn _nameGleich(a: int64, b: pchar): bool {
+  var i: int64 := 0;
+  while (i < 300) {
+    var ca: int64 := peek8(a + i) & 255;
+    var cb: int64 := StrCharAt(b, i) & 255;
+    if (ca != cb) { return false; }
+    if (ca == 0) { return true; }
+    i := i + 1;
+  }
+  return false;
+}
+
+// Einen Namen in einem Verzeichnis suchen. Rueckgabe: Inode-Nummer, 0 = nicht
+// da, EXT4_ERR = Fehler.
+//
+// Gross- und Kleinschreibung werden UNTERSCHIEDEN — anders als bei FAT. Das
+// ist keine Nachlaessigkeit, sondern die Semantik dieser Dateisysteme.
+pub fn Ext4FindInDir(vol: Ext4Volume, dir: Ext4Inode, name: pchar): int64 {
+  var d: Ext4Dir := Ext4DirOpen(vol, dir);
+  if (!d.gueltig) { return EXT4_ERR; }
+  var e: Ext4Entry;
+  var buf: int64 := alloc(300);
+  var r: int64 := 0;
+  while (true) {
+    var got: int64 := Ext4DirNext(vol, d, e, buf, 300);
+    if (got == EXT4_ERR) { r := EXT4_ERR; break; }
+    if (got == 0) { r := 0; break; }
+    if (_nameGleich(buf, name)) { r := e.ino; break; }
+  }
+  free(buf, 300);
+  Ext4DirClose(vol, d);
+  return r;
+}
+
+// Einen Pfad aufloesen. Rueckgabe: Inode-Nummer, 0 = nicht da, EXT4_ERR.
+pub fn Ext4FindPath(vol: Ext4Volume, path: pchar): int64 {
+  if (!vol.gueltig) { return EXT4_ERR; }
+  var len: int64 := StrLen(path);
+  var teil: int64 := alloc(300);
+  var akt: int64 := EXT4_ROOT_INO;
+  var i: int64 := 0;
+  var ergebnis: int64 := akt;
+  var abbruch: bool := false;
+
+  while (i < len && !abbruch) {
+    var c: int64 := StrCharAt(path, i) & 255;
+    if (c == 47) { i := i + 1; }
+    else {
+      var n: int64 := 0;
+      var imTeil: bool := true;
+      while (i < len && imTeil) {
+        var c2: int64 := StrCharAt(path, i) & 255;
+        if (c2 == 47) { imTeil := false; }
+        else {
+          if (n < 299) { poke8(teil + n, c2); n := n + 1; }
+          i := i + 1;
+        }
+      }
+      poke8(teil + n, 0);
+
+      var dirIno: Ext4Inode;
+      if (Ext4ReadInode(vol, akt, dirIno) != 1) { ergebnis := EXT4_ERR; abbruch := true; }
+      else {
+        var gef: int64 := Ext4FindInDir(vol, dirIno, teil as pchar);
+        Ext4InodeFree(dirIno);
+        if (gef == EXT4_ERR) { ergebnis := EXT4_ERR; abbruch := true; }
+        else if (gef == 0) { ergebnis := 0; abbruch := true; }
+        else { akt := gef; ergebnis := gef; }
+      }
+    }
+  }
+  free(teil, 300);
+  return ergebnis;
+}
+
+// ── Datentraegerkennung ───────────────────────────────────────────────────
+
+pub fn Ext4VolumeLabel(vol: Ext4Volume, buf: int64, max: int64): int64 {
+  if (!vol.gueltig) { return EXT4_ERR; }
+  var sb: int64 := alloc(1024);
+  var pos: int64 := vol.partOffset + 1024;
+  if (lseek(vol.fd, pos, 0) != pos) { free(sb, 1024); return EXT4_ERR; }
+  if (read(vol.fd, sb as pchar, 1024) != 1024) { free(sb, 1024); return EXT4_ERR; }
+  // Die Kennung steht bei Offset 120, hoechstens 16 Byte, mit Nullen
+  // aufgefuellt. Das Ende sucht ein FLAG, keine hochgesetzte Zaehlvariable:
+  // wer den Zaehler als Abbruchmarke missbraucht, gibt dessen Endwert als
+  // Laenge zurueck — hier waeren das 16 statt der tatsaechlichen Zeichenzahl.
+  var n: int64 := 0;
+  var weiter: bool := true;
+  while (weiter && n < 16 && n < max - 1) {
+    var c: int64 := _u8(sb, 120 + n);
+    if (c == 0) { weiter := false; } else { poke8(buf + n, c); n := n + 1; }
+  }
+  poke8(buf + n, 0);
+  free(sb, 1024);
+  return n;
+}

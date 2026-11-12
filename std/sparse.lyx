@@ -1,0 +1,805 @@
+// std/sparse.lyx
+// Duennbesetzte Vektoren: Skalarprodukt, Kosinus, Rechnen, Aehnlichkeitssuche
+
+@description("Sparse vectors in sorted index/value form: dot product, cosine and angular similarity, axpy, Hadamard product, L1/L2 norms, Jaccard on index sets, dense conversion, deduplicating sort, nearest neighbour and top-k search")
+@author("Andreas Roene")
+@copyright("2026 Andreas Roene")
+unit std.sparse;
+
+import std.math;
+import std.alloc;
+
+// ── Wozu duenn ───────────────────────────────────────────────────────────────
+//
+// Ein Textvektor ueber einem Vokabular von 50.000 Woertern hat fuer einen
+// Satz vielleicht zwanzig Eintraege ungleich null. Dicht gerechnet kostet ein
+// einziger Kosinus 100.000 Speicherzugriffe und 100.000 Multiplikationen, von
+// denen 99,96 Prozent null mal null sind. Duenn gerechnet kostet er vierzig.
+//
+// std.dist rechnet dicht und ist dort richtig, wo alle Dimensionen belegt sind
+// (Koordinaten, Messreihen, Merkmalsvektoren). Diese Unit ist die Fassung fuer
+// den anderen Fall — dieselben Masse, andere Darstellung.
+//
+// ── Darstellung ──────────────────────────────────────────────────────────────
+//
+// Ein duenner Vektor sind ZWEI Felder gleicher Laenge plus eine Anzahl:
+//
+//     idx : int64-Feld, die Positionen der Eintraege, STRENG AUFSTEIGEND
+//     val : f64-Feld,   die zugehoerigen Werte
+//     nnz : wie viele Eintraege belegt sind
+//
+// Zwei getrennte Felder statt eines Feldes von Paaren, weil Felder von Structs
+// im Compiler null liefern (#1109). Der Aufrufer besitzt den Speicher; keine
+// Funktion hier allokiert etwas, das sie nicht selbst wieder freigibt.
+//
+// ── Die Sortierung ist Vorbedingung, nicht Empfehlung ────────────────────────
+//
+// Skalarprodukt, Addition und elementweises Produkt laufen als GLEICHLAUF ueber
+// beide Vektoren: zwei Zeiger, in jedem Schritt rueckt der mit dem kleineren
+// Index vor. Das ist O(na+nb) statt O(na*nb) und der eigentliche Grund, warum
+// duenne Vektoren sich lohnen. Es setzt aber voraus, dass beide Indexfolgen
+// aufsteigend sind — sonst laufen die Zeiger aneinander vorbei und das
+// Ergebnis ist still falsch, nicht etwa ein Fehler.
+//
+// Wer nicht sicher ist, ruft SparseSort (sortiert und fasst doppelte Indizes
+// zusammen) oder prueft mit SparseIsSorted.
+//
+// ── f64-Fallstricke des Compilers ────────────────────────────────────────────
+//
+// Wie in den uebrigen Units: `con f64` als Operand (#1499), negatives Literal
+// als Operand (#1496), unaeres Minus auf einer Variablen im Ausdruck (#1512)
+// und peekf64 direkt als Argument rechnen still falsch. Konstanten stehen als
+// Funktionen, gelesen wird ueber _g().
+
+fn _zero(): f64 { return 0.0; }
+fn _one(): f64  { return 1.0; }
+fn _neg(x: f64): f64 { return 0.0 - x; }
+fn _eps(): f64  { return 0.000000000001; }
+
+// ── Kompensiertes Summieren ──────────────────────────────────────────────────
+//
+// Duenne Vektoren sind oft lang — Textvektoren haben leicht Zehntausende von
+// Eintraegen. Ueber so viele Summanden addiert sich der Rundungsfehler jeder
+// einzelnen Addition auf; bei einer Million Werten bleiben von sechzehn
+// Stellen knapp zwoelf.
+//
+// Alle Summenschleifen hier fuehren deshalb einen Korrekturterm nach Neumaier
+// mit. _corr liefert den bei s + x = t verlorenen Rest; welcher der beiden
+// Werte groesser ist, entscheidet die Form. Ausfuehrlich in std.sum.
+fn _corr(s: f64, x: f64, t: f64): f64 {
+  if (AbsF64(s) >= AbsF64(x)) { return (s - t) + x; }
+  return (x - t) + s;
+}
+
+fn _g(p: int64, i: int64): f64 {
+  var v: f64 := peekf64(p + i * 8);
+  return v;
+}
+
+fn _p(p: int64, i: int64, v: f64): void {
+  pokef64(p + i * 8, v);
+}
+
+// ── Grundlegendes ────────────────────────────────────────────────────────────
+
+// Sind die Indizes streng aufsteigend? Vorbedingung aller Gleichlauf-
+// funktionen. Ein Vektor mit nnz <= 1 ist es immer.
+pub fn SparseIsSorted(idx: int64, nnz: int64): bool {
+  var i: int64 := 1;
+  while (i < nnz) {
+    if (peek64(idx + i * 8) <= peek64(idx + (i - 1) * 8)) { return false; }
+    i := i + 1;
+  }
+  return true;
+}
+
+// Wert an Position i, oder 0, wenn dort nichts steht.
+//
+// Binaere Suche, weil die Indizes sortiert sind — bei zwanzig Eintraegen
+// fuenf Vergleiche statt zwanzig. Einzelzugriffe sind trotzdem nicht der
+// Zweck der Darstellung; wer viele davon braucht, faehrt mit SparseToDense
+// besser.
+pub fn SparseGet(idx: int64, val: int64, nnz: int64, i: int64): f64 {
+  var lo: int64 := 0;
+  var hi: int64 := nnz - 1;
+  while (lo <= hi) {
+    var mid: int64 := lo + (hi - lo) / 2;
+    var k: int64 := peek64(idx + mid * 8);
+    if (k == i) { return _g(val, mid); }
+    if (k < i) { lo := mid + 1; }
+    else { hi := mid - 1; }
+  }
+  return _zero();
+}
+
+// Duenn aus dicht: alle Eintraege mit |wert| > eps uebernehmen.
+// Rueckgabe ist nnz, oder -1, wenn cap nicht reicht.
+//
+// eps und nicht "ungleich null", weil ein Rechenweg selten exakte Nullen
+// liefert. Wer wirklich jede Null will, uebergibt eps = 0 — dann bleibt nur
+// die exakte Null draussen.
+pub fn SparseFromDense(dense: int64, n: int64, eps: f64,
+                       outIdx: int64, outVal: int64, cap: int64): int64 {
+  var m: int64 := 0;
+  var i: int64 := 0;
+  while (i < n) {
+    var v: f64 := _g(dense, i);
+    var a: f64 := AbsF64(v);
+    if (a > eps) {
+      if (m >= cap) { return 0 - 1; }
+      poke64(outIdx + m * 8, i);
+      _p(outVal, m, v);
+      m := m + 1;
+    }
+    i := i + 1;
+  }
+  return m;
+}
+
+// Dicht aus duenn: out wird auf n Nullen gesetzt und dann belegt.
+// false, wenn ein Index ausserhalb [0,n) liegt — das Feld ist dann bereits
+// geleert, aber nur teilweise befuellt.
+pub fn SparseToDense(idx: int64, val: int64, nnz: int64,
+                     out: int64, n: int64): bool {
+  var i: int64 := 0;
+  while (i < n) {
+    _p(out, i, _zero());
+    i := i + 1;
+  }
+  var ok: bool := true;
+  i := 0;
+  while (i < nnz) {
+    var k: int64 := peek64(idx + i * 8);
+    var inRange: bool := k >= 0;
+    if (inRange) { inRange := k < n; }
+    if (inRange) { _p(out, k, _g(val, i)); }
+    else { ok := false; }
+    i := i + 1;
+  }
+  return ok;
+}
+
+// Sortiert Indizes aufsteigend und fasst doppelte zusammen (ihre Werte werden
+// addiert). Arbeitet an Ort und Stelle; Rueckgabe ist das neue nnz.
+//
+// Einfuegesortierung: duenne Vektoren sind kurz, und wer sie aus einer
+// Zaehlung baut, hat sie meist schon fast sortiert — dann ist sie linear.
+pub fn SparseSort(idx: int64, val: int64, nnz: int64): int64 {
+  var i: int64 := 1;
+  while (i < nnz) {
+    var k: int64 := peek64(idx + i * 8);
+    var v: f64 := _g(val, i);
+    var j: int64 := i - 1;
+    var run: bool := true;
+    while (run) {
+      if (j < 0) { run := false; }
+      else {
+        if (peek64(idx + j * 8) > k) {
+          poke64(idx + (j + 1) * 8, peek64(idx + j * 8));
+          _p(val, j + 1, _g(val, j));
+          j := j - 1;
+        }
+        else { run := false; }
+      }
+    }
+    poke64(idx + (j + 1) * 8, k);
+    _p(val, j + 1, v);
+    i := i + 1;
+  }
+
+  // Doppelte zusammenfassen
+  if (nnz < 2) { return nnz; }
+  var w: int64 := 1;
+  i := 1;
+  while (i < nnz) {
+    var k: int64 := peek64(idx + i * 8);
+    if (k == peek64(idx + (w - 1) * 8)) {
+      var s: f64 := _g(val, w - 1) + _g(val, i);
+      _p(val, w - 1, s);
+    }
+    else {
+      poke64(idx + w * 8, k);
+      _p(val, w, _g(val, i));
+      w := w + 1;
+    }
+    i := i + 1;
+  }
+  return w;
+}
+
+// Wirft Eintraege mit |wert| <= eps weg. An Ort und Stelle, Rueckgabe ist das
+// neue nnz. Nach vielen Additionen sammeln sich sonst Nullen an, die jeden
+// Gleichlauf verlangsamen, ohne etwas beizutragen.
+pub fn SparsePrune(idx: int64, val: int64, nnz: int64, eps: f64): int64 {
+  var w: int64 := 0;
+  var i: int64 := 0;
+  while (i < nnz) {
+    var v: f64 := _g(val, i);
+    var a: f64 := AbsF64(v);
+    if (a > eps) {
+      poke64(idx + w * 8, peek64(idx + i * 8));
+      _p(val, w, v);
+      w := w + 1;
+    }
+    i := i + 1;
+  }
+  return w;
+}
+
+// ── Normen ───────────────────────────────────────────────────────────────────
+
+// Summe der Quadrate. Ohne Wurzel — zum Vergleichen reicht sie.
+pub fn SparseNormSq(val: int64, nnz: int64): f64 {
+  var s: f64 := _zero();
+  var c: f64 := _zero();
+  var i: int64 := 0;
+  while (i < nnz) {
+    var v: f64 := _g(val, i);
+    var x: f64 := v * v;
+    var t: f64 := s + x;
+    c := c + _corr(s, x, t);
+    s := t;
+    i := i + 1;
+  }
+  return s + c;
+}
+
+// Euklidische Laenge, ueberlaufsicher: der groesste Betrag wird ausgeklammert,
+// damit kein Quadrat den Wertebereich verlaesst (dieselbe Ueberlegung wie bei
+// DistHypot in std.dist).
+pub fn SparseNorm(val: int64, nnz: int64): f64 {
+  var big: f64 := _zero();
+  var i: int64 := 0;
+  while (i < nnz) {
+    var a: f64 := AbsF64(_g(val, i));
+    if (a > big) { big := a; }
+    i := i + 1;
+  }
+  if (big == _zero()) { return _zero(); }
+
+  var s: f64 := _zero();
+  var c: f64 := _zero();
+  i := 0;
+  while (i < nnz) {
+    var r: f64 := _g(val, i) / big;
+    var x: f64 := r * r;
+    var t: f64 := s + x;
+    c := c + _corr(s, x, t);
+    s := t;
+    i := i + 1;
+  }
+  return big * SqrtF64(s + c);
+}
+
+// Summe der Betraege.
+pub fn SparseNormL1(val: int64, nnz: int64): f64 {
+  var s: f64 := _zero();
+  var c: f64 := _zero();
+  var i: int64 := 0;
+  while (i < nnz) {
+    var x: f64 := AbsF64(_g(val, i));
+    var t: f64 := s + x;
+    c := c + _corr(s, x, t);
+    s := t;
+    i := i + 1;
+  }
+  return s + c;
+}
+
+// Groesster Betrag.
+pub fn SparseNormInf(val: int64, nnz: int64): f64 {
+  var big: f64 := _zero();
+  var i: int64 := 0;
+  while (i < nnz) {
+    var a: f64 := AbsF64(_g(val, i));
+    if (a > big) { big := a; }
+    i := i + 1;
+  }
+  return big;
+}
+
+// Teilt alle Werte durch die euklidische Laenge. false beim Nullvektor — er
+// hat keine Richtung, und Teilen durch null waere hier eine stille Luege.
+pub fn SparseNormalize(val: int64, nnz: int64): bool {
+  var nrm: f64 := SparseNorm(val, nnz);
+  if (nrm < _eps()) { return false; }
+  var i: int64 := 0;
+  while (i < nnz) {
+    _p(val, i, _g(val, i) / nrm);
+    i := i + 1;
+  }
+  return true;
+}
+
+// Multipliziert alle Werte mit s.
+pub fn SparseScale(val: int64, nnz: int64, s: f64): void {
+  var i: int64 := 0;
+  while (i < nnz) {
+    _p(val, i, _g(val, i) * s);
+    i := i + 1;
+  }
+}
+
+// ── Gleichlauf: Skalarprodukt ────────────────────────────────────────────────
+
+// Skalarprodukt zweier duenner Vektoren.
+//
+// Beide Indexfolgen werden EINMAL parallel durchlaufen; multipliziert wird nur
+// da, wo beide einen Eintrag haben. Alles andere ist null mal irgendwas und
+// braucht gar nicht erst gelesen zu werden.
+//
+// Setzt aufsteigende Indizes voraus (siehe Kopf der Unit).
+pub fn SparseDot(ia: int64, va: int64, na: int64,
+                 ib: int64, vb: int64, nb: int64): f64 {
+  var s: f64 := _zero();
+  var c: f64 := _zero();
+  var i: int64 := 0;
+  var j: int64 := 0;
+  while (i < na) {
+    if (j >= nb) { i := na; }
+    else {
+      var ka: int64 := peek64(ia + i * 8);
+      var kb: int64 := peek64(ib + j * 8);
+      if (ka == kb) {
+        var x: f64 := _g(va, i) * _g(vb, j);
+        var t: f64 := s + x;
+        c := c + _corr(s, x, t);
+        s := t;
+        i := i + 1;
+        j := j + 1;
+      }
+      else {
+        if (ka < kb) { i := i + 1; }
+        else { j := j + 1; }
+      }
+    }
+  }
+  return s + c;
+}
+
+// Zahl der Positionen, an denen BEIDE einen Eintrag haben.
+pub fn SparseOverlap(ia: int64, na: int64, ib: int64, nb: int64): int64 {
+  var c: int64 := 0;
+  var i: int64 := 0;
+  var j: int64 := 0;
+  while (i < na) {
+    if (j >= nb) { i := na; }
+    else {
+      var ka: int64 := peek64(ia + i * 8);
+      var kb: int64 := peek64(ib + j * 8);
+      if (ka == kb) { c := c + 1; i := i + 1; j := j + 1; }
+      else {
+        if (ka < kb) { i := i + 1; }
+        else { j := j + 1; }
+      }
+    }
+  }
+  return c;
+}
+
+// Jaccard-Aehnlichkeit der INDEXMENGEN: Schnitt durch Vereinigung. Die Werte
+// spielen keine Rolle — es zaehlt nur, wo etwas steht. Fuer zwei leere
+// Vektoren ist die Vereinigung leer; dann kommt 1 zurueck (zwei leere Mengen
+// sind gleich).
+pub fn SparseJaccard(ia: int64, na: int64, ib: int64, nb: int64): f64 {
+  var both: int64 := SparseOverlap(ia, na, ib, nb);
+  var uni: int64 := na + nb - both;
+  if (uni == 0) { return _one(); }
+  return (both as f64) / (uni as f64);
+}
+
+// ── Winkelmasse ──────────────────────────────────────────────────────────────
+
+// Kosinus-Aehnlichkeit: 1 gleiche Richtung, 0 rechter Winkel, -1 entgegen.
+//
+// Anders als bei der dichten Fassung in std.dist wird hier NICHT vorher
+// normiert, sondern das Skalarprodukt durch das Produkt der Normen geteilt.
+// Der Grund ist der Gleichlauf: eine Vornormierung muesste beide Vektoren
+// kopieren, um sie nicht zu veraendern. Ueberlauf ist trotzdem gebannt, weil
+// SparseNorm den groessten Betrag ausklammert und die Division stattfindet,
+// bevor etwas Grosses quadriert wird — solange die Einzelwerte selbst im
+// Bereich liegen.
+//
+// Wer denselben Vektor gegen viele andere haelt, normiert ihn einmal mit
+// SparseNormalize und benutzt danach SparseDot direkt: das spart pro Vergleich
+// eine Wurzel.
+pub fn SparseCosine(ia: int64, va: int64, na: int64,
+                    ib: int64, vb: int64, nb: int64): f64 {
+  var ra: f64 := SparseNorm(va, na);
+  var rb: f64 := SparseNorm(vb, nb);
+  if (ra < _eps()) { return _zero(); }
+  if (rb < _eps()) { return _zero(); }
+
+  var d: f64 := SparseDot(ia, va, na, ib, vb, nb);
+  var s: f64 := (d / ra) / rb;
+
+  // Rundung kann knapp ueber 1 hinausschiessen
+  if (s > _one()) { s := _one(); }
+  var lo: f64 := _neg(_one());
+  if (s < lo) { s := lo; }
+  return s;
+}
+
+// Kosinus-Abstand: 1 - Aehnlichkeit.
+//
+// Wie in std.dist: das ist KEINE Metrik, die Dreiecksungleichung gilt nicht.
+// Wer darauf einen Suchbaum baut, bekommt falsche Ergebnisse.
+pub fn SparseCosineDist(ia: int64, va: int64, na: int64,
+                        ib: int64, vb: int64, nb: int64): f64 {
+  return _one() - SparseCosine(ia, va, na, ib, vb, nb);
+}
+
+// Der Winkel in Radiant — anders als der Kosinus-Abstand eine echte Metrik.
+pub fn SparseAngular(ia: int64, va: int64, na: int64,
+                     ib: int64, vb: int64, nb: int64): f64 {
+  return AcosF64(SparseCosine(ia, va, na, ib, vb, nb));
+}
+
+// ── Abstaende ────────────────────────────────────────────────────────────────
+
+// Euklidischer Abstand, im Gleichlauf gerechnet.
+//
+// NICHT ueber ||a||^2 + ||b||^2 - 2*<a,b>. Diese Formel ist algebraisch
+// richtig und numerisch eine Falle: bei zwei aehnlichen Vektoren loeschen sich
+// die drei grossen Terme fast vollstaendig aus, und uebrig bleibt der
+// Rundungsfehler. Bei ||a||=||b||=1 und einem Abstand von 1e-8 sind von den
+// sechzehn Stellen noch null uebrig. Die Differenzen direkt zu bilden kostet
+// einen Durchlauf mehr und ist immer richtig.
+pub fn SparseEuclid(ia: int64, va: int64, na: int64,
+                    ib: int64, vb: int64, nb: int64): f64 {
+  var s: f64 := _zero();
+  var c: f64 := _zero();
+  var i: int64 := 0;
+  var j: int64 := 0;
+  var run: bool := true;
+  while (run) {
+    if (i >= na) {
+      if (j >= nb) { run := false; }
+      else {
+        var v: f64 := _g(vb, j);
+
+        var x: f64 := v * v;
+
+        var t2: f64 := s + x;
+
+        c := c + _corr(s, x, t2);
+
+        s := t2;
+        j := j + 1;
+      }
+    }
+    else {
+      if (j >= nb) {
+        var v: f64 := _g(va, i);
+
+        var x: f64 := v * v;
+
+        var t2: f64 := s + x;
+
+        c := c + _corr(s, x, t2);
+
+        s := t2;
+        i := i + 1;
+      }
+      else {
+        var ka: int64 := peek64(ia + i * 8);
+        var kb: int64 := peek64(ib + j * 8);
+        if (ka == kb) {
+          var d: f64 := _g(va, i) - _g(vb, j);
+          var xd: f64 := d * d;
+          var td: f64 := s + xd;
+          c := c + _corr(s, xd, td);
+          s := td;
+          i := i + 1;
+          j := j + 1;
+        }
+        else {
+          if (ka < kb) {
+            var v: f64 := _g(va, i);
+
+            var x: f64 := v * v;
+
+            var t2: f64 := s + x;
+
+            c := c + _corr(s, x, t2);
+
+            s := t2;
+            i := i + 1;
+          }
+          else {
+            var v: f64 := _g(vb, j);
+
+            var x: f64 := v * v;
+
+            var t2: f64 := s + x;
+
+            c := c + _corr(s, x, t2);
+
+            s := t2;
+            j := j + 1;
+          }
+        }
+      }
+    }
+  }
+  return SqrtF64(s + c);
+}
+
+// Manhattan-Abstand, ebenfalls im Gleichlauf.
+pub fn SparseManhattan(ia: int64, va: int64, na: int64,
+                       ib: int64, vb: int64, nb: int64): f64 {
+  var s: f64 := _zero();
+  var c: f64 := _zero();
+  var i: int64 := 0;
+  var j: int64 := 0;
+  var run: bool := true;
+  while (run) {
+    if (i >= na) {
+      if (j >= nb) { run := false; }
+      else {
+        var xm: f64 := AbsF64(_g(vb, j));
+
+        var tm: f64 := s + xm;
+
+        c := c + _corr(s, xm, tm);
+
+        s := tm;
+        j := j + 1;
+      }
+    }
+    else {
+      if (j >= nb) {
+        var xm: f64 := AbsF64(_g(va, i));
+
+        var tm: f64 := s + xm;
+
+        c := c + _corr(s, xm, tm);
+
+        s := tm;
+        i := i + 1;
+      }
+      else {
+        var ka: int64 := peek64(ia + i * 8);
+        var kb: int64 := peek64(ib + j * 8);
+        if (ka == kb) {
+          var xm: f64 := AbsF64(_g(va, i) - _g(vb, j));
+
+          var tm: f64 := s + xm;
+
+          c := c + _corr(s, xm, tm);
+
+          s := tm;
+          i := i + 1;
+          j := j + 1;
+        }
+        else {
+          if (ka < kb) {
+            var xm: f64 := AbsF64(_g(va, i));
+
+            var tm: f64 := s + xm;
+
+            c := c + _corr(s, xm, tm);
+
+            s := tm;
+            i := i + 1;
+          }
+          else {
+            var xm: f64 := AbsF64(_g(vb, j));
+
+            var tm: f64 := s + xm;
+
+            c := c + _corr(s, xm, tm);
+
+            s := tm;
+            j := j + 1;
+          }
+        }
+      }
+    }
+  }
+  return s + c;
+}
+
+// ── Rechnen ──────────────────────────────────────────────────────────────────
+
+// out := a + s*b, im Gleichlauf. Rueckgabe ist das nnz von out, oder -1, wenn
+// cap nicht reicht; die obere Schranke ist na+nb.
+//
+// out darf nicht auf a oder b liegen — die Felder werden von vorn beschrieben,
+// waehrend noch von hinten gelesen wird.
+//
+// Exakte Nullen, die durch Ausloeschung entstehen, bleiben als Eintrag stehen.
+// Das ist Absicht: sie wegzuwerfen kostet einen Vergleich pro Eintrag, und wer
+// sie los sein will, ruft SparsePrune.
+pub fn SparseAxpy(ia: int64, va: int64, na: int64,
+                  ib: int64, vb: int64, nb: int64, s: f64,
+                  outIdx: int64, outVal: int64, cap: int64): int64 {
+  var m: int64 := 0;
+  var i: int64 := 0;
+  var j: int64 := 0;
+  var run: bool := true;
+  while (run) {
+    if (m >= cap) { return 0 - 1; }
+
+    if (i >= na) {
+      if (j >= nb) { run := false; }
+      else {
+        poke64(outIdx + m * 8, peek64(ib + j * 8));
+        _p(outVal, m, s * _g(vb, j));
+        m := m + 1;
+        j := j + 1;
+      }
+    }
+    else {
+      if (j >= nb) {
+        poke64(outIdx + m * 8, peek64(ia + i * 8));
+        _p(outVal, m, _g(va, i));
+        m := m + 1;
+        i := i + 1;
+      }
+      else {
+        var ka: int64 := peek64(ia + i * 8);
+        var kb: int64 := peek64(ib + j * 8);
+        if (ka == kb) {
+          poke64(outIdx + m * 8, ka);
+          _p(outVal, m, _g(va, i) + s * _g(vb, j));
+          m := m + 1;
+          i := i + 1;
+          j := j + 1;
+        }
+        else {
+          if (ka < kb) {
+            poke64(outIdx + m * 8, ka);
+            _p(outVal, m, _g(va, i));
+            m := m + 1;
+            i := i + 1;
+          }
+          else {
+            poke64(outIdx + m * 8, kb);
+            _p(outVal, m, s * _g(vb, j));
+            m := m + 1;
+            j := j + 1;
+          }
+        }
+      }
+    }
+  }
+  return m;
+}
+
+// out := a + b.
+pub fn SparseAdd(ia: int64, va: int64, na: int64,
+                 ib: int64, vb: int64, nb: int64,
+                 outIdx: int64, outVal: int64, cap: int64): int64 {
+  return SparseAxpy(ia, va, na, ib, vb, nb, _one(), outIdx, outVal, cap);
+}
+
+// out := a - b.
+pub fn SparseSub(ia: int64, va: int64, na: int64,
+                 ib: int64, vb: int64, nb: int64,
+                 outIdx: int64, outVal: int64, cap: int64): int64 {
+  var m1: f64 := _neg(_one());
+  return SparseAxpy(ia, va, na, ib, vb, nb, m1, outIdx, outVal, cap);
+}
+
+// Elementweises Produkt. Es entsteht nur dort etwas, wo BEIDE einen Eintrag
+// haben — die obere Schranke fuer cap ist min(na,nb), nicht die Summe.
+pub fn SparseHadamard(ia: int64, va: int64, na: int64,
+                      ib: int64, vb: int64, nb: int64,
+                      outIdx: int64, outVal: int64, cap: int64): int64 {
+  var m: int64 := 0;
+  var i: int64 := 0;
+  var j: int64 := 0;
+  while (i < na) {
+    if (j >= nb) { i := na; }
+    else {
+      var ka: int64 := peek64(ia + i * 8);
+      var kb: int64 := peek64(ib + j * 8);
+      if (ka == kb) {
+        if (m >= cap) { return 0 - 1; }
+        poke64(outIdx + m * 8, ka);
+        _p(outVal, m, _g(va, i) * _g(vb, j));
+        m := m + 1;
+        i := i + 1;
+        j := j + 1;
+      }
+      else {
+        if (ka < kb) { i := i + 1; }
+        else { j := j + 1; }
+      }
+    }
+  }
+  return m;
+}
+
+// ── Aehnlichkeitssuche ───────────────────────────────────────────────────────
+//
+// Eine Sammlung duenner Vektoren steht als DREI Felder da: cIdx[k] und cVal[k]
+// sind die Adressen der Felder des k-ten Vektors, cNnz[k] seine Laenge. Wieder
+// getrennte Felder statt eines Feldes von Structs (#1109).
+
+// Der aehnlichste Vektor der Sammlung zur Anfrage, gemessen am Kosinus.
+// Rueckgabe ist sein Platz, oder -1 bei leerer Sammlung. Steht outSim nicht
+// auf null, landet dort die erreichte Aehnlichkeit.
+pub fn SparseNearest(qi: int64, qv: int64, qn: int64,
+                     cIdx: int64, cVal: int64, cNnz: int64, count: int64,
+                     outSim: int64): int64 {
+  var best: int64 := 0 - 1;
+  var bs: f64 := _zero();
+  var first: bool := true;
+
+  var k: int64 := 0;
+  while (k < count) {
+    var s: f64 := SparseCosine(qi, qv, qn,
+                               peek64(cIdx + k * 8), peek64(cVal + k * 8),
+                               peek64(cNnz + k * 8));
+    var take: bool := first;
+    if (!take) { take := s > bs; }
+    if (take) {
+      bs := s;
+      best := k;
+      first := false;
+    }
+    k := k + 1;
+  }
+  if (outSim != 0) { _p(outSim, 0, bs); }
+  return best;
+}
+
+// Die k aehnlichsten, absteigend nach Kosinus, in outPos/outSim.
+// Rueckgabe ist ihre Anzahl (weniger als k, wenn die Sammlung kleiner ist).
+//
+// Einfuegen in eine sortierte Liste der Laenge k statt Sortieren der ganzen
+// Sammlung: das kostet O(count*k) und braucht keinen Zusatzspeicher. Fuer
+// kleine k — und k ist bei einer Bestenliste immer klein — ist das schneller
+// als jedes Sortierverfahren.
+//
+// Auch hier bleibt es ein vollstaendiger Durchlauf durch die Sammlung. Wer
+// Millionen Vektoren durchsucht, braucht einen invertierten Index, der nur die
+// Kandidaten mit gemeinsamen Indizes anfasst; das ist eine eigene Aufgabe und
+// steht hier bewusst nicht.
+pub fn SparseTopK(qi: int64, qv: int64, qn: int64,
+                  cIdx: int64, cVal: int64, cNnz: int64, count: int64,
+                  k: int64, outPos: int64, outSim: int64): int64 {
+  if (k < 1) { return 0; }
+  var m: int64 := 0;
+
+  var c: int64 := 0;
+  while (c < count) {
+    var s: f64 := SparseCosine(qi, qv, qn,
+                               peek64(cIdx + c * 8), peek64(cVal + c * 8),
+                               peek64(cNnz + c * 8));
+
+    // Einfuegestelle suchen: erste Stelle, an der s groesser ist
+    var pos: int64 := m;
+    var j: int64 := 0;
+    var found: bool := false;
+    while (j < m) {
+      if (!found) {
+        var cur: f64 := _g(outSim, j);
+        if (s > cur) {
+          pos := j;
+          found := true;
+        }
+      }
+      j := j + 1;
+    }
+
+    var fits: bool := pos < k;
+    if (fits) {
+      var last: int64 := m;
+      if (last >= k) { last := k - 1; }
+      var t: int64 := last;
+      while (t > pos) {
+        poke64(outPos + t * 8, peek64(outPos + (t - 1) * 8));
+        _p(outSim, t, _g(outSim, t - 1));
+        t := t - 1;
+      }
+      poke64(outPos + pos * 8, c);
+      _p(outSim, pos, s);
+      if (m < k) { m := m + 1; }
+    }
+    c := c + 1;
+  }
+  return m;
+}

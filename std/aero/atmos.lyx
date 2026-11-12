@@ -1,0 +1,472 @@
+// std/aero/atmos.lyx — ICAO-Standardatmosphäre, Höhen und Geschwindigkeiten
+//
+// Fundament für alles, was ein Flugführungsrechner (MCDU/FMS) ausrechnet.
+// Ohne sie ist jede Steig- und Sinkrechnung falsch: Steigrate, wahre
+// Geschwindigkeit und Machzahl hängen sämtlich an Druck, Temperatur und
+// Dichte in der jeweiligen Höhe.
+//
+// WAS HIER DIE FALLEN SIND — jede einzelne hat in der Luftfahrt schon
+// Zwischenfälle verursacht:
+//
+//   * EINE FLUGFLÄCHE IST KEINE HÖHE. FL350 heißt: der Höhenmesser steht auf
+//     1013,25 hPa und zeigt 35000 ft. Die geometrische Höhe darüber liegt bei
+//     kaltem Wetter deutlich TIEFER — bei ISA−30 fehlen auf 10000 ft rund
+//     1200 ft. Wer Flugflächen und Höhen gleichsetzt, fliegt im Winter tiefer
+//     als er denkt. Deshalb sind hier Druckhöhe und wahre Höhe getrennte
+//     Größen mit getrennten Funktionen, und die Umrechnung verlangt die
+//     Temperaturabweichung als Argument.
+//
+//   * TAS IST NICHT CAS·√(ρ0/ρ). Das ist EAS. Der Unterschied ist die
+//     KOMPRESSIBILITÄT, und sie wächst mit der Geschwindigkeit: bei 300 kt in
+//     FL350 liegen zwischen der einfachen Wurzelformel und der richtigen
+//     Rechnung über zehn Knoten. Diese Unit rechnet durchgehend kompressibel.
+//
+//   * ÜBER DER TROPOPAUSE GILT DIE TROPOSPHÄRENFORMEL NICHT. Oberhalb 11 km
+//     ist die Temperatur konstant (216,65 K), der Druck fällt exponentiell.
+//     Wer die Temperaturgradient-Formel weiterrechnet, bekommt oberhalb von
+//     rund 71 km negative Temperaturen — lange vorher schon falsche Drücke.
+//
+//   * ISA IST GEOPOTENTIELL DEFINIERT, nicht geometrisch. Der Unterschied ist
+//     klein (in 11 km rund 19 m), aber er ist da; die Umrechnung steht hier
+//     ausdrücklich, statt stillschweigend gleichgesetzt zu werden.
+//
+// GÜLTIGKEIT: 0 bis 20 km geopotentielle Höhe (zwei Schichten der ICAO-
+// Standardatmosphäre) und Unterschall bis Mach 1. Außerhalb liefert jede
+// Funktion den Fehlerwert, statt zu extrapolieren.
+//
+// EINHEITEN: intern SI (m, Pa, K, m/s). Nach außen zusätzlich die in der
+// Luftfahrt üblichen Einheiten — mit der Einheit IM NAMEN, damit an der
+// Aufrufstelle sichtbar ist, was übergeben wird. `AvTasKtFromCasKt` nimmt und
+// liefert Knoten; `AvIsaPressurePa` liefert Pascal. Ein Name ohne Einheit ist
+// in dieser Unit ein Fehler.
+
+@description("ICAO-Standardatmosphäre, Druck-/Dichtehöhe, Flugflächen, CAS/EAS/TAS/Mach")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+@capabilities([])
+
+unit std.aero.atmos;
+
+import std.math;
+
+// ── Fehlerwert ────────────────────────────────────────────────────────────
+//
+// NaN, aus demselben Grund wie in std.astro: 0 und 1 sehen bei physikalischen
+// Größen beide nach einem gültigen Ergebnis aus, und ein stiller Ersatzwert
+// wandert unbemerkt in die nächste Rechnung. Eine Steigrate von 0 ist eine
+// Aussage; eine Steigrate von 0, weil die Eingabe unsinnig war, ist eine Lüge.
+pub fn AvError(): f64 {
+  var nix: f64 := 0.0;
+  return nix / nix;
+}
+
+// NaN ist der einzige Wert, der sich selbst ungleich ist.
+pub fn AvIsError(x: f64): bool { return x != x; }
+
+// ── Konstanten der ICAO-Standardatmosphäre ────────────────────────────────
+
+pub con AV_T0_K:        f64 := 288.15;      // Temperatur auf Meereshöhe
+pub con AV_P0_PA:       f64 := 101325.0;    // Druck auf Meereshöhe
+pub con AV_RHO0:        f64 := 1.225;       // Dichte auf Meereshöhe, kg/m³
+pub con AV_LAPSE:       f64 := 0.0065;      // Temperaturgradient, K/m
+pub con AV_G0:          f64 := 9.80665;     // Normfallbeschleunigung, m/s²
+pub con AV_R_AIR:       f64 := 287.05287;   // spezifische Gaskonstante, J/(kg·K)
+pub con AV_KAPPA:       f64 := 1.4;         // Isentropenexponent
+pub con AV_TROPO_M:     f64 := 11000.0;     // Tropopause, geopotentiell
+pub con AV_T_TROPO_K:   f64 := 216.65;      // Temperatur ab Tropopause
+pub con AV_OBERGRENZE_M: f64 := 20000.0;    // Gültigkeitsgrenze dieser Unit
+pub con AV_ERDRADIUS_M: f64 := 6356766.0;   // Radius für geopotentiell↔geometrisch
+
+// Druck an der Tropopause. Nicht als Literal hingeschrieben, sondern aus den
+// Konstanten gerechnet — ein abgeschriebener Wert und die Formel darüber
+// laufen sonst auseinander.
+fn _pTropoPa(): f64 {
+  var t: f64 := AV_T0_K - AV_LAPSE * AV_TROPO_M;
+  return AV_P0_PA * PowF64(t / AV_T0_K, AV_G0 / (AV_R_AIR * AV_LAPSE));
+}
+
+// ── Einheiten ─────────────────────────────────────────────────────────────
+//
+// Exakte Umrechnungsfaktoren nach internationaler Definition, nicht gerundet:
+// 1 ft = 0,3048 m, 1 NM = 1852 m, 1 kt = 1 NM/h.
+
+pub con AV_FT_IN_M:  f64 := 0.3048;
+pub con AV_NM_IN_M:  f64 := 1852.0;
+pub con AV_KT_IN_MS: f64 := 0.5144444444444444;   // 1852/3600
+
+pub fn AvFtToM(ft: f64): f64 { return ft * AV_FT_IN_M; }
+pub fn AvMToFt(m: f64): f64  { return m / AV_FT_IN_M; }
+pub fn AvNmToM(nm: f64): f64 { return nm * AV_NM_IN_M; }
+pub fn AvMToNm(m: f64): f64  { return m / AV_NM_IN_M; }
+pub fn AvKtToMs(kt: f64): f64 { return kt * AV_KT_IN_MS; }
+pub fn AvMsToKt(ms: f64): f64 { return ms / AV_KT_IN_MS; }
+pub fn AvCToK(c: f64): f64 { return c + 273.15; }
+pub fn AvKToC(k: f64): f64 { return k - 273.15; }
+pub fn AvHpaToPa(hpa: f64): f64 { return hpa * 100.0; }
+pub fn AvPaToHpa(pa: f64): f64 { return pa / 100.0; }
+
+// Steigrate: 1 kt = 101,26859... ft/min. Der Faktor wird gerechnet, nicht
+// abgeschrieben — er taucht in jeder Sinkflugrechnung auf.
+pub fn AvKtToFpm(kt: f64): f64 { return kt * (AV_NM_IN_M / AV_FT_IN_M) / 60.0; }
+pub fn AvFpmToKt(fpm: f64): f64 { return fpm * 60.0 * AV_FT_IN_M / AV_NM_IN_M; }
+
+// ── Geopotentiell und geometrisch ─────────────────────────────────────────
+//
+// ISA ist über der GEOPOTENTIELLEN Höhe definiert; ein Höhenmesser misst
+// Druck und liefert damit ebenfalls eine geopotentielle Größe. Die
+// geometrische Höhe liegt darüber, weil die Schwere mit der Höhe abnimmt.
+// In 11 km sind es rund 19 m — klein, aber es ist ein Unterschied.
+
+pub fn AvGeometrischZuGeopotentiell(hGeoM: f64): f64 {
+  return AV_ERDRADIUS_M * hGeoM / (AV_ERDRADIUS_M + hGeoM);
+}
+
+pub fn AvGeopotentiellZuGeometrisch(hPotM: f64): f64 {
+  var nenner: f64 := AV_ERDRADIUS_M - hPotM;
+  if (nenner <= 0.0) { return AvError(); }
+  return AV_ERDRADIUS_M * hPotM / nenner;
+}
+
+// ── Standardatmosphäre ────────────────────────────────────────────────────
+
+fn _hoeheGueltig(hM: f64): bool {
+  if (hM != hM) { return false; }                 // NaN reicht nicht durch
+  if (hM < 0.0 - 5000.0) { return false; }        // unter Totes Meer: keine Aussage
+  if (hM > AV_OBERGRENZE_M) { return false; }
+  return true;
+}
+
+// Temperatur in geopotentieller Höhe, Kelvin.
+pub fn AvIsaTemperaturK(hM: f64): f64 {
+  if (_hoeheGueltig(hM) == false) { return AvError(); }
+  if (hM <= AV_TROPO_M) { return AV_T0_K - AV_LAPSE * hM; }
+  // Ab der Tropopause konstant. Wer hier weiterrechnet, bekommt Werte, die
+  // unterhalb 20 km schon mehrere Kelvin danebenliegen.
+  return AV_T_TROPO_K;
+}
+
+// Druck in geopotentieller Höhe, Pascal.
+pub fn AvIsaDruckPa(hM: f64): f64 {
+  if (_hoeheGueltig(hM) == false) { return AvError(); }
+  if (hM <= AV_TROPO_M) {
+    var t: f64 := AV_T0_K - AV_LAPSE * hM;
+    return AV_P0_PA * PowF64(t / AV_T0_K, AV_G0 / (AV_R_AIR * AV_LAPSE));
+  }
+  // Isotherme Schicht: exponentieller Abfall ab dem Tropopausendruck.
+  var dh: f64 := hM - AV_TROPO_M;
+  return _pTropoPa() * ExpF64(0.0 - AV_G0 * dh / (AV_R_AIR * AV_T_TROPO_K));
+}
+
+// Dichte in geopotentieller Höhe, kg/m³ — über die Gasgleichung, nicht über
+// eine zweite Näherungsformel. Zwei Formeln für dieselbe Größe laufen
+// auseinander.
+pub fn AvIsaDichte(hM: f64): f64 {
+  var p: f64 := AvIsaDruckPa(hM);
+  if (AvIsError(p)) { return AvError(); }
+  return p / (AV_R_AIR * AvIsaTemperaturK(hM));
+}
+
+// Relativwerte, wie sie in Flughandbüchern stehen: δ (Druck), θ (Temperatur),
+// σ (Dichte), jeweils bezogen auf Meereshöhe.
+pub fn AvDelta(hM: f64): f64 { return AvIsaDruckPa(hM) / AV_P0_PA; }
+pub fn AvTheta(hM: f64): f64 { return AvIsaTemperaturK(hM) / AV_T0_K; }
+pub fn AvSigma(hM: f64): f64 { return AvIsaDichte(hM) / AV_RHO0; }
+
+// Umkehrung: geopotentielle Höhe zu einem gegebenen Druck. Das ist die
+// Rechnung, die ein Höhenmesser macht.
+pub fn AvHoeheAusDruckM(pPa: f64): f64 {
+  if (pPa != pPa || pPa <= 0.0) { return AvError(); }
+  var pTropo: f64 := _pTropoPa();
+  if (pPa >= pTropo) {
+    var verh: f64 := PowF64(pPa / AV_P0_PA, AV_R_AIR * AV_LAPSE / AV_G0);
+    var h: f64 := (AV_T0_K / AV_LAPSE) * (1.0 - verh);
+    if (_hoeheGueltig(h) == false) { return AvError(); }
+    return h;
+  }
+  var h2: f64 := AV_TROPO_M
+      + (AV_R_AIR * AV_T_TROPO_K / AV_G0) * LogF64(pTropo / pPa);
+  if (_hoeheGueltig(h2) == false) { return AvError(); }
+  return h2;
+}
+
+// ── Höhenmesser: QNH, Druckhöhe, Dichtehöhe ───────────────────────────────
+//
+// QNH ist der auf Meereshöhe zurückgerechnete Ortsdruck. Steht der
+// Höhenmesser auf QNH, zeigt er die Höhe über Meer.
+
+// Statischer Druck in wahrer Höhe `hM` bei gegebenem QNH.
+pub fn AvStatischerDruckPa(qnhHpa: f64, hM: f64): f64 {
+  if (qnhHpa != qnhHpa || qnhHpa <= 0.0) { return AvError(); }
+  if (_hoeheGueltig(hM) == false) { return AvError(); }
+  var p0: f64 := AvHpaToPa(qnhHpa);
+  if (hM <= AV_TROPO_M) {
+    var t: f64 := AV_T0_K - AV_LAPSE * hM;
+    return p0 * PowF64(t / AV_T0_K, AV_G0 / (AV_R_AIR * AV_LAPSE));
+  }
+  var dh: f64 := hM - AV_TROPO_M;
+  var pT: f64 := p0 * PowF64(AV_T_TROPO_K / AV_T0_K, AV_G0 / (AV_R_AIR * AV_LAPSE));
+  return pT * ExpF64(0.0 - AV_G0 * dh / (AV_R_AIR * AV_T_TROPO_K));
+}
+
+// DRUCKHÖHE: die Höhe, die ein auf 1013,25 hPa gestellter Höhenmesser zeigt.
+// Das ist die Größe, aus der Flugflächen gebildet werden — nicht die wahre
+// Höhe.
+pub fn AvDruckhoeheM(qnhHpa: f64, hM: f64): f64 {
+  var p: f64 := AvStatischerDruckPa(qnhHpa, hM);
+  if (AvIsError(p)) { return AvError(); }
+  return AvHoeheAusDruckM(p);
+}
+
+pub fn AvDruckhoeheFt(qnhHpa: f64, hFt: f64): f64 {
+  var h: f64 := AvDruckhoeheM(qnhHpa, AvFtToM(hFt));
+  if (AvIsError(h)) { return AvError(); }
+  return AvMToFt(h);
+}
+
+// DICHTEHÖHE: die Höhe, in der die Standardatmosphäre die tatsächlich
+// herrschende Dichte hat. Sie bestimmt Startstrecke und Steigleistung —
+// an einem heißen Tag steht ein Flugzeug leistungsmäßig Tausende Fuß höher,
+// als der Höhenmesser zeigt.
+pub fn AvDichtehoeheM(druckhoeheM: f64, oatC: f64): f64 {
+  if (_hoeheGueltig(druckhoeheM) == false) { return AvError(); }
+  if (oatC != oatC) { return AvError(); }
+  var p: f64 := AvIsaDruckPa(druckhoeheM);
+  if (AvIsError(p)) { return AvError(); }
+  var tK: f64 := AvCToK(oatC);
+  if (tK <= 0.0) { return AvError(); }
+  var rho: f64 := p / (AV_R_AIR * tK);
+  // Umkehrung der Dichteformel in der Troposphäre.
+  var verh: f64 := rho / AV_RHO0;
+  var exponent: f64 := 1.0 / (AV_G0 / (AV_R_AIR * AV_LAPSE) - 1.0);
+  // ACHTUNG AUSLOESCHUNG: bei kleinen Hoehen liegt PowF64(...) nahe bei 1,
+  // die Differenz 1 - x traegt also nur wenige gueltige Stellen, und der
+  // Vorfaktor 44331 verstaerkt den Rest. Gemessen: ein relativer Fehler von
+  // 1e-8 in der Potenz wird zu 4,4e-4 Metern im Ergebnis. Fuer die Praxis
+  // belanglos (Dichtehoehen werden in Fuss gerundet), aber wer diese Funktion
+  // gegen eine andere Umsetzung haelt, sollte es wissen.
+  var h: f64 := (AV_T0_K / AV_LAPSE) * (1.0 - PowF64(verh, exponent));
+  if (_hoeheGueltig(h) == false) { return AvError(); }
+  return h;
+}
+
+pub fn AvDichtehoeheFt(druckhoeheFt: f64, oatC: f64): f64 {
+  var h: f64 := AvDichtehoeheM(AvFtToM(druckhoeheFt), oatC);
+  if (AvIsError(h)) { return AvError(); }
+  return AvMToFt(h);
+}
+
+// ISA-Abweichung: um wie viel weicht die tatsächliche Temperatur von der
+// Standardtemperatur dieser Druckhöhe ab? Geht in jede Steig-, Sink- und
+// Reichweitenrechnung ein.
+pub fn AvIsaAbweichungK(druckhoeheM: f64, oatC: f64): f64 {
+  var tStd: f64 := AvIsaTemperaturK(druckhoeheM);
+  if (AvIsError(tStd)) { return AvError(); }
+  if (oatC != oatC) { return AvError(); }
+  return AvCToK(oatC) - tStd;
+}
+
+// WAHRE HÖHE aus angezeigter Höhe bei Temperaturabweichung. Die Faustformel
+// der Fliegerei lautet "4 % je 10 °C Abweichung"; hier steht die Rechnung
+// dahinter, weil die Faustformel bei großen Abweichungen mehrere hundert Fuß
+// danebenliegt.
+//
+// Bei KALTER Luft ist die wahre Höhe KLEINER als die angezeigte — das ist die
+// gefährliche Richtung, und deshalb gibt es diese Funktion.
+pub fn AvWahreHoeheM(angezeigtM: f64, gelaendeM: f64, isaAbwK: f64): f64 {
+  if (angezeigtM != angezeigtM || gelaendeM != gelaendeM) { return AvError(); }
+  if (isaAbwK != isaAbwK) { return AvError(); }
+  var hueberGelaende: f64 := angezeigtM - gelaendeM;
+  var tStdGel: f64 := AvIsaTemperaturK(gelaendeM);
+  if (AvIsError(tStdGel)) { return AvError(); }
+  var tGel: f64 := tStdGel + isaAbwK;
+  if (tGel <= 0.0) { return AvError(); }
+  // Die Höhendifferenz skaliert mit dem Verhältnis der wahren zur
+  // Standardtemperatur der Schicht.
+  return gelaendeM + hueberGelaende * (tGel / tStdGel);
+}
+
+// ── Flugflächen ───────────────────────────────────────────────────────────
+//
+// Eine Flugfläche ist die Druckhöhe in Hundert Fuß, bezogen auf 1013,25 hPa.
+// FL350 = 35000 ft Druckhöhe. Sie ist KEINE Höhe über Grund und keine über
+// Meer — der Unterschied ist genau der Grund für die Funktionen oben.
+
+pub fn AvFlugflaecheAusDruckhoeheFt(druckhoeheFt: f64): f64 {
+  if (druckhoeheFt != druckhoeheFt) { return AvError(); }
+  return druckhoeheFt / 100.0;
+}
+
+pub fn AvDruckhoeheFtAusFlugflaeche(fl: f64): f64 {
+  if (fl != fl) { return AvError(); }
+  return fl * 100.0;
+}
+
+// Übergangsfläche: die niedrigste nutzbare Flugfläche über der
+// Übergangshöhe. Bei niedrigem QNH liegt sie höher — genau deshalb wird sie
+// gerechnet und nicht als Konstante geführt.
+//
+// `mindestabstandFt` ist die geforderte Trennung zwischen Übergangshöhe und
+// Übergangsfläche (je nach Staat 0 bis 1000 ft).
+pub fn AvUebergangsflaeche(uebergangshoeheFt: f64, qnhHpa: f64,
+                            mindestabstandFt: f64): f64 {
+  if (uebergangshoeheFt != uebergangshoeheFt) { return AvError(); }
+  if (mindestabstandFt != mindestabstandFt || mindestabstandFt < 0.0) { return AvError(); }
+  var dh: f64 := AvDruckhoeheFt(qnhHpa, uebergangshoeheFt);
+  if (AvIsError(dh)) { return AvError(); }
+  var noetig: f64 := dh + mindestabstandFt;
+  // Auf die nächste durch 500 ft teilbare Fläche aufrunden: Flugflächen sind
+  // nicht beliebig fein.
+  var fl: f64 := noetig / 100.0;
+  var gerundet: f64 := CeilF64(fl / 5.0) * 5.0;
+  return gerundet;
+}
+
+// ── Schallgeschwindigkeit und Machzahl ────────────────────────────────────
+
+pub fn AvSchallgeschwindigkeitMs(tK: f64): f64 {
+  if (tK != tK || tK <= 0.0) { return AvError(); }
+  return SqrtF64(AV_KAPPA * AV_R_AIR * tK);
+}
+
+pub fn AvSchallgeschwindigkeitKt(tK: f64): f64 {
+  var a: f64 := AvSchallgeschwindigkeitMs(tK);
+  if (AvIsError(a)) { return AvError(); }
+  return AvMsToKt(a);
+}
+
+// ── Geschwindigkeiten: CAS, EAS, TAS, Mach ────────────────────────────────
+//
+// KOMPRESSIBEL gerechnet, nach den Beziehungen für isentrope Strömung.
+// Die verbreitete Näherung TAS = CAS·√(ρ0/ρ) liefert EAS, nicht TAS; der
+// Unterschied wächst mit Geschwindigkeit und Höhe und liegt im Reiseflug bei
+// über zehn Knoten.
+//
+// Kette: CAS → Staudruck qc (mit Meereshöhen-Werten) → Machzahl (mit dem
+// örtlichen statischen Druck) → TAS (mit der örtlichen Schallgeschwindigkeit).
+
+fn _a0Ms(): f64 { return SqrtF64(AV_KAPPA * AV_R_AIR * AV_T0_K); }
+
+// Staudruck aus CAS. Gültig im Unterschall.
+fn _qcAusCas(casMs: f64): f64 {
+  var m0: f64 := casMs / _a0Ms();
+  var innen: f64 := 1.0 + 0.2 * m0 * m0;
+  return AV_P0_PA * (PowF64(innen, 3.5) - 1.0);
+}
+
+// Machzahl aus Staudruck und statischem Druck.
+fn _machAusQc(qc: f64, pPa: f64): f64 {
+  if (pPa <= 0.0) { return AvError(); }
+  var innen: f64 := qc / pPa + 1.0;
+  var wert: f64 := 5.0 * (PowF64(innen, 2.0 / 7.0) - 1.0);
+  if (wert < 0.0) { return AvError(); }
+  return SqrtF64(wert);
+}
+
+fn _eingabenGueltig(v: f64, hM: f64): bool {
+  if (v != v || v < 0.0) { return false; }
+  return _hoeheGueltig(hM);
+}
+
+// CAS → Machzahl in gegebener Druckhöhe.
+pub fn AvMachAusCasKt(casKt: f64, druckhoeheM: f64): f64 {
+  if (_eingabenGueltig(casKt, druckhoeheM) == false) { return AvError(); }
+  var p: f64 := AvIsaDruckPa(druckhoeheM);
+  if (AvIsError(p)) { return AvError(); }
+  return _machAusQc(_qcAusCas(AvKtToMs(casKt)), p);
+}
+
+// CAS → TAS. `oatC` ist die tatsächliche Außentemperatur; sie geht nur über
+// die Schallgeschwindigkeit ein, nicht über den Druck — der kommt aus der
+// Druckhöhe. Wer hier die Standardtemperatur einsetzt, bekommt an einem
+// warmen Tag eine zu kleine TAS.
+pub fn AvTasKtAusCasKt(casKt: f64, druckhoeheM: f64, oatC: f64): f64 {
+  var m: f64 := AvMachAusCasKt(casKt, druckhoeheM);
+  if (AvIsError(m)) { return AvError(); }
+  if (oatC != oatC) { return AvError(); }
+  var a: f64 := AvSchallgeschwindigkeitKt(AvCToK(oatC));
+  if (AvIsError(a)) { return AvError(); }
+  return m * a;
+}
+
+// TAS → CAS, die Umkehrung derselben Kette.
+pub fn AvCasKtAusTasKt(tasKt: f64, druckhoeheM: f64, oatC: f64): f64 {
+  if (_eingabenGueltig(tasKt, druckhoeheM) == false) { return AvError(); }
+  if (oatC != oatC) { return AvError(); }
+  var a: f64 := AvSchallgeschwindigkeitKt(AvCToK(oatC));
+  if (AvIsError(a)) { return AvError(); }
+  var m: f64 := tasKt / a;
+  var p: f64 := AvIsaDruckPa(druckhoeheM);
+  if (AvIsError(p)) { return AvError(); }
+  // qc aus Mach und örtlichem Druck …
+  var qc: f64 := p * (PowF64(1.0 + 0.2 * m * m, 3.5) - 1.0);
+  // … und daraus zurück auf CAS, jetzt mit den Meereshöhen-Werten.
+  var innen: f64 := qc / AV_P0_PA + 1.0;
+  var wert: f64 := 5.0 * (PowF64(innen, 2.0 / 7.0) - 1.0);
+  if (wert < 0.0) { return AvError(); }
+  return AvMsToKt(_a0Ms() * SqrtF64(wert));
+}
+
+// Mach → TAS und Mach → CAS.
+pub fn AvTasKtAusMach(mach: f64, oatC: f64): f64 {
+  if (mach != mach || mach < 0.0) { return AvError(); }
+  if (oatC != oatC) { return AvError(); }
+  var a: f64 := AvSchallgeschwindigkeitKt(AvCToK(oatC));
+  if (AvIsError(a)) { return AvError(); }
+  return mach * a;
+}
+
+pub fn AvCasKtAusMach(mach: f64, druckhoeheM: f64): f64 {
+  if (mach != mach || mach < 0.0) { return AvError(); }
+  if (_hoeheGueltig(druckhoeheM) == false) { return AvError(); }
+  var p: f64 := AvIsaDruckPa(druckhoeheM);
+  if (AvIsError(p)) { return AvError(); }
+  var qc: f64 := p * (PowF64(1.0 + 0.2 * mach * mach, 3.5) - 1.0);
+  var innen: f64 := qc / AV_P0_PA + 1.0;
+  var wert: f64 := 5.0 * (PowF64(innen, 2.0 / 7.0) - 1.0);
+  if (wert < 0.0) { return AvError(); }
+  return AvMsToKt(_a0Ms() * SqrtF64(wert));
+}
+
+// EAS — die Geschwindigkeit, die denselben Staudruck auf Meereshöhe ergäbe.
+// Sie ist die Größe, an der Strukturgrenzen hängen (VMO).
+pub fn AvEasKtAusTasKt(tasKt: f64, druckhoeheM: f64): f64 {
+  if (_eingabenGueltig(tasKt, druckhoeheM) == false) { return AvError(); }
+  var sigma: f64 := AvSigma(druckhoeheM);
+  if (AvIsError(sigma) || sigma <= 0.0) { return AvError(); }
+  return tasKt * SqrtF64(sigma);
+}
+
+// ÜBERGANGSHÖHE zwischen CAS- und Mach-Führung: unterhalb steigt ein Flugzeug
+// mit fester CAS, oberhalb mit fester Machzahl. Genau in dieser Höhe gehören
+// beide zusammen. Sie wird gesucht, nicht abgeschätzt — mit einer Bisektion
+// über die Höhe, weil die Beziehung nicht geschlossen umkehrbar ist.
+pub fn AvUebergangshoeheM(casKt: f64, mach: f64): f64 {
+  if (casKt != casKt || casKt <= 0.0) { return AvError(); }
+  if (mach != mach || mach <= 0.0) { return AvError(); }
+  var unten: f64 := 0.0;
+  var oben: f64 := AV_OBERGRENZE_M;
+  // Unten ist die CAS-Machzahl kleiner als die Zielmachzahl, oben größer.
+  // Gibt es keinen Schnitt im Gültigkeitsbereich, ist die Antwort ein Fehler
+  // und keine Bereichsgrenze — eine zurückgegebene Grenze sähe aus wie ein
+  // Ergebnis.
+  var mUnten: f64 := AvMachAusCasKt(casKt, unten);
+  var mOben: f64 := AvMachAusCasKt(casKt, oben);
+  if (AvIsError(mUnten) || AvIsError(mOben)) { return AvError(); }
+  if (mUnten > mach) { return AvError(); }
+  if (mOben < mach) { return AvError(); }
+  var i: int64 := 0;
+  while (i < 80) {
+    var mitte: f64 := (unten + oben) / 2.0;
+    var mMitte: f64 := AvMachAusCasKt(casKt, mitte);
+    if (AvIsError(mMitte)) { return AvError(); }
+    if (mMitte < mach) { unten := mitte; } else { oben := mitte; }
+    i := i + 1;
+  }
+  return (unten + oben) / 2.0;
+}
+
+pub fn AvUebergangshoeheFt(casKt: f64, mach: f64): f64 {
+  var h: f64 := AvUebergangshoeheM(casKt, mach);
+  if (AvIsError(h)) { return AvError(); }
+  return AvMToFt(h);
+}

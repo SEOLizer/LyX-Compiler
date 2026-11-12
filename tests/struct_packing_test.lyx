@@ -1,7 +1,14 @@
 // tests/struct_packing_test.lyx
 // WP-4.1-A: Struct Packing — @packed und at(offset)
 //
-// Tests: tightly-packed field layout, explicit field offsets, type-size mapping.
+// Geprüft wird die tatsächliche Feldlage: geschrieben wird DURCH die
+// Struct-Felder, gelesen roh über peek an festen Offsets. Nur diese Richtung
+// sieht den Abstand zwischen den Feldern.
+//
+// Die frühere Fassung poked und peekte an selbst gewählten Offsets, ohne je ein
+// Feld anzufassen — sie prüfte damit poke/peek, nicht das Layout, und blieb
+// grün, während `@packed` wirkungslos war (#1038: das Parser-Bit wurde auf dem
+// benutzten Pfad nie gesetzt, jedes Feld behielt 8 Byte Abstand).
 
 @description("WP-4.1-A: struct packing tests")
 @author("Andreas Röne")
@@ -9,7 +16,13 @@
 unit tests.struct_packing_test;
 
 import std.alloc;
-// --- 1. @packed struct: fields use natural type sizes, no 8-byte padding ---
+
+fn clear(buf: int64, n: int64) {
+  var i: int64 := 0;
+  while (i < n) { poke8(buf + i, 0); i := i + 1; }
+}
+
+// --- 1. @packed struct: Felder liegen dicht ------------------------------
 @packed
 struct TightHeader {
   magic:   uint8;
@@ -19,57 +32,56 @@ struct TightHeader {
 }
 
 fn testPackedFieldOffsets(): int64 {
-  // In a @packed struct the fields are laid out tightly:
-  //   magic   @ offset 0  (uint8,  1 byte)
-  //   version @ offset 1  (uint8,  1 byte)
-  //   flags   @ offset 2  (uint16, 2 bytes)
-  //   length  @ offset 4  (uint32, 4 bytes)
-  // total: 8 bytes
+  //   magic @ 0 (1), version @ 1 (1), flags @ 2 (2), length @ 4 (4)
+  var buf: int64 := alloc(32);
+  clear(buf, 32);
+  var h: TightHeader := buf as TightHeader;
+  h.magic   := 0xAB;
+  h.version := 0x02;
+  h.flags   := 0x0102;
+  h.length  := 0xDEAD;
 
-  var buf: int64 := alloc(16);
-  var h: TightHeader;
-  poke8 (buf + 0, 0xAB);   // magic
-  poke8 (buf + 1, 0x02);   // version
-  poke16(buf + 2, 0x0102); // flags  (little-endian: 0x02, 0x01)
-  poke32(buf + 4, 0xDEAD); // length
+  // Rohe Bytes: 0xAB 0x02 | 0x02 0x01 | 0xAD 0xDE 0x00 0x00
+  if (peek8(buf + 0) != 0xAB) { Print("FAIL: magic nicht auf Offset 0\n"); return 1; }
+  if (peek8(buf + 1) != 0x02) { Print("FAIL: version nicht auf Offset 1\n"); return 1; }
+  if (peek8(buf + 2) != 0x02) { Print("FAIL: flags nicht auf Offset 2\n"); return 1; }
+  if (peek8(buf + 3) != 0x01) { Print("FAIL: flags nur 1 Byte breit\n"); return 1; }
+  if (peek8(buf + 4) != 0xAD) { Print("FAIL: length nicht auf Offset 4\n"); return 1; }
+  if (peek8(buf + 5) != 0xDE) { Print("FAIL: length nur 1 Byte breit\n"); return 1; }
 
-  // Read back via struct field accessors using known offsets
-  var m: uint8  := peek8 (buf + 0) as uint8;
-  var v: uint8  := peek8 (buf + 1) as uint8;
-  var f: uint16 := peek16(buf + 2) as uint16;
-  var l: uint32 := peek32(buf + 4) as uint32;
+  // Rücklesen über die Felder muss dasselbe ergeben.
+  if (h.magic   as int64 != 0xAB)   { Print("FAIL: magic rueckgelesen\n");   return 1; }
+  if (h.version as int64 != 0x02)   { Print("FAIL: version rueckgelesen\n"); return 1; }
+  if (h.flags   as int64 != 0x0102) { Print("FAIL: flags rueckgelesen\n");   return 1; }
+  if (h.length  as int64 != 0xDEAD) { Print("FAIL: length rueckgelesen\n");  return 1; }
 
-  if (m as int64 != 0xAB)   { Print("FAIL: magic\n");   return 1; }
-  if (v as int64 != 0x02)   { Print("FAIL: version\n"); return 1; }
-  if (f as int64 != 0x0102) { Print("FAIL: flags\n");   return 1; }
-  if (l as int64 != 0xDEAD) { Print("FAIL: length\n");  return 1; }
   Print("OK: @packed field layout\n");
   return 0;
 }
 
-// --- 2. Non-packed struct still uses 8-byte strides ---
+// --- 2. Ohne @packed bleibt der 8-Byte-Abstand ---------------------------
 struct WideHeader {
   magic:   uint8;
   version: uint8;
 }
 
 fn testUnpackedStride(): int64 {
-  // Each field in an unpacked struct takes 8 bytes
-  // magic   @ 0, version @ 8
   var buf: int64 := alloc(32);
-  poke8(buf + 0, 0x55);
-  poke8(buf + 8, 0x77);
+  clear(buf, 32);
+  var w: WideHeader := buf as WideHeader;
+  w.magic   := 0x55;
+  w.version := 0x77;
 
-  var m: uint8 := peek8(buf + 0) as uint8;
-  var v: uint8 := peek8(buf + 8) as uint8;
+  if (peek8(buf + 0) != 0x55) { Print("FAIL: wide magic nicht auf Offset 0\n"); return 1; }
+  if (peek8(buf + 8) != 0x77) { Print("FAIL: wide version nicht auf Offset 8\n"); return 1; }
+  // Offset 1 muss leer bleiben — sonst wurde doch gepackt.
+  if (peek8(buf + 1) != 0)    { Print("FAIL: unpacked struct liegt gepackt\n"); return 1; }
 
-  if (m as int64 != 0x55) { Print("FAIL: wide magic\n");   return 1; }
-  if (v as int64 != 0x77) { Print("FAIL: wide version\n"); return 1; }
   Print("OK: unpacked 8-byte stride\n");
   return 0;
 }
 
-// --- 3. @packed struct with all primitive types ---
+// --- 3. @packed über alle Primitivbreiten --------------------------------
 @packed
 struct MixedPacked {
   a: uint8;
@@ -79,27 +91,32 @@ struct MixedPacked {
 }
 
 fn testMixedPackedSizes(): int64 {
-  // a @ 0 (1), b @ 1 (2), c @ 3 (4), d @ 7 (8) — total 15 bytes
-  var buf: int64 := alloc(32);
-  poke8 (buf + 0,  0x01);
-  poke16(buf + 1,  0x0203);
-  poke32(buf + 3,  0x04050607);
-  poke64(buf + 7,  0x0102030405060708);
+  // a @ 0 (1), b @ 1 (2), c @ 3 (4), d @ 7 (8) — zusammen 15 Byte
+  var buf: int64 := alloc(64);
+  clear(buf, 64);
+  var m: MixedPacked := buf as MixedPacked;
+  m.a := 0x01;
+  m.b := 0x0203;
+  m.c := 0x04050607;
+  m.d := 0x0102030405060708;
 
-  var a: uint8  := peek8 (buf + 0) as uint8;
-  var b: uint16 := peek16(buf + 1) as uint16;
-  var c: uint32 := peek32(buf + 3) as uint32;
-  var d: int64  := peek64(buf + 7);
+  if (peek8(buf + 0) != 0x01) { Print("FAIL: mixed a nicht auf 0\n"); return 1; }
+  if (peek8(buf + 1) != 0x03) { Print("FAIL: mixed b nicht auf 1\n"); return 1; }
+  if (peek8(buf + 3) != 0x07) { Print("FAIL: mixed c nicht auf 3\n"); return 1; }
+  if (peek8(buf + 7) != 0x08) { Print("FAIL: mixed d nicht auf 7\n"); return 1; }
+  // Hinter d ist Schluss: Byte 15 gehoert nicht mehr zur Struktur.
+  if (peek8(buf + 15) != 0)   { Print("FAIL: mixed reicht ueber 15 Byte hinaus\n"); return 1; }
 
-  if (a as int64 != 0x01)               { Print("FAIL: mixed a\n"); return 1; }
-  if (b as int64 != 0x0203)             { Print("FAIL: mixed b\n"); return 1; }
-  if (c as int64 != 0x04050607)         { Print("FAIL: mixed c\n"); return 1; }
-  if (d != 0x0102030405060708)          { Print("FAIL: mixed d\n"); return 1; }
+  if (m.a as int64 != 0x01)              { Print("FAIL: mixed a rueckgelesen\n"); return 1; }
+  if (m.b as int64 != 0x0203)            { Print("FAIL: mixed b rueckgelesen\n"); return 1; }
+  if (m.c as int64 != 0x04050607)        { Print("FAIL: mixed c rueckgelesen\n"); return 1; }
+  if (m.d != 0x0102030405060708)         { Print("FAIL: mixed d rueckgelesen\n"); return 1; }
+
   Print("OK: mixed packed sizes\n");
   return 0;
 }
 
-// --- 4. at(offset) explicit field placement ---
+// --- 4. at(offset): ausdrückliche Feldlage -------------------------------
 @packed
 struct ExplicitLayout {
   id:    uint16 at(0);
@@ -109,19 +126,22 @@ struct ExplicitLayout {
 }
 
 fn testExplicitOffsets(): int64 {
-  var buf: int64 := alloc(32);
-  poke16(buf + 0, 0xBEEF);
-  poke8 (buf + 2, 0x42);
-  poke8 (buf + 3, 0x00);
-  poke64(buf + 4, 9999);
+  var buf: int64 := alloc(64);
+  clear(buf, 64);
+  var e: ExplicitLayout := buf as ExplicitLayout;
+  e.id    := 0xBEEF;
+  e.flags := 0x42;
+  e.value := 9999;
 
-  var id:    uint16 := peek16(buf + 0) as uint16;
-  var flags: uint8  := peek8 (buf + 2) as uint8;
-  var value: int64  := peek64(buf + 4);
+  if (peek8(buf + 0) != 0xEF) { Print("FAIL: id nicht auf Offset 0\n");    return 1; }
+  if (peek8(buf + 1) != 0xBE) { Print("FAIL: id nur 1 Byte breit\n");      return 1; }
+  if (peek8(buf + 2) != 0x42) { Print("FAIL: flags nicht auf Offset 2\n"); return 1; }
+  if (peek8(buf + 4) != 15)   { Print("FAIL: value nicht auf Offset 4\n"); return 1; }
 
-  if (id as int64    != 0xBEEF) { Print("FAIL: explicit id\n");    return 1; }
-  if (flags as int64 != 0x42)   { Print("FAIL: explicit flags\n"); return 1; }
-  if (value          != 9999)   { Print("FAIL: explicit value\n"); return 1; }
+  if (e.id    as int64 != 0xBEEF) { Print("FAIL: id rueckgelesen\n");    return 1; }
+  if (e.flags as int64 != 0x42)   { Print("FAIL: flags rueckgelesen\n"); return 1; }
+  if (e.value          != 9999)   { Print("FAIL: value rueckgelesen\n"); return 1; }
+
   Print("OK: explicit at(offset) layout\n");
   return 0;
 }

@@ -1,0 +1,736 @@
+// std/convolve.lyx
+// Faltung und Filterung: 1D, 2D, Randbehandlung, Kernel
+
+@description("Convolution and filtering: direct and FFT-based 1D/2D, edge modes, overlap-add, kernel generators")
+@author("Andreas Roene")
+@copyright("2026 Andreas Roene")
+unit std.convolve;
+
+import std.math;
+import std.alloc;
+import std.fft;
+
+// ── Name ─────────────────────────────────────────────────────────────────────
+//
+// Diese Einheit heisst std.convolve, NICHT std.conv: den Namen std.conv hat
+// bereits die Typkonvertierung (IntToHex, ParseHex, Bitmanipulation). Zwei
+// Dateien mit derselben unit-Zeile waeren kein Fehler, den der Compiler meldet
+// — es waere unbestimmt, welche von beiden ein `import std.conv` laedt. Genau
+// dieser Fall besteht im Bestand bereits zwischen std/db/redis.lyx und
+// std/db/redis_simple.lyx und ist dort als offener Punkt vermerkt.
+//
+// Das Praefix Conv* bleibt: es ist im gesamten std-Baum sonst unbenutzt.
+//
+// ── Abgrenzung zu std.fft ────────────────────────────────────────────────────
+//
+// std.fft kann bereits falten: FftConvolveReal (linear, ueber die FFT),
+// FftConvolveCircular und FftCorrelateReal. Das ist der Motor, nicht die
+// Bedienung — dort fehlt alles, was Faltung im Alltag ausmacht:
+//
+//   - kurze Kerne. Ein 5-Punkte-Filter ueber die FFT zu jagen kostet mehr als
+//     die direkte Summe. Diese Einheit waehlt selbst (siehe ConvThreshold).
+//   - Randbehandlung. Ein Filter braucht Werte links vom Anfang und rechts vom
+//     Ende. Ob dort Nullen stehen, der Randwert fortgesetzt wird oder das
+//     Signal gespiegelt wird, aendert das Ergebnis sichtbar — bei Bildern
+//     entscheidet es ueber dunkle Raender.
+//   - Ausgabelaenge. full, same, valid.
+//   - zwei Dimensionen, separable Kerne, lange Stroeme.
+//
+// ── Faltung ist NICHT Korrelation ────────────────────────────────────────────
+//
+// Faltung spiegelt den Kern:   (a*k)[i] = sum_j a[j] * k[i-j]
+// Korrelation tut das nicht:   (a#k)[i] = sum_j a[j] * k[j-i]
+//
+// Bei symmetrischen Kernen (Box, Gauss) faellt der Unterschied nicht auf — und
+// genau deshalb faellt er bei Sobel dann als vertauschtes Vorzeichen auf, wenn
+// man es am wenigsten erwartet. Beide Formen stehen hier getrennt zur
+// Verfuegung; wer "Filter" sagt und ein Faltungskern-Bild meint, will meistens
+// die Korrelation (so arbeiten die gaengigen Bildbibliotheken).
+//
+// ── Darstellung ──────────────────────────────────────────────────────────────
+//
+// Reihen und Bilder sind f64-Felder als Adresse. Ein Bild der Groesse w mal h
+// liegt zeilenweise, Pixel (x,y) an y*w + x. Der Aufrufer legt den Speicher an.
+//
+// ── f64-Fallstricke des Compilers ────────────────────────────────────────────
+//
+// Wie in den uebrigen Units dieses Verzeichnisses: `con f64` als Operand
+// (#1499), negatives Literal als Operand (#1496), unaeres Minus auf einer
+// Variablen im Ausdruck (#1512) und peekf64 direkt im Ausdruck rechnen still
+// falsch. Konstanten stehen als Funktionen, negiert wird ueber _neg(), und
+// jeder gelesene Wert geht erst in eine typisierte Variable.
+
+fn _zero(): f64 { return 0.0; }
+fn _one(): f64  { return 1.0; }
+fn _neg(x: f64): f64 { return 0.0 - x; }
+fn _eps(): f64  { return 0.000000000001; }
+
+fn _get(p: int64, i: int64): f64 {
+  var v: f64 := peekf64(p + i * 8);
+  return v;
+}
+
+fn _put(p: int64, i: int64, v: f64): void {
+  pokef64(p + i * 8, v);
+}
+
+// ── Ausgabemodi ──────────────────────────────────────────────────────────────
+//
+// FULL   Laenge na+nk-1. Jede Ueberlappung zaehlt, auch die an den Enden, bei
+//        der Kern und Signal sich nur in einem Wert beruehren. Mathematisch
+//        die vollstaendige Faltung.
+// SAME   Laenge na. Der um die Kernmitte zentrierte Ausschnitt aus FULL —
+//        Ein- und Ausgang sind gleich lang, was Filterketten erst brauchbar
+//        macht. Braucht Randbehandlung.
+// VALID  Laenge na-nk+1. Nur die Stellen, an denen der Kern vollstaendig im
+//        Signal liegt. Kein Rand, keine Annahme, kein Randartefakt — dafuer
+//        wird die Ausgabe kuerzer.
+
+pub con CONV_FULL:  int64 := 0;
+pub con CONV_SAME:  int64 := 1;
+pub con CONV_VALID: int64 := 2;
+
+// ── Randmodi ─────────────────────────────────────────────────────────────────
+//
+// Nur fuer CONV_SAME von Bedeutung: FULL setzt ausserhalb per Definition Null,
+// VALID greift nie ausserhalb.
+//
+// ZERO     ausserhalb ist 0. Ehrlich, aber zieht Raender gegen null — bei
+//          Bildern der dunkle Saum.
+// CLAMP    der Randwert wird fortgesetzt. Der uebliche Vorgabewert fuer Bilder.
+// REFLECT  am Rand gespiegelt (abcd -> dcba|abcd|dcba). Vermeidet den Sprung
+//          in der ersten Ableitung, deshalb bei Kantenfiltern die beste Wahl.
+// WRAP     zyklisch. Richtig, wenn das Signal periodisch IST — sonst legt es
+//          das Ende auf den Anfang und erzeugt Artefakte aus dem Nichts.
+
+pub con CONV_EDGE_ZERO:    int64 := 0;
+pub con CONV_EDGE_CLAMP:   int64 := 1;
+pub con CONV_EDGE_REFLECT: int64 := 2;
+pub con CONV_EDGE_WRAP:    int64 := 3;
+
+// Ab dieser Kernlaenge lohnt der Weg ueber die FFT. Der direkte Weg kostet
+// na*nk, der FFT-Weg rund 3*m*log2(m) mit m als naechster Zweierpotenz plus
+// drei Feldern Speicher. Der Umschlagpunkt liegt gemessen bei einigen Dutzend;
+// 64 ist konservativ gewaehlt, weil der direkte Weg dafuer keinen Speicher
+// braucht und exakt bleibt.
+pub fn ConvThreshold(): int64 { return 64; }
+
+// Laenge der Ausgabe fuer einen Modus. -1 bei unzulaessiger Kombination
+// (VALID mit einem Kern, der laenger als das Signal ist).
+pub fn ConvOutputLen(na: int64, nk: int64, mode: int64): int64 {
+  if (na < 1) { return -1; }
+  if (nk < 1) { return -1; }
+  if (mode == CONV_FULL)  { return na + nk - 1; }
+  if (mode == CONV_SAME)  { return na; }
+  if (mode == CONV_VALID) {
+    if (nk > na) { return -1; }
+    return na - nk + 1;
+  }
+  return -1;
+}
+
+// Ein Wert der Reihe, mit Randbehandlung. Index darf ausserhalb liegen.
+fn _sample(a: int64, n: int64, i: int64, edge: int64): f64 {
+  if (i >= 0) {
+    if (i < n) { return _get(a, i); }
+  }
+
+  if (edge == CONV_EDGE_ZERO) { return _zero(); }
+
+  if (edge == CONV_EDGE_CLAMP) {
+    if (i < 0) { return _get(a, 0); }
+    return _get(a, n - 1);
+  }
+
+  if (edge == CONV_EDGE_REFLECT) {
+    // Spiegelung ohne Wiederholung des Randwerts: -1 -> 0, -2 -> 1.
+    // Mehrfach angewandt, damit auch Kerne laenger als die Reihe gehen.
+    var idx: int64 := i;
+    var guard: int64 := 0;
+    while (guard < 64) {
+      if (idx < 0) { idx := _neg_i(idx) - 1; }
+      else {
+        if (idx >= n) { idx := 2 * n - idx - 1; }
+        else { guard := 64; }
+      }
+      if (guard < 64) { guard := guard + 1; }
+    }
+    if (idx < 0) { idx := 0; }
+    if (idx >= n) { idx := n - 1; }
+    return _get(a, idx);
+  }
+
+  if (edge == CONV_EDGE_WRAP) {
+    var idx: int64 := i % n;
+    if (idx < 0) { idx := idx + n; }
+    return _get(a, idx);
+  }
+
+  return _zero();
+}
+
+// Ganzzahlige Negation. Auf int64 ist das unaere Minus unauffaellig (#1512
+// betrifft f64), der Aufruf haelt die Absicht aber sichtbar an einer Stelle.
+fn _neg_i(x: int64): int64 { return 0 - x; }
+
+// ── Direkte Faltung, 1D ──────────────────────────────────────────────────────
+
+// Faltung mit gespiegeltem Kern. out muss ConvOutputLen(na,nk,mode) Werte
+// fassen und darf nicht auf a zeigen.
+pub fn ConvDirect(a: int64, na: int64, k: int64, nk: int64,
+                  mode: int64, edge: int64, out: int64): bool {
+  var outLen: int64 := ConvOutputLen(na, nk, mode);
+  if (outLen < 1) { return false; }
+  if (out == a) { return false; }
+  if (out == k) { return false; }
+
+  // Verschiebung des Ausgabefensters gegenueber der vollen Faltung
+  var shift: int64 := 0;
+  if (mode == CONV_SAME)  { shift := nk / 2; }
+  if (mode == CONV_VALID) { shift := nk - 1; }
+
+  var i: int64 := 0;
+  while (i < outLen) {
+    var s: f64 := _zero();
+    var j: int64 := 0;
+    while (j < nk) {
+      var idx: int64 := i + shift - j;
+      var av: f64 := _zero();
+      if (mode == CONV_SAME) { av := _sample(a, na, idx, edge); }
+      else {
+        // FULL und VALID: ausserhalb ist per Definition null bzw. kommt
+        // nicht vor
+        if (idx >= 0) {
+          if (idx < na) { av := _get(a, idx); }
+        }
+      }
+      var kv: f64 := _get(k, j);
+      s := s + av * kv;
+      j := j + 1;
+    }
+    _put(out, i, s);
+    i := i + 1;
+  }
+  return true;
+}
+
+// Kreuzkorrelation: derselbe Ablauf ohne Spiegelung des Kerns. Das ist, was
+// Bildbibliotheken "Filtern mit einem Kern" nennen.
+pub fn ConvCorrelateDirect(a: int64, na: int64, k: int64, nk: int64,
+                           mode: int64, edge: int64, out: int64): bool {
+  var outLen: int64 := ConvOutputLen(na, nk, mode);
+  if (outLen < 1) { return false; }
+  if (out == a) { return false; }
+  if (out == k) { return false; }
+
+  var shift: int64 := 0;
+  if (mode == CONV_SAME)  { shift := nk / 2; }
+  if (mode == CONV_FULL)  { shift := nk - 1; }
+
+  var i: int64 := 0;
+  while (i < outLen) {
+    var s: f64 := _zero();
+    var j: int64 := 0;
+    while (j < nk) {
+      var idx: int64 := i - shift + j;
+      var av: f64 := _zero();
+      if (mode == CONV_SAME) { av := _sample(a, na, idx, edge); }
+      else {
+        if (idx >= 0) {
+          if (idx < na) { av := _get(a, idx); }
+        }
+      }
+      var kv: f64 := _get(k, j);
+      s := s + av * kv;
+      j := j + 1;
+    }
+    _put(out, i, s);
+    i := i + 1;
+  }
+  return true;
+}
+
+// ── Faltung ueber die FFT ────────────────────────────────────────────────────
+
+// Nur mit Null-Rand sinnvoll: die FFT faltet zyklisch, und das Auffuellen mit
+// Nullen ist genau die Annahme "ausserhalb ist nichts". Fuer CLAMP, REFLECT
+// oder WRAP muss der direkte Weg genommen werden — deshalb faellt ConvFilter()
+// dort selbsttaetig zurueck.
+pub fn ConvFft(a: int64, na: int64, k: int64, nk: int64,
+               mode: int64, out: int64): bool {
+  var outLen: int64 := ConvOutputLen(na, nk, mode);
+  if (outLen < 1) { return false; }
+
+  var fullLen: int64 := na + nk - 1;
+  var full: int64 := alloc(fullLen * 8);
+  if (full == 0) { return false; }
+
+  if (!FftConvolveReal(a, na, k, nk, full)) {
+    free(full, fullLen * 8);
+    return false;
+  }
+
+  var shift: int64 := 0;
+  if (mode == CONV_SAME)  { shift := nk / 2; }
+  if (mode == CONV_VALID) { shift := nk - 1; }
+
+  var i: int64 := 0;
+  while (i < outLen) {
+    _put(out, i, _get(full, i + shift));
+    i := i + 1;
+  }
+  free(full, fullLen * 8);
+  return true;
+}
+
+// Faltung mit selbsttaetiger Wahl des Verfahrens.
+//
+// Der direkte Weg gewinnt bei kurzen Kernen und ist der einzige, der andere
+// Randmodi als ZERO beherrscht. Die FFT gewinnt, sobald der Kern lang wird.
+pub fn ConvFilter(a: int64, na: int64, k: int64, nk: int64,
+                  mode: int64, edge: int64, out: int64): bool {
+  if (nk < ConvThreshold()) {
+    return ConvDirect(a, na, k, nk, mode, edge, out);
+  }
+  if (edge != CONV_EDGE_ZERO) {
+    return ConvDirect(a, na, k, nk, mode, edge, out);
+  }
+  return ConvFft(a, na, k, nk, mode, out);
+}
+
+// ── Overlap-Add ──────────────────────────────────────────────────────────────
+
+// Langes Signal, kurzer Kern, volle Faltung — blockweise.
+//
+// Ein Signal von einer Million Werten in einem Stueck ueber die FFT zu falten
+// verlangt drei Felder von je zwei Millionen Werten und rechnet mit
+// Drehfaktoren, die ueber die ganze Laenge Fehler ansammeln. Overlap-Add
+// zerlegt es in Bloecke, faltet jeden einzeln und addiert die Ueberhaenge
+// auf — gleiches Ergebnis, gedeckelter Speicher, und jede Teilfaltung ist
+// kurz genug, um genau zu bleiben.
+//
+// out fasst na+nk-1 Werte und wird von dieser Funktion genullt.
+pub fn ConvOverlapAdd(a: int64, na: int64, k: int64, nk: int64,
+                      blockSize: int64, out: int64): bool {
+  if (na < 1) { return false; }
+  if (nk < 1) { return false; }
+  if (blockSize < 1) { return false; }
+  if (out == a) { return false; }
+
+  var outLen: int64 := na + nk - 1;
+  var i: int64 := 0;
+  while (i < outLen) {
+    _put(out, i, _zero());
+    i := i + 1;
+  }
+
+  var pieceLen: int64 := blockSize + nk - 1;
+  var piece: int64 := alloc(pieceLen * 8);
+  var block: int64 := alloc(blockSize * 8);
+  if (piece == 0) { return false; }
+  if (block == 0) { free(piece, pieceLen * 8); return false; }
+
+  var start: int64 := 0;
+  while (start < na) {
+    var len: int64 := blockSize;
+    if (start + len > na) { len := na - start; }
+
+    var j: int64 := 0;
+    while (j < len) {
+      _put(block, j, _get(a, start + j));
+      j := j + 1;
+    }
+
+    var pl: int64 := len + nk - 1;
+    if (FftConvolveReal(block, len, k, nk, piece)) {
+      j := 0;
+      while (j < pl) {
+        var dst: int64 := start + j;
+        if (dst < outLen) {
+          _put(out, dst, _get(out, dst) + _get(piece, j));
+        }
+        j := j + 1;
+      }
+    }
+    start := start + blockSize;
+  }
+
+  free(piece, pieceLen * 8);
+  free(block, blockSize * 8);
+  return true;
+}
+
+// ── Kernel ───────────────────────────────────────────────────────────────────
+
+// Summe auf 1 bringen. Ein Glaettungskern MUSS das erfuellen, sonst wird das
+// Signal heller oder dunkler. Bei Kernen mit Summe 0 (Sobel, Laplace) ist die
+// Normierung sinnlos und wird deshalb abgelehnt.
+pub fn ConvNormalize(k: int64, n: int64): bool {
+  var s: f64 := _zero();
+  var i: int64 := 0;
+  while (i < n) {
+    s := s + _get(k, i);
+    i := i + 1;
+  }
+  if (AbsF64(s) < _eps()) { return false; }
+
+  i := 0;
+  while (i < n) {
+    _put(k, i, _get(k, i) / s);
+    i := i + 1;
+  }
+  return true;
+}
+
+pub fn ConvKernelSum(k: int64, n: int64): f64 {
+  var s: f64 := _zero();
+  var i: int64 := 0;
+  while (i < n) {
+    s := s + _get(k, i);
+    i := i + 1;
+  }
+  return s;
+}
+
+// Gleitender Mittelwert
+pub fn ConvKernelBox(out: int64, n: int64): bool {
+  if (n < 1) { return false; }
+  var v: f64 := _one() / (n as f64);
+  var i: int64 := 0;
+  while (i < n) {
+    _put(out, i, v);
+    i := i + 1;
+  }
+  return true;
+}
+
+// Gauss-Kern, auf Summe 1 normiert. n sollte ungerade sein, damit es eine
+// Mitte gibt; bei geradem n liegt der Schwerpunkt zwischen zwei Werten und der
+// Filter verschiebt das Signal um einen halben Abtastwert.
+pub fn ConvKernelGauss1D(out: int64, n: int64, sigma: f64): bool {
+  if (n < 1) { return false; }
+  if (sigma <= _zero()) { return false; }
+
+  var c: f64 := ((n - 1) as f64) / 2.0;
+  var twoSig2: f64 := 2.0 * sigma * sigma;
+
+  var i: int64 := 0;
+  while (i < n) {
+    var d: f64 := (i as f64) - c;
+    var e: f64 := _neg(d * d / twoSig2);
+    _put(out, i, ExpF64(e));
+    i := i + 1;
+  }
+  return ConvNormalize(out, n);
+}
+
+// Faustregel fuer die Kernlaenge zu einem sigma: 6*sigma erfasst 99.7 Prozent
+// der Glocke, aufgerundet auf eine ungerade Zahl. Kuerzer abzuschneiden ist
+// kein Rundungsfehler, sondern ein anderer Filter.
+pub fn ConvGaussLen(sigma: f64): int64 {
+  if (sigma <= _zero()) { return 1; }
+  var n: int64 := (6.0 * sigma) as int64;
+  if (n < 1) { n := 1; }
+  if ((n % 2) == 0) { n := n + 1; }
+  return n;
+}
+
+// 2D-Gauss als n mal n Feld, normiert.
+pub fn ConvKernelGauss2D(out: int64, n: int64, sigma: f64): bool {
+  if (n < 1) { return false; }
+  if (sigma <= _zero()) { return false; }
+
+  var c: f64 := ((n - 1) as f64) / 2.0;
+  var twoSig2: f64 := 2.0 * sigma * sigma;
+
+  var y: int64 := 0;
+  while (y < n) {
+    var x: int64 := 0;
+    while (x < n) {
+      var dy: f64 := (y as f64) - c;
+      var dx: f64 := (x as f64) - c;
+      var e: f64 := _neg((dx * dx + dy * dy) / twoSig2);
+      _put(out, y * n + x, ExpF64(e));
+      x := x + 1;
+    }
+    y := y + 1;
+  }
+  return ConvNormalize(out, n * n);
+}
+
+// Sobel: Ableitung in x-Richtung, geglaettet in y. 3x3.
+// [[-1,0,1],[-2,0,2],[-1,0,1]]
+pub fn ConvKernelSobelX(out: int64): void {
+  var m1: f64 := _neg(_one());
+  var m2: f64 := _neg(2.0);
+  _put(out, 0, m1);  _put(out, 1, _zero());  _put(out, 2, _one());
+  _put(out, 3, m2);  _put(out, 4, _zero());  _put(out, 5, 2.0);
+  _put(out, 6, m1);  _put(out, 7, _zero());  _put(out, 8, _one());
+}
+
+// [[-1,-2,-1],[0,0,0],[1,2,1]]
+pub fn ConvKernelSobelY(out: int64): void {
+  var m1: f64 := _neg(_one());
+  var m2: f64 := _neg(2.0);
+  _put(out, 0, m1);      _put(out, 1, m2);      _put(out, 2, m1);
+  _put(out, 3, _zero()); _put(out, 4, _zero()); _put(out, 5, _zero());
+  _put(out, 6, _one());  _put(out, 7, 2.0);     _put(out, 8, _one());
+}
+
+// Laplace, 4er-Nachbarschaft: [[0,1,0],[1,-4,1],[0,1,0]]
+pub fn ConvKernelLaplace(out: int64): void {
+  var m4: f64 := _neg(4.0);
+  _put(out, 0, _zero()); _put(out, 1, _one()); _put(out, 2, _zero());
+  _put(out, 3, _one());  _put(out, 4, m4);     _put(out, 5, _one());
+  _put(out, 6, _zero()); _put(out, 7, _one()); _put(out, 8, _zero());
+}
+
+// Schaerfen: Original plus Laplace-Anteil. [[0,-1,0],[-1,5,-1],[0,-1,0]]
+pub fn ConvKernelSharpen(out: int64): void {
+  var m1: f64 := _neg(_one());
+  _put(out, 0, _zero()); _put(out, 1, m1);  _put(out, 2, _zero());
+  _put(out, 3, m1);      _put(out, 4, 5.0); _put(out, 5, m1);
+  _put(out, 6, _zero()); _put(out, 7, m1);  _put(out, 8, _zero());
+}
+
+// ── 2D ───────────────────────────────────────────────────────────────────────
+
+// Bildpunkt mit Randbehandlung
+fn _sample2(img: int64, w: int64, h: int64, x: int64, y: int64, edge: int64): f64 {
+  var xx: int64 := x;
+  var yy: int64 := y;
+
+  if (edge == CONV_EDGE_ZERO) {
+    if (x < 0)  { return _zero(); }
+    if (y < 0)  { return _zero(); }
+    if (x >= w) { return _zero(); }
+    if (y >= h) { return _zero(); }
+  }
+  else {
+    if (edge == CONV_EDGE_CLAMP) {
+      if (xx < 0)  { xx := 0; }
+      if (yy < 0)  { yy := 0; }
+      if (xx >= w) { xx := w - 1; }
+      if (yy >= h) { yy := h - 1; }
+    }
+    else {
+      if (edge == CONV_EDGE_REFLECT) {
+        if (xx < 0)  { xx := _neg_i(xx) - 1; }
+        if (yy < 0)  { yy := _neg_i(yy) - 1; }
+        if (xx >= w) { xx := 2 * w - xx - 1; }
+        if (yy >= h) { yy := 2 * h - yy - 1; }
+        if (xx < 0)  { xx := 0; }
+        if (yy < 0)  { yy := 0; }
+        if (xx >= w) { xx := w - 1; }
+        if (yy >= h) { yy := h - 1; }
+      }
+      else {
+        xx := xx % w;  if (xx < 0) { xx := xx + w; }
+        yy := yy % h;  if (yy < 0) { yy := yy + h; }
+      }
+    }
+  }
+  return _get(img, yy * w + xx);
+}
+
+// 2D-Faltung, Ausgabe immer in Bildgroesse (entspricht CONV_SAME). Der Kern
+// ist kw mal kh und wird gespiegelt; fuer die ungespiegelte Form
+// Conv2DCorrelate nehmen. out darf nicht auf img zeigen.
+pub fn Conv2D(img: int64, w: int64, h: int64,
+              k: int64, kw: int64, kh: int64, edge: int64, out: int64): bool {
+  if (w < 1) { return false; }
+  if (h < 1) { return false; }
+  if (kw < 1) { return false; }
+  if (kh < 1) { return false; }
+  if (out == img) { return false; }
+
+  var cx: int64 := kw / 2;
+  var cy: int64 := kh / 2;
+
+  var y: int64 := 0;
+  while (y < h) {
+    var x: int64 := 0;
+    while (x < w) {
+      var s: f64 := _zero();
+      var j: int64 := 0;
+      while (j < kh) {
+        var i: int64 := 0;
+        while (i < kw) {
+          var sx: int64 := x + cx - i;
+          var sy: int64 := y + cy - j;
+          var pv: f64 := _sample2(img, w, h, sx, sy, edge);
+          var kv: f64 := _get(k, j * kw + i);
+          s := s + pv * kv;
+          i := i + 1;
+        }
+        j := j + 1;
+      }
+      _put(out, y * w + x, s);
+      x := x + 1;
+    }
+    y := y + 1;
+  }
+  return true;
+}
+
+// Ungespiegelte Form — das, was Bildbibliotheken unter "Filtern" verstehen.
+// Fuer Sobel und andere unsymmetrische Kerne ist das der Unterschied zwischen
+// links und rechts.
+pub fn Conv2DCorrelate(img: int64, w: int64, h: int64,
+                       k: int64, kw: int64, kh: int64, edge: int64, out: int64): bool {
+  if (w < 1) { return false; }
+  if (h < 1) { return false; }
+  if (kw < 1) { return false; }
+  if (kh < 1) { return false; }
+  if (out == img) { return false; }
+
+  var cx: int64 := kw / 2;
+  var cy: int64 := kh / 2;
+
+  var y: int64 := 0;
+  while (y < h) {
+    var x: int64 := 0;
+    while (x < w) {
+      var s: f64 := _zero();
+      var j: int64 := 0;
+      while (j < kh) {
+        var i: int64 := 0;
+        while (i < kw) {
+          var sx: int64 := x - cx + i;
+          var sy: int64 := y - cy + j;
+          var pv: f64 := _sample2(img, w, h, sx, sy, edge);
+          var kv: f64 := _get(k, j * kw + i);
+          s := s + pv * kv;
+          i := i + 1;
+        }
+        j := j + 1;
+      }
+      _put(out, y * w + x, s);
+      x := x + 1;
+    }
+    y := y + 1;
+  }
+  return true;
+}
+
+// Separable 2D-Faltung: erst zeilenweise mit kx, dann spaltenweise mit ky.
+//
+// Der Gewinn ist der Grund, warum Gauss-Filter ueberhaupt praktikabel sind:
+// ein n mal n Kern kostet direkt n^2 Multiplikationen je Pixel, separabel nur
+// 2n. Bei n = 15 ist das Faktor 7, bei n = 31 Faktor 15 — und der 2D-Gauss ist
+// nachweislich separabel, weil exp(-(x^2+y^2)/c) = exp(-x^2/c) * exp(-y^2/c).
+//
+// Nicht jeder Kern kann das. Sobel schon (Ableitung mal Glaettung), ein
+// beliebiger Kern nicht.
+pub fn Conv2DSeparable(img: int64, w: int64, h: int64,
+                       kx: int64, nkx: int64, ky: int64, nky: int64,
+                       edge: int64, out: int64): bool {
+  if (w < 1) { return false; }
+  if (h < 1) { return false; }
+  if (out == img) { return false; }
+
+  var tmp: int64 := alloc(w * h * 8);
+  if (tmp == 0) { return false; }
+
+  var cx: int64 := nkx / 2;
+  var cy: int64 := nky / 2;
+
+  // waagerecht
+  var y: int64 := 0;
+  while (y < h) {
+    var x: int64 := 0;
+    while (x < w) {
+      var s: f64 := _zero();
+      var i: int64 := 0;
+      while (i < nkx) {
+        var sx: int64 := x + cx - i;
+        var pv: f64 := _sample2(img, w, h, sx, y, edge);
+        var kv: f64 := _get(kx, i);
+        s := s + pv * kv;
+        i := i + 1;
+      }
+      _put(tmp, y * w + x, s);
+      x := x + 1;
+    }
+    y := y + 1;
+  }
+
+  // senkrecht
+  y := 0;
+  while (y < h) {
+    var x: int64 := 0;
+    while (x < w) {
+      var s: f64 := _zero();
+      var j: int64 := 0;
+      while (j < nky) {
+        var sy: int64 := y + cy - j;
+        var pv: f64 := _sample2(tmp, w, h, x, sy, edge);
+        var kv: f64 := _get(ky, j);
+        s := s + pv * kv;
+        j := j + 1;
+      }
+      _put(out, y * w + x, s);
+      x := x + 1;
+    }
+    y := y + 1;
+  }
+
+  free(tmp, w * h * 8);
+  return true;
+}
+
+// Gauss-Weichzeichnung ueber den separablen Weg — der haeufigste Fall,
+// deshalb als eigene Funktion.
+pub fn Conv2DGaussBlur(img: int64, w: int64, h: int64, sigma: f64,
+                       edge: int64, out: int64): bool {
+  if (sigma <= _zero()) { return false; }
+
+  var n: int64 := ConvGaussLen(sigma);
+  var k: int64 := alloc(n * 8);
+  if (k == 0) { return false; }
+
+  var ok: bool := ConvKernelGauss1D(k, n, sigma);
+  if (ok) { ok := Conv2DSeparable(img, w, h, k, n, k, n, edge, out); }
+
+  free(k, n * 8);
+  return ok;
+}
+
+// Kantenbetrag nach Sobel: sqrt(Gx^2 + Gy^2) je Pixel.
+pub fn Conv2DSobelMagnitude(img: int64, w: int64, h: int64,
+                            edge: int64, out: int64): bool {
+  if (out == img) { return false; }
+
+  var kx: int64 := alloc(9 * 8);
+  var ky: int64 := alloc(9 * 8);
+  var gx: int64 := alloc(w * h * 8);
+  var gy: int64 := alloc(w * h * 8);
+  if (kx == 0) { return false; }
+  if (ky == 0) { return false; }
+  if (gx == 0) { return false; }
+  if (gy == 0) { return false; }
+
+  ConvKernelSobelX(kx);
+  ConvKernelSobelY(ky);
+
+  // Korrelation, nicht Faltung: sonst kehren sich die Vorzeichen der
+  // Ableitungen um. Fuer den Betrag waere das gleichgueltig — fuer jeden, der
+  // spaeter Gx und Gy einzeln will, nicht.
+  var ok: bool := Conv2DCorrelate(img, w, h, kx, 3, 3, edge, gx);
+  if (ok) { ok := Conv2DCorrelate(img, w, h, ky, 3, 3, edge, gy); }
+
+  if (ok) {
+    var i: int64 := 0;
+    var cnt: int64 := w * h;
+    while (i < cnt) {
+      var a: f64 := _get(gx, i);
+      var b: f64 := _get(gy, i);
+      _put(out, i, SqrtF64(a * a + b * b));
+      i := i + 1;
+    }
+  }
+
+  free(kx, 9 * 8);  free(ky, 9 * 8);
+  free(gx, w * h * 8);  free(gy, w * h * 8);
+  return ok;
+}

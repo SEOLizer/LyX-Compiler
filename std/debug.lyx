@@ -5,6 +5,11 @@
 // perf_event_open: Hardware/Software-Performance-Counter (CPU-Cycles,
 //                  Instructions, Cache-Misses, Page-Faults usw.).
 
+@description("Debugging and performance counters (ptrace, perf_event_open)")
+@author("Andreas Röne")
+@copyright("2024-2026 Andreas Röne")
+unit std.debug;
+
 import std.alloc;
 
 // ============================================================
@@ -144,10 +149,25 @@ pub con PERF_ATTR_SAMPLE_TYPE:  int64 := 24;
 pub con PERF_ATTR_READ_FORMAT:  int64 := 32;
 pub con PERF_ATTR_FLAGS:        int64 := 40;  // Bitfeld
 
-// perf_event_attr.flags Bitpositionen
-pub con PERF_ATTR_DISABLED:     int64 := 1;   // Bit 0: Counter startet nicht-aktiv
-pub con PERF_ATTR_INHERIT:      int64 := 2;   // Bit 1: Kind-Prozesse erben Counter
-pub con PERF_ATTR_EXCLUDE_KERNEL: int64 := 8; // Bit 3: Kernel-Zeit nicht messen
+// perf_event_attr.flags Bitpositionen (linux/perf_event.h, Reihenfolge des
+// Bitfelds): disabled(0), inherit(1), pinned(2), exclusive(3),
+// exclude_user(4), exclude_kernel(5), exclude_hv(6), exclude_idle(7).
+//
+// #2401: PERF_ATTR_EXCLUDE_KERNEL stand hier auf 8, also auf Bit 3 —
+// das ist `exclusive`, nicht `exclude_kernel`. Die Folge war doppelt falsch:
+// die Kernelzeit wurde WEITER mitgezaehlt (gemessen 1,348e9 Zyklen gegen
+// `perf stat -e cycles`, identisch; mit `cycles:u` waeren es 9,4e7 gewesen),
+// und der Zaehler forderte exklusiven Zugriff auf die PMU — dadurch musste
+// ein gleichzeitig laufendes `perf stat` multiplexen (Zaehler nur 50 % der
+// Zeit aktiv, Ergebnis um Faktor 7 zu klein). Jetzt Bit 5.
+pub con PERF_ATTR_DISABLED:     int64 := 1;    // Bit 0: Counter startet nicht-aktiv
+pub con PERF_ATTR_INHERIT:      int64 := 2;    // Bit 1: Kind-Prozesse erben Counter
+pub con PERF_ATTR_PINNED:       int64 := 4;    // Bit 2
+pub con PERF_ATTR_EXCLUSIVE:    int64 := 8;    // Bit 3: exklusiver PMU-Zugriff
+pub con PERF_ATTR_EXCLUDE_USER:   int64 := 16; // Bit 4
+pub con PERF_ATTR_EXCLUDE_KERNEL: int64 := 32; // Bit 5: Kernel-Zeit nicht messen
+pub con PERF_ATTR_EXCLUDE_HV:     int64 := 64; // Bit 6
+pub con PERF_ATTR_EXCLUDE_IDLE:   int64 := 128; // Bit 7
 
 // ioctl-Codes fuer perf fd
 pub con PERF_EVENT_IOC_ENABLE:  int64 := 9216;   // 0x2400
@@ -168,20 +188,33 @@ pub fn PerfEventOpen(attr: int64, pid: int64, cpu: int64, groupFd: int64, flags:
   return sys_perf_event_open(attr, pid, cpu, groupFd, flags);
 }
 
-// PerfCount: oeffnet einen einfachen Software/Hardware-Counter fuer den aktuellen Prozess.
-// type_:   PERF_TYPE_SOFTWARE oder PERF_TYPE_HARDWARE
-// config:  z.B. PERF_COUNT_SW_CPU_CLOCK
-// Gibt fd zurueck oder negativen Fehlercode.
-pub fn PerfCount(type_: int64, config: int64): int64 {
+// PerfCountFlags: oeffnet einen Counter fuer den aktuellen Prozess mit
+// ausdruecklich gewaehlten attr-Flags. Gibt fd zurueck oder negativen
+// Fehlercode.
+//
+// #2401: Diese Form gibt es, weil die Wahl der Flags die BEDEUTUNG der Zahl
+// aendert. Fuer "Takt waehrend aktiver Ausfuehrung" (std/cpu/clock.lyx) muss
+// die Kernelzeit MITgezaehlt werden — der Thread laeuft auch dann auf dem
+// Kern. Fuer ein Profil des eigenen Codes will man sie ausschliessen. Beides
+// ist richtig, nur nicht dasselbe, und der Aufrufer muss es sagen.
+pub fn PerfCountFlags(type_: int64, config: int64, flags: int64): int64 {
   var attr: int64 := alloc(PERF_ATTR_SIZE);
   if (attr == 0) { return -12; }
   poke32(attr + PERF_ATTR_TYPE,       type_ as int32);
   poke32(attr + PERF_ATTR_SIZE_FIELD, PERF_ATTR_SIZE as int32);
   poke64(attr + PERF_ATTR_CONFIG,     config);
-  poke64(attr + PERF_ATTR_FLAGS,      PERF_ATTR_EXCLUDE_KERNEL);
+  poke64(attr + PERF_ATTR_FLAGS,      flags);
   var fd: int64 := sys_perf_event_open(attr, 0, -1, -1, 0);
   free(attr, PERF_ATTR_SIZE);
   return fd;
+}
+
+// PerfCount: wie PerfCountFlags, ohne Kernelzeit (das war schon immer die
+// Absicht dieser Funktion — bis #2401 setzte sie dafuer das falsche Bit).
+// type_:   PERF_TYPE_SOFTWARE oder PERF_TYPE_HARDWARE
+// config:  z.B. PERF_COUNT_SW_CPU_CLOCK
+pub fn PerfCount(type_: int64, config: int64): int64 {
+  return PerfCountFlags(type_, config, PERF_ATTR_EXCLUDE_KERNEL);
 }
 
 // PerfRead: liest den aktuellen Zaehlerstand aus einem perf-fd.

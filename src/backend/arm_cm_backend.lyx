@@ -33,6 +33,7 @@
 // ============================================================================
 
 
+import src.emit_write;
 import src.std.alloc;
 con CM_R0: int64 := 0;
 con CM_R1: int64 := 1;
@@ -55,6 +56,11 @@ con CM_PATCH_BNE: int64 := 3;   // BNE.W conditional (T3, cond=1)
 // Memory map (STM32F4xx)
 con CM_FLASH_BASE: int64 := 0x08000000;
 con CM_RAM_TOP:    int64 := 0x20002000;   // top of 8KB SRAM
+// #1765: Globale Variablen liegen im RAM, je vier Byte, ab dem unteren Ende.
+// Der Stapel waechst vom oberen Ende (CM_RAM_TOP) nach unten — beide treffen
+// sich erst, wenn ein Programm den ganzen Speicher braucht. Im Flash koennten
+// sie nicht liegen: dorthin laesst sich nicht schreiben.
+con CM_GLOBALS_BASE: int64 := 0x20000000;
 
 // ============================================================================
 // EmitARMCM  —  IR → Thumb-2 machine code
@@ -71,6 +77,9 @@ pub type EmitARMCM = class {
   patchCount: int64;
   funcAddrs:  int64;
   funcCount:  int64;
+  cmMainOff:  int64;   // #1765: Code-Offset von main (-1 = nicht gefunden)
+  spExtra:    int64;   // #1765: zusaetzlicher Abstand, solange Stapelargumente liegen
+  wort32Merker: int64; // #2239: _irWort32Merker-Tabelle (0 = keine)
 
   // --------------------------------------------------------------------------
   // Code emission primitives
@@ -80,6 +89,12 @@ pub type EmitARMCM = class {
     poke8(self.codeBuf + self.codeLen,     v & 0xFF);
     poke8(self.codeBuf + self.codeLen + 1, (v >> 8) & 0xFF);
     self.codeLen := self.codeLen + 2;
+  }
+
+  // #1339: einzelnes Byte — fuer Zeichenketten, die inline im Codestrom liegen.
+  fn cm_e8(v: int64) {
+    poke8(self.codeBuf + self.codeLen, v & 0xFF);
+    self.codeLen := self.codeLen + 1;
   }
 
   // Emit 32-bit Thumb-2 instruction as two consecutive halfwords
@@ -110,7 +125,31 @@ pub type EmitARMCM = class {
   fn cm_MOV_sp_r7() { self.cm_e16(0x46BD); }
 
   // SUB sp, sp, #bytes: T2 = 0xB080 | (bytes/4) — bytes must be multiple of 4, <= 508
-  fn cm_SUB_sp(bytes: int64) { self.cm_e16(0xB080 | ((bytes >> 2) & 0x7F)); }
+  //
+  // #2228: Die 16-Bit-Form traegt nur sieben Bit (508 Byte = 127 Slots). Bis
+  // 1.2.x wurde ein groesserer Rahmen still mit `& 0x7F` gekuerzt: der Rahmen
+  // war zu klein, die oberen Slots lagen auf dem geretteten r7/lr, und eine
+  // Funktion mit vielen Temporaeren lieferte ihren Rueckgabewert nicht ab
+  // (gemessen: `return 42` kam beim Aufrufer als 0 an, danach Lockup).
+  // Groessere Rahmen jetzt ueber SUBW/ADDW (zwoelf Bit, bis 4095 Byte) — so
+  // weit reicht auch die Slot-Adressierung (cm_LDR_sp); darueber laut.
+  fn cm_SUB_sp(bytes: int64) { self.cm_spImm(bytes, 0xB080, 0xF2AD); }
+  // #1765: Gegenstueck zu cm_SUB_sp — gibt den Platz der Stapelargumente
+  // nach dem Aufruf wieder frei.
+  fn cm_ADD_sp(bytes: int64) { self.cm_spImm(bytes, 0xB000, 0xF20D); }
+  fn cm_spImm(bytes: int64, kurz: int64, lang: int64) {
+    if bytes < 0 || bytes > 4095 {
+      EPrintStr("error: arm-cm: Stapelrahmen von "c); EPrintInt(bytes);
+      EPrintStrLn(" Byte -- mehr als 4095 erreicht die Slot-Adressierung nicht (#2228)."c);
+      exit(1);
+    }
+    if bytes <= 508 && (bytes & 3) == 0 {
+      self.cm_e16(kurz | (bytes >> 2));
+    } else {
+      // ADDW/SUBW SP, SP, #imm12 (T4): i:imm3:imm8.
+      self.cm_t32(lang | (((bytes >> 11) & 1) << 10), (((bytes >> 8) & 7) << 12) | 0x0D00 | (bytes & 0xFF));
+    }
+  }
 
   // MOVS Rd, #imm8: T1 (Rd in 0-7)
   fn cm_MOVS_imm(rd: int64, imm: int64) {
@@ -159,6 +198,28 @@ pub type EmitARMCM = class {
 
   // Load 32-bit immediate (truncated from int64) into Rd
   fn cm_LI(rd: int64, imm: int64) {
+    // #2237: Hier wurde jeder Wert still auf seine unteren 32 Bit gekuerzt —
+    // XXHash64 uebersetzte fuer arm-cm4 und lieferte 98376185. Jetzt dieselbe
+    // Regel wie xt_li auf esp32 (#2149): zulaessig ist, was vorzeichenbehaftet
+    // oder vorzeichenlos in 32 Bit passt (int64 ist hier ein Wort); alles
+    // andere wird laut abgewiesen.
+    var v32: int64 := imm & 0xFFFFFFFF;
+    if (v32 & 0x80000000) != 0 { v32 := v32 - 4294967296; }
+    if v32 != imm && imm != (imm & 0xFFFFFFFF) {
+      EPrintStr("error: arm-cm: Konstante "c); EPrintInt(imm);
+      EPrintStrLn(" passt nicht in 32 Bit (#2237)."c);
+      exit(1);
+    }
+    self.cm_LIroh(rd, imm);
+  }
+
+  // Laedt die unteren 32 Bit OHNE Pruefung. Nur fuer die Anfangswerte der
+  // Modulvariablen (main, Startcode): dort waere ein Abbruch zu weit — jede
+  // importierte Unit mit einer ungenutzten 64-Bit-Konstante (std.hash: FNV)
+  // braechte das Uebersetzen, auch fuer MD5/DJB2. Der gekuerzte Wert wird
+  // nie gelesen: seit #2239 traegt ein solches Global einen Merker, und
+  // Lesen vor dem ersten Schreiben haelt an (IRO_LOAD_GLOBAL).
+  fn cm_LIroh(rd: int64, imm: int64) {
     var imm32: int64 := imm & 0xFFFFFFFF;
     if imm32 >= 0 && imm32 <= 255 && rd < 8 {
       self.cm_MOVS_imm(rd, imm32);
@@ -175,20 +236,39 @@ pub type EmitARMCM = class {
     self.cm_t32(0xF850 | rn, (rt << 12) | 0x0C00 | (off & 0xFF));
   }
 
+  // #1388: positive Offsets und schmale Breiten fuer die Speicher-Builtins.
+  // LDR.W Rt, [Rn, #off12]
+  fn cm_LDR_pos(rt: int64, rn: int64, off: int64) {
+    self.cm_t32(0xF8D0 | rn, (rt << 12) | (off & 0xFFF));
+  }
+  // STR.W Rt, [Rn, #off12]
+  fn cm_STR_pos(rt: int64, rn: int64, off: int64) {
+    self.cm_t32(0xF8C0 | rn, (rt << 12) | (off & 0xFFF));
+  }
+  // LDRB.W Rt, [Rn, #off12]
+  fn cm_LDRB(rt: int64, rn: int64, off: int64) {
+    self.cm_t32(0xF890 | rn, (rt << 12) | (off & 0xFFF));
+  }
+  // LDRH.W Rt, [Rn, #off12]
+  fn cm_LDRH(rt: int64, rn: int64, off: int64) {
+    self.cm_t32(0xF8B0 | rn, (rt << 12) | (off & 0xFFF));
+  }
+  // STRB.W Rt, [Rn, #off12]
+  fn cm_STRB(rt: int64, rn: int64, off: int64) {
+    self.cm_t32(0xF880 | rn, (rt << 12) | (off & 0xFFF));
+  }
+  // STRH.W Rt, [Rn, #off12]
+  fn cm_STRH(rt: int64, rn: int64, off: int64) {
+    self.cm_t32(0xF8A0 | rn, (rt << 12) | (off & 0xFFF));
+  }
+
   // STR.W Rt, [Rn, #-off8]: T4 negative-offset form
   fn cm_STR_neg(rt: int64, rn: int64, off: int64) {
     self.cm_t32(0xF840 | rn, (rt << 12) | 0x0C00 | (off & 0xFF));
   }
 
-  // LDR.W Rt, [Rn, #imm12]: T3 positive-offset form
-  fn cm_LDR_pos(rt: int64, rn: int64, imm: int64) {
-    self.cm_t32(0xF8D0 | rn, (rt << 12) | (imm & 0xFFF));
-  }
-
-  // STR.W Rt, [Rn, #imm12]: T3 positive-offset form
-  fn cm_STR_pos(rt: int64, rn: int64, imm: int64) {
-    self.cm_t32(0xF8C0 | rn, (rt << 12) | (imm & 0xFFF));
-  }
+  // #2151: cm_LDR_pos/cm_STR_pos standen hier ein zweites Mal (gleiche
+  // Kodierung wie oben).
 
   // ADD.W Rd, Rn, Rm: T2
   fn cm_ADD(rd: int64, rn: int64, rm: int64) {
@@ -245,9 +325,33 @@ pub type EmitARMCM = class {
     self.cm_t32(0xFA20 | rn, 0xF000 | (rd << 8) | rs);
   }
 
+  // ASR.W Rd, Rn, Rm (T2) — arithmetisch rechts (#2236)
+  fn cm_ASR(rd: int64, rn: int64, rs: int64) {
+    self.cm_t32(0xFA40 | rn, 0xF000 | (rd << 8) | rs);
+  }
+
   // CMP.W Rn, Rm: T3
   fn cm_CMP_W(rn: int64, rm: int64) {
     self.cm_t32(0xEBB0 | rn, 0x0F00 | rm);
+  }
+
+  // #2228: Bit-Rechenwerke. CLZ, RBIT und ROR gehoeren zu ARMv7-M (Thumb-2)
+  // und damit zu jedem Cortex-M3/M4 — keine Option, keine Faehigkeitsfrage.
+  // CLZ Rd, Rm: T1
+  fn cm_CLZ(rd: int64, rm: int64) {
+    self.cm_t32(0xFAB0 | rm, 0xF080 | (rd << 8) | rm);
+  }
+  // RBIT Rd, Rm: T1
+  fn cm_RBIT(rd: int64, rm: int64) {
+    self.cm_t32(0xFA90 | rm, 0xF0A0 | (rd << 8) | rm);
+  }
+  // ROR.W Rd, Rn, Rm: T2 — Weite = Rm[7:0], rotiert wird um Weite mod 32.
+  fn cm_ROR(rd: int64, rn: int64, rm: int64) {
+    self.cm_t32(0xFA60 | rn, 0xF000 | (rd << 8) | rm);
+  }
+  // MOV.W Rd, Rm, <typ> #imm (typ 0 = LSL, 1 = LSR, 2 = ASR); imm 1..31.
+  fn cm_SHI(rd: int64, rm: int64, typ: int64, imm: int64) {
+    self.cm_t32(0xEA4F, (((imm >> 2) & 7) << 12) | (rd << 8) | ((imm & 3) << 6) | (typ << 4) | rm);
   }
 
   // --------------------------------------------------------------------------
@@ -297,16 +401,45 @@ pub type EmitARMCM = class {
 
   fn slotOff(i: int64): int64 { return (i + 1) * 4; }
 
+  // #1765: Die Slots wurden ueber LDR/STR mit NEGATIVEM Offset vom
+  // Rahmenzeiger angesprochen — und dieses Befehlsformat traegt nur ACHT Bit.
+  // Ab Slot 63 fiel der Offset ab: der Zugriff traf einen fremden Slot, still
+  // und ohne Meldung. Kleine Funktionen liefen deshalb, groessere lieferten
+  // Unsinn (IntToStrIn schrieb "10" statt "1234").
+  //
+  // Jetzt wird vom STAPELZEIGER aus positiv adressiert: dieses Format traegt
+  // zwoelf Bit, also 4096 Byte oder 1024 Slots. Der Abstand steht fest, weil
+  // calcStackFrame die Rahmengroesse vor dem Erzeugen kennt.
+  fn spSlotOff(s: int64): int64 { return self.stackSize + self.spExtra - (s + 1) * 4; }
+
   fn cm_loadSlot(s: int64) {
-    self.cm_LDR_neg(CM_R4, CM_R7, self.slotOff(s));
+    self.cm_LDR_sp(CM_R4, self.spSlotOff(s));
   }
 
   fn cm_loadSlot2(s: int64) {
-    self.cm_LDR_neg(CM_R5, CM_R7, self.slotOff(s));
+    self.cm_LDR_sp(CM_R5, self.spSlotOff(s));
   }
 
   fn cm_storeSlot(s: int64) {
-    self.cm_STR_neg(CM_R4, CM_R7, self.slotOff(s));
+    self.cm_STR_sp(CM_R4, self.spSlotOff(s));
+  }
+
+  // LDR.W Rt, [SP, #off12]  /  STR.W Rt, [SP, #off12]
+  // #2228: off ausserhalb 0..4095 wurde still auf zwoelf Bit gekuerzt.
+  fn cm_LDR_sp(rt: int64, off: int64) {
+    self.cm_spOffPruefen(off);
+    self.cm_t32(0xF8DD, (rt << 12) | (off & 0xFFF));
+  }
+  fn cm_STR_sp(rt: int64, off: int64) {
+    self.cm_spOffPruefen(off);
+    self.cm_t32(0xF8CD, (rt << 12) | (off & 0xFFF));
+  }
+  fn cm_spOffPruefen(off: int64) {
+    if off < 0 || off > 4095 {
+      EPrintStr("error: arm-cm: Slot-Versatz "c); EPrintInt(off);
+      EPrintStrLn(" ausserhalb 0..4095 -- LDR/STR [sp, #imm12] erreicht ihn nicht (#2228)."c);
+      exit(1);
+    }
   }
 
   // --------------------------------------------------------------------------
@@ -355,8 +488,17 @@ pub type EmitARMCM = class {
       var labelId: int64 := peek64(base + 8);
       var ptype:   int64 := peek64(base + 16);
       var target:  int64 := -1;
+      // #1765: -2 heisst „schon gepatcht" — der Durchlauf am Ende von emit()
+      // sieht dieselbe Liste noch einmal.
+      if labelId != -2 {
       if ptype == CM_PATCH_BL {
-        if labelId < 256 { target := peek64(self.funcAddrs + labelId * 8); }
+        // #1765: funcAddrs kommt aus alloc und ist null. Ein Ziel 0 ist nur
+        // fuer die ZUERST erzeugte Funktion echt; fuer jede andere heisst es
+        // „noch nicht erzeugt".
+        if labelId < 256 {
+          target := peek64(self.funcAddrs + labelId * 8);
+          if target == 0 { if labelId != 0 { target := -1; } }
+        }
       } else {
         if labelId < 1024 { target := peek64(self.labelAddrs + labelId * 8); }
       }
@@ -375,6 +517,8 @@ pub type EmitARMCM = class {
         }
         self.cm_poke16at(codeOff,     (enc >> 16) & 0xFFFF);
         self.cm_poke16at(codeOff + 2, enc & 0xFFFF);
+        poke64(base + 8, -2);   // #1765: aufgeloest, beim Schlussdurchlauf ueberspringen
+      }
       }
       i := i + 1;
     }
@@ -384,7 +528,49 @@ pub type EmitARMCM = class {
   // Instruction dispatch
   // --------------------------------------------------------------------------
 
+    // #1339: Der Dispatcher unten ist eine flache Liste aus `if op == X`
+  // ohne else und ohne Default. Ein Opcode, den keine Zeile trifft, erzeugte
+  // damit GAR NICHTS und verschwand lautlos aus dem Programm — bei
+  // IRO_PANIC hiess das: nach einer erkannten Verletzung laeuft es weiter.
+  //
+  // Diese Liste nennt die Opcodes, die arm-cm4 tatsaechlich behandelt. Sie ist
+  // aus dem Dispatcher erhoben und wird gegen ihn geprueft. Weicht sie ab,
+  // scheitert der Lauf LAUT — die Abweichung faellt damit beim Uebersetzen
+  // auf und nicht erst im erzeugten Programm.
+  fn cm_opBehandelt(op: int64): int64 {
+    // #1339: die vier Zusicherungen — ir_lower erzeugt sie (ASSERT_NOT_ZERO
+    // steht vor jeder Division), und bis 1.0.18B behandelte sie ausser lyxos
+    // kein Backend.
+    if (op == IRO_ASSERT_NOT_NULL || op == IRO_ASSERT_NOT_ZERO) { return 1; }
+    if (op == IRO_ASSERT_TRUE || op == IRO_ASSERT_BOUNDS) { return 1; }
+    if (op == IRO_CONST_STR) { return 1; }   // #1339
+    if (op == IRO_F64_ZU_F32 || op == IRO_F32_ZU_F64) { return 1; }   // #2160
+    if (op == 167 || op == IRO_ADD || op == IRO_ALLOC || op == IRO_AND) { return 1; }
+    if (op == IRO_BITAND || op == IRO_BITNOT || op == IRO_BITOR || op == IRO_BITXOR) { return 1; }
+    if (op == IRO_BR_FALSE || op == IRO_BR_TRUE || op == IRO_CALL || op == IRO_CALL_BUILTIN) { return 1; }
+    if (op == IRO_CAST || op == IRO_CMP_EQ || op == IRO_CMP_GE || op == IRO_CMP_GT) { return 1; }
+    if (op == IRO_CMP_LE || op == IRO_CMP_LT || op == IRO_CMP_NEQ || op == IRO_CONST_FLOAT) { return 1; }
+    if (op == IRO_CONST_INT || op == IRO_DIV || op == IRO_FREE || op == IRO_FTOI) { return 1; }
+    if (op == IRO_FUNC_EXIT || op == IRO_ITOF || op == IRO_JMP || op == IRO_LABEL) { return 1; }
+    if (op == IRO_LOAD_FIELD || op == IRO_LOAD_FIELD_HEAP || op == IRO_LOAD_GLOBAL || op == IRO_LOAD_LOCAL) { return 1; }
+    if (op == IRO_MOD || op == IRO_MUL || op == IRO_NEG || op == IRO_NOT) { return 1; }
+    if (op == IRO_OR || op == IRO_PANIC || op == IRO_SEXT || op == IRO_SHL) { return 1; }
+    if (op == IRO_SHR || op == IRO_SAR || op == IRO_STORE_FIELD || op == IRO_STORE_FIELD_HEAP || op == IRO_STORE_GLOBAL) { return 1; }
+    if (op == IRO_STORE_LOCAL || op == IRO_SUB || op == IRO_THROW || op == IRO_TRUNC) { return 1; }
+    if (op == IRO_XOR || op == IRO_ZEXT) { return 1; }
+    return 0;
+  }
+
   fn emitInstr(funcId: int64, idx: int64) {
+    var opRoh: int64 := self.getInstrOp(idx);
+    if (self.cm_opBehandelt(opRoh) == 0) {
+      EPrintStr("error: arm-cm4-Backend kennt Opcode "c);
+      EPrintInt(opRoh);
+      EPrintStrLn(" nicht -- er wuerde stillschweigend verschwinden (#1339)."c);
+      EPrintStrLn("  Entweder den Opcode hier umsetzen oder ihn in ir_lower fuer dieses Ziel abweisen."c);
+      exit(1);
+    }
+
     var op:   int64 := self.getInstrOp(idx);
     var dest: int64 := self.getInstrDest(idx);
     var src1: int64 := self.getInstrSrc1(idx);
@@ -451,89 +637,164 @@ pub type EmitARMCM = class {
       self.cm_loadSlot(src1); self.cm_loadSlot2(src2);
       self.cm_LSR(CM_R4, CM_R4, CM_R5); self.cm_storeSlot(dest);
     }
+    if op == IRO_SAR {                       // #2236: arithmetisch
+      self.cm_loadSlot(src1); self.cm_loadSlot2(src2);
+      self.cm_ASR(CM_R4, CM_R4, CM_R5); self.cm_storeSlot(dest);
+    }
 
     // --- Comparisons: CMP r4,r5 + MOVS r4,#0 + B<inv_cond>.N +2 + MOVS r4,#1 ---
+    // #1765: Hier stand ueberall `MOVS r4, #0` ZWISCHEN dem CMP und dem
+    // bedingten Sprung. MOVS setzt in Thumb die Flags — der Vergleich war
+    // damit ueberschrieben, bevor ihn jemand las, und die Bedingung fiel
+    // immer gleich aus. `if 3 < 5` nahm den else-Zweig, jede while-Schleife
+    // lief null Mal. Jetzt wird ZUERST gesprungen und danach gesetzt.
     if op == IRO_CMP_EQ {
       self.cm_loadSlot(src1); self.cm_loadSlot2(src2);
       self.cm_CMP(CM_R4, CM_R5);
-      self.cm_MOVS_imm(CM_R4, 0); self.cm_e16(0xD101);   // BNE.N +2
-      self.cm_MOVS_imm(CM_R4, 1); self.cm_storeSlot(dest);
+      self.cmSetzeAusFlag(0xD101, dest);   // BNE.N ueberspringt die 1
     }
     if op == IRO_CMP_NEQ {
       self.cm_loadSlot(src1); self.cm_loadSlot2(src2);
       self.cm_CMP(CM_R4, CM_R5);
-      self.cm_MOVS_imm(CM_R4, 0); self.cm_e16(0xD001);   // BEQ.N +2
-      self.cm_MOVS_imm(CM_R4, 1); self.cm_storeSlot(dest);
+      self.cmSetzeAusFlag(0xD001, dest);   // BEQ.N
     }
     if op == IRO_CMP_LT {
       self.cm_loadSlot(src1); self.cm_loadSlot2(src2);
       self.cm_CMP(CM_R4, CM_R5);
-      self.cm_MOVS_imm(CM_R4, 0); self.cm_e16(0xDA01);   // BGE.N +2
-      self.cm_MOVS_imm(CM_R4, 1); self.cm_storeSlot(dest);
+      self.cmSetzeAusFlag(0xDA01, dest);   // BGE.N
     }
     if op == IRO_CMP_GE {
       self.cm_loadSlot(src1); self.cm_loadSlot2(src2);
       self.cm_CMP(CM_R4, CM_R5);
-      self.cm_MOVS_imm(CM_R4, 0); self.cm_e16(0xDB01);   // BLT.N +2
-      self.cm_MOVS_imm(CM_R4, 1); self.cm_storeSlot(dest);
+      self.cmSetzeAusFlag(0xDB01, dest);   // BLT.N
     }
     if op == IRO_CMP_GT {
-      // r4 > r5  ↔  r5 < r4: swap operands in CMP
+      // r4 > r5  entspricht  r5 < r4: Operanden im CMP tauschen
       self.cm_loadSlot(src1); self.cm_loadSlot2(src2);
       self.cm_CMP(CM_R5, CM_R4);
-      self.cm_MOVS_imm(CM_R4, 0); self.cm_e16(0xDA01);   // BGE.N +2
-      self.cm_MOVS_imm(CM_R4, 1); self.cm_storeSlot(dest);
+      self.cmSetzeAusFlag(0xDA01, dest);   // BGE.N
     }
     if op == IRO_CMP_LE {
       self.cm_loadSlot(src1); self.cm_loadSlot2(src2);
       self.cm_CMP(CM_R4, CM_R5);
-      self.cm_MOVS_imm(CM_R4, 0); self.cm_e16(0xDC01);   // BGT.N +2
-      self.cm_MOVS_imm(CM_R4, 1); self.cm_storeSlot(dest);
+      self.cmSetzeAusFlag(0xDC01, dest);   // BGT.N
     }
 
     // --- Memory: locals / globals ---
     if op == IRO_LOAD_LOCAL || op == IRO_STORE_LOCAL {
       self.cm_loadSlot(src1); self.cm_storeSlot(dest);
     }
+    // #1765: src1 bzw. das DEST-Feld tragen einen globalIdx, KEINE Adresse.
+    // arm-cm lud ihn als Zahl und griff darauf zu — der Zugriff auf die erste
+    // globale Variable ging also auf Adresse 0, was auf einem Cortex-M im
+    // Stillstand endet. Jetzt zeigt die Rechnung in den RAM-Bereich.
+    //
+    // Beim Schreiben steht der Index im DEST-Feld, nicht in src2: ir_lower
+    // erzeugt STORE_GLOBAL als (dest = gIdx, src1 = Wert, src2 = -1). Aus src2
+    // gelesen wurde -1, geschrieben also vier Byte VOR den Bereich.
     if op == IRO_LOAD_GLOBAL {
-      self.cm_LI(CM_R6, src1);
+      // #2239: Anfangswert passte nicht in ein Wort und es wurde noch nicht
+      // geschrieben → Debug-Halt wie bei IRO_PANIC statt eines still
+      // gekuerzten Werts.
+      var lMerk: int64 := _irWort32MerkerFuer(self.wort32Merker, src1);
+      if lMerk >= 0 {
+        self.cm_LI(CM_R6, CM_GLOBALS_BASE + lMerk * 4);
+        self.cm_LDR_pos(CM_R4, CM_R6, 0);
+        self.cm_CMP0(CM_R4);
+        self.cm_e16(0xD100);       // BNE +0 → ueberspringt das folgende BKPT
+        self.cm_e16(0xBE00);       // bkpt #0
+      }
+      self.cm_LI(CM_R6, CM_GLOBALS_BASE + src1 * 4);
       self.cm_LDR_pos(CM_R4, CM_R6, 0); self.cm_storeSlot(dest);
     }
     if op == IRO_STORE_GLOBAL {
-      self.cm_LI(CM_R6, src2);
+      self.cm_LI(CM_R6, CM_GLOBALS_BASE + dest * 4);
       self.cm_loadSlot(src1);
       self.cm_STR_pos(CM_R4, CM_R6, 0);
+      var sMerk: int64 := _irWort32MerkerFuer(self.wort32Merker, dest);
+      if sMerk >= 0 {              // #2239: ab jetzt ist der Wert gueltig
+        self.cm_LI(CM_R6, CM_GLOBALS_BASE + sMerk * 4);
+        self.cm_LI(CM_R4, 1);
+        self.cm_STR_pos(CM_R4, CM_R6, 0);
+      }
     }
 
     // --- Struct field access ---
+    // #2147: imm = Breite | (vorzeichenbehaftet << 8) — wie emitLoadFieldArt
+    // in emit_arm64.lyx. Bis 1.2.16C immer ein ganzes Wort.
     if op == IRO_LOAD_FIELD || op == IRO_LOAD_FIELD_HEAP {
       self.cm_loadSlot(src1);
-      self.cm_LDR_pos(CM_R4, CM_R4, src2); self.cm_storeSlot(dest);
+      var cfW: int64 := imm & 255;
+      var cfVz: int64 := (imm >> 8) & 1;
+      if cfW == 1 && cfVz == 0 { self.cm_LDRB(CM_R4, CM_R4, src2); }
+      else if cfW == 2 && cfVz == 0 { self.cm_LDRH(CM_R4, CM_R4, src2); }
+      else if cfW == 1 { self.cm_t32(0xF990 | CM_R4, (CM_R4 << 12) | (src2 & 0xFFF)); }   // LDRSB.W
+      else if cfW == 2 { self.cm_t32(0xF9B0 | CM_R4, (CM_R4 << 12) | (src2 & 0xFFF)); }   // LDRSH.W
+      else { self.cm_LDR_pos(CM_R4, CM_R4, src2); }
+      self.cm_storeSlot(dest);
     }
+    // #1765: Beim Schreiben steht der Feld-Offset im DEST-Feld, nicht in imm —
+    // dieselbe Verwechslung wie auf riscv (#1767), wo jedes Feld auf Offset 0
+    // landete und das zweite das erste ueberschrieb.
     if op == IRO_STORE_FIELD || op == IRO_STORE_FIELD_HEAP {
       self.cm_loadSlot(src2);                // r4 = base ptr
       self.cm_MOV(CM_R6, CM_R4);             // r6 = base
       self.cm_loadSlot(src1);                // r4 = value
-      self.cm_STR_pos(CM_R4, CM_R6, imm);
+      var csW: int64 := imm & 255;          // #2147
+      if csW == 1 { self.cm_STRB(CM_R4, CM_R6, dest); }
+      else if csW == 2 { self.cm_STRH(CM_R4, CM_R6, dest); }
+      else { self.cm_STR_pos(CM_R4, CM_R6, dest); }   // dest = Feld-Offset in Byte
     }
 
     // --- Function calls (AAPCS: r0-r3 args) ---
     if op == IRO_CALL {
+      // #1765: Die Argumente liegen im reservierten Block ab src2 (argBase),
+      // nicht in den Slots 0..N-1 — die gehoeren den Locals des Aufrufers.
+      // arm-cm las sie bis hierher aus Slot 0 und uebergab damit irgendeinen
+      // fremden Wert; arm64, lyxos und riscv rechnen laengst ab argBase.
       var argCount: int64 := imm;
+      var argBase:  int64 := src2;
+      if argBase < 0 { argBase := 0; }
+      // #1765: Ab dem FUENFTEN Argument geht es nach AAPCS ueber den Stapel.
+      // Bis hierher fielen diese Argumente still weg (`while ai < 4`) — genau
+      // die Sorte Fehler, die auf lyxos #1761 war: die Funktion rechnete mit
+      // dem letzten Registerwert weiter.
+      //
+      // Der Platz wird VORHER am Stueck reserviert statt einzeln gepusht:
+      // solange er liegt, verschiebt er den Abstand zu den eigenen Slots, und
+      // dieser Versatz steht so an einer einzigen Stelle (spExtra).
+      var nStack: int64 := 0;
+      if argCount > 4 { nStack := argCount - 4; }
+      var stackBytes: int64 := nStack * 4;
+      if (stackBytes % 8) != 0 { stackBytes := stackBytes + 4; }   // 8-Byte-Ausrichtung
+      if stackBytes > 0 {
+        self.cm_SUB_sp(stackBytes);
+        self.spExtra := stackBytes;
+        var si: int64 := 4;
+        while si < argCount {
+          self.cm_loadSlot(argBase + si);
+          self.cm_STR_sp(CM_R4, (si - 4) * 4);
+          si := si + 1;
+        }
+      }
       var ai: int64 := 0;
       while ai < argCount && ai < 4 {
-        self.cm_loadSlot(ai);
+        self.cm_loadSlot(argBase + ai);
         self.cm_MOV(CM_R0 + ai, CM_R4);
         ai := ai + 1;
       }
       var patchOff: int64 := self.codeLen;
       self.cm_t32(0xF000, 0xD000);   // BL placeholder
       self.addPatch(patchOff, src1, CM_PATCH_BL);
+      if stackBytes > 0 {
+        self.cm_ADD_sp(stackBytes);
+        self.spExtra := 0;
+      }
       self.cm_MOV(CM_R4, CM_R0);
       self.cm_storeSlot(dest);
     }
     if op == IRO_CALL_BUILTIN {
-      self.emitBuiltinCall(imm, dest);
+      self.emitBuiltinCall(imm, src1, dest);
     }
 
     // --- Control flow ---
@@ -565,22 +826,532 @@ pub type EmitARMCM = class {
       self.emitEpilogue();
     }
 
-    // --- Memory allocation (bare-metal stub) ---
+    // --- Speicherbeschaffung ---
+    // #1783: Hier stand ein Stummel, der 0 lieferte — ohne ein Wort. Wer
+    // `alloc` oder `new` benutzte, bekam einen Nullzeiger und schrieb darauf;
+    // auf einem Cortex-M endet das im Stillstand, und die Ursache liegt dann
+    // weit weg von der Zeile, die sie verursacht hat. Genau so ist
+    // std/io.PrintInt hier ausgefallen: es holt sich 32 Byte vom Heap.
+    //
+    // Ein freistehendes Ziel hat keinen Allokator. Das ist kein Versehen,
+    // sondern die Eigenschaft der Plattform — also wird es benannt, statt
+    // etwas Plausibles zu tun.
     if op == IRO_ALLOC {
-      self.cm_MOVS_imm(CM_R4, 0); self.cm_storeSlot(dest);
+      EPrintStrLn("error: arm-cm: alloc/new gibt es auf einem freistehenden Ziel nicht."c);
+      EPrintStrLn("  Kein Betriebssystem, kein Allokator, keine Quelle fuer Speicher,"c);
+      EPrintStrLn("  der den Aufruf ueberlebt. Bis 1.1.9K lieferte diese Stelle still"c);
+      EPrintStrLn("  einen Nullzeiger (#1783)."c);
+      EPrintStrLn("  Behelf: Puffer selbst mitgeben -- IntToStrIn/StrSubIn aus"c);
+      EPrintStrLn("  std.string_in, oder eine feste Adresse im RAM."c);
+      exit(1);
     }
     if op == IRO_FREE { }   // no-op for bare-metal
 
     // --- Type conversions: copy only (no FP hardware used) ---
-    if op == IRO_ITOF || op == IRO_FTOI || op == IRO_CAST || op == IRO_SEXT || op == IRO_ZEXT || op == IRO_TRUNC {
+    // #2160: wie ITOF/FTOI hier — dieses Ziel rechnet Gleitkomma nicht
+    // (keine FPU-Befehle im Backend), der Wert wird durchgereicht.
+    if op == IRO_F64_ZU_F32 || op == IRO_F32_ZU_F64 || op == IRO_ITOF || op == IRO_FTOI || op == IRO_CAST || op == IRO_SEXT || op == IRO_ZEXT || op == IRO_TRUNC {
       self.cm_loadSlot(src1); self.cm_storeSlot(dest);
+    }
+
+    // --- WSP-05: Inline-Assembly (imm = arch-Mnemonic-Id aus ir_lower Thumb-2-Tabelle).
+    // 32-bit-Thumb-Instruktionen: höheres Halbwort zuerst, jedes cm_e16 little-endian. ---
+    // #1281: IRO_THROW auf blankem Metall. Es gibt kein Betriebssystem, das
+    // einen Exit-Code entgegennimmt — der Abbruch ist deshalb `bkpt #0`: der
+    // Debugger haelt an, ohne Debugger loest es HardFault aus. Beides ist ein
+    // sichtbarer Abbruch. Bis 1.0.16G erzeugte `throw` hier nichts und lief
+    // einfach weiter. Fangen kann ihn niemand: ir_lower weist try/catch ab.
+    if op == IRO_THROW {
+      self.cm_e16(0xBE00);   // bkpt #0
+    }
+
+    // #1339: IRO_CONST_STR — Zeichenkettenliteral. Es fehlte; auf diesem Ziel
+    // scheiterte damit schon `PrintLn("hallo")`.
+    //
+    // Die Bytes stehen INLINE im Codestrom, die Adresse entsteht PC-relativ,
+    // ein Sprung fuehrt darum herum — wie im arm64-Backend. Bewusst NICHT ueber
+    // ADR/LDR-literal: beide rechnen mit Align(PC,4), und ob der Befehl gerade
+    // auf einer 4-Byte-Grenze liegt, haengt vom vorherigen Code ab. `MOV r4, PC`
+    // liest den Wert ohne Ausrichtungsregel und ist damit an jeder Stelle
+    // richtig.
+    if op == IRO_CONST_STR {
+      var strBufC: int64 := peek64(self.ir + 32);
+      var spC: int64 := strBufC + imm;
+    // #1968: Die Laenge steht im VORSPANN vor der Zeichenkette (acht Byte bei
+    // off-8, von irAddString gelegt), nicht in der Nullterminierung. `StrLen`
+    // schnitt hier alles ab dem ersten Nullbyte im INHALT ab — bei einer
+    // eingebetteten Datei (#1961) blieb davon ein Bruchstueck plus Fremdbytes
+    // aus dem anschliessenden Speicher. Die Null wird weiterhin MITgeschrieben,
+    // die Laufzeit erwartet sie bei pchar; sie ist nur nicht mehr das Mass.
+      var lenC: int64 := _irStrLenVorspann(strBufC, imm);
+      var totalC: int64 := lenC + 1;                 // mit der abschliessenden 0
+      var padC: int64 := totalC & 1;                 // auf gerade Laenge bringen
+      var paddedC: int64 := totalC + padC;
+      // MOV r4, PC  → r4 = Adresse dieses Befehls + 4
+      self.cm_e16(0x467C);
+      // ADDS r4, #2 → zeigt hinter den folgenden Sprung, also auf die Bytes
+      self.cm_e16(0x3402);
+      // B ueber die Zeichenkette: T2-Sprungweite in Halbworten, PC = B + 4
+      self.cm_e16(0xE000 | (((paddedC - 2) / 2) & 0x7FF));
+      var iC: int64 := 0;
+      while (iC < lenC) { self.cm_e8(peek8(spC + iC)); iC := iC + 1; }
+      self.cm_e8(0);
+      var pC: int64 := 0;
+      while (pC < padC) { self.cm_e8(0); pC := pC + 1; }
+      self.cm_storeSlot(dest);
+    }
+
+    // #1339: Die Zusicherungen. ir_lower setzt ASSERT_NOT_ZERO vor jede
+    // Division; bis 1.0.18B behandelte sie ausser lyxos kein Backend, der
+    // Opcode verschwand, und die Division lief ungeprueft.
+    //
+    // Auf einem Mikrocontroller ist der Abbruch der Debug-Halt (BKPT #0),
+    // dasselbe wie bei IRO_PANIC. BNE ueberspringt ihn (T1-Sprungweite in
+    // Zweibyte-Schritten: 1 Befehl = imm8 0).
+    if op == IRO_ASSERT_NOT_NULL || op == IRO_ASSERT_NOT_ZERO || op == IRO_ASSERT_TRUE {
+      self.cm_loadSlot(src1);
+      self.cm_CMP0(CM_R4);
+      self.cm_e16(0xD100);       // BNE +0 → ueberspringt das folgende BKPT
+      self.cm_e16(0xBE00);       // bkpt #0
+    }
+
+    // ASSERT_BOUNDS: src1 = Index, src2 = Laenge; vorzeichenlos verglichen
+    // (BLO), damit ein negativer Index als sehr grosse Zahl auffaellt.
+    if op == IRO_ASSERT_BOUNDS {
+      self.cm_loadSlot(src1);
+      self.cm_loadSlot2(src2);
+      self.cm_CMP(CM_R4, CM_R5);
+      self.cm_e16(0xD300);       // BLO +0 → Index < Laenge: ueberspringen
+      self.cm_e16(0xBE00);       // bkpt #0
+    }
+
+    // #1339: IRO_PANIC (121) fehlte — auf einem Mikrocontroller gibt es kein
+    // exit(); der Abbruch ist der Debug-Halt. BKPT #0 haelt im Debugger an und
+    // loest ohne Debugger die HardFault-Behandlung aus. Beides ist ein Abbruch;
+    // vorher lief das Programm nach dem panic einfach weiter.
+    if op == IRO_PANIC {
+      self.cm_e16(0xBE00);   // bkpt #0
+    }
+
+    if op == 167 {
+      if      imm == 0  { self.cm_e16(0xBF00); }                     // nop
+      else if imm == 1  { self.cm_e16(0xBF30); }                     // wfi
+      else if imm == 2  { self.cm_e16(0xBF20); }                     // wfe
+      else if imm == 3  { self.cm_e16(0xBF40); }                     // sev
+      else if imm == 4  { self.cm_e16(0xBF10); }                     // yield
+      else if imm == 5  { self.cm_e16(0xF3BF); self.cm_e16(0x8F6F); } // isb
+      else if imm == 6  { self.cm_e16(0xF3BF); self.cm_e16(0x8F4F); } // dsb
+      else if imm == 7  { self.cm_e16(0xF3BF); self.cm_e16(0x8F5F); } // dmb
+      else if imm == 8  { self.cm_e16(0xDF00); }                     // svc #0
+      else if imm == 9  { self.cm_e16(0xBE00); }                     // bkpt #0
+      else if imm == 10 { self.cm_e16(0xB672); }                     // cpsid i
+      else if imm == 11 { self.cm_e16(0xB662); }                     // cpsie i
+      else {
+        EPrintStrLn("error: asm: unbekannte Mnemonic (arm_cm)"c);
+        exit(1);
+      }
     }
   }
 
-  fn emitBuiltinCall(id: int64, dest: int64) {
-    // Bare-metal stubs: no OS syscalls
+  // #1388: Hier stand ein einziger Zweig — JEDER Builtin lieferte 0, ohne ein
+  // Wort darueber. Auf einem freistehenden Ziel ist das fuer Ausgabe-Builtins
+  // vertretbar (es gibt kein Betriebssystem), fuer Speicherzugriffe nicht:
+  // `peek8(p)` gab 0 zurueck, statt zu lesen, und `poke8` schrieb nirgendwo
+  // hin. Beides ohne Meldung — derselbe stille Default wie bei den Opcodes in
+  // #1339, eine Ebene tiefer.
+  //
+  // Jetzt: die Speicherzugriffe sind umgesetzt, alles andere wird benannt.
+  fn emitBuiltinCall(id: int64, argBase: int64, dest: int64) {
+    // #1388: Die Adresse steht NICHT in Slot 0, sondern in einem hohen Block,
+    // dessen erster Slot als src1 mitkommt (argBase). ir_lower spillt seit dem
+    // Misdispatch-Fix (#839) absichtlich dorthin, weil die festen Slots 0..2
+    // die Locals des Aufrufers ueberschreiben. Bis 1.1.5C lasen die drei
+    // IR-Backends trotzdem Slot 0 und 1 — sie bekamen also irgendeinen Wert
+    // des Aufrufers als Adresse. Auf arm64 war das ein Segfault bei jedem
+    // peek8; gemessen wurde damals nur, ob die BYTES entstehen, nicht, ob das
+    // Programm laeuft.
+    var sBase: int64 := argBase;
+    if (sBase < 0) { sBase := 0; }
+    if (id == 200 || id == 208 || id == 201 || id == 202) {
+      // peek8/16/32/64 — Adresse aus Slot 0. Cortex-M ist 32-bittig; peek64
+      // liest darum das untere Wort und wird als solches gemeldet, wenn es
+      // jemand braucht.
+      self.cm_loadSlot(sBase);                  // r4 = Adresse
+      if (id == 200) { self.cm_LDRB(CM_R4, CM_R4, 0); }
+      if (id == 208) { self.cm_LDRH(CM_R4, CM_R4, 0); }
+      if (id == 201 || id == 202) { self.cm_LDR_pos(CM_R4, CM_R4, 0); }
+      self.cm_storeSlot(dest);
+      return;
+    }
+    if (id == 15) {
+      // #1388: StrLen — Zeichen bis zur Null zaehlen. Braucht kein
+      // Betriebssystem und gehoert deshalb auch auf ein freistehendes Ziel.
+      //
+      // r4 = Zeiger, r5 = Zaehler, r6 = gelesenes Byte. Sprungweiten in
+      // Zweibyte-Schritten: T1 rechnet ab PC+4, also zwei Befehle weiter.
+      // #1765: Der Ausstieg stand als „BEQ +2 Befehle" da und zaehlte in
+      // Zweibyte-Schritten — cm_ADD ist aber ein 32-Bit-Befehl. Der Sprung
+      // landete damit auf dem Ruecksprung statt dahinter, und StrLen lief
+      // endlos. Jetzt wird das Ziel nachgetragen; gezaehlte Weiten sind hier
+      // grundsaetzlich die falsche Technik, weil Thumb-2 Befehle beider
+      // Breiten mischt.
+      self.cm_loadSlot(sBase);                  // r4 = s
+      self.cm_MOVS_imm(CM_R5, 0);               // r5 = 0
+      var slL: int64 := self.codeLen;
+      self.cm_ADD(CM_R6, CM_R4, CM_R5);
+      self.cm_LDRB(CM_R6, CM_R6, 0);
+      self.cm_CMP0(CM_R6);
+      var slRaus: int64 := self.codeLen; self.cm_e16(0);   // BEQ -> hinter die Schleife
+      self.cm_MOVS_imm(CM_R6, 1);
+      self.cm_ADD(CM_R5, CM_R5, CM_R6);
+      self.cm_e16(0xE000 | (((slL - (self.codeLen + 4)) / 2) & 0x7FF));
+      self.cm_poke16at(slRaus, 0xD000 | (((self.codeLen - (slRaus + 4)) / 2) & 0xFF));
+      self.cm_MOV(CM_R4, CM_R5);
+      self.cm_storeSlot(dest);
+      return;
+    }
+    if (id == 6 || id == 16) {
+      // #1388: StrSub und IntToStr brauchen einen Puffer, der den Aufruf
+      // ueberlebt. Auf arm64 und riscv kommt der aus mmap; ein freistehendes
+      // Cortex-M-Ziel hat weder mmap noch einen Allokator.
+      //
+      // Ein fester Puffer im Datenbereich waere die naheliegende Abkuerzung
+      // und genau die falsche: zwei Aufrufe hintereinander lieferten denselben
+      // Zeiger, der zweite ueberschriebe das Ergebnis des ersten, und niemand
+      // saehe es. Lieber eine Meldung als eine Zeichenkette, die sich unter
+      // der Hand aendert.
+      EPrintStr("error: arm-cm: Builtin-ID "c);
+      EPrintInt(id);
+      EPrintStrLn(" braucht einen Puffer, der den Aufruf ueberlebt (#1388)."c);
+      EPrintStrLn("  Auf einem freistehenden Ziel gibt es dafuer keine Quelle: kein mmap,"c);
+      EPrintStrLn("  kein Allokator. Ein gemeinsamer fester Puffer waere still falsch."c);
+      EPrintStrLn("  Wer die Zeichenkette braucht, gibt den Zielpuffer selbst mit."c);
+      exit(1);
+    }
+    if (id == 206) {
+      // #1388: StrCharAt(s, i) — Byte an Position i, ohne Vorzeichen.
+      self.cm_loadSlot(sBase);                  // r4 = s
+      self.cm_loadSlot2(sBase + 1);             // r5 = i
+      self.cm_ADD(CM_R4, CM_R4, CM_R5);
+      self.cm_LDRB(CM_R4, CM_R4, 0);
+      self.cm_storeSlot(dest);
+      return;
+    }
+    if (id == 207) {
+      // #1388: StrSetChar(s, i, c) — Byte an Position i setzen.
+      self.cm_loadSlot(sBase);                  // r4 = s
+      self.cm_loadSlot2(sBase + 1);             // r5 = i
+      self.cm_ADD(CM_R4, CM_R4, CM_R5);
+      self.cm_loadSlot2(sBase + 2);             // r5 = c
+      self.cm_STRB(CM_R5, CM_R4, 0);
+      self.cm_MOVS_imm(CM_R4, 0);
+      self.cm_storeSlot(dest);
+      return;
+    }
+    if (id == 203 || id == 209 || id == 204 || id == 205) {
+      // poke8/16/32/64 — Adresse aus Slot 0, Wert aus Slot 1.
+      self.cm_loadSlot(sBase);                  // r4 = Adresse
+      self.cm_loadSlot2(sBase + 1);             // r5 = Wert
+      if (id == 203) { self.cm_STRB(CM_R5, CM_R4, 0); }
+      if (id == 209) { self.cm_STRH(CM_R5, CM_R4, 0); }
+      if (id == 204 || id == 205) { self.cm_STR_pos(CM_R5, CM_R4, 0); }
+      self.cm_MOVS_imm(CM_R4, 0);
+      self.cm_storeSlot(dest);
+      return;
+    }
+    // #1744: Ausgabe ueber ARM-Semihosting.
+    //
+    // Bis hierher waren 1, 2, 9, 12, 13 und 14 ein ausdruecklicher No-op: das
+    // Programm uebersetzte, `PrintLn` tat nichts, und niemand sah es. Der
+    // Kommentar von damals nannte selbst den Ausweg — semihosting. Genau der
+    // ist jetzt umgesetzt: BKPT 0xAB mit SYS_WRITEC (0x03) je Zeichen. Das ist
+    // der uebliche Weg, von einem Cortex-M Text herauszubekommen, und er
+    // funktioniert unter qemu-system-arm ebenso wie an einem echten Debugger.
+    //
+    // Zeichenweise statt ueber SYS_WRITE, weil SYS_WRITE einen Parameterblock
+    // im RAM braucht — den muesste das Backend erst anlegen, und einen festen
+    // haette dieselbe Falle wie der feste Zeichenkettenpuffer weiter oben.
+    if (id == 1 || id == 13 || id == 14 || id == 223) {
+      // id 1: write(stdout, buf, len) — Puffer und Laenge ab argBase.
+      // id 13/14: EPrintStr — Puffer ab argBase, Laenge zaehlt der Code.
+      // id 223: write(fd, buf, len) — fd wird verworfen, es gibt nur einen
+      //         Ausgabeweg; das steht so auch in der Meldung unten.
+      var wBuf: int64 := sBase;
+      var wLen: int64 := sBase + 1;
+      if (id == 223) { wBuf := sBase + 1; wLen := sBase + 2; }
+      self.cm_loadSlot(wBuf);                   // r4 = Puffer
+      if (id == 13 || id == 14) {
+        self.cm_MOVS_imm(CM_R5, 0);
+        self.cm_MOVS_imm(CM_R6, 1);
+        self.cm_SUB(CM_R5, CM_R5, CM_R6);       // r5 = -1 (Sentinel: bis zum Nullbyte)
+      } else {
+        self.cm_loadSlot2(wLen);                // r5 = Laenge
+      }
+      self.emitSemihostWrite();
+      self.cm_MOVS_imm(CM_R4, 0);
+      self.cm_storeSlot(dest);
+      return;
+    }
+    if (id == 2) {
+      // PrintInt(n): Ziffern in einen Stapelpuffer, dann zeichenweise
+      // ausgeben. Der Puffer lebt nur waehrend des Aufrufs — das genuegt hier,
+      // weil die Ausgabe im selben Aufruf passiert. Genau darin unterscheidet
+      // sich der Fall von IntToStr, das einen Zeiger ZURUECKGIBT (#1744).
+      self.cm_loadSlot(sBase);                  // r4 = Zahl
+      self.emitSemihostInt();
+      self.cm_MOVS_imm(CM_R4, 0);
+      self.cm_storeSlot(dest);
+      return;
+    }
+    if (id == 3 || id == 227) {
+      // Exit: SYS_EXIT (0x18) mit ADP_Stopped_ApplicationExit.
+      // 3 ist der allgemeine Exit-Builtin, 227 der aus der Syscall-Familie
+      // (`exit(code)` im Quelltext laeuft ueber diesen). Der Wert steht
+      // im erweiterten Block {Grund, Code}, damit der Rueckgabewert des
+      // Programms sichtbar wird — sonst liesse sich ein Lauf nicht pruefen.
+      // Ohne Semihosting-Wirt bleibt BKPT stehen, wie bisher.
+      self.cm_loadSlot(sBase);                  // r4 = Code
+      self.emitSemihostExit();
+      return;
+    }
+    if (id >= 255 && id <= 262) {
+      self.cm_emitBitBuiltin(id, sBase, dest);
+      return;
+    }
+    self._builtinUnsupportedCM(id);
+  }
+
+  // #2228: Bit-Rechenwerke (#2190, #2177) auf Cortex-M4.
+  //
+  // DARSTELLUNG: dieses Backend haelt jeden int64-Wert als EIN 32-Bit-Wort
+  // im Slot (cm_loadSlot/cm_storeSlot, LDR/STR). Vergleiche (CMP + BGE/BLT),
+  // SDIV und PrintInt lesen das Wort vorzeichenbehaftet; der dargestellte
+  // int64-Wert ist die Vorzeichenerweiterung des Wortes. Gerechnet wird unter
+  // genau dieser Annahme — fuer jeden Wert in [-2^31, 2^31) ist das Ergebnis
+  // dasselbe wie auf x86:
+  //
+  //   popcount(x) = popcount32(w) + (w < 0 ? 32 : 0)       SWAR + MUL
+  //   clz(x)      = clz32(w) + (w >= 0 ? 32 : 0)           CLZ (clz(0) == 64)
+  //   ctz(x)      = ctz32(w) + (w == 0 ? 32 : 0)           RBIT + CLZ
+  //   rotl32/rotr32: NEG + ROR bzw. ROR. Das Ergebniswort sind exakt die
+  //     unteren 32 Bit des x86-Ergebnisses; ein Ergebnis >= 2^31 liest dieses
+  //     Ziel — wie jede solche Konstante — als negativ.
+  //
+  // bswap64, rotl und rotr (64 Bit) haben KEIN darstellbares Ergebnis: die
+  // unteren 32 Bit des Ergebnisses kaemen aus dem oberen Wort, das es hier
+  // nicht gibt. Laut abgewiesen statt still auf 32 Bit gerechnet (REV und
+  // ROR waeren da — sie lieferten nur das Falsche).
+  //
+  // Dieselbe Rechnung steht in xtensa.lyx (xt_emitBitBuiltin) — die beiden
+  // muessen uebereinstimmen.
+  fn cm_emitBitBuiltin(id: int64, sBase: int64, dest: int64) {
+    if (id == 258 || id == 259 || id == 260) {
+      EPrintStr("error: arm-cm: "c);
+      if (id == 258) { EPrintStr("bswap64"c); }
+      if (id == 259) { EPrintStr("rotl"c); }
+      if (id == 260) { EPrintStr("rotr"c); }
+      EPrintStrLn(" braucht 64 Bit -- dieses Ziel haelt int64 als ein 32-Bit-Wort (#2228)."c);
+      EPrintStrLn("  Die unteren 32 Bit des Ergebnisses kaemen aus dem oberen Wort, das es"c);
+      EPrintStrLn("  hier nicht gibt; ein Ergebnis auf 32 Bit waere still falsch."c);
+      EPrintStrLn("  Fuer 32-Bit-Woerter: rotl32/rotr32."c);
+      exit(1);
+    }
+    self.cm_loadSlot(sBase);                    // r4 = w
+    if (id == 261 || id == 262) {
+      self.cm_loadSlot2(sBase + 1);             // r5 = Weite
+      if (id == 261) { self.cm_NEG(CM_R5, CM_R5); }   // links um n = rechts um -n (mod 32)
+      self.cm_ROR(CM_R4, CM_R4, CM_R5);
+      self.cm_storeSlot(dest);
+      return;
+    }
+    if (id == 255) {
+      self.cm_MOV(CM_R0, CM_R4);                // r0 = w (fuer das Vorzeichen)
+      self.cm_SHI(CM_R5, CM_R4, 1, 1);
+      self.cm_LI(CM_R6, 0x55555555);
+      self.cm_AND(CM_R5, CM_R5, CM_R6);
+      self.cm_SUB(CM_R4, CM_R4, CM_R5);
+      self.cm_LI(CM_R6, 0x33333333);
+      self.cm_SHI(CM_R5, CM_R4, 1, 2);
+      self.cm_AND(CM_R5, CM_R5, CM_R6);
+      self.cm_AND(CM_R4, CM_R4, CM_R6);
+      self.cm_ADD(CM_R4, CM_R4, CM_R5);
+      self.cm_SHI(CM_R5, CM_R4, 1, 4);
+      self.cm_ADD(CM_R4, CM_R4, CM_R5);
+      self.cm_LI(CM_R6, 0x0F0F0F0F);
+      self.cm_AND(CM_R4, CM_R4, CM_R6);
+      self.cm_LI(CM_R6, 0x01010101);
+      self.cm_MUL(CM_R4, CM_R4, CM_R6);         // Bytesummen im obersten Byte
+      self.cm_SHI(CM_R4, CM_R4, 1, 24);
+      self.cm_SHI(CM_R5, CM_R0, 2, 31);         // -1 bei w < 0, sonst 0
+      self.cm_LI(CM_R6, 32);
+      self.cm_AND(CM_R5, CM_R5, CM_R6);
+      self.cm_ADD(CM_R4, CM_R4, CM_R5);
+      self.cm_storeSlot(dest);
+      return;
+    }
+    if (id == 256) {
+      self.cm_CLZ(CM_R5, CM_R4);                // clz32, 32 bei w == 0
+      self.cm_MVN(CM_R6, CM_R4);
+      self.cm_SHI(CM_R6, CM_R6, 1, 31);         // 1 bei w >= 0
+      self.cm_SHI(CM_R6, CM_R6, 0, 5);          // 32 bei w >= 0
+      self.cm_ADD(CM_R4, CM_R5, CM_R6);
+      self.cm_storeSlot(dest);
+      return;
+    }
+    // id == 257: ctz32 = CLZ(RBIT w); 32 genau bei w == 0, dann 64.
+    self.cm_RBIT(CM_R5, CM_R4);
+    self.cm_CLZ(CM_R5, CM_R5);
+    self.cm_LI(CM_R6, 32);
+    self.cm_AND(CM_R6, CM_R5, CM_R6);
+    self.cm_ADD(CM_R4, CM_R5, CM_R6);
+    self.cm_storeSlot(dest);
+  }
+
+  // #1744: r4 = Puffer, r5 = Laenge (negativ heisst "bis zum Nullbyte").
+  // Gibt zeichenweise ueber SYS_WRITEC aus.
+  //
+  // Benutzt werden r0..r3 und r6. NICHT r7 — das ist in diesem Backend der
+  // Rahmenzeiger. Ein erster Anlauf nahm ihn als Kratzregister: die Ausgabe
+  // kam, danach sprang das Programm beim Ruecksprung aus main ins Leere und
+  // qemu meldete "Lockup: can't escalate 3 to HardFault". Die Vektortabelle
+  // hat nur zwei Eintraege, ein Fehler endet dort also immer im Stillstand.
+  //
+  // Alle Spruenge werden nachgetragen statt gezaehlt.
+  fn emitSemihostWrite() {
+    self.cm_MOVS_imm(CM_R6, 0);                 // r6 = Index
+    var lLoop: int64 := self.codeLen;
+    self.cm_CMP0(CM_R5);
+    var bSentinel: int64 := self.codeLen; self.cm_e16(0);   // BLT -> Nullbyte-Pruefung
+    self.cm_CMP(CM_R6, CM_R5);
+    var bEndeFest: int64 := self.codeLen; self.cm_e16(0);   // BGE -> fertig
+    var jSchreib: int64 := self.codeLen; self.cm_e16(0);    // B   -> schreiben
+    var lSentinel: int64 := self.codeLen;
+    self.cm_ADD(CM_R3, CM_R4, CM_R6);
+    self.cm_LDRB(CM_R2, CM_R3, 0);
+    self.cm_CMP0(CM_R2);
+    var bEndeNull: int64 := self.codeLen; self.cm_e16(0);   // BEQ -> fertig
+    var lSchreib: int64 := self.codeLen;
+    self.cm_ADD(CM_R3, CM_R4, CM_R6);
+    self.cm_MOVS_imm(CM_R0, 3);                 // SYS_WRITEC
+    self.cm_MOV(CM_R1, CM_R3);
+    self.cm_e16(0xBEAB);                        // BKPT 0xAB
+    self.cm_MOVS_imm(CM_R2, 1);
+    self.cm_ADD(CM_R6, CM_R6, CM_R2);
+    self.cm_e16(0xE000 | (((lLoop - (self.codeLen + 4)) / 2) & 0x7FF));
+    var lEnde: int64 := self.codeLen;
+    self.cm_poke16at(bSentinel, 0xDB00 | (((lSentinel - (bSentinel + 4)) / 2) & 0xFF));  // BLT
+    self.cm_poke16at(bEndeFest, 0xDA00 | (((lEnde     - (bEndeFest + 4)) / 2) & 0xFF));  // BGE
+    self.cm_poke16at(jSchreib,  0xE000 | (((lSchreib  - (jSchreib  + 4)) / 2) & 0x7FF)); // B
+    self.cm_poke16at(bEndeNull, 0xD000 | (((lEnde     - (bEndeNull + 4)) / 2) & 0xFF));  // BEQ
+  }
+
+  // #1744: r4 = Zahl, zeichenweise ausgegeben. Ein ganzer Ziffernpuffer waere
+  // unnoetig: jede Ziffer geht sofort raus, es muss also nur EIN Byte
+  // irgendwo liegen. Dafuer dient ein Stapelwort, dessen Adresse in r6 steht.
+  fn emitSemihostInt() {
+    self.cm_e16(0xB081);                        // SUB sp, #4
+    self.cm_MOV(CM_R6, 13);                     // r6 = sp
+    self.cm_CMP0(CM_R4);
+    var bNichtNeg: int64 := self.codeLen; self.cm_e16(0);   // BGE
+    self.cm_MOVS_imm(CM_R2, 45);                // '-'
+    self.cm_STRB(CM_R2, CM_R6, 0);
+    self.cm_MOVS_imm(CM_R0, 3);
+    self.cm_MOV(CM_R1, CM_R6);
+    self.cm_e16(0xBEAB);
+    self.cm_MOVS_imm(CM_R2, 0);
+    self.cm_SUB(CM_R4, CM_R2, CM_R4);           // r4 = -r4
+    var lPositiv: int64 := self.codeLen;
+    self.cm_MOVS_imm(CM_R5, 1);                 // Teiler
+    var gLoop: int64 := self.codeLen;
+    self.cm_MOVS_imm(CM_R2, 10);
+    self.cm_SDIV(CM_R0, CM_R4, CM_R5);
+    self.cm_CMP(CM_R0, CM_R2);
+    var bTeilerFertig: int64 := self.codeLen; self.cm_e16(0);   // BLT
+    self.cm_MUL(CM_R5, CM_R5, CM_R2);
+    self.cm_e16(0xE000 | (((gLoop - (self.codeLen + 4)) / 2) & 0x7FF));
+    var lZiffern: int64 := self.codeLen;
+    var zLoop: int64 := self.codeLen;
+    self.cm_MOVS_imm(CM_R2, 10);
+    self.cm_SDIV(CM_R0, CM_R4, CM_R5);          // r0 = Zahl / Teiler
+    self.cm_SDIV(CM_R1, CM_R0, CM_R2);
+    self.cm_MLS(CM_R0, CM_R1, CM_R2, CM_R0);    // r0 = r0 - (r0/10)*10
+    self.cm_MOVS_imm(CM_R1, 48);
+    self.cm_ADD(CM_R0, CM_R0, CM_R1);           // '0' + Ziffer
+    self.cm_STRB(CM_R0, CM_R6, 0);
+    self.cm_MOVS_imm(CM_R0, 3);
+    self.cm_MOV(CM_R1, CM_R6);
+    self.cm_e16(0xBEAB);                        // SYS_WRITEC
+    self.cm_MOVS_imm(CM_R2, 10);
+    self.cm_SDIV(CM_R5, CM_R5, CM_R2);          // Teiler /= 10
+    self.cm_CMP0(CM_R5);
+    var bEndeZ: int64 := self.codeLen; self.cm_e16(0);          // BEQ
+    self.cm_e16(0xE000 | (((zLoop - (self.codeLen + 4)) / 2) & 0x7FF));
+    var lEndeZ: int64 := self.codeLen;
+    self.cm_e16(0xB001);                        // ADD sp, #4
+    self.cm_poke16at(bNichtNeg,     0xDA00 | (((lPositiv - (bNichtNeg + 4)) / 2) & 0xFF));
+    self.cm_poke16at(bTeilerFertig, 0xDB00 | (((lZiffern - (bTeilerFertig + 4)) / 2) & 0xFF));
+    self.cm_poke16at(bEndeZ,        0xD000 | (((lEndeZ   - (bEndeZ + 4)) / 2) & 0xFF));
+  }
+
+  // #1744: SYS_EXIT (0x18) mit erweitertem Block {Grund, Code} auf dem Stapel.
+  // r4 = Code, ADP_Stopped_ApplicationExit = 0x20026. Ohne Semihosting-Wirt
+  // bleibt das BKPT stehen — wie das bisherige BKPT #0, nur mit Bedeutung.
+  fn emitSemihostExit() {
+    self.cm_e16(0xB082);                        // SUB sp, #8
+    self.cm_MOV(CM_R6, 13);                     // r6 = sp
+    self.cm_MOVW(CM_R2, 0x0026);
+    self.cm_MOVT(CM_R2, 0x0002);                // r2 = 0x00020026
+    self.cm_STR_pos(CM_R2, CM_R6, 0);
+    self.cm_STR_pos(CM_R4, CM_R6, 4);           // zweites Wort des Blocks
+    self.cm_MOVS_imm(CM_R0, 0x18);              // SYS_EXIT
+    self.cm_MOV(CM_R1, CM_R6);
+    self.cm_e16(0xBEAB);
+    self.cm_e16(0xB002);                        // ADD sp, #8
+  }
+
+  // #1765: r4 := 1, wenn die Bedingung gilt, sonst 0 — OHNE die Flags
+  // zwischen CMP und Sprung anzufassen.
+  //
+  //   Bcc.N  +1     ; Bedingung gilt NICHT -> zur Null
+  //   MOVS r4, #1
+  //   B.N    +0     ; ueber die Null hinweg
+  //   MOVS r4, #0
+  //
+  // bcc ist das fertige Befehlswort des UMGEKEHRTEN Sprungs samt Weite 1.
+  fn cmSetzeAusFlag(bcc: int64, dest: int64) {
+    self.cm_e16(bcc);
+    self.cm_MOVS_imm(CM_R4, 1);
+    self.cm_e16(0xE000);
     self.cm_MOVS_imm(CM_R4, 0);
     self.cm_storeSlot(dest);
+  }
+
+  // #1765: heisst die Funktion "main"? Der Name steht als Offset in den
+  // String-Pool des IR-Moduls.
+  fn cmIsMain(funcId: int64): int64 {
+    var funcBuf: int64 := peek64(self.ir + 80);
+    var rec:     int64 := funcBuf + funcId * 80;
+    if peek64(rec + 8) != 4 { return 0; }        // nameLen
+    var strBufC: int64 := peek64(self.ir + 32);
+    var p:       int64 := strBufC + peek64(rec + 0);
+    if peek8(p + 0) != 109 { return 0; }   // 'm'
+    if peek8(p + 1) != 97  { return 0; }   // 'a'
+    if peek8(p + 2) != 105 { return 0; }   // 'i'
+    if peek8(p + 3) != 110 { return 0; }   // 'n'
+    return 1;
+  }
+
+  // #1765: Code-Offset von main; -1, wenn das Modul keines hat.
+  pub fn getMainOff(): int64 { return self.cmMainOff; }
+
+  fn _builtinUnsupportedCM(id: int64) {
+    EPrintStr("error: arm-cm: Builtin-ID "c);
+    EPrintInt(id);
+    EPrintStrLn(" wird nicht behandelt"c);
+    EPrintStrLn("  Ein freistehendes Ziel hat kein Betriebssystem: Ausgabe- und"c);
+    EPrintStrLn("  Dateibuiltins gibt es dort nicht. Speicherzugriffe sind umgesetzt."c);
+    EPrintStrLn("  Vergabe und Belegung der IDs: src/backend/_builtin_ids.md."c);
+    exit(1);
   }
 
   // --------------------------------------------------------------------------
@@ -592,12 +1363,58 @@ pub type EmitARMCM = class {
       poke64(self.funcAddrs + funcId * 8, self.codeLen);
       self.funcCount := self.funcCount + 1;
     }
+    // #1765: Anfang von main merken. Der Reset-Rumpf sprang fest auf die
+    // ZUERST erzeugte Funktion; stand main nicht an erster Stelle, lief das
+    // Programm in eine fremde Funktion und danach in die Endlosschleife —
+    // ohne Ausgabe und ohne Meldung.
+    if self.cmIsMain(funcId) != 0 { self.cmMainOff := self.codeLen; }
     self.stackSize  := 0;
-    self.patchCount := 0;
+    // #1765: patchCount wird NICHT zurueckgesetzt. Aufruf-Patches muessen die
+    // Funktion ueberleben, sonst kann der Durchlauf am Ende von emit() die
+    // Vorwaertsaufrufe nicht mehr aufloesen — bis hierher blieb ein solcher
+    // Aufruf auf seinem Platzhalter stehen. Aufgeloeste Eintraege sind mit
+    // labelId = -2 markiert und werden uebersprungen.
     var li: int64 := 0;
     while li < 1024 { poke64(self.labelAddrs + li * 8, -1); li := li + 1; }
     self.calcStackFrame(funcId);
     self.emitPrologue();
+    // #1765: eingehende Argumentregister r0..r3 in die Param-Slots spillen.
+    // Ohne das las ein LOAD_LOCAL eines Parameters uninitialisierten Stapel.
+    // Die Parameter liegen hinter dem Kratzstreifen (IR_BARG_SLOTS), wie bei
+    // arm64 (#1388) und riscv (#1740).
+    var pSpill: int64 := peek64(peek64(self.ir + 80) + funcId * 80 + 40);
+    var pi: int64 := 0;
+    while pi < pSpill {
+      if pi < 4 {
+        self.cm_MOV(CM_R4, CM_R0 + pi);
+        self.cm_storeSlot(IR_BARG_SLOTS + pi);
+      } else {
+        // #1765: Argumente ab dem fuenften liegen beim Aufrufer auf dem
+        // Stapel, oberhalb des geretteten r7 und der Ruecksprungadresse:
+        // [r7+8] ist das fuenfte, [r7+12] das sechste.
+        self.cm_LDR_pos(CM_R4, CM_R7, 8 + (pi - 4) * 4);
+        self.cm_storeSlot(IR_BARG_SLOTS + pi);
+      }
+      pi := pi + 1;
+    }
+    // #1765: Die Anfangswerte der globalen Variablen stehen im Flash und
+    // muessen in den RAM. Statt einer Kopierschleife im Reset-Rumpf — die den
+    // Offset von main verschoben haette — setzt main sie selbst, bevor der
+    // erste Befehl des Programms laeuft. Auch die Nullen werden geschrieben:
+    // auf echter Hardware ist der RAM beim Start NICHT garantiert leer.
+    if self.cmIsMain(funcId) != 0 {
+      var gCount: int64 := peek64(self.ir + 120);
+      var gBuf:   int64 := peek64(self.ir + 104);
+      var gi: int64 := 0;
+      while gi < gCount {
+        var gv: int64 := 0;
+        if gBuf != 0 { gv := peek64(gBuf + gi * 8); }
+        self.cm_LIroh(CM_R4, gv);   // #2239: gekuerzt, aber durch den Merker gesperrt (cm_LIroh)
+        self.cm_LI(CM_R6, CM_GLOBALS_BASE + gi * 4);
+        self.cm_STR_pos(CM_R4, CM_R6, 0);
+        gi := gi + 1;
+      }
+    }
     var instrStart: int64 := self.getFuncInstrStart(funcId);
     var instrCount: int64 := self.getFuncInstrCount(funcId);
     var i: int64 := 0;
@@ -611,6 +1428,9 @@ pub type EmitARMCM = class {
   // --------------------------------------------------------------------------
 
   pub fn init(irMod: int64) {
+    self.cmMainOff  := 0 - 1;
+    self.spExtra    := 0;
+    self.wort32Merker := 0;
     self.ir         := irMod;
     self.codeBuf    := alloc(131072);
     self.codeCap    := 131072;
@@ -624,9 +1444,15 @@ pub type EmitARMCM = class {
   }
 
   pub fn emit(): int64 {
+    // #2239: Merker anlegen, bevor main die Anfangswerte setzt — sie gehoeren
+    // dazu (Anfangswert 0).
+    self.wort32Merker := _irWort32Merker(self.ir);
     var n: int64 := self.getFuncCount();
     var i: int64 := 0;
     while i < n { self.emitFunc(i); i := i + 1; }
+    // #1765: jetzt steht jede Funktionsadresse fest — offene Vorwaertsaufrufe
+    // aufloesen.
+    self.applyPatches();
     return self.codeLen;
   }
 
@@ -676,6 +1502,7 @@ pub type ARMCMBackend = class {
   code:    int64;
   codeLen: int64;
   codeCap: int64;
+  mainOff: int64;   // #1765: Code-Offset von main (0 = erste Funktion)
 
   fn acb_e8(v: int64) {
     poke8(self.code + self.codeLen, v & 0xFF);
@@ -707,9 +1534,25 @@ pub type ARMCMBackend = class {
   // Reset handler (6 bytes at offset 8):
   //   BL main: delta = +2 → {0xF000, 0xF801}  (main at offset 14, PC=12)
   //   B .    : infinite loop = 0xE7FE
-  fn acb_emitResetHandler() {
-    self.acb_e16(0xF000);   // BL hw1
-    self.acb_e16(0xF801);   // BL hw2 (S=0, J1=1, J2=1, imm11=1)
+  fn acb_emitResetHandler(mainOff: int64) {
+    // #1765: Der Sprung ging fest auf Offset 14, also auf die zuerst erzeugte
+    // Funktion. Das ist nur dann main, wenn main auch als erste dasteht —
+    // sonst lief das Programm in eine fremde Funktion und danach in die
+    // Endlosschleife darunter, ohne Ausgabe und ohne Meldung.
+    //
+    // Der BL steht auf Offset 8, main auf 14 + mainOff; PC ist bei Thumb-2 die
+    // Befehlsadresse + 4.
+    var delta: int64 := (14 + mainOff) - (8 + 4);
+    var dh:    int64 := delta >> 1;
+    var S:     int64 := (dh >> 23) & 1;
+    var I1:    int64 := (dh >> 22) & 1;
+    var I2:    int64 := (dh >> 21) & 1;
+    var J1:    int64 := (~(I1 ^ S)) & 1;
+    var J2:    int64 := (~(I2 ^ S)) & 1;
+    var imm10: int64 := (dh >> 11) & 0x3FF;
+    var imm11: int64 := dh & 0x7FF;
+    self.acb_e16(0xF000 | (S << 10) | imm10);
+    self.acb_e16(0xD000 | (J1 << 13) | (J2 << 11) | imm11);
     self.acb_e16(0xE7FE);   // B . (B #-2)
   }
 
@@ -717,11 +1560,12 @@ pub type ARMCMBackend = class {
     self.codeCap := 65536;
     self.code    := alloc(self.codeCap);
     self.codeLen := 0;
+    self.mainOff := 0;
   }
 
   pub fn Build(irBuf: int64, irLen: int64) {
-    self.acb_emitVectorTable();    // 8 bytes  → text[0..7]
-    self.acb_emitResetHandler();   // 6 bytes  → text[8..13]
+    self.acb_emitVectorTable();            // 8 bytes  → text[0..7]
+    self.acb_emitResetHandler(self.mainOff);   // 6 bytes  → text[8..13]
     // IR code: main always starts at text offset 14
     var i: int64 := 0;
     while i < irLen {
@@ -761,7 +1605,11 @@ pub type ARMCMBackend = class {
     poke16(elfBuf + 16, 2);           // e_type: ET_EXEC
     poke16(elfBuf + 18, 0x28);        // e_machine: EM_ARM = 40
     poke32(elfBuf + 20, 1);           // e_version: EV_CURRENT
-    poke32(elfBuf + 24, 0x08000008);  // e_entry: reset handler VA
+    // #1744: Das Thumb-Bit gehoert auch an den Einstiegspunkt. Die
+    // Vektortabelle setzt es (0x08000009), e_entry stand ohne — ein Lader, der
+    // dorthin springt statt ueber die Tabelle zu booten, startete damit im
+    // ARM-Zustand und lief sofort in den Graben.
+    poke32(elfBuf + 24, 0x08000009);  // e_entry: reset handler VA | Thumb
     poke32(elfBuf + 28, 52);          // e_phoff: program header after ELF header
     poke32(elfBuf + 32, 0);           // e_shoff: no section headers
     poke32(elfBuf + 36, 0x05000200);  // e_flags: EABI5 | Thumb-interwork
@@ -773,24 +1621,28 @@ pub type ARMCMBackend = class {
     poke16(elfBuf + 50, 0);           // e_shstrndx
 
     // PT_LOAD segment header (32 bytes at offset 52)
-    poke32(elfBuf + 52, 1);               // p_type: PT_LOAD
-    poke32(elfBuf + 56, 0);              // p_offset: load from file start
-    poke32(elfBuf + 60, 0x08000000);     // p_vaddr: FLASH_BASE
-    poke32(elfBuf + 64, 0x08000000);     // p_paddr
-    poke32(elfBuf + 68, elfSize);        // p_filesz (32-bit truncation)
-    poke32(elfBuf + 72, elfSize);        // p_memsz
+    //
+    // #1744: Hier stand p_offset = 0 und p_filesz = elfSize — geladen wurde
+    // also die Datei AB IHREM ANFANG, mitsamt ELF-Header und Auffuellung. Die
+    // Vektortabelle landete damit auf 0x08001000 statt 0x08000000, und der
+    // Kern las seinen Startstapelzeiger aus dem ELF-Magic. Das Erzeugnis war
+    // nie lauffaehig: qemu blieb mit „can't escalate 3 to HardFault" stehen,
+    // ein echter Flasher haette dasselbe Bild ergeben. Gemessen wurde bis
+    // hierher nur, dass die Datei entsteht.
+    poke32(elfBuf + 52, 1);                    // p_type: PT_LOAD
+    poke32(elfBuf + 56, codeFileOffset);       // p_offset: der Code, nicht der Header
+    poke32(elfBuf + 60, 0x08000000);           // p_vaddr: FLASH_BASE
+    poke32(elfBuf + 64, 0x08000000);           // p_paddr
+    poke32(elfBuf + 68, codeSize);             // p_filesz
+    poke32(elfBuf + 72, codeSize);             // p_memsz
     poke32(elfBuf + 76, 5);              // p_flags: PF_R | PF_X
     poke32(elfBuf + 80, 0x1000);         // p_align: 4096
 
-    var fd: int64 := open(path, 577, 493);
-    if fd < 0 {
-      EPrintStr("error: cannot write output: "c);
-      EPrintStrLn(path);
-      free(elfBuf, elfSize);
-      return;
-    }
-    write(fd, elfBuf as pchar, elfSize);
-    close(fd);
+    EmitWriteFile(path, elfBuf, elfSize);   // #1682
     free(elfBuf, elfSize);
   }
+
+  // #1765: Code-Offset von main. Muss VOR Build gesetzt werden — der
+  // Reset-Rumpf entsteht dort.
+  pub fn SetMainOff(off: int64) { self.mainOff := off; }
 };

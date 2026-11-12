@@ -1,0 +1,524 @@
+// std/crypto/bignum.lyx — vorzeichenlose Langzahlen in Radix 2^64
+//
+// Teil von #2096: RSA braucht Modexp ueber 2048 bis 4096 Bit. Grundlage ist
+// das Builtin-Paar `a * b` (untere 64 Bit) und `umulhi(a, b)` (obere 64 Bit),
+// gemessen am Erzeugnis (1.2.31A, x86-64):
+//   umulhi(2^63, 2)   == 1
+//   umulhi(max, max)  == 0xFFFFFFFFFFFFFFFE, max * max == 1
+// Damit entfaellt der Umweg ueber Radix 2^26 oder 2^51.
+//
+// Darstellung: ein Feld aus `n` Gliedern a 64 Bit, Glied 0 ist das
+// NIEDRIGSTWERTIGE. Die Zahl ist vorzeichenlos; `int64` ist nur das
+// Speicherformat. Jeder Vergleich und jede Verschiebung geht darum ueber
+// `as uint64` — `>>` auf int64 ist arithmetisch (SAR) und wuerde das oberste
+// Glied mit Einsen auffuellen.
+//
+// Alle Puffer kommen vom Aufrufer; die Unit belegt einen EINZIGEN
+// Kratzbereich je Programmlauf (siehe Kommentar bei bnScr). Kein alloc/free
+// je Aufruf und kein `defer` — dazu Issue #2380 und der Befund aus #2096.
+//
+// Konstante Laufzeit: die Rechenwege haengen nur an der GLIEDZAHL, nicht an
+// den Werten. Die bedingte Subtraktion am Ende der Montgomery-Reduktion
+// laeuft maskiert (BnSubCond), die Fensterauswahl beim geheimen Exponenten
+// liest ALLE Tabelleneintraege (BnModExpCT). Ein Vergleich, dessen Ergebnis
+// einen Sprung steuert, ist in BnCmp ausdruecklich als oeffentlich benannt.
+//
+// Oeffentliche API (Auszug):
+//   BnMaxGlieder()                       — Obergrenze (128 Glieder = 8192 Bit)
+//   BnZero/BnCopy/BnIsZero/BnCmp
+//   BnAdd/BnSub/BnSubCond/BnAddLimb
+//   BnMul(r, a, b, n)                    — 2n Glieder Ergebnis
+//   BnFromBytes/BnToBytes                — big-endian, wie in Zertifikaten
+//   BnBitLen/BnBit
+//   BnMontN0(m0) / BnMontMul / BnMontRedc / BnMontR2
+//   BnModExp(r, b, e, eLen, m, n)        — oeffentlicher Exponent
+//   BnModExpCT(r, b, e, eLen, m, n)      — geheimer Exponent
+
+unit std.crypto.bignum;
+
+import std.alloc;
+import std.crypto.ct;
+
+con BN_MAX: int64 := 128;          // 8192 Bit
+con BN_WORD_BITS: int64 := 64;
+
+pub fn BnMaxGlieder(): int64 { return BN_MAX; }
+
+// ---------------------------------------------------------------------------
+// Kratzbereich
+//
+// Ein einmal belegter Block mit festen Unterbereichen je Funktion. Die
+// Bereiche sind disjunkt, weil sich die Funktionen gegenseitig aufrufen
+// (BnModExp -> BnMontMul -> BnSubCond). Rekursion gibt es keine.
+// ---------------------------------------------------------------------------
+
+con BS_MM:    int64 := 0;                      // BnMontMul: n+2 Glieder
+con BS_REDC:  int64 := 1040;                   // BnMontRedc: 2n+2
+con BS_EXP:   int64 := 3120;                   // BnModExp: Basis in Montgomery
+con BS_EXPA:  int64 := 4160;                   // BnModExp: Akkumulator
+con BS_EXPT:  int64 := 5200;                   // BnModExp: Zwischenprodukt
+con BS_TAB:   int64 := 6240;                    // 16 Fenstereintraege
+con BS_MUL:   int64 := 22624;                  // BnMul-Zwischenergebnis 2n
+con BS_R2:    int64 := 24704;                  // BnMontR2
+con BS_GROESSE: int64 := 26784;
+
+var _bnScr: int64 := 0;
+
+fn bnScr(): int64 {
+    if (_bnScr != 0) { return _bnScr; }
+    var p: int64 := alloc(BS_GROESSE);
+    if (p == 0) { panic("bignum: kein Speicher fuer den Kratzbereich"); }
+    _bnScr := p;
+    return p;
+}
+
+// ---------------------------------------------------------------------------
+// Grundrechnungen
+// ---------------------------------------------------------------------------
+
+// Uebertrag von x + y, ohne Sprung: (x&y) | ((x|y) & ~s) hat genau dann das
+// oberste Bit gesetzt, wenn die Addition ueberlaeuft.
+fn bnCarry(x: int64, y: int64, s: int64): int64 {
+    return (((x & y) | ((x | y) & (s ^ 0xFFFFFFFFFFFFFFFF))) as uint64) >> 63;
+}
+
+// Borgen von x - y.
+fn bnBorrow(x: int64, y: int64, d: int64): int64 {
+    return ((((y & d) | ((y | d) & (x ^ 0xFFFFFFFFFFFFFFFF)))) as uint64) >> 63;
+}
+
+pub fn BnZero(r: int64, n: int64): void {
+    var i: int64 := 0;
+    while (i < n) { poke64(r + i * 8, 0); i := i + 1; }
+}
+
+pub fn BnCopy(r: int64, a: int64, n: int64): void {
+    var i: int64 := 0;
+    while (i < n) { poke64(r + i * 8, peek64(a + i * 8)); i := i + 1; }
+}
+
+// -1 wenn alle Glieder 0 sind, sonst 0 (Maske, nicht bool — vgl. ct.lyx).
+pub fn BnIsZero(a: int64, n: int64): int64 {
+    var acc: int64 := 0;
+    var i: int64 := 0;
+    while (i < n) { acc := acc | peek64(a + i * 8); i := i + 1; }
+    return CTIsZero(acc);
+}
+
+// Vergleich mit OEFFENTLICHEM Ergebnis: -1 (a<b), 0 (a==b), 1 (a>b).
+// Nur fuer oeffentliche Werte verwenden (Modulus, Signatur, Laengen) — der
+// Aufrufer verzweigt darauf.
+pub fn BnCmp(a: int64, b: int64, n: int64): int64 {
+    var i: int64 := n - 1;
+    while (i >= 0) {
+        var x: int64 := peek64(a + i * 8);
+        var y: int64 := peek64(b + i * 8);
+        if (x != y) {
+            if (((x as uint64) > (y as uint64))) { return 1; }
+            return -1;
+        }
+        i -= 1;
+    }
+    return 0;
+}
+
+// r := a + b, liefert den Uebertrag.
+pub fn BnAdd(r: int64, a: int64, b: int64, n: int64): int64 {
+    var c: int64 := 0;
+    var i: int64 := 0;
+    while (i < n) {
+        var x: int64 := peek64(a + i * 8);
+        var y: int64 := peek64(b + i * 8);
+        var s: int64 := x + y;
+        var c1: int64 := bnCarry(x, y, s);
+        var s2: int64 := s + c;
+        var c2: int64 := bnCarry(s, c, s2);
+        poke64(r + i * 8, s2);
+        c := c1 + c2;
+        i += 1;
+    }
+    return c;
+}
+
+// r := a - b, liefert das Borgen.
+pub fn BnSub(r: int64, a: int64, b: int64, n: int64): int64 {
+    var c: int64 := 0;
+    var i: int64 := 0;
+    while (i < n) {
+        var x: int64 := peek64(a + i * 8);
+        var y: int64 := peek64(b + i * 8);
+        var d: int64 := x - y;
+        var b1: int64 := bnBorrow(x, y, d);
+        var d2: int64 := d - c;
+        var b2: int64 := bnBorrow(d, c, d2);
+        poke64(r + i * 8, d2);
+        c := b1 + b2;
+        i += 1;
+    }
+    return c;
+}
+
+// r := r - b, wenn maske == -1; sonst bleibt r. Laufzeit und Speicherzugriffe
+// sind in beiden Faellen gleich — das ist der Abschluss der
+// Montgomery-Reduktion und haengt am Geheimnis.
+pub fn BnSubCond(r: int64, b: int64, n: int64, maske: int64): void {
+    var c: int64 := 0;
+    var i: int64 := 0;
+    while (i < n) {
+        var x: int64 := peek64(r + i * 8);
+        var y: int64 := peek64(b + i * 8) & maske;
+        var d: int64 := x - y;
+        var b1: int64 := bnBorrow(x, y, d);
+        var d2: int64 := d - c;
+        var b2: int64 := bnBorrow(d, c, d2);
+        poke64(r + i * 8, d2);
+        c := b1 + b2;
+        i += 1;
+    }
+}
+
+pub fn BnAddLimb(r: int64, n: int64, w: int64): int64 {
+    var c: int64 := w;
+    var i: int64 := 0;
+    while (i < n && c != 0) {
+        var x: int64 := peek64(r + i * 8);
+        var s: int64 := x + c;
+        c := bnCarry(x, c, s);
+        poke64(r + i * 8, s);
+        i += 1;
+    }
+    return c;
+}
+
+// r (2n Glieder) := a * b (je n Glieder). Schulmultiplikation; die Laufzeit
+// haengt nur an n.
+pub fn BnMul(r: int64, a: int64, b: int64, n: int64): void {
+    BnZero(r, 2 * n);
+    var i: int64 := 0;
+    while (i < n) {
+        var bi: int64 := peek64(b + i * 8);
+        var c: int64 := 0;
+        var j: int64 := 0;
+        while (j < n) {
+            var aj: int64 := peek64(a + j * 8);
+            var lo: int64 := aj * bi;
+            var hi: int64 := umulhi(aj, bi);
+            // t = r[i+j] + lo + c  (drei Summanden, Uebertrag nach hi)
+            var t0: int64 := peek64(r + (i + j) * 8);
+            var s1: int64 := t0 + lo;
+            var k1: int64 := bnCarry(t0, lo, s1);
+            var s2: int64 := s1 + c;
+            var k2: int64 := bnCarry(s1, c, s2);
+            poke64(r + (i + j) * 8, s2);
+            c := hi + k1 + k2;      // kann nicht ueberlaufen: hi <= 2^64-2
+            j += 1;
+        }
+        // Uebertrag in das Glied i+n (und weiter, falls dort ueberlaeuft)
+        var p: int64 := i + n;
+        var cc: int64 := c;
+        while (cc != 0 && p < 2 * n) {
+            var x: int64 := peek64(r + p * 8);
+            var s: int64 := x + cc;
+            cc := bnCarry(x, cc, s);
+            poke64(r + p * 8, s);
+            p += 1;
+        }
+        i += 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Byte-Umwandlung (big-endian, so stehen Modulus und Signatur im Zertifikat)
+// ---------------------------------------------------------------------------
+
+// Liefert false, wenn die Zahl nicht in n Glieder passt.
+pub fn BnFromBytes(r: int64, n: int64, bytes: int64, len: int64): bool {
+    if (len < 0) { return false; }
+    if (len > n * 8) {
+        // Fuehrende Nullbyte sind erlaubt (DER-INTEGER tragen oft eines).
+        var i: int64 := 0;
+        while (i < len - n * 8) {
+            if ((peek8(bytes + i) & 0xFF) != 0) { return false; }
+            i += 1;
+        }
+    }
+    BnZero(r, n);
+    var pos: int64 := len - 1;
+    var bit: int64 := 0;
+    while (pos >= 0 && bit < n * 64) {
+        var b: int64 := peek8(bytes + pos) & 0xFF;
+        var glied: int64 := bit / 64;
+        var schub: int64 := bit % 64;
+        poke64(r + glied * 8, peek64(r + glied * 8) | (b << schub));
+        pos -= 1;
+        bit += 8;
+    }
+    return true;
+}
+
+// Schreibt n*8 Byte big-endian (mit fuehrenden Nullen) nach bytes.
+pub fn BnToBytes(bytes: int64, a: int64, n: int64): void {
+    var i: int64 := 0;
+    while (i < n * 8) {
+        var glied: int64 := (n * 8 - 1 - i) / 8;
+        var byteIm: int64 := (n * 8 - 1 - i) % 8;
+        var w: int64 := peek64(a + glied * 8);
+        poke8(bytes + i, ((w as uint64) >> (byteIm * 8)) & 0xFF);
+        i += 1;
+    }
+}
+
+pub fn BnBit(a: int64, i: int64): int64 {
+    var glied: int64 := i / 64;
+    var schub: int64 := i % 64;
+    return ((peek64(a + glied * 8) as uint64) >> schub) & 1;
+}
+
+// Bitlaenge; OEFFENTLICHE Groesse (Modulus), darum mit Sprung.
+pub fn BnBitLen(a: int64, n: int64): int64 {
+    var i: int64 := n - 1;
+    while (i >= 0) {
+        var w: int64 := peek64(a + i * 8);
+        if (w != 0) { return i * 64 + (64 - clz(w)); }
+        i -= 1;
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Montgomery-Arithmetik
+// ---------------------------------------------------------------------------
+
+// n0 = -m^-1 mod 2^64, ueber Newton-Iteration (fuenf Schritte reichen fuer
+// 64 Bit, weil sich die Genauigkeit je Schritt verdoppelt: 2^2, 2^4, ... 2^64).
+pub fn BnMontN0(m0: int64): int64 {
+    if ((m0 & 1) == 0) { panic("bignum: Modulus muss ungerade sein"); }
+    var inv: int64 := 1;
+    var i: int64 := 0;
+    while (i < 6) {
+        inv := inv * (2 - m0 * inv);
+        i += 1;
+    }
+    return 0 - inv;                 // -m^-1 mod 2^64
+}
+
+// r := a * b * R^-1 mod m, mit R = 2^(64n). a, b < m. CIOS-Verfahren.
+pub fn BnMontMul(r: int64, a: int64, b: int64, m: int64, n: int64, n0: int64): void {
+    if (n > BN_MAX) { panic("bignum: Gliedzahl ueber der Grenze"); }
+    var t: int64 := bnScr() + BS_MM;
+    BnZero(t, n + 2);
+
+    var i: int64 := 0;
+    while (i < n) {
+        var bi: int64 := peek64(b + i * 8);
+        // t := t + a * b[i]
+        var c: int64 := 0;
+        var j: int64 := 0;
+        while (j < n) {
+            var aj: int64 := peek64(a + j * 8);
+            var lo: int64 := aj * bi;
+            var hi: int64 := umulhi(aj, bi);
+            var t0: int64 := peek64(t + j * 8);
+            var s1: int64 := t0 + lo;
+            var k1: int64 := bnCarry(t0, lo, s1);
+            var s2: int64 := s1 + c;
+            var k2: int64 := bnCarry(s1, c, s2);
+            poke64(t + j * 8, s2);
+            c := hi + k1 + k2;
+            j += 1;
+        }
+        var tn: int64 := peek64(t + n * 8);
+        var sn: int64 := tn + c;
+        var kn: int64 := bnCarry(tn, c, sn);
+        poke64(t + n * 8, sn);
+        poke64(t + (n + 1) * 8, peek64(t + (n + 1) * 8) + kn);
+
+        // mu := t[0] * n0 mod 2^64; t := (t + mu * m) / 2^64
+        var mu: int64 := peek64(t) * n0;
+        c := 0;
+        j := 0;
+        while (j < n) {
+            var mj: int64 := peek64(m + j * 8);
+            var lo2: int64 := mj * mu;
+            var hi2: int64 := umulhi(mj, mu);
+            var u0: int64 := peek64(t + j * 8);
+            var p1: int64 := u0 + lo2;
+            var g1: int64 := bnCarry(u0, lo2, p1);
+            var p2: int64 := p1 + c;
+            var g2: int64 := bnCarry(p1, c, p2);
+            poke64(t + j * 8, p2);
+            c := hi2 + g1 + g2;
+            j += 1;
+        }
+        var tn2: int64 := peek64(t + n * 8);
+        var sn2: int64 := tn2 + c;
+        var kn2: int64 := bnCarry(tn2, c, sn2);
+        poke64(t + n * 8, sn2);
+        poke64(t + (n + 1) * 8, peek64(t + (n + 1) * 8) + kn2);
+
+        // um ein Glied nach rechts schieben
+        j := 0;
+        while (j <= n) { poke64(t + j * 8, peek64(t + (j + 1) * 8)); j := j + 1; }
+        poke64(t + (n + 1) * 8, 0);
+        i += 1;
+    }
+
+    // t < 2m: einmal bedingt subtrahieren, maskiert.
+    BnCopy(r, t, n);
+    var ueber: int64 := peek64(t + n * 8);
+    // maske = -1, wenn t >= m (also oberes Glied gesetzt ODER r >= m)
+    var hatUeber: int64 := CTIsZero(ueber) ^ 0xFFFFFFFFFFFFFFFF;   // -1 wenn ueber != 0
+    var gr: int64 := bnGeMaske(r, m, n);
+    BnSubCond(r, m, n, hatUeber | gr);
+}
+
+// Maske -1, wenn a >= b, sonst 0 — ohne Sprung, ueber die Subtraktion.
+fn bnGeMaske(a: int64, b: int64, n: int64): int64 {
+    var c: int64 := 0;
+    var i: int64 := 0;
+    while (i < n) {
+        var x: int64 := peek64(a + i * 8);
+        var y: int64 := peek64(b + i * 8);
+        var d: int64 := x - y;
+        var b1: int64 := bnBorrow(x, y, d);
+        var d2: int64 := d - c;
+        var b2: int64 := bnBorrow(d, c, d2);
+        c := b1 + b2;
+        i += 1;
+    }
+    // c == 0 heisst a >= b
+    return CTIsZero(c);
+}
+
+// R2 = R^2 mod m, gebraucht fuer den Wechsel in die Montgomery-Form.
+// Rechnung ohne Division: 2^(128n) mod m durch 128n Verdopplungen.
+pub fn BnMontR2(r2: int64, m: int64, n: int64): void {
+    var t: int64 := bnScr() + BS_R2;
+    BnZero(t, n);
+    poke64(t, 1);
+    var bits: int64 := 2 * n * 64;
+    var i: int64 := 0;
+    while (i < bits) {
+        // t := 2t mod m
+        var c: int64 := 0;
+        var j: int64 := 0;
+        while (j < n) {
+            var w: int64 := peek64(t + j * 8);
+            var neu: int64 := (w << 1) | c;
+            c := ((w as uint64) >> 63) & 1;
+            poke64(t + j * 8, neu);
+            j += 1;
+        }
+        var hatUeber: int64 := CTIsZero(c) ^ 0xFFFFFFFFFFFFFFFF;
+        BnSubCond(t, m, n, hatUeber | bnGeMaske(t, m, n));
+        i += 1;
+    }
+    BnCopy(r2, t, n);
+}
+
+// a in Montgomery-Form bringen: r := a * R mod m
+pub fn BnToMont(r: int64, a: int64, m: int64, n: int64, n0: int64, r2: int64): void {
+    BnMontMul(r, a, r2, m, n, n0);
+}
+
+// zurueck: r := a * R^-1 mod m
+pub fn BnFromMont(r: int64, a: int64, m: int64, n: int64, n0: int64): void {
+    var eins: int64 := bnScr() + BS_REDC;
+    BnZero(eins, n);
+    poke64(eins, 1);
+    BnMontMul(r, a, eins, m, n, n0);
+}
+
+// ---------------------------------------------------------------------------
+// Modexp
+// ---------------------------------------------------------------------------
+
+// Gemeinsamer Kern. `ct` entscheidet, ob die Fensterauswahl alle Eintraege
+// liest (geheimer Exponent) oder direkt zugreift (oeffentlicher Exponent).
+fn modExpKern(r: int64, b: int64, e: int64, eBits: int64, m: int64, n: int64,
+              ct: bool): void {
+    var n0: int64 := BnMontN0(peek64(m));
+    var scr: int64 := bnScr();
+    var r2: int64 := scr + BS_R2;
+    BnMontR2(r2, m, n);
+
+    var basis: int64 := scr + BS_EXP;
+    var akku: int64 := scr + BS_EXPA;
+    var tmp: int64 := scr + BS_EXPT;
+    var tab: int64 := scr + BS_TAB;
+
+    // Tabelle: tab[k] = b^k * R mod m, k = 0..15
+    BnToMont(basis, b, m, n, n0, r2);
+    var eins: int64 := tab;                       // tab[0] = R mod m = 1*R
+    BnZero(eins, n);
+    poke64(eins, 1);
+    BnToMont(eins, eins, m, n, n0, r2);
+    BnCopy(tab + n * 8, basis, n);                // tab[1]
+    var k: int64 := 2;
+    while (k < 16) {
+        BnMontMul(tab + k * n * 8, tab + (k - 1) * n * 8, basis, m, n, n0);
+        k += 1;
+    }
+
+    BnCopy(akku, tab, n);                         // akku := R mod m
+
+    // Fenster von oben nach unten, 4 Bit je Schritt.
+    var i: int64 := ((eBits + 3) / 4) * 4 - 4;
+    while (i >= 0) {
+        // vier Quadrierungen
+        var q: int64 := 0;
+        while (q < 4) {
+            BnMontMul(tmp, akku, akku, m, n, n0);
+            BnCopy(akku, tmp, n);
+            q += 1;
+        }
+        // Fensterwert lesen
+        var w: int64 := 0;
+        var bitI: int64 := 0;
+        while (bitI < 4) {
+            if (i + bitI < eBits) {
+                w := w | (BnBit(e, i + bitI) << bitI);
+            }
+            bitI += 1;
+        }
+        if (ct) {
+            // Alle 16 Eintraege lesen und maskiert auswaehlen: der Zugriff
+            // darf nicht am Exponenten haengen (Cache-Seitenkanal).
+            BnZero(tmp, n);
+            var kk: int64 := 0;
+            while (kk < 16) {
+                var maske: int64 := CTEqual(kk, w);
+                var j: int64 := 0;
+                while (j < n) {
+                    poke64(tmp + j * 8,
+                           peek64(tmp + j * 8) | (peek64(tab + kk * n * 8 + j * 8) & maske));
+                    j += 1;
+                }
+                kk += 1;
+            }
+            var res: int64 := scr + BS_MUL;
+            BnMontMul(res, akku, tmp, m, n, n0);
+            BnCopy(akku, res, n);
+        } else {
+            if (w != 0) {
+                BnMontMul(tmp, akku, tab + w * n * 8, m, n, n0);
+                BnCopy(akku, tmp, n);
+            }
+        }
+        i -= 4;
+    }
+
+    BnFromMont(r, akku, m, n, n0);
+}
+
+// r := b^e mod m, Exponent OEFFENTLICH (RSA-Verifikation, e = 65537).
+pub fn BnModExp(r: int64, b: int64, e: int64, eBits: int64, m: int64, n: int64): void {
+    modExpKern(r, b, e, eBits, m, n, false);
+}
+
+// r := b^e mod m mit GEHEIMEM Exponenten (RSA-Signatur). Die Fensterauswahl
+// liest alle Tabelleneintraege, die Rechenwege sind gliedzahlabhaengig, nicht
+// wertabhaengig.
+pub fn BnModExpCT(r: int64, b: int64, e: int64, eBits: int64, m: int64, n: int64): void {
+    modExpKern(r, b, e, eBits, m, n, true);
+}

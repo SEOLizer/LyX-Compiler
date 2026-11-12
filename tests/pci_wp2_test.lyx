@@ -1,0 +1,383 @@
+// tests/pci_wp2_test.lyx
+// PCI Phase 2 (PCI-05..PCI-08) — Tests ohne Hardware und ohne root.
+//
+// Wie in Phase 1 wird der Weg geprueft, nicht das Ergebnis eines
+// Registerlesens: BAR-Bits, die Groessenrechnung aus dem resource-Text,
+// der Lauf durch die Capability-Kette (samt Zyklus) und der Parser der
+// pci.ids-Datei gegen eine kleine Beispieldatei.
+//
+// Abnahmekriterien:
+// AC-1  BAR-Decode: I/O, 32 Bit, 64 Bit, prefetchable, Adressmasken
+// AC-2  64-Bit-BAR belegt zwei Slots; im letzten Slot ist es unvollstaendig
+// AC-3  Groesse und Flags aus dem resource-Text, unbelegte Region = 0
+// AC-4  Capability-Kette: finden, zaehlen, Ende erkennen
+// AC-5  Zyklus in der Kette wird erkannt und beendet den Lauf
+// AC-6  MSI/MSI-X/PCIe-Felder korrekt zerlegt
+// AC-7  pci.ids: Vendor, Device, Subsystem, Klasse, Unbekanntes, Kommentare
+// AC-8  ohne Datenbank wird kein Name erfunden
+
+unit tests.pci_wp2_test;
+
+import std.hardware.pci_types;
+import std.hardware.pci_syscalls;
+import std.hardware.pci_config;
+import std.hardware.pci_bar;
+import std.hardware.pci_caps;
+import std.hardware.pci_ids;
+import std.alloc;
+import std.string;
+import std.io;
+
+var failures: int64 := 0;
+
+fn checkInt(name: pchar, got: int64, want: int64) {
+  if (got == want) {
+    Print("PASS "); Print(name); Print(" = "); PrintLn(IntToStr(got));
+  } else {
+    failures := failures + 1;
+    Print("FAIL "); Print(name); Print(": erwartet "); Print(IntToStr(want));
+    Print(", bekommen "); PrintLn(IntToStr(got));
+  }
+}
+
+fn checkStr(name: pchar, got: pchar, want: pchar) {
+  if (StrCmp(got, want) == 0) {
+    Print("PASS "); Print(name); Print(" = "); PrintLn(got);
+  } else {
+    failures := failures + 1;
+    Print("FAIL "); Print(name); Print(": erwartet '"); Print(want);
+    Print("', bekommen '"); Print(got); PrintLn("'");
+  }
+}
+
+// Schreibt einen NUL-terminierten Text in einen Puffer und liefert die Laenge.
+fn fill(buf: int64, s: pchar): int64 {
+  var n: int64 := StrLen(s);
+  var i: int64 := 0;
+  while (i < n) { poke8(buf + i, StrCharAt(s, i)); i := i + 1; }
+  poke8(buf + n, 0);
+  return n;
+}
+
+// ============================================================
+// AC-1/AC-2: BAR-Decode
+// ============================================================
+
+fn testBarDecode() {
+  PrintLn("-- AC-1/AC-2 BAR-Decode --");
+
+  // 32-Bit-Speicher-BAR bei 0xF7C00000
+  var mem32: int64 := 0xF7C00000;
+  checkInt("mem32 io",     PciBarIsIo(mem32), 0);
+  checkInt("mem32 64bit",  PciBarIs64(mem32), 0);
+  checkInt("mem32 prefetch", PciBarIsPrefetchable(mem32), 0);
+  checkInt("mem32 addr",   PciBarAddress32(mem32), 0xF7C00000);
+
+  // 64-Bit-Speicher-BAR, prefetchable: Typbits 0b10 (0x4) und Bit 3
+  var mem64: int64 := 0xE0000000 | 0x4 | 0x8;
+  checkInt("mem64 io",       PciBarIsIo(mem64), 0);
+  checkInt("mem64 64bit",    PciBarIs64(mem64), 1);
+  checkInt("mem64 prefetch", PciBarIsPrefetchable(mem64), 1);
+  checkInt("mem64 addr low", PciBarAddress32(mem64), 0xE0000000);
+  checkInt("mem64 addr voll", PciBarAddress64(mem64, 0x1), 0x1E0000000);
+
+  // I/O-BAR bei 0x3000
+  var io: int64 := 0x3001;
+  checkInt("io io",       PciBarIsIo(io), 1);
+  checkInt("io 64bit",    PciBarIs64(io), 0);
+  // Ein I/O-BAR ist nie prefetchable — Bit 3 gehoert dort zur Adresse.
+  checkInt("io prefetch", PciBarIsPrefetchable(io | 8), 0);
+  checkInt("io addr",     PciBarAddress32(io), 0x3000);
+
+  // Leeres BAR
+  checkInt("leer addr", PciBarAddress32(0), 0);
+
+  // Slot-Fortschaltung im Config-Space
+  var cfgBuf: int64 := allocZeroed(256);
+  poke32(cfgBuf + PCI_CFG_BAR0,      mem64);       // BAR0/1 = 64 Bit
+  poke32(cfgBuf + PCI_CFG_BAR0 + 4,  0x1);         // obere Adresshaelfte
+  poke32(cfgBuf + PCI_CFG_BAR0 + 8,  0x3001);      // BAR2 = I/O
+  poke32(cfgBuf + PCI_CFG_BAR0 + 20, mem64);       // BAR5 = 64 Bit, unvollstaendig
+  var ctx: int64 := PciCfgOpenMem(cfgBuf, 256, 0);
+
+  checkInt("bar0 raw",   PciBarRaw(ctx, 0), mem64);
+  checkInt("bar0 adresse", PciBarAddress(ctx, 0), 0x1E0000000);
+  checkInt("bar0 next",  PciBarNextIndex(ctx, 0), 2);
+  checkInt("bar2 next",  PciBarNextIndex(ctx, 2), 3);
+  checkInt("bar2 adresse", PciBarAddress(ctx, 2), 0x3000);
+
+  // 64-Bit-BAR im letzten Slot: die oberen 32 Bit fehlen. Sie als 0
+  // anzunehmen ergaebe eine Adresse, die es nicht gibt.
+  checkInt("bar5 64bit unvollstaendig", PciBarAddress(ctx, 5), PCI_E_RANGE);
+
+  checkInt("bar index 6",  PciBarRaw(ctx, 6),  PCI_E_BADARG);
+  checkInt("bar index -1", PciBarRaw(ctx, -1), PCI_E_BADARG);
+
+  PciCfgClose(ctx);
+  free(cfgBuf, 256);
+}
+
+// ============================================================
+// AC-3: resource-Text
+// ============================================================
+
+fn testResourceText() {
+  PrintLn("-- AC-3 resource-Text --");
+  var buf: int64 := alloc(1024);
+
+  // Aufbau wie in /sys/bus/pci/devices/<bdf>/resource:
+  // BAR0 belegt (8 KB), BAR1 leer, BAR2 I/O (32 Byte).
+  var txt: pchar := "0x00000000e8100000 0x00000000e8101fff 0x0000000000140204\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000003000 0x000000000000301f 0x0000000000040101\n";
+  var n: int64 := fill(buf, txt);
+
+  checkInt("bar0 start", PciResourceField(buf, n, 0), 0xE8100000);
+  checkInt("bar0 ende",  PciResourceField(buf, n, 1), 0xE8101FFF);
+  checkInt("bar0 flags", PciResourceField(buf, n, 2), 0x140204);
+  checkInt("bar0 groesse", PciResourceSize(buf, n, 0), 8192);
+  checkInt("bar1 groesse (leer)", PciResourceSize(buf, n, 1), 0);
+  checkInt("bar2 groesse", PciResourceSize(buf, n, 2), 32);
+  checkInt("bar2 start",  PciResourceField(buf, n, 6), 0x3000);
+
+  // Fehlende Zeilen: der Text hat drei Regionen, BAR3 gibt es nicht.
+  checkInt("bar3 fehlt", PciResourceSize(buf, n, 3), PCI_E_IO);
+  checkInt("bar index 6", PciResourceSize(buf, n, 6), PCI_E_BADARG);
+
+  // Ende kleiner als Anfang ist keine Groesse, sondern ein Widerspruch.
+  var bad: pchar := "0x2000 0x1000 0x0\n";
+  var m: int64 := fill(buf, bad);
+  checkInt("ende vor anfang", PciResourceSize(buf, m, 0), PCI_E_IO);
+
+  free(buf, 1024);
+}
+
+// ============================================================
+// Synthetischer Config-Space mit Capability-Kette
+// ============================================================
+
+con CFG: int64 := 256;
+
+// Kette: 0x40 PM -> 0x50 MSI -> 0x70 MSI-X -> 0xA0 PCIe -> Ende
+fn makeCapConfig(): int64 {
+  var b: int64 := allocZeroed(CFG);
+  poke16(b + PCI_CFG_VENDOR_ID, 0x8086);
+  poke16(b + PCI_CFG_DEVICE_ID, 0x10D3);
+  poke16(b + PCI_CFG_STATUS,    PCI_STATUS_CAP_LIST);
+  poke8(b + PCI_CFG_CAP_PTR,    0x40);
+
+  poke8(b + 0x40, PCI_CAP_ID_PM);   poke8(b + 0x41, 0x50);
+
+  poke8(b + 0x50, PCI_CAP_ID_MSI);  poke8(b + 0x51, 0x70);
+  // Message Control: enable=1, 4 Vektoren angefordert (Exponent 2), 64 Bit
+  poke16(b + 0x52, 1 | (2 << 1) | 128);
+
+  poke8(b + 0x70, PCI_CAP_ID_MSIX); poke8(b + 0x71, 0xA0);
+  // Message Control: Tabellengroesse 16 (also 15 kodiert), enabled
+  poke16(b + 0x72, 15 | 32768);
+  poke32(b + 0x74, 0x2000 | 4);     // Tabelle in BAR4, Offset 0x2000
+  poke32(b + 0x78, 0x3000 | 5);     // PBA in BAR5, Offset 0x3000
+
+  poke8(b + 0xA0, PCI_CAP_ID_PCIE); poke8(b + 0xA1, 0x00);
+  poke32(b + 0xA0 + 0x0C, 4 | (16 << 4));    // max: 16 GT/s, x16
+  poke16(b + 0xA0 + 0x12, 3 | (8 << 4));     // aktuell: 8 GT/s, x8
+  return b;
+}
+
+// ============================================================
+// AC-4/AC-5: Capability-Kette
+// ============================================================
+
+fn testCaps() {
+  PrintLn("-- AC-4/AC-5 Capability-Kette --");
+  var b: int64 := makeCapConfig();
+  var ctx: int64 := PciCfgOpenMem(b, CFG, 0);
+
+  checkInt("anzahl", PciCapCount(ctx), 4);
+  checkInt("finde PM",   PciCapFind(ctx, PCI_CAP_ID_PM),   0x40);
+  checkInt("finde MSI",  PciCapFind(ctx, PCI_CAP_ID_MSI),  0x50);
+  checkInt("finde MSIX", PciCapFind(ctx, PCI_CAP_ID_MSIX), 0x70);
+  checkInt("finde PCIe", PciCapFind(ctx, PCI_CAP_ID_PCIE), 0xA0);
+  checkInt("finde AGP (fehlt)", PciCapFind(ctx, PCI_CAP_ID_AGP), PCI_E_NODEV);
+
+  checkInt("iterator 1", PciCapNext(ctx, 0),    0x40);
+  checkInt("iterator 2", PciCapNext(ctx, 0x40), 0x50);
+  checkInt("iterator 3", PciCapNext(ctx, 0x50), 0x70);
+  checkInt("iterator 4", PciCapNext(ctx, 0x70), 0xA0);
+  checkInt("iterator ende", PciCapNext(ctx, 0xA0), PCI_E_NODEV);
+  checkStr("name MSIX", PciCapIdName(PCI_CAP_ID_MSIX), "MSI-X");
+  checkStr("name unbekannt", PciCapIdName(0x7E), "Unknown capability");
+
+  // Ohne das Statusbit gibt es keine Liste — 0x34 enthaelt dann Muell,
+  // und wer ihn trotzdem verfolgt, laeuft durch fremde Registerinhalte.
+  poke16(b + PCI_CFG_STATUS, 0);
+  checkInt("ohne cap-list bit: suchen", PciCapFind(ctx, PCI_CAP_ID_MSI), PCI_E_NODEV);
+  checkInt("ohne cap-list bit: zaehlen", PciCapCount(ctx), 0);
+  poke16(b + PCI_CFG_STATUS, PCI_STATUS_CAP_LIST);
+
+  // Zyklus: MSI-X zeigt zurueck auf PM. Ohne Besuchsmarkierung liefe die
+  // Suche nach einer nicht vorhandenen Capability endlos.
+  poke8(b + 0x71, 0x40);
+  checkInt("zyklus beim suchen", PciCapFind(ctx, PCI_CAP_ID_AGP), PCI_E_CAPLOOP);
+  checkInt("zyklus beim zaehlen", PciCapCount(ctx), PCI_E_CAPLOOP);
+
+  // Selbstbezug ist derselbe Fall in seiner kuerzesten Form.
+  poke8(b + 0x71, 0x70);
+  checkInt("selbstbezug", PciCapFind(ctx, PCI_CAP_ID_AGP), PCI_E_CAPLOOP);
+  checkInt("iterator selbstbezug", PciCapNext(ctx, 0x70), PCI_E_CAPLOOP);
+
+  PciCfgClose(ctx);
+  free(b, CFG);
+}
+
+// ============================================================
+// AC-6: MSI / MSI-X / PCIe
+// ============================================================
+
+fn testCapFields() {
+  PrintLn("-- AC-6 MSI/MSI-X/PCIe --");
+  var b: int64 := makeCapConfig();
+  var ctx: int64 := PciCfgOpenMem(b, CFG, 0);
+
+  checkInt("msi enabled",   PciMsiIsEnabled(ctx, 0x50), 1);
+  checkInt("msi vektoren",  PciMsiRequestedVectors(ctx, 0x50), 4);
+  checkInt("msi 64 bit",    PciMsiIs64Bit(ctx, 0x50), 1);
+
+  checkInt("msix tabelle",  PciMsixTableSize(ctx, 0x70), 16);
+  checkInt("msix enabled",  PciMsixIsEnabled(ctx, 0x70), 1);
+  checkInt("msix table bar", PciMsixTableBar(ctx, 0x70), 4);
+  checkInt("msix table off", PciMsixTableOffset(ctx, 0x70), 0x2000);
+  checkInt("msix pba bar",   PciMsixPbaBar(ctx, 0x70), 5);
+  checkInt("msix pba off",   PciMsixPbaOffset(ctx, 0x70), 0x3000);
+
+  checkInt("pcie speed",     PciPcieLinkSpeed(ctx, 0xA0), 3);
+  checkInt("pcie width",     PciPcieLinkWidth(ctx, 0xA0), 8);
+  checkInt("pcie max speed", PciPcieMaxLinkSpeed(ctx, 0xA0), 4);
+  checkInt("pcie max width", PciPcieMaxLinkWidth(ctx, 0xA0), 16);
+  checkStr("speed 8 GT/s",   PciPcieSpeedName(3), "8 GT/s");
+  checkStr("speed unbekannt", PciPcieSpeedName(9), "unknown speed");
+
+  // Extended Capabilities gibt es nur im 4096-Byte-Raum. Ein 256-Byte-
+  // Backend darf dort nicht zu lesen beginnen.
+  checkInt("ext caps ohne pcie-raum", PciExtCapFind(ctx, PCI_EXT_CAP_ID_AER), PCI_E_NODEV);
+
+  PciCfgClose(ctx);
+  free(b, CFG);
+}
+
+// Extended-Capability-Kette in einem 4096-Byte-Puffer.
+fn testExtCaps() {
+  PrintLn("-- AC-6b Extended Capabilities --");
+  var b: int64 := allocZeroed(PCI_CFG_SIZE_PCIE);
+  poke16(b + PCI_CFG_VENDOR_ID, 0x8086);
+  // 0x100: AER, Version 2, next = 0x150
+  poke32(b + 0x100, PCI_EXT_CAP_ID_AER | (2 << 16) | (0x150 << 20));
+  // 0x150: Seriennummer, Version 1, Ende
+  poke32(b + 0x150, PCI_EXT_CAP_ID_SN | (1 << 16));
+  var ctx: int64 := PciCfgOpenMem(b, PCI_CFG_SIZE_PCIE, 0);
+
+  checkInt("ext AER",     PciExtCapFind(ctx, PCI_EXT_CAP_ID_AER), 0x100);
+  checkInt("ext SN",      PciExtCapFind(ctx, PCI_EXT_CAP_ID_SN),  0x150);
+  checkInt("ext VC fehlt", PciExtCapFind(ctx, PCI_EXT_CAP_ID_VC), PCI_E_NODEV);
+  checkInt("ext id",      PciExtCapId(ctx, 0x100), PCI_EXT_CAP_ID_AER);
+  checkInt("ext version", PciExtCapVersion(ctx, 0x100), 2);
+
+  // Rueckwaerts zeigender Zeiger = Zyklus.
+  poke32(b + 0x150, PCI_EXT_CAP_ID_SN | (1 << 16) | (0x100 << 20));
+  checkInt("ext zyklus", PciExtCapFind(ctx, PCI_EXT_CAP_ID_VC), PCI_E_CAPLOOP);
+
+  PciCfgClose(ctx);
+  free(b, PCI_CFG_SIZE_PCIE);
+}
+
+// ============================================================
+// AC-7/AC-8: pci.ids
+// ============================================================
+
+// Beispieldatei im Testverzeichnis. Der Test haengt damit nicht an der
+// Systeminstallation: er prueft den Parser, nicht die Vollstaendigkeit
+// einer fremden Datei.
+con IDS_MINI: pchar := "tests/data/pci_ids_mini.ids";
+
+fn testIds() {
+  PrintLn("-- AC-7/AC-8 pci.ids --");
+
+  var db: int64 := PciIdsOpenPath(IDS_MINI);
+  if (db < 0) {
+    // Wird der Test aus einem anderen Verzeichnis gestartet, ist die
+    // Beispieldatei nicht erreichbar. Das wird gesagt, nicht verschwiegen.
+    PrintLn("HINWEIS tests/data/pci_ids_mini.ids nicht erreichbar — relativer Pfad");
+    checkInt("kein zugriff meldet NODB", db, PCI_E_NODB);
+    return;
+  }
+
+  var d: int64 := alloc(256);
+  var s: pchar := d as pchar;
+
+  checkInt("vendor-index", PciIdsVendorCount(db), 2);
+  checkInt("klassen-index", PciIdsClassCount(db), 2);
+
+  PciIdsVendorName(db, 0x1234, d, 256);
+  checkStr("vendor 1234", s, "Beispiel Hersteller");
+  PciIdsVendorName(db, 0x8086, d, 256);
+  checkStr("vendor 8086", s, "Intel Corporation");
+
+  PciIdsDeviceName(db, 0x1234, 0x0001, d, 256);
+  checkStr("device 1234:0001", s, "Erstes Geraet");
+
+  // Hinter dem Kommentar: wer bei '#' abbricht, findet dieses Geraet nicht.
+  PciIdsDeviceName(db, 0x1234, 0x0002, d, 256);
+  checkStr("device hinter kommentar", s, "Zweites Geraet");
+  PciIdsDeviceName(db, 0x1234, 0x00ff, d, 256);
+  checkStr("letztes device im block", s, "Letztes Geraet");
+
+  // Der naechste Vendor-Block beendet die Suche — 8086:10d3 gehoert nicht
+  // zu Vendor 1234.
+  checkInt("device aus fremdem block",
+           PciIdsDeviceName(db, 0x1234, 0x10d3, d, 256), PCI_E_NODEV);
+  PciIdsDeviceName(db, 0x8086, 0x10d3, d, 256);
+  checkStr("device 8086:10d3", s, "82574L Gigabit Network Connection");
+
+  PciIdsSubsystemName(db, 0x1234, 0x0001, 0x1234, 0x9999, d, 256);
+  checkStr("subsystem 1234:9999", s, "Zweite Beispielkarte");
+  checkInt("subsystem unbekannt",
+           PciIdsSubsystemName(db, 0x1234, 0x0001, 0x1234, 0x0000, d, 256), PCI_E_NODEV);
+  // Subsysteme des ersten Geraets duerfen nicht dem zweiten zugerechnet werden.
+  checkInt("subsystem am falschen geraet",
+           PciIdsSubsystemName(db, 0x1234, 0x0002, 0x1234, 0x8888, d, 256), PCI_E_NODEV);
+
+  PciIdsClassName(db, 0x02, -1, d, 256);
+  checkStr("klasse 02", s, "Network controller");
+  PciIdsClassName(db, 0x02, 0x00, d, 256);
+  checkStr("klasse 02:00", s, "Ethernet controller");
+  PciIdsClassName(db, 0x0c, 0x03, d, 256);
+  checkStr("klasse 0c:03", s, "USB controller");
+
+  // Unbekanntes bleibt unbekannt — kein erfundener Name.
+  checkInt("vendor unbekannt", PciIdsVendorName(db, 0xEEEE, d, 256), PCI_E_NODEV);
+  checkInt("device unbekannt", PciIdsDeviceName(db, 0x1234, 0xEEEE, d, 256), PCI_E_NODEV);
+  checkInt("klasse unbekannt", PciIdsClassName(db, 0xFE, -1, d, 256), PCI_E_NODEV);
+  checkInt("subklasse unbekannt", PciIdsClassName(db, 0x02, 0x7F, d, 256), PCI_E_NODEV);
+
+  // Argumentpruefung
+  checkInt("kein ziel",       PciIdsVendorName(db, 0x1234, 0, 256), PCI_E_BADARG);
+  checkInt("puffer zu klein", PciIdsVendorName(db, 0x1234, d, 1),   PCI_E_BADARG);
+  checkInt("keine datenbank", PciIdsVendorName(0, 0x1234, d, 256),  PCI_E_BADARG);
+
+  // AC-8: eine Datei, die es nicht gibt, ergibt keine halbe Datenbank.
+  checkInt("fehlende datei", PciIdsOpenPath("tests/data/gibt-es-nicht.ids"), PCI_E_NODB);
+
+  free(d, 256);
+  PciIdsClose(db);
+}
+
+fn main(): int64 {
+  PrintLn("=== PCI Phase 2: pci_bar / pci_caps / pci_ids ===");
+  testBarDecode();
+  testResourceText();
+  testCaps();
+  testCapFields();
+  testExtCaps();
+  testIds();
+  Print("=== Fehlgeschlagen: "); PrintLn(IntToStr(failures));
+  if (failures > 0) { return 1; }
+  return 0;
+}

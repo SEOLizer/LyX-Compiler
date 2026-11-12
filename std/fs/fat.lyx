@@ -1,0 +1,664 @@
+// std/fs/fat.lyx — FAT12, FAT16 und FAT32 LESEN
+//
+// Erste Unit einer Sammlung fuer Dateisysteme. Sie liest ein FAT-Abbild oder
+// eine FAT-Partition: Bootsektor auswerten, Clusterketten verfolgen,
+// Verzeichnisse durchlaufen (8.3 und lange Namen), Dateien lesen.
+//
+// ZUGANG: ueber einen DATEIDESKRIPTOR und sektorweise Lesezugriffe
+// (open/lseek/read), nicht ueber das Einlesen des ganzen Abbilds. std/iso.lyx
+// laedt seine Datei am Stueck — fuer eine CD mag das gehen, fuer einen
+// Datentraeger nicht: eine 32-GB-Karte passt in keinen Puffer. Derselbe Weg
+// traegt spaeter ein echtes Geraet, ohne dass sich die Schnittstelle aendert.
+//
+// `lbaOffset` ist der Byte-Versatz des Volumes im Deskriptor. Fuer ein reines
+// Abbild ist er 0; fuer eine Partition steht dort deren Anfang. Damit liest
+// dieselbe Unit beides, und die Partitionstabelle bleibt Sache des Aufrufers
+// (MBR/GPT kommen als eigene Unit).
+//
+// NUR LESEN. Schreiben ist bewusst nicht enthalten: es verlangt
+// Cluster-Belegung, zwei FAT-Kopien im Gleichlauf, Verzeichniseintraege mit
+// Pruefsummen fuer lange Namen und eine Antwort auf den Stromausfall mitten
+// im Vorgang. Halb hingeschrieben waere es gefaehrlicher als gar nicht da —
+// ein Dateisystem, das beim Schreiben aufgibt, nimmt Daten mit.
+//
+// Ebenfalls nicht enthalten: exFAT. Es teilt den Namen, aber kaum ein
+// Strukturfeld mit FAT32 und gehoert in eine eigene Unit.
+//
+// Alle Zahlen im Abbild sind LITTLE ENDIAN, unabhaengig vom Wirt.
+//
+// Die Ausgabeparameter (`FatDir`, `FatEntry`) stehen als `ref` in der
+// Signatur. Ohne das bekaeme der Gerufene eine KOPIE, der Aufrufer saehe
+// keine Aenderung, und ein Verzeichnisdurchlauf lieferte endlos denselben
+// ersten Eintrag — ein Fehler, der nicht meldet, sondern haengt.
+
+@description("FAT12/16/32 lesen: Bootsektor, Clusterketten, Verzeichnisse, Dateien")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+@capabilities([fs.read, fs.meta, system.memory.heap])
+
+unit std.fs.fat;
+
+import std.alloc;
+import std.io;
+
+// ── Fehlerwerte ───────────────────────────────────────────────────────────
+//
+// Ganzzahlige Rueckgaben brauchen einen Wert AUSSERHALB des Wertebereichs.
+// 0 ist hier fast ueberall gueltig — eine Datei der Laenge 0, der Cluster 0
+// als "kein Cluster", der Verzeichnisplatz 0. Deshalb -1.
+pub con FAT_ERR: int64 := 0 - 1;
+
+// Kettenende. FAT12 markiert ab 0xFF8, FAT16 ab 0xFFF8, FAT32 ab 0x0FFFFFF8;
+// nach aussen ist all das derselbe Fall.
+pub con FAT_EOC: int64 := 0 - 2;
+
+// Freier Cluster in der Tabelle. Nicht dasselbe wie das Kettenende: ein
+// freier Cluster MITTEN in einer Kette ist ein beschaedigtes Dateisystem,
+// und das laesst sich nur unterscheiden, wenn beide Faelle eigene Werte
+// haben.
+pub con FAT_FREI: int64 := 0;
+
+pub con FAT_ATTR_READ_ONLY: int64 := 1;
+pub con FAT_ATTR_HIDDEN:    int64 := 2;
+pub con FAT_ATTR_SYSTEM:    int64 := 4;
+pub con FAT_ATTR_VOLUME_ID: int64 := 8;
+pub con FAT_ATTR_DIRECTORY: int64 := 16;
+pub con FAT_ATTR_ARCHIVE:   int64 := 32;
+// Ein Eintrag mit GENAU diesen vier Bits ist kein Verzeichniseintrag, sondern
+// ein Stueck eines langen Namens. Die Kennung ist bewusst so gewaehlt, dass
+// alte Systeme ihn fuer eine versteckte System-Datenträgerkennung halten und
+// in Ruhe lassen.
+pub con FAT_ATTR_LONG_NAME: int64 := 15;
+
+pub con FAT_TYPE_12: int64 := 12;
+pub con FAT_TYPE_16: int64 := 16;
+pub con FAT_TYPE_32: int64 := 32;
+
+// ── Typen ─────────────────────────────────────────────────────────────────
+
+pub type FatVolume = struct {
+  fd:              int64;   // offener Deskriptor auf Abbild oder Geraet
+  lbaOffset:       int64;   // Byte-Versatz des Volumes darin
+  bytesPerSector:  int64;
+  sectorsPerClus:  int64;
+  reservedSectors: int64;
+  numFats:         int64;
+  rootEntCount:    int64;   // 0 bei FAT32
+  totalSectors:    int64;
+  fatSize:         int64;   // Sektoren je FAT-Kopie
+  rootCluster:     int64;   // nur FAT32
+  fatType:         int64;   // 12, 16, 32 — oder FAT_ERR
+  firstDataSector: int64;
+  rootDirSectors:  int64;
+  countOfClusters: int64;
+}
+
+// Ein Verzeichniseintrag, so wie ihn FatDirNext liefert.
+//
+// Der NAME steht nicht hier, sondern in einem Puffer des Aufrufers. Ein
+// Zeiger im Struct waere eine Besitzfrage, die niemand beantworten will:
+// wer gibt ihn frei, und was passiert beim naechsten Eintrag?
+pub type FatEntry = struct {
+  attr:      int64;
+  cluster:   int64;   // erster Cluster; 0 = leere Datei
+  size:      int64;   // Bytes; bei Verzeichnissen 0
+  isDir:     bool;
+  isVolume:  bool;
+}
+
+// Laufender Zustand beim Durchlaufen eines Verzeichnisses.
+pub type FatDir = struct {
+  cluster:    int64;   // aktueller Cluster; 0 = Wurzel bei FAT12/16
+  sectorInCl: int64;   // Sektor innerhalb des Clusters
+  entryInSec: int64;   // Eintrag innerhalb des Sektors
+  rootSector: int64;   // nur FAT12/16-Wurzel: laufender Sektor
+  istWurzel:  bool;    // feste Wurzel (FAT12/16) statt Clusterkette
+  fertig:     bool;
+  sekPuffer:  int64;   // ein Sektor, einmal belegt
+}
+
+// ── Kleine Helfer ─────────────────────────────────────────────────────────
+
+fn _u8(p: int64, off: int64): int64 { return peek8(p + off) & 255; }
+
+fn _u16(p: int64, off: int64): int64 {
+  return (peek8(p + off) & 255) | ((peek8(p + off + 1) & 255) << 8);
+}
+
+fn _u32(p: int64, off: int64): int64 {
+  return (peek8(p + off)     & 255)
+       | ((peek8(p + off + 1) & 255) << 8)
+       | ((peek8(p + off + 2) & 255) << 16)
+       | ((peek8(p + off + 3) & 255) << 24);
+}
+
+// Einen Sektor in den Puffer lesen. Rueckgabe: 1 = gelesen, 0 = nicht.
+fn _leseSektor(vol: FatVolume, sektor: int64, puffer: int64): int64 {
+  var pos: int64 := vol.lbaOffset + sektor * vol.bytesPerSector;
+  if (lseek(vol.fd, pos, 0) != pos) { return 0; }
+  if (read(vol.fd, puffer as pchar, vol.bytesPerSector) != vol.bytesPerSector) { return 0; }
+  return 1;
+}
+
+// Erster Sektor eines Clusters. Cluster 0 und 1 gibt es nicht — die beiden
+// Plaetze der FAT sind mit dem Medientyp belegt.
+pub fn FatClusterSector(vol: FatVolume, cluster: int64): int64 {
+  if (cluster < 2) { return FAT_ERR; }
+  return vol.firstDataSector + (cluster - 2) * vol.sectorsPerClus;
+}
+
+pub fn FatVolumeValid(vol: FatVolume): bool {
+  if (vol.fatType != FAT_TYPE_12 && vol.fatType != FAT_TYPE_16
+      && vol.fatType != FAT_TYPE_32) { return false; }
+  return vol.bytesPerSector > 0 && vol.sectorsPerClus > 0;
+}
+
+pub fn FatBytesPerCluster(vol: FatVolume): int64 {
+  return vol.bytesPerSector * vol.sectorsPerClus;
+}
+
+// ── Einhaengen ────────────────────────────────────────────────────────────
+//
+// Ausgewertet wird der BIOS Parameter Block im ersten Sektor. Der TYP steht
+// NICHT im Abbild — er faellt aus der Anzahl der Cluster, und zwar nach den
+// Grenzen der Microsoft-Spezifikation:
+//
+//     < 4085   -> FAT12
+//     < 65525  -> FAT16
+//     sonst    -> FAT32
+//
+// Das ist die einzige richtige Bestimmung. Wer stattdessen den Text bei
+// Offset 54 bzw. 82 liest ("FAT16   ", "FAT32   "), liest ein Feld, das die
+// Spezifikation ausdruecklich als nicht massgeblich bezeichnet — es steht
+// dort zur Information und wird von Formatierern uneinheitlich gefuellt.
+pub fn FatMount(fd: int64, lbaOffset: int64): FatVolume {
+  var vol: FatVolume;
+  vol.fd := fd;
+  vol.lbaOffset := lbaOffset;
+  vol.fatType := FAT_ERR;
+  vol.bytesPerSector := 0;
+  vol.sectorsPerClus := 0;
+
+  var bs: int64 := alloc(512);
+  if (lseek(fd, lbaOffset, 0) != lbaOffset) { free(bs, 512); return vol; }
+  if (read(fd, bs as pchar, 512) != 512) { free(bs, 512); return vol; }
+
+  // Die Signatur 0x55AA am Sektorende. Sie beweist kein FAT, schliesst aber
+  // die haeufigste Verwechslung aus: eine Datei, die gar kein Abbild ist.
+  if (_u8(bs, 510) != 0x55 || _u8(bs, 511) != 0xAA) { free(bs, 512); return vol; }
+
+  var bps: int64 := _u16(bs, 11);
+  var spc: int64 := _u8(bs, 13);
+  // Nur die Groessen, die die Spezifikation zulaesst. Ein Wert wie 0 oder 300
+  // wuerde jede folgende Rechnung verderben, und zwar unauffaellig: die
+  // Sektoradressen blieben plausibel, nur eben falsch.
+  if (bps != 512 && bps != 1024 && bps != 2048 && bps != 4096) { free(bs, 512); return vol; }
+  if (spc != 1 && spc != 2 && spc != 4 && spc != 8 && spc != 16
+      && spc != 32 && spc != 64 && spc != 128) { free(bs, 512); return vol; }
+
+  vol.bytesPerSector  := bps;
+  vol.sectorsPerClus  := spc;
+  vol.reservedSectors := _u16(bs, 14);
+  vol.numFats         := _u8(bs, 16);
+  vol.rootEntCount    := _u16(bs, 17);
+
+  var tot16: int64 := _u16(bs, 19);
+  var tot32: int64 := _u32(bs, 32);
+  if (tot16 != 0) { vol.totalSectors := tot16; } else { vol.totalSectors := tot32; }
+
+  var fatsz16: int64 := _u16(bs, 22);
+  if (fatsz16 != 0) { vol.fatSize := fatsz16; } else { vol.fatSize := _u32(bs, 36); }
+
+  vol.rootCluster := _u32(bs, 44);
+
+  if (vol.numFats == 0 || vol.fatSize == 0 || vol.totalSectors == 0) {
+    free(bs, 512); vol.fatType := FAT_ERR; return vol;
+  }
+  if (vol.reservedSectors == 0) { free(bs, 512); vol.fatType := FAT_ERR; return vol; }
+
+  // Die Wurzel liegt bei FAT12/16 als fester Block zwischen FAT und Daten;
+  // bei FAT32 ist sie eine gewoehnliche Clusterkette und rootEntCount ist 0.
+  vol.rootDirSectors := (vol.rootEntCount * 32 + bps - 1) / bps;
+  vol.firstDataSector := vol.reservedSectors + vol.numFats * vol.fatSize
+                       + vol.rootDirSectors;
+
+  if (vol.totalSectors <= vol.firstDataSector) {
+    free(bs, 512); vol.fatType := FAT_ERR; return vol;
+  }
+  vol.countOfClusters := (vol.totalSectors - vol.firstDataSector) / spc;
+
+  if (vol.countOfClusters < 4085) { vol.fatType := FAT_TYPE_12; }
+  else if (vol.countOfClusters < 65525) { vol.fatType := FAT_TYPE_16; }
+  else { vol.fatType := FAT_TYPE_32; }
+
+  // FAT32 hat keine feste Wurzel — steht dort trotzdem eine, stimmt etwas
+  // nicht, und die Rechnung oben waere schon verschoben.
+  if (vol.fatType == FAT_TYPE_32 && vol.rootEntCount != 0) {
+    free(bs, 512); vol.fatType := FAT_ERR; return vol;
+  }
+  if (vol.fatType != FAT_TYPE_32 && vol.rootEntCount == 0) {
+    free(bs, 512); vol.fatType := FAT_ERR; return vol;
+  }
+
+  free(bs, 512);
+  return vol;
+}
+
+// ── Clusterkette ──────────────────────────────────────────────────────────
+//
+// Der Nachfolger eines Clusters steht in der FAT. Die drei Fassungen
+// unterscheiden sich in der Breite des Eintrags — und FAT12 ist der Grund,
+// warum es diese Unterscheidung ueberhaupt gibt: dort belegt ein Eintrag
+// ZWOELF Bit, zwei Eintraege teilen sich also drei Bytes, und je nachdem ob
+// die Nummer gerade oder ungerade ist, liegt der Wert in der oberen oder
+// unteren Haelfte des mittleren Bytes.
+pub fn FatNextCluster(vol: FatVolume, cluster: int64): int64 {
+  if (!FatVolumeValid(vol)) { return FAT_ERR; }
+  if (cluster < 2 || cluster > vol.countOfClusters + 1) { return FAT_ERR; }
+
+  var bps: int64 := vol.bytesPerSector;
+  var puf: int64 := alloc(bps * 2);
+
+  var wert: int64 := 0;
+  if (vol.fatType == FAT_TYPE_12) {
+    var byteOff: int64 := cluster + (cluster / 2);       // 1.5 Byte je Eintrag
+    var sek: int64 := vol.reservedSectors + byteOff / bps;
+    var inSek: int64 := byteOff - (byteOff / bps) * bps;
+    // Ein FAT12-Eintrag kann ueber die Sektorgrenze reichen. Deshalb ZWEI
+    // Sektoren lesen; wer nur einen liest, bekommt an genau diesen Stellen
+    // den halben Wert und eine Kette, die ins Leere fuehrt.
+    if (_leseSektor(vol, sek, puf) == 0) { free(puf, bps * 2); return FAT_ERR; }
+    if (_leseSektor(vol, sek + 1, puf + bps) == 0) {
+      // Der zweite Sektor darf fehlen, solange der Eintrag ihn nicht braucht.
+      if (inSek + 1 >= bps) { free(puf, bps * 2); return FAT_ERR; }
+    }
+    var roh: int64 := (peek8(puf + inSek) & 255) | ((peek8(puf + inSek + 1) & 255) << 8);
+    if ((cluster & 1) != 0) { wert := (roh >> 4) & 0xFFF; }
+    else { wert := roh & 0xFFF; }
+    free(puf, bps * 2);
+    if (wert == 0) { return FAT_FREI; }
+    if (wert >= 0xFF8) { return FAT_EOC; }
+    return wert;
+  }
+
+  if (vol.fatType == FAT_TYPE_16) {
+    var byteOff2: int64 := cluster * 2;
+    var sek2: int64 := vol.reservedSectors + byteOff2 / bps;
+    var inSek2: int64 := byteOff2 - (byteOff2 / bps) * bps;
+    if (_leseSektor(vol, sek2, puf) == 0) { free(puf, bps * 2); return FAT_ERR; }
+    wert := _u16(puf, inSek2);
+    free(puf, bps * 2);
+    if (wert == 0) { return FAT_FREI; }
+    if (wert >= 0xFFF8) { return FAT_EOC; }
+    return wert;
+  }
+
+  var byteOff3: int64 := cluster * 4;
+  var sek3: int64 := vol.reservedSectors + byteOff3 / bps;
+  var inSek3: int64 := byteOff3 - (byteOff3 / bps) * bps;
+  if (_leseSektor(vol, sek3, puf) == 0) { free(puf, bps * 2); return FAT_ERR; }
+  // Die oberen vier Bit gehoeren nicht zur Nummer: FAT32 traegt in Wahrheit
+  // 28 Bit. Wer sie mitliest, bekommt bei jedem Eintrag, den ein Formatierer
+  // dort markiert hat, eine unsinnig grosse Clusternummer.
+  wert := _u32(puf, inSek3) & 0x0FFFFFFF;
+  free(puf, bps * 2);
+  if (wert == 0) { return FAT_FREI; }
+  if (wert >= 0x0FFFFFF8) { return FAT_EOC; }
+  return wert;
+}
+
+// Laenge einer Kette in Clustern. -1, wenn sie beschaedigt ist.
+//
+// Die Obergrenze ist kein Schoenheitsfehler: eine Kette, die auf sich selbst
+// zeigt, laeuft sonst endlos. Genau das ist der haeufigste Schaden nach einem
+// Stromausfall, und ein Leser, der daran haengenbleibt, ist unbrauchbar.
+pub fn FatChainLength(vol: FatVolume, start: int64): int64 {
+  if (!FatVolumeValid(vol)) { return FAT_ERR; }
+  if (start < 2) { return FAT_ERR; }
+  var n: int64 := 0;
+  var c: int64 := start;
+  var grenze: int64 := vol.countOfClusters + 2;
+  while (c >= 2) {
+    n := n + 1;
+    if (n > grenze) { return FAT_ERR; }
+    c := FatNextCluster(vol, c);
+    if (c == FAT_EOC) { return n; }
+    if (c == FAT_ERR || c == FAT_FREI) { return FAT_ERR; }
+  }
+  return FAT_ERR;
+}
+
+// ── Verzeichnisse ─────────────────────────────────────────────────────────
+
+// Ein Verzeichnis zum Durchlaufen oeffnen. `cluster` = 0 bedeutet die Wurzel.
+pub fn FatDirOpen(vol: FatVolume, cluster: int64): FatDir {
+  var d: FatDir;
+  d.cluster := cluster;
+  d.sectorInCl := 0;
+  d.entryInSec := 0;
+  d.rootSector := 0;
+  d.istWurzel := false;
+  d.fertig := false;
+  d.sekPuffer := 0;
+  if (!FatVolumeValid(vol)) { d.fertig := true; return d; }
+  if (cluster == 0) {
+    if (vol.fatType == FAT_TYPE_32) { d.cluster := vol.rootCluster; }
+    else { d.istWurzel := true; }
+  }
+  d.sekPuffer := alloc(vol.bytesPerSector);
+  return d;
+}
+
+pub fn FatDirClose(vol: FatVolume, ref d: FatDir): void {
+  if (d.sekPuffer != 0) { free(d.sekPuffer, vol.bytesPerSector); }
+}
+
+// Ein Zeichen aus einem UCS-2-Paar. Alles ausserhalb von ASCII wird zu '?'.
+//
+// Das ist eine ANGABE, keine Umsetzung: FAT speichert lange Namen in UTF-16,
+// und eine ehrliche Umwandlung nach UTF-8 gehoert in std.text. Ein stiller
+// Abschnitt des hohen Bytes waere schlimmer — aus "Grüße" wuerde "GrE" oder
+// Schlimmeres, ohne dass es jemand merkt.
+fn _ucs2Zeichen(hi: int64, lo: int64): int64 {
+  if (hi != 0) { return 63; }          // '?'
+  return lo;
+}
+
+// Naechsten Eintrag holen.
+//
+// Rueckgabe: 1 = Eintrag geliefert, 0 = Verzeichnisende, FAT_ERR = Lesefehler.
+// `nameBuf` bekommt den Namen nullterminiert; lange Namen werden aus den
+// vorangehenden Teilstuecken zusammengesetzt, sonst gilt der 8.3-Name.
+pub fn FatDirNext(vol: FatVolume, ref d: FatDir, ref e: FatEntry,
+                  nameBuf: int64, nameMax: int64): int64 {
+  if (!FatVolumeValid(vol)) { return FAT_ERR; }
+  if (d.fertig) { return 0; }
+  if (nameMax < 13) { return FAT_ERR; }
+
+  var bps: int64 := vol.bytesPerSector;
+  var proSektor: int64 := bps / 32;
+
+  // Lange Namen stehen VOR ihrem 8.3-Eintrag, und zwar rueckwaerts: das
+  // letzte Stueck zuerst. Gesammelt wird deshalb in einem Zwischenpuffer,
+  // dessen Plaetze aus der Ordnungszahl folgen.
+  var lfn: int64 := alloc(280);
+  var lfnLen: int64 := 0;
+  poke8(lfn, 0);
+
+  var weiter: bool := true;
+  while (weiter) {
+    // Welcher Sektor ist gerade dran?
+    var sek: int64 := 0;
+    if (d.istWurzel) {
+      if (d.rootSector >= vol.rootDirSectors) { d.fertig := true; free(lfn, 280); return 0; }
+      sek := vol.reservedSectors + vol.numFats * vol.fatSize + d.rootSector;
+    } else {
+      if (d.cluster < 2) { d.fertig := true; free(lfn, 280); return 0; }
+      var basis: int64 := FatClusterSector(vol, d.cluster);
+      if (basis == FAT_ERR) { d.fertig := true; free(lfn, 280); return FAT_ERR; }
+      sek := basis + d.sectorInCl;
+    }
+
+    if (_leseSektor(vol, sek, d.sekPuffer) == 0) { free(lfn, 280); return FAT_ERR; }
+
+    while (d.entryInSec < proSektor) {
+      var ep: int64 := d.sekPuffer + d.entryInSec * 32;
+      var b0: int64 := _u8(ep, 0);
+      d.entryInSec := d.entryInSec + 1;
+
+      // 0x00 heisst: hier und danach kommt nichts mehr. 0xE5 heisst: dieser
+      // Platz ist geloescht, der naechste kann wieder belegt sein. Die beiden
+      // zu verwechseln kostet entweder Eintraege oder eine Endlosschleife.
+      if (b0 == 0x00) { d.fertig := true; free(lfn, 280); return 0; }
+      if (b0 == 0xE5) { lfnLen := 0; poke8(lfn, 0); }
+      else {
+        var attr: int64 := _u8(ep, 11);
+        if ((attr & 63) == FAT_ATTR_LONG_NAME) {
+          // Teilstueck eines langen Namens: 13 Zeichen an drei Stellen.
+          var ord: int64 := b0 & 63;
+          if (ord >= 1 && ord <= 20) {
+            var ziel: int64 := (ord - 1) * 13;
+            var k: int64 := 0;
+            while (k < 5) {
+              poke8(lfn + ziel + k, _ucs2Zeichen(_u8(ep, 2 + k*2), _u8(ep, 1 + k*2)));
+              k := k + 1;
+            }
+            k := 0;
+            while (k < 6) {
+              poke8(lfn + ziel + 5 + k, _ucs2Zeichen(_u8(ep, 15 + k*2), _u8(ep, 14 + k*2)));
+              k := k + 1;
+            }
+            k := 0;
+            while (k < 2) {
+              poke8(lfn + ziel + 11 + k, _ucs2Zeichen(_u8(ep, 29 + k*2), _u8(ep, 28 + k*2)));
+              k := k + 1;
+            }
+            if (ziel + 13 > lfnLen) { lfnLen := ziel + 13; }
+          }
+        } else {
+          // Der 8.3-Eintrag. Er schliesst eine etwaige Namenssammlung ab.
+          e.attr := attr;
+          e.isDir := (attr & FAT_ATTR_DIRECTORY) != 0;
+          e.isVolume := (attr & FAT_ATTR_VOLUME_ID) != 0;
+          e.cluster := (_u16(ep, 20) << 16) | _u16(ep, 26);
+          e.size := _u32(ep, 28);
+
+          var geschrieben: int64 := 0;
+          if (lfnLen > 0) {
+            // Die gesammelten Zeichen bis zum ersten 0 oder 0xFFFF-Fueller.
+            var i: int64 := 0;
+            while (i < lfnLen && geschrieben < nameMax - 1) {
+              var ch: int64 := _u8(lfn, i) & 255;
+              if (ch == 0 || ch == 255) { i := lfnLen; }
+              else { poke8(nameBuf + geschrieben, ch); geschrieben := geschrieben + 1; i := i + 1; }
+            }
+          }
+          if (geschrieben == 0) {
+            // 8.3: acht Zeichen Name, drei Erweiterung, mit Leerzeichen
+            // aufgefuellt. Der Punkt steht nicht im Abbild.
+            var j: int64 := 0;
+            while (j < 8 && geschrieben < nameMax - 1) {
+              var c1: int64 := _u8(ep, j);
+              if (c1 != 32) { poke8(nameBuf + geschrieben, c1); geschrieben := geschrieben + 1; }
+              j := j + 1;
+            }
+            var hatExt: bool := _u8(ep, 8) != 32;
+            if (hatExt && geschrieben < nameMax - 1) {
+              poke8(nameBuf + geschrieben, 46); geschrieben := geschrieben + 1;   // '.'
+              var m: int64 := 0;
+              while (m < 3 && geschrieben < nameMax - 1) {
+                var c2: int64 := _u8(ep, 8 + m);
+                if (c2 != 32) { poke8(nameBuf + geschrieben, c2); geschrieben := geschrieben + 1; }
+                m := m + 1;
+              }
+            }
+          }
+          poke8(nameBuf + geschrieben, 0);
+          free(lfn, 280);
+          return 1;
+        }
+      }
+    }
+
+    // Sektor zu Ende — den naechsten holen.
+    d.entryInSec := 0;
+    if (d.istWurzel) {
+      d.rootSector := d.rootSector + 1;
+    } else {
+      d.sectorInCl := d.sectorInCl + 1;
+      if (d.sectorInCl >= vol.sectorsPerClus) {
+        d.sectorInCl := 0;
+        var nx: int64 := FatNextCluster(vol, d.cluster);
+        if (nx == FAT_EOC) { d.fertig := true; free(lfn, 280); return 0; }
+        if (nx == FAT_ERR || nx == FAT_FREI) { d.fertig := true; free(lfn, 280); return FAT_ERR; }
+        d.cluster := nx;
+      }
+    }
+  }
+  free(lfn, 280);
+  return 0;
+}
+
+// ── Suchen ────────────────────────────────────────────────────────────────
+
+fn _nameGleich(a: int64, b: pchar): bool {
+  var i: int64 := 0;
+  while (true) {
+    var ca: int64 := peek8(a + i) & 255;
+    var cb: int64 := StrCharAt(b, i) & 255;
+    // Ohne Ruecksicht auf Gross- und Kleinschreibung: FAT legt 8.3-Namen in
+    // GROSSBUCHSTABEN ab, der Aufrufer schreibt sie aber so, wie er sie sieht.
+    if (ca >= 97 && ca <= 122) { ca := ca - 32; }
+    if (cb >= 97 && cb <= 122) { cb := cb - 32; }
+    if (ca != cb) { return false; }
+    if (ca == 0) { return true; }
+    i := i + 1;
+    if (i > 260) { return false; }
+  }
+  return false;
+}
+
+// Einen Eintrag im Verzeichnis `dirCluster` suchen (0 = Wurzel).
+// Rueckgabe: 1 = gefunden (e ist gefuellt), 0 = nicht da, FAT_ERR = Lesefehler.
+pub fn FatFindInDir(vol: FatVolume, dirCluster: int64, name: pchar, ref e: FatEntry): int64 {
+  var d: FatDir := FatDirOpen(vol, dirCluster);
+  var buf: int64 := alloc(300);
+  var r: int64 := 0;
+  while (true) {
+    var got: int64 := FatDirNext(vol, d, e, buf, 300);
+    if (got == FAT_ERR) { r := FAT_ERR; break; }
+    if (got == 0) { r := 0; break; }
+    // Die Datenträgerkennung ist kein Eintrag, den jemand sucht — sie traegt
+    // den Namen des Datentraegers im Namensfeld und wuerde sonst gelegentlich
+    // treffen.
+    if (!e.isVolume) {
+      if (_nameGleich(buf, name)) { r := 1; break; }
+    }
+  }
+  free(buf, 300);
+  FatDirClose(vol, d);
+  return r;
+}
+
+// Einen Pfad wie "ORDNER/UNTER/DATEI.TXT" aufloesen.
+// Fuehrende, doppelte und abschliessende Trennzeichen werden uebergangen;
+// beide Schreibweisen ('/' und '\\') gelten.
+//
+// Rueckgabe: 1 = gefunden, 0 = nicht da, FAT_ERR = Lesefehler.
+pub fn FatFindPath(vol: FatVolume, path: pchar, ref e: FatEntry): int64 {
+  if (!FatVolumeValid(vol)) { return FAT_ERR; }
+  var len: int64 := StrLen(path);
+  var teil: int64 := alloc(300);
+  var akt: int64 := 0;            // 0 = Wurzel
+  var i: int64 := 0;
+  var gefunden: int64 := 0;
+  var ergebnis: int64 := 0;
+  var abbruch: bool := false;
+
+  while (i < len && !abbruch) {
+    // Trennzeichen ueberspringen.
+    var c: int64 := StrCharAt(path, i) & 255;
+    if (c == 47 || c == 92) { i := i + 1; }
+    else {
+      // Einen Namensteil bis zum naechsten Trennzeichen einsammeln.
+      var n: int64 := 0;
+      var imTeil: bool := true;
+      while (i < len && imTeil) {
+        var c2: int64 := StrCharAt(path, i) & 255;
+        if (c2 == 47 || c2 == 92) { imTeil := false; }
+        else {
+          if (n < 299) { poke8(teil + n, c2); n := n + 1; }
+          i := i + 1;
+        }
+      }
+      poke8(teil + n, 0);
+
+      var r: int64 := FatFindInDir(vol, akt, teil as pchar, e);
+      if (r != 1) { ergebnis := r; abbruch := true; }
+      else {
+        gefunden := 1;
+        // Fuer den naechsten Schritt in dieses Verzeichnis hinabsteigen. Ob
+        // es eines IST, entscheidet der naechste Durchgang: steht danach
+        // nichts mehr, war der letzte Teil das Ziel und darf eine Datei sein.
+        akt := e.cluster;
+      }
+    }
+  }
+
+  free(teil, 300);
+  if (abbruch) { return ergebnis; }
+  return gefunden;
+}
+
+// ── Dateien lesen ─────────────────────────────────────────────────────────
+
+// Bis zu `max` Bytes einer Datei lesen. Rueckgabe: gelesene Bytes, oder
+// FAT_ERR.
+//
+// Gelesen wird CLUSTERWEISE entlang der Kette, nicht am Stueck: die Cluster
+// einer Datei liegen nicht notwendig hintereinander. Genau dafuer gibt es die
+// FAT — wer die Datei als zusammenhaengenden Bereich liest, bekommt bei jeder
+// fragmentierten Datei fremden Inhalt, und zwar ohne Fehlermeldung.
+pub fn FatReadFile(vol: FatVolume, e: FatEntry, buf: int64, max: int64): int64 {
+  if (!FatVolumeValid(vol)) { return FAT_ERR; }
+  if (e.isDir) { return FAT_ERR; }
+  if (e.size == 0) { return 0; }
+  if (e.cluster < 2) { return FAT_ERR; }
+
+  var wollen: int64 := e.size;
+  if (wollen > max) { wollen := max; }
+
+  var proCluster: int64 := FatBytesPerCluster(vol);
+  var sekPuf: int64 := alloc(vol.bytesPerSector);
+  var geschrieben: int64 := 0;
+  var c: int64 := e.cluster;
+  var runden: int64 := 0;
+  var grenze: int64 := vol.countOfClusters + 2;
+
+  while (geschrieben < wollen && c >= 2) {
+    runden := runden + 1;
+    if (runden > grenze) { free(sekPuf, vol.bytesPerSector); return FAT_ERR; }
+    var basis: int64 := FatClusterSector(vol, c);
+    if (basis == FAT_ERR) { free(sekPuf, vol.bytesPerSector); return FAT_ERR; }
+    var s: int64 := 0;
+    while (s < vol.sectorsPerClus && geschrieben < wollen) {
+      if (_leseSektor(vol, basis + s, sekPuf) == 0) {
+        free(sekPuf, vol.bytesPerSector); return FAT_ERR;
+      }
+      var k: int64 := 0;
+      while (k < vol.bytesPerSector && geschrieben < wollen) {
+        poke8(buf + geschrieben, peek8(sekPuf + k));
+        geschrieben := geschrieben + 1;
+        k := k + 1;
+      }
+      s := s + 1;
+    }
+    if (geschrieben < wollen) {
+      var nx: int64 := FatNextCluster(vol, c);
+      if (nx == FAT_EOC) {
+        // Die Kette endet vor der angegebenen Groesse — das Dateisystem
+        // widerspricht sich. Gemeldet, nicht mit dem halben Inhalt so getan,
+        // als waere alles gelesen.
+        free(sekPuf, vol.bytesPerSector); return FAT_ERR;
+      }
+      if (nx == FAT_ERR || nx == FAT_FREI) {
+        free(sekPuf, vol.bytesPerSector); return FAT_ERR;
+      }
+      c := nx;
+    }
+  }
+  free(sekPuf, vol.bytesPerSector);
+  return geschrieben;
+}
+
+// ── Datum und Uhrzeit ─────────────────────────────────────────────────────
+//
+// FAT speichert beides gepackt in je 16 Bit. Die Sekunden haben nur eine
+// Aufloesung von ZWEI Sekunden — deshalb der Faktor unten, und deshalb hat
+// FAT nie eine ungerade Sekundenzahl.
+pub fn FatDateYear(datum: int64): int64  { return ((datum >> 9) & 127) + 1980; }
+pub fn FatDateMonth(datum: int64): int64 { return (datum >> 5) & 15; }
+pub fn FatDateDay(datum: int64): int64   { return datum & 31; }
+pub fn FatTimeHour(zeit: int64): int64   { return (zeit >> 11) & 31; }
+pub fn FatTimeMinute(zeit: int64): int64 { return (zeit >> 5) & 63; }
+pub fn FatTimeSecond(zeit: int64): int64 { return (zeit & 31) * 2; }

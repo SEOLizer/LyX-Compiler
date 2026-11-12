@@ -76,6 +76,51 @@ Hello, Lyx!
 ./lyxc hello.lyx -o hello.elf --target=riscv
 ```
 
+### 1.4 Project Files (`*.lpf`)
+
+Once a program needs more than a switch or two, put the build into a project
+file and compile it with `lyxc project.lpf`:
+
+```toml
+[projekt]
+quelle  = "apps/vcldemo.lyx"      # the .lyx to compile (required)
+ziel    = "lyxos"                 # like --target=
+ausgabe = "build/vcldemo.lbf"     # like -o
+
+[include]
+pfade = [".", "platform/lyxos"]   # like -I, in order
+
+[schalter]
+liste = ["--emit=lbf", "-O2"]     # written exactly as on the command line
+
+[pakete]
+vega = "0.3.1"                    # fetched from the LPM cache via `lpm resolve`
+```
+
+```bash
+# Instead of:
+./lyxc apps/vcldemo.lyx --target=lyxos -I . -I platform/lyxos \
+       --emit=lbf -O2 -o build/vcldemo.lbf
+
+# Just:
+./lyxc vcldemo.lpf
+```
+
+Two things worth knowing before you rely on it:
+
+- **The command line wins.** `./lyxc vcldemo.lpf --target=linux` compiles the
+  same project for another target without touching the file — handy for a quick
+  counter-check.
+- **Relative paths are relative to the `.lpf`**, not to your shell. The same
+  project file therefore builds the same thing no matter where you invoke it
+  from.
+
+German and English keys are interchangeable (`quelle`/`source`, `ziel`/`target`,
+`ausgabe`/`output`, `pfade`/`paths`, `liste`/`flags`, `[pakete]`/`[packages]`).
+A misspelled section or key is reported rather than ignored — a silent
+`[incldue]` would swallow every path in it and turn up much later as a missing
+module.
+
 ---
 
 ## 2. Language Basics
@@ -268,6 +313,89 @@ fn main(): int64 {
 }
 ```
 
+### 3.4 Tabellen lesen und schreiben (std.csv)
+
+```lyx
+import std.csv;
+
+fn main(): int64 {
+  // Leerraum getrennt, "?" steht fuer einen fehlenden Wert
+  var t: int64 := CsvOpenWhitespace("auto-mpg.data"c, false);
+  if (t == 0) { PrintInt(CsvError()); return 1; }
+  var ok: bool := CsvSetMissing(t, "?"c);
+
+  // Spalten 0..6 als f64-Matrix; Zeilen mit Luecken werden GEZAEHLT,
+  // nicht stillschweigend mit 0 gefuellt
+  var cols: int64 := alloc(7 * 8);
+  var i: int64 := 0;
+  while (i < 7) { poke64(cols + i * 8, i); i := i + 1; }
+  var brauchbar: int64 := CsvUsableRowCount(t, cols, 7);
+  var M: int64 := alloc(brauchbar * 7 * 8);
+  var weg: int64 := alloc(8);
+  var n: int64 := CsvToMatrixSkip(t, cols, 7, M, brauchbar, weg);
+  PrintInt(n);              // gelesene Zeilen
+  PrintInt(peek64(weg));    // uebersprungene Zeilen
+  CsvFree(t);
+  return 0;
+}
+```
+
+`CsvToMatrix` (ohne `Skip`) scheitert an einer Luecke, statt sie mit 0 zu
+fuellen. Zum Schreiben: `CsvWriterNew`, `CsvWriteField`/`CsvWriteFloat`,
+`CsvEndRow`, `CsvWriterSave` — Anfuehrungszeichen setzt der Schreiber selbst,
+sobald das Feld sie braucht.
+
+### 3.5 Neuronale Netze (std.nn)
+
+```lyx
+import std.nn;
+import std.nn_io;
+
+fn main(): int64 {
+  var net: int64 := NnNew(6, 3);          // 6 Eingaenge, Platz fuer 3 Schichten
+  NnSeed(net, 4711);                      // reproduzierbare Anfangsgewichte
+  var ok: bool := NnAddDense(net, 16, NN_ACT_TANH);
+  ok := NnAddDense(net, 8, NN_ACT_TANH);
+  ok := NnAddDense(net, 1, NN_ACT_LINEAR);
+  ok := NnInitXavier(net);
+  ok := NnSetLoss(net, NN_LOSS_MSE);      // prueft die Ausgabeaktivierung mit
+  ok := NnSetOptimizer(net, NN_OPT_ADAM);
+  NnSetLearningRate(net, 0.01);
+  ok := NnSetWeightDecay(net, 0.0005);
+  ok := NnSetGradClip(net, 5.0);
+  ok := NnSetDropout(net, 0, 0.1);        // nur verdeckte Schichten
+  ok := NnSetLrSchedule(net, NN_LR_COSINE, 0.001, 300.0);
+
+  // X ist n x 6, Y ist n x 1, beide zeilenweise
+  var bestVal: f64 := NnTrainEarlyStop(net, X, Y, nTrain,
+                                       Xval, Yval, nVal, 16, 300, 25);
+
+  NnSetTraining(net, false);               // ohne Dropout vorhersagen
+  var o: int64 := NnForward(net, Xtest);
+  PrintFloat(NnOutputAt(net, 0));
+
+  var bytes: int64 := NnIoSaveFile(net, "netz.lyxnn"c, true);
+  NnFree(net);
+  return 0;
+}
+```
+
+Drei Punkte, die man sonst teuer lernt:
+
+* **Trainings- und Inferenzmodus trennen.** Dropout wirkt nur im Training;
+  ohne `NnSetTraining(net, false)` antwortet das Netz auf dieselbe Eingabe
+  zweimal verschieden, ohne dass ein Fehler gemeldet wird.
+* **Skalieren mit den Kennwerten des Trainingsteils.** `NnDataFitStandard`
+  auf den Trainingszeilen, `NnDataApplyStandard` dann auf alle — wer den
+  Testteil mit seinen eigenen Kennwerten skaliert, misst sich zu gut.
+* **Den Optimiererzustand mitsichern** (`withOpt = true`), wenn das Training
+  fortgesetzt werden soll; sonst laeuft es nach dem Laden anders weiter.
+
+Vollstaendiges Probetraining mit Kennzahlen, Abbruchkriterium und
+Modellsicherung: `examples/ml/nn_auto_mpg.lyx`. Ablage in einer Datenbank
+statt in einer Datei: `std.nn_store` (SQLite) und `std.nn_store_pg`
+(PostgreSQL).
+
 ---
 
 ## 4. Safety Features
@@ -417,8 +545,11 @@ fn main(): int64 {
 # Enable linter warnings
 ./lyxc program.lyx --lint
 
-# Dump IR as pseudo-assembler
+# Disassemble the generated x86-64 code (to <output>.asm)
 ./lyxc program.lyx --emit-asm
+
+# Same, to standard output; with --asm-listing also the source lines
+./lyxc program.lyx --dump-asm
 
 # Show relocations and symbols
 ./lyxc program.lyx --dump-relocs

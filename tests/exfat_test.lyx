@@ -1,0 +1,239 @@
+// tests/exfat_test.lyx — std.fs.exfat gegen ein geprueftes Abbild
+//
+// Das Abbild erzeugt `mkfs.exfat` (exfatprogs); befuellt wird es von
+// tests/lib/exfat_fuellen.py, weil es fuer exFAT kein `mtools` gibt und ein
+// Loop-Mount Wurzelrechte braeuchte.
+//
+// DAMIT DAS TRAEGT, urteilt eine fremde Umsetzung: der Runner laesst
+// `fsck.exfat` ueber das befuellte Abbild laufen, BEVOR dieser Test es liest.
+// Meldet fsck nicht "clean", bricht der Lauf ab — dann waere die Vorlage
+// falsch und jede Pruefung hier wertlos.
+//
+// Zwei Faelle tragen die Batterie, und beide gibt es bei FAT nicht:
+//
+//   1. `NoFatChain`. Eine zusammenhaengende Datei steht in exFAT GAR NICHT
+//      in der Zuordnungstabelle. Wer dort nachschlaegt, liest 0 und haelt die
+//      Datei fuer zu Ende — bei JEDER unfragmentierten Datei. Deshalb ist
+//      HALLO.TXT zusammenhaengend und GROSS.BIN ausdruecklich fragmentiert.
+//   2. Die Upcase-Tabelle. Sie ist ein echter Datenstrom mit einer
+//      Pruefsumme, die `mkfs.exfat` hineingeschrieben hat. Sie zu lesen und
+//      nachzurechnen prueft Clusterrechnung, Stromlesen und die
+//      Pruefsummenvorschrift auf einmal — gegen eine Zahl, die nicht von uns
+//      stammt.
+
+unit main;
+
+import std.io;
+import std.env;
+import std.alloc;
+import std.string;
+import std.fs.exfat;
+
+var _fails: int64 := 0;
+var _checks: int64 := 0;
+
+fn Check(name: pchar, got: int64, want: int64): void {
+  _checks := _checks + 1;
+  if (got == want) { PrintStr("PASS "c); PrintStrLn(name); }
+  else {
+    PrintStr("FAIL "c); PrintStr(name);
+    PrintStr(": erhalten "c); PrintInt(got);
+    PrintStr(" erwartet "c); PrintInt(want); PrintLn(""c);
+    _fails := _fails + 1;
+  }
+}
+
+fn CheckWahr(name: pchar, got: bool): void {
+  _checks := _checks + 1;
+  if (got) { PrintStr("PASS "c); PrintStrLn(name); }
+  else { PrintStr("FAIL "c); PrintStr(name); PrintStrLn(" (erwartet: wahr)"c); _fails := _fails + 1; }
+}
+
+fn CheckFalsch(name: pchar, got: bool): void {
+  _checks := _checks + 1;
+  if (!got) { PrintStr("PASS "c); PrintStrLn(name); }
+  else { PrintStr("FAIL "c); PrintStr(name); PrintStrLn(" (erwartet: falsch)"c); _fails := _fails + 1; }
+}
+
+fn NameGleich(buf: int64, s: pchar): bool {
+  var i: int64 := 0;
+  while (i < 300) {
+    var a: int64 := peek8(buf + i) & 255;
+    var b: int64 := StrCharAt(s, i) & 255;
+    if (a != b) { return false; }
+    if (a == 0) { return true; }
+    i := i + 1;
+  }
+  return false;
+}
+
+fn main(): int64 {
+  if (GetArgC() < 2) {
+    PrintStrLn("FAIL: Abbildpfad fehlt (Aufruf: exfat_test <abbild>)"c);
+    return 1;
+  }
+  var pfad: pchar := ArgvGet(GetArgV(), 1);
+
+  var fd: int64 := open(pfad, 0, 0);
+  _checks := _checks + 1;
+  if (fd < 0) { PrintStrLn("FAIL: Abbild nicht zu oeffnen"c); return 1; }
+  PrintStrLn("PASS Abbild geoeffnet"c);
+
+  var vol: ExfatVolume := ExfatMount(fd, 0);
+  CheckWahr("Volume ist gueltig"c, ExfatValid(vol));
+  // Die beiden Groessen stehen im Bootsektor als EXPONENT. Wer sie direkt
+  // liest, bekommt 9 und 3 statt 512 und 8 — und rechnet ab da alles falsch.
+  Check("Sektorgroesse aus dem Exponenten"c, vol.bytesPerSector, 512);
+  CheckWahr("Cluster hat wenigstens einen Sektor"c, vol.sectorsPerClus >= 1);
+  CheckWahr("Datenbereich liegt hinter der Tabelle"c, vol.heapOffset > vol.fatOffset);
+  CheckWahr("Wurzel liegt im Datenbereich"c,
+            vol.rootCluster >= 2 && vol.rootCluster <= vol.clusterCount + 1);
+
+  // ── Datentraegerkennung ─────────────────────────────────────────────
+  var lbuf: int64 := alloc(64);
+  Check("Kennung hat sieben Zeichen"c, ExfatVolumeLabel(vol, lbuf, 64), 7);
+  CheckWahr("Kennung lautet PRUEFEX"c, NameGleich(lbuf, "PRUEFEX"c));
+  free(lbuf, 64);
+
+  // ── Upcase-Tabelle: fremde Pruefsumme nachrechnen ────────────────────
+  var up: ExfatEntry;
+  Check("Upcase-Tabelle gefunden"c, ExfatSystemStream(vol, EXFAT_ET_UPCASE, up), 1);
+  CheckWahr("Upcase-Tabelle ist nicht leer"c, up.size > 0);
+  var upBuf: int64 := alloc(up.size + 16);
+  Check("Upcase-Tabelle gelesen"c, ExfatReadFile(vol, up, upBuf, up.size), up.size);
+  var soll: int64 := ExfatUpcaseStoredChecksum(vol);
+  // DIE Pruefung: die Zahl stammt von mkfs.exfat, gerechnet wird sie hier.
+  // Sie stimmt nur, wenn Clusterrechnung, Stromlesen UND die
+  // Pruefsummenvorschrift alle drei stimmen.
+  Check("Pruefsumme der Upcase-Tabelle"c, ExfatChecksum32(upBuf, up.size), soll);
+  free(upBuf, up.size + 16);
+
+  // ── Belegungsbitmap ──────────────────────────────────────────────────
+  var bm: ExfatEntry;
+  Check("Belegungsbitmap gefunden"c, ExfatSystemStream(vol, EXFAT_ET_BITMAP, bm), 1);
+  // Ein Bit je Cluster: die Laenge muss zur Clusterzahl passen.
+  var sollBytes: int64 := (vol.clusterCount + 7) / 8;
+  Check("Bitmaplaenge passt zur Clusterzahl"c, bm.size, sollBytes);
+  var bmBuf: int64 := alloc(bm.size + 16);
+  Check("Bitmap gelesen"c, ExfatReadFile(vol, bm, bmBuf, bm.size), bm.size);
+  // Cluster 2 traegt die Bitmap selbst — sein Bit MUSS gesetzt sein. Waere es
+  // das nicht, haette der Leser die Bitmap an der falschen Stelle gesucht.
+  CheckWahr("Cluster 2 gilt als belegt"c, (peek8(bmBuf) & 1) != 0);
+  free(bmBuf, bm.size + 16);
+
+  // ── Wurzelverzeichnis ────────────────────────────────────────────────
+  var d: ExfatDir := ExfatDirOpen(vol, 0);
+  var e: ExfatEntry;
+  var nb: int64 := alloc(320);
+  var zHallo: int64 := 0; var zGross: int64 := 0;
+  var zOrdner: int64 := 0; var zLang: int64 := 0; var zAll: int64 := 0;
+  var grossSize: int64 := 0;
+  var grossFrag: bool := true;
+  var halloZus: bool := false;
+  var laufend: bool := true;
+  while (laufend) {
+    var r: int64 := ExfatDirNext(vol, d, e, nb, 320);
+    if (r != 1) { laufend := false; }
+    else {
+      zAll := zAll + 1;
+      if (NameGleich(nb, "HALLO.TXT"c)) { zHallo := zHallo + 1; halloZus := e.noFatChain; }
+      if (NameGleich(nb, "GROSS.BIN"c)) { zGross := zGross + 1; grossSize := e.size; grossFrag := !e.noFatChain; }
+      if (NameGleich(nb, "ORDNER"c)) { zOrdner := zOrdner + 1; CheckWahr("ORDNER ist ein Verzeichnis"c, e.isDir); }
+      if (NameGleich(nb, "Ein langer Dateiname.txt"c)) { zLang := zLang + 1; }
+    }
+  }
+  ExfatDirClose(vol, d);
+
+  Check("HALLO.TXT im Wurzelverzeichnis"c, zHallo, 1);
+  Check("GROSS.BIN im Wurzelverzeichnis"c, zGross, 1);
+  Check("ORDNER im Wurzelverzeichnis"c, zOrdner, 1);
+  // Namen ueber 15 Zeichen brauchen mehrere Namenseintraege. Ohne deren
+  // Zusammenbau hiesse die Datei "Ein langer Dat".
+  Check("langer Name aus mehreren Eintraegen"c, zLang, 1);
+  // Genau vier: Bitmap, Upcase und Kennung sind KEINE Dateien und duerfen im
+  // Listing nicht auftauchen. Ohne diese Zahl waeren drei Geistereintraege
+  // nicht zu bemerken.
+  Check("genau vier Eintraege im Wurzelverzeichnis"c, zAll, 4);
+  Check("GROSS.BIN Groesse"c, grossSize, 200000);
+
+  // Die beiden Ablageformen, die es bei FAT nicht gibt.
+  CheckWahr("HALLO.TXT liegt zusammenhaengend (NoFatChain)"c, halloZus);
+  CheckWahr("GROSS.BIN liegt fragmentiert (echte Kette)"c, grossFrag);
+
+  // ── Lesen ────────────────────────────────────────────────────────────
+  var e2: ExfatEntry;
+  Check("HALLO.TXT gefunden"c, ExfatFindInDir(vol, 0, "HALLO.TXT"c, e2), 1);
+  var buf: int64 := alloc(64);
+  Check("HALLO.TXT gelesen"c, ExfatReadFile(vol, e2, buf, 64), 12);
+  poke8(buf + 12, 0);
+  CheckWahr("HALLO.TXT Inhalt"c, NameGleich(buf, "Hallo exFAT\n"c));
+  free(buf, 64);
+
+  var e3: ExfatEntry;
+  Check("GROSS.BIN gefunden"c, ExfatFindInDir(vol, 0, "GROSS.BIN"c, e3), 1);
+  var gb: int64 := alloc(200000);
+  Check("GROSS.BIN vollstaendig gelesen"c, ExfatReadFile(vol, e3, gb, 200000), 200000);
+  var falsch: int64 := 0;
+  var ersterFehler: int64 := 0 - 1;
+  var i2: int64 := 0;
+  while (i2 < 200000) {
+    if ((peek8(gb + i2) & 255) != ((i2 * 7 + 3) & 255)) {
+      falsch := falsch + 1;
+      if (ersterFehler < 0) { ersterFehler := i2; }
+    }
+    i2 := i2 + 1;
+  }
+  _checks := _checks + 1;
+  if (falsch == 0) { PrintStrLn("PASS GROSS.BIN Inhalt Byte fuer Byte"c); }
+  else {
+    PrintStr("FAIL GROSS.BIN Inhalt: "c); PrintInt(falsch);
+    PrintStr(" Abweichungen, erste bei "c); PrintInt(ersterFehler); PrintLn(""c);
+    _fails := _fails + 1;
+  }
+  free(gb, 200000);
+
+  // ── Pfade ────────────────────────────────────────────────────────────
+  var e4: ExfatEntry;
+  Check("ORDNER/TIEF/UNTEN.TXT gefunden"c,
+        ExfatFindPath(vol, "ORDNER/TIEF/UNTEN.TXT"c, e4), 1);
+  var b2: int64 := alloc(64);
+  Check("UNTEN.TXT gelesen"c, ExfatReadFile(vol, e4, b2, 64), 12);
+  free(b2, 64);
+  var e5: ExfatEntry;
+  Check("derselbe Pfad mit Schraegstrichen davor"c,
+        ExfatFindPath(vol, "/ORDNER//TIEF/UNTEN.TXT"c, e5), 1);
+
+  // ── Was es nicht gibt ────────────────────────────────────────────────
+  var e6: ExfatEntry;
+  Check("fehlende Datei wird nicht gefunden"c,
+        ExfatFindInDir(vol, 0, "GIBTESNICHT.XYZ"c, e6), 0);
+  Check("fehlender Pfad wird nicht gefunden"c,
+        ExfatFindPath(vol, "ORDNER/TIEF/NICHTDA.TXT"c, e6), 0);
+  var e7: ExfatEntry;
+  Check("ORDNER gefunden"c, ExfatFindInDir(vol, 0, "ORDNER"c, e7), 1);
+  var b3: int64 := alloc(64);
+  Check("Verzeichnis lesen wird abgewiesen"c, ExfatReadFile(vol, e7, b3, 64), EXFAT_ERR);
+  free(b3, 64);
+  Check("Cluster 0 gibt es nicht"c, ExfatNextCluster(vol, 0), EXFAT_ERR);
+  Check("Cluster 1 gibt es nicht"c, ExfatNextCluster(vol, 1), EXFAT_ERR);
+  Check("Cluster hinter dem Ende"c,
+        ExfatNextCluster(vol, vol.clusterCount + 5), EXFAT_ERR);
+
+  free(nb, 320);
+  close(fd);
+
+  // Gegenprobe: ein ELF ist kein exFAT. Ohne sie waere jede Pruefung oben
+  // auch von einem Mount erfuellt, der wahllos "gueltig" sagt.
+  var selbst: int64 := open("/proc/self/exe"c, 0, 0);
+  if (selbst >= 0) {
+    var v2: ExfatVolume := ExfatMount(selbst, 0);
+    CheckFalsch("ein ELF ist kein exFAT-Volume"c, ExfatValid(v2));
+    close(selbst);
+  }
+
+  PrintStr("\n"c);
+  PrintInt(_checks); PrintStr(" Pruefungen, "c);
+  PrintInt(_fails); PrintStrLn(" FAIL"c);
+  if (_fails == 0) { PrintStrLn("OK: std.fs.exfat"c); return 0; }
+  return 1;
+}

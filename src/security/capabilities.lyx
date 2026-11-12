@@ -9,12 +9,14 @@
 //
 // Explizite Capabilities (25 Stück, aus Abschnitt 4.2 der Spezifikation):
 //   system.time, system.env, system.rand, system.unsafe.format_string,
-//   fs.read, fs.write, fs.create, fs.delete, fs.meta, fs.exec,
+//   fs.read, fs.write, fs.create, fs.delete, fs.meta, fs.perm, fs.exec,
 //   memory.mmap, memory.lock,
 //   network.tcp.bind, network.tcp.connect, network.udp.bind, network.udp.connect,
 //   network.unix, network.raw,
-//   hardware.gpio, hardware.i2c, hardware.spi, hardware.usb,
-//   process.fork, process.exec, process.signal, process.sched, process.exit
+//   hardware.gpio, hardware.i2c, hardware.spi, hardware.usb, hardware.block,
+//   process.fork, process.exec, process.signal, process.sched, process.exit,
+//   ki.embed, ki.graph, audio.mic   (#1826: nur fuer das lyxos-Manifest,
+//     auf Linux ohne Syscall-Wirkung)
 
 // ============================================================================
 // Capability-ID-Konstanten
@@ -64,8 +66,124 @@ pub con CAP_PROCESS_SIGNAL:       int64 := 27;
 pub con CAP_PROCESS_SCHED:        int64 := 28;
 pub con CAP_PROCESS_EXIT:         int64 := 29;
 
+// #1188: Metadaten SCHREIBEN. `fs.meta` deckt laut capabilities.md das LESEN
+// ab (stat, Verzeichnislisting); chmod/chown aendern Rechte und Eigentuemer.
+// Sie dort anzuhaengen waere eine stille Ausweitung fuer jeden, der fs.meta
+// nur zum Auflisten anfordert — deshalb eine eigene Capability.
+pub con CAP_FS_PERM:              int64 := 30;
+
+// #1755: Rohzugriff auf Blockgeraete. Der Kernel von Lyx OS fuehrt dafuer eine
+// eigene Klasse (PLEDGE_BLOCK, Syscalls 98-102), fuer die es bisher keine
+// Schreibweise gab — dd, diskinfo, partinfo, partition und ramdisk konnten das
+// Recht nicht anfordern.
+pub con CAP_HARDWARE_BLOCK:       int64 := 31;
+
 pub con CAP_UNKNOWN: int64 := -1;
-pub con CAP_COUNT:   int64 := 30;  // Gesamtanzahl
+// #1797: persistente Konfiguration SCHREIBEN. `fs.write` reicht dafuer nicht —
+// das hat praktisch jedes Programm, das eine Datei anlegt, und wenn dasselbe
+// Recht auch die Netz- oder Systemkonfiguration umschreiben darf, ist die
+// Pruefung wirkungslos. Lesen bleibt frei.
+pub con CAP_SYSTEM_CONFIG:        int64 := 32;
+
+// #1826: Die Warnmeldung des lyxos-Ziels nennt ki.embed, ki.graph und audio
+// als abgebildet — die CAPS-Bits gibt es auch (16, 32, 512, siehe
+// _capBitsFromPath in lyxc.lyx). Nur die NAMEN fehlten hier, weshalb
+// `@capabilities([ki.embed])` mit "unbekannte Capability" abwies. Dieselbe
+// Klasse wie #1797: das Bit war da, das Wort nicht.
+//
+// Auf Linux erteilen diese drei kein Syscall-Recht — es gibt dort nichts,
+// worauf sie sich beziehen. Sie sind Deklarationen fuer das lyxos-Manifest;
+// der Seccomp-Filter bleibt davon unberuehrt.
+pub con CAP_KI_EMBED:             int64 := 33;
+pub con CAP_KI_GRAPH:             int64 := 34;
+// Nur MIC, nicht "audio" allgemein: das einzige vorhandene Bit ist
+// LBF_CAP_AUDIO_MIC. Ein Name `audio.play`, der auf dasselbe Bit abbildet,
+// wuerde beim Anmelden der Wiedergabe stillschweigend das Mikrofon miterlauben
+// — genau die Verwechslung, die #1797 bei `audio` gegen system.config schon
+// einmal beinahe erzeugt haette.
+pub con CAP_AUDIO_MIC:            int64 := 35;
+
+// #1873: Tonausgabe ist eine ANDERE Zusage als Mithoeren. Fuer das Manifest
+// ist genau das der interessante Unterschied: ein Mikrofon greift in die
+// Umgebung des Nutzers ein, ein Lautsprecher nicht. Eigenes CAPS-Bit
+// (LBF_CAP_AUDIO_PLAY), damit `audio.play` nicht auf das Mikrofonbit
+// abbildet — der Grund, warum es diesen Namen bisher nicht gab.
+pub con CAP_AUDIO_PLAY:           int64 := 36;
+
+// #1868: Warten auf Deskriptoren. Die Capability macht KEIN neues Objekt
+// erreichbar — man wartet nur auf das, was man ohnehin schon hat. Sie ist
+// trotzdem eine eigene: eventfd, signalfd und timerfd ERZEUGEN Deskriptoren,
+// und ohne sie ist unter LCBS kein Server mit mehreren Verbindungen
+// schreibbar, nur blockierendes read.
+pub con CAP_IO_WAIT:              int64 := 37;
+
+// #1869: pipe/dup. Ohne sie ist std.pipe unbenutzbar, und ein Kindprozess
+// kann nichts zurueckgeben — process.fork/exec sind deklarierbar, die
+// Weiterleitung der Ausgabe war es nicht. fcntl gehoert NICHT dazu: es ist
+// seit #1276 unter fs.read/fs.write mit Argumentfilter freigegeben.
+pub con CAP_IO_FD:                int64 := 38;
+
+// #1867: Terminalarbeit. Die termios- und Fenstergroessen-ioctls hingen bisher
+// an hardware.gpio — ein Recht auf Universal-I/O-Pins, das mit dem Terminal
+// nichts zu tun hat. Umgekehrt bekam jedes GPIO-Programm den vollen
+// ioctl-Vorrat. Hier mit Argumentfilter auf genau die sechs Kommandos.
+pub con CAP_SYSTEM_TTY:           int64 := 39;
+
+// ── Runde B: #1870, #1871, #1872 ─────────────────────────────────────────
+//
+// Alle Namen dieser Gruppe haben dieselbe Vorgeschichte wie die aus #1866 bis
+// #1873: das Recht war nicht zu weit gefasst, es gab schlicht KEINEN NAMEN
+// dafuer. Ein Programm mit @capabilities([...]) starb beim ersten Aufruf, und
+// keine Schreibweise haette es freigeben koennen.
+
+// #1870: Rechte ABGEBEN ist das gewuenschte Muster — ein Dienst, der nach dem
+// Start auf einen unprivilegierten Nutzer wechselt. Genau das liess sich nicht
+// deklarieren, und wer es brauchte, baute ohne @capabilities und verlor damit
+// den GANZEN Filter.
+//
+// Drei Namen statt einem, weil die Vertrauensfragen verschieden sind: die
+// eigene Kennung wechseln, sich in einen eigenen Namensraum stellen, oder die
+// Maschine umkonfigurieren.
+pub con CAP_PROCESS_PRIVILEGES:   int64 := 40;   // setuid/setgid/setsid/capset
+pub con CAP_SYSTEM_NAMESPACE:     int64 := 41;   // unshare/setns/chroot/mount
+pub con CAP_SYSTEM_ADMIN:         int64 := 42;   // reboot/sethostname
+
+// #1871: gemeinsamer Speicher ist der Weg, auf dem zwei Lyx-Programme ohne
+// Netz und ohne Datei miteinander reden. Getrennt von memory.mmap: eine
+// anonyme Abbildung im eigenen Adressraum ist eine andere Zusage als ein
+// Bereich, den ein fremder Prozess mitliest.
+pub con CAP_IPC_SHM:              int64 := 43;
+pub con CAP_IPC_QUEUE:            int64 := 44;   // System-V msg* und POSIX mq_*
+pub con CAP_IPC_SEM:              int64 := 45;
+
+// #1872: Dateisystem-Einzelstuecke, die fs.read/fs.write nicht abdecken.
+pub con CAP_FS_XATTR:             int64 := 46;
+pub con CAP_FS_WATCH:             int64 := 47;   // inotify
+pub con CAP_FS_CWD:               int64 := 48;   // chdir
+
+// #1872: Beobachtung. Diese beiden gehoeren AUSDRUECKLICH nicht an eine
+// bestehende Capability — sie erlauben, andere Prozesse zu lesen bzw.
+// Kernelcode zu laden. Die Namen sind so gewaehlt, dass sie im Manifest
+// auffallen.
+pub con CAP_DEBUG_TRACE:          int64 := 49;   // ptrace, perf_event_open
+pub con CAP_KERNEL_BPF:           int64 := 50;   // bpf, io_uring
+
+// #1912: systemweite Kurzmeldung ("Toast"). Der Kernel fuehrt dafuer
+// PLEDGE_NOTIFY und verlangt es fuer sys_toast_post (344).
+//
+// Nur das SENDEN. Das Lesen fremder Meldungen (sys_toast_fetch 345,
+// sys_toast_seq 346) waere eine andere Zusage — wer Meldungen absetzen darf,
+// darf deshalb nicht automatisch mitlesen, was andere melden. Solange das
+// nicht entschieden ist, deckt dieser Name ausdruecklich nur 344 ab.
+//
+// Auf LINUX gibt dieser Name nichts frei: es gibt dort keinen Syscall fuer
+// systemweite Meldungen. Das ist kein Versehen, sondern der Grund, warum er
+// in seccomp_gen keinen Eintrag hat — vermerkt, damit die naechste Erhebung
+// ihn nicht als vergessene Luecke zaehlt (vgl. #1875, wo hardware.block
+// wirklich eine war).
+pub con CAP_UI_NOTIFY:            int64 := 51;
+
+pub con CAP_COUNT:   int64 := 52;  // Gesamtanzahl
 
 // WP-L7: Lesbare Capability-Namen für Fehlermeldungen
 pub fn cap_nameOf(capId: int64): pchar {
@@ -76,11 +194,13 @@ pub fn cap_nameOf(capId: int64): pchar {
   if capId == CAP_SYSTEM_ENV           { return "system.env"c; }
   if capId == CAP_SYSTEM_RAND          { return "system.rand"c; }
   if capId == CAP_SYSTEM_UNSAFE_FORMAT { return "system.unsafe.format_string"c; }
+  if capId == CAP_SYSTEM_CONFIG        { return "system.config"c; }
   if capId == CAP_FS_READ              { return "fs.read"c; }
   if capId == CAP_FS_WRITE             { return "fs.write"c; }
   if capId == CAP_FS_CREATE            { return "fs.create"c; }
   if capId == CAP_FS_DELETE            { return "fs.delete"c; }
   if capId == CAP_FS_META              { return "fs.meta"c; }
+  if capId == CAP_FS_PERM              { return "fs.perm"c; }
   if capId == CAP_FS_EXEC              { return "fs.exec"c; }
   if capId == CAP_MEMORY_MMAP          { return "memory.mmap"c; }
   if capId == CAP_MEMORY_LOCK          { return "memory.lock"c; }
@@ -94,6 +214,26 @@ pub fn cap_nameOf(capId: int64): pchar {
   if capId == CAP_HARDWARE_I2C         { return "hardware.i2c"c; }
   if capId == CAP_HARDWARE_SPI         { return "hardware.spi"c; }
   if capId == CAP_HARDWARE_USB         { return "hardware.usb"c; }
+  if capId == CAP_HARDWARE_BLOCK       { return "hardware.block"c; }
+  if capId == CAP_KI_EMBED             { return "ki.embed"c; }        // #1826
+  if capId == CAP_KI_GRAPH             { return "ki.graph"c; }        // #1826
+  if capId == CAP_AUDIO_MIC            { return "audio.mic"c; }       // #1826
+  if capId == CAP_AUDIO_PLAY           { return "audio.play"c; }      // #1873
+  if capId == CAP_UI_NOTIFY            { return "ui.notify"c; }       // #1912
+  if capId == CAP_IO_WAIT              { return "io.wait"c; }         // #1868
+  if capId == CAP_IO_FD                { return "io.fd"c; }           // #1869
+  if capId == CAP_SYSTEM_TTY           { return "system.tty"c; }      // #1867
+  if capId == CAP_PROCESS_PRIVILEGES   { return "process.privileges"c; }  // #1870
+  if capId == CAP_SYSTEM_NAMESPACE     { return "system.namespace"c; }    // #1870
+  if capId == CAP_SYSTEM_ADMIN         { return "system.admin"c; }        // #1870
+  if capId == CAP_IPC_SHM              { return "ipc.shm"c; }             // #1871
+  if capId == CAP_IPC_QUEUE            { return "ipc.queue"c; }           // #1871
+  if capId == CAP_IPC_SEM              { return "ipc.sem"c; }             // #1871
+  if capId == CAP_FS_XATTR             { return "fs.xattr"c; }            // #1872
+  if capId == CAP_FS_WATCH             { return "fs.watch"c; }            // #1872
+  if capId == CAP_FS_CWD               { return "fs.cwd"c; }              // #1872
+  if capId == CAP_DEBUG_TRACE          { return "debug.trace"c; }         // #1872
+  if capId == CAP_KERNEL_BPF           { return "kernel.bpf"c; }          // #1872
   if capId == CAP_PROCESS_FORK         { return "process.fork"c; }
   if capId == CAP_PROCESS_EXEC         { return "process.exec"c; }
   if capId == CAP_PROCESS_SIGNAL       { return "process.signal"c; }
@@ -160,11 +300,13 @@ pub type CapabilityRegistry = class {
     if self._pathEqN("system.env"c,                   path, pathLen) { return CAP_SYSTEM_ENV; }
     if self._pathEqN("system.rand"c,                  path, pathLen) { return CAP_SYSTEM_RAND; }
     if self._pathEqN("system.unsafe.format_string"c,  path, pathLen) { return CAP_SYSTEM_UNSAFE_FORMAT; }
+    if self._pathEqN("system.config"c,                path, pathLen) { return CAP_SYSTEM_CONFIG; }
     if self._pathEqN("fs.read"c,                      path, pathLen) { return CAP_FS_READ; }
     if self._pathEqN("fs.write"c,                     path, pathLen) { return CAP_FS_WRITE; }
     if self._pathEqN("fs.create"c,                    path, pathLen) { return CAP_FS_CREATE; }
     if self._pathEqN("fs.delete"c,                    path, pathLen) { return CAP_FS_DELETE; }
     if self._pathEqN("fs.meta"c,                      path, pathLen) { return CAP_FS_META; }
+    if self._pathEqN("fs.perm"c,                      path, pathLen) { return CAP_FS_PERM; }
     if self._pathEqN("fs.exec"c,                      path, pathLen) { return CAP_FS_EXEC; }
     if self._pathEqN("memory.mmap"c,                  path, pathLen) { return CAP_MEMORY_MMAP; }
     if self._pathEqN("memory.lock"c,                  path, pathLen) { return CAP_MEMORY_LOCK; }
@@ -178,6 +320,26 @@ pub type CapabilityRegistry = class {
     if self._pathEqN("hardware.i2c"c,                 path, pathLen) { return CAP_HARDWARE_I2C; }
     if self._pathEqN("hardware.spi"c,                 path, pathLen) { return CAP_HARDWARE_SPI; }
     if self._pathEqN("hardware.usb"c,                 path, pathLen) { return CAP_HARDWARE_USB; }
+    if self._pathEqN("hardware.block"c,               path, pathLen) { return CAP_HARDWARE_BLOCK; }
+    if self._pathEqN("ki.embed"c,                     path, pathLen) { return CAP_KI_EMBED; }   // #1826
+    if self._pathEqN("ki.graph"c,                     path, pathLen) { return CAP_KI_GRAPH; }   // #1826
+    if self._pathEqN("audio.mic"c,                    path, pathLen) { return CAP_AUDIO_MIC; }  // #1826
+    if self._pathEqN("audio.play"c,                   path, pathLen) { return CAP_AUDIO_PLAY; } // #1873
+    if self._pathEqN("ui.notify"c,                    path, pathLen) { return CAP_UI_NOTIFY; }  // #1912
+    if self._pathEqN("io.wait"c,                      path, pathLen) { return CAP_IO_WAIT; }    // #1868
+    if self._pathEqN("io.fd"c,                        path, pathLen) { return CAP_IO_FD; }      // #1869
+    if self._pathEqN("system.tty"c,                   path, pathLen) { return CAP_SYSTEM_TTY; } // #1867
+    if self._pathEqN("process.privileges"c,           path, pathLen) { return CAP_PROCESS_PRIVILEGES; } // #1870
+    if self._pathEqN("system.namespace"c,             path, pathLen) { return CAP_SYSTEM_NAMESPACE; }   // #1870
+    if self._pathEqN("system.admin"c,                 path, pathLen) { return CAP_SYSTEM_ADMIN; }       // #1870
+    if self._pathEqN("ipc.shm"c,                      path, pathLen) { return CAP_IPC_SHM; }            // #1871
+    if self._pathEqN("ipc.queue"c,                    path, pathLen) { return CAP_IPC_QUEUE; }          // #1871
+    if self._pathEqN("ipc.sem"c,                      path, pathLen) { return CAP_IPC_SEM; }            // #1871
+    if self._pathEqN("fs.xattr"c,                     path, pathLen) { return CAP_FS_XATTR; }           // #1872
+    if self._pathEqN("fs.watch"c,                     path, pathLen) { return CAP_FS_WATCH; }           // #1872
+    if self._pathEqN("fs.cwd"c,                       path, pathLen) { return CAP_FS_CWD; }             // #1872
+    if self._pathEqN("debug.trace"c,                  path, pathLen) { return CAP_DEBUG_TRACE; }        // #1872
+    if self._pathEqN("kernel.bpf"c,                   path, pathLen) { return CAP_KERNEL_BPF; }         // #1872
     if self._pathEqN("process.fork"c,                 path, pathLen) { return CAP_PROCESS_FORK; }
     if self._pathEqN("process.exec"c,                 path, pathLen) { return CAP_PROCESS_EXEC; }
     if self._pathEqN("process.signal"c,               path, pathLen) { return CAP_PROCESS_SIGNAL; }
@@ -210,8 +372,13 @@ pub type CapabilityRegistry = class {
       out.count := 1;
       out.s0 := "mmap(MAP_STACK)"c;
     } else if capId == CAP_SYSTEM_TIME {
-      out.count := 1;
+      // #1866: nanosleep gehoert dazu. Warten ist keine eigene
+      // Vertrauensfrage — wer die Uhr lesen darf, darf auch warten, und ohne
+      // system.time laesst sich ueber nanosleep auch keine Zeit messen.
+      out.count := 3;
       out.s0 := "clock_gettime"c;
+      out.s1 := "nanosleep"c;
+      out.s2 := "clock_nanosleep"c;
     } else if capId == CAP_SYSTEM_ENV {
       out.count := 0;
     } else if capId == CAP_SYSTEM_RAND {
@@ -238,6 +405,10 @@ pub type CapabilityRegistry = class {
       out.count := 2;
       out.s0 := "statx"c;
       out.s1 := "getdents64"c;
+    } else if capId == CAP_FS_PERM {
+      out.count := 2;
+      out.s0 := "chmod"c;
+      out.s1 := "chown"c;
     } else if capId == CAP_FS_EXEC {
       out.count := 1;
       out.s0 := "execveat"c;
@@ -286,6 +457,84 @@ pub type CapabilityRegistry = class {
     } else if capId == CAP_HARDWARE_USB {
       out.count := 1;
       out.s0 := "ioctl"c;
+    } else if capId == CAP_IO_WAIT {
+      // Fuenf Plaetze, die Liste ist laenger: poll, ppoll, select, epoll_*,
+      // eventfd2, signalfd4, timerfd_*. Genannt sind die gebraeuchlichsten.
+      out.count := 5;
+      out.s0 := "poll"c;
+      out.s1 := "select"c;
+      out.s2 := "epoll_wait"c;
+      out.s3 := "eventfd2"c;
+      out.s4 := "timerfd_settime"c;
+    } else if capId == CAP_IO_FD {
+      out.count := 3;
+      out.s0 := "pipe2"c;
+      out.s1 := "dup2"c;
+      out.s2 := "dup3"c;
+    } else if capId == CAP_SYSTEM_TTY {
+      out.count := 2;
+      out.s0 := "ioctl(TCGETS/TCSETS*)"c;
+      out.s1 := "ioctl(TIOCGWINSZ/TIOCSWINSZ)"c;
+    } else if capId == CAP_PROCESS_PRIVILEGES {
+      out.count := 4;
+      out.s0 := "setuid"c;
+      out.s1 := "setgid"c;
+      out.s2 := "setsid"c;
+      out.s3 := "capset"c;
+    } else if capId == CAP_SYSTEM_NAMESPACE {
+      out.count := 4;
+      out.s0 := "unshare"c;
+      out.s1 := "setns"c;
+      out.s2 := "chroot"c;
+      out.s3 := "mount"c;
+    } else if capId == CAP_SYSTEM_ADMIN {
+      out.count := 2;
+      out.s0 := "reboot"c;
+      out.s1 := "sethostname"c;
+    } else if capId == CAP_IPC_SHM {
+      out.count := 4;
+      out.s0 := "shmget"c;
+      out.s1 := "shmat"c;
+      out.s2 := "shmdt"c;
+      out.s3 := "shmctl"c;
+    } else if capId == CAP_IPC_QUEUE {
+      out.count := 3;
+      out.s0 := "msgget/msgsnd/msgrcv/msgctl"c;
+      out.s1 := "mq_open/mq_unlink"c;
+      out.s2 := "mq_timedsend/mq_timedreceive"c;
+    } else if capId == CAP_IPC_SEM {
+      out.count := 3;
+      out.s0 := "semget"c;
+      out.s1 := "semop"c;
+      out.s2 := "semctl"c;
+    } else if capId == CAP_FS_XATTR {
+      out.count := 4;
+      out.s0 := "getxattr"c;
+      out.s1 := "setxattr"c;
+      out.s2 := "listxattr"c;
+      out.s3 := "removexattr"c;
+    } else if capId == CAP_FS_WATCH {
+      out.count := 3;
+      out.s0 := "inotify_init1"c;
+      out.s1 := "inotify_add_watch"c;
+      out.s2 := "inotify_rm_watch"c;
+    } else if capId == CAP_FS_CWD {
+      out.count := 1;
+      out.s0 := "chdir"c;
+    } else if capId == CAP_DEBUG_TRACE {
+      out.count := 2;
+      out.s0 := "ptrace"c;
+      out.s1 := "perf_event_open"c;
+    } else if capId == CAP_KERNEL_BPF {
+      out.count := 4;
+      out.s0 := "bpf"c;
+      out.s1 := "io_uring_setup"c;
+      out.s2 := "io_uring_enter"c;
+      out.s3 := "io_uring_register"c;
+    } else if capId == CAP_AUDIO_PLAY {
+      // Wie audio.mic: auf Linux ohne Syscall-Wirkung, eine Deklaration fuer
+      // das lyxos-Manifest (#1826).
+      out.count := 0;
     } else if capId == CAP_PROCESS_FORK {
       out.count := 2;
       out.s0 := "clone"c;
@@ -324,7 +573,7 @@ pub type CapabilityRegistry = class {
   // Validierung: GPIO-Pin muss 0–53 sein. Gibt Fehlermeldung oder 0 zurück.
   pub fn ValidateGpioPin(val: int64): pchar {
     if val < 0 || val > 53 {
-      return "Pin außerhalb des gültigen Bereichs 0-53"c;
+      return "Pin ausserhalb des gueltigen Bereichs 0-53"c;
     }
     return 0 as pchar;
   }
@@ -332,7 +581,7 @@ pub type CapabilityRegistry = class {
   // Validierung: Port muss 1–65535 sein.
   pub fn ValidatePort(val: int64): pchar {
     if val < 1 || val > 65535 {
-      return "Port außerhalb des gültigen Bereichs 1-65535"c;
+      return "Port ausserhalb des gueltigen Bereichs 1-65535"c;
     }
     return 0 as pchar;
   }
@@ -340,7 +589,7 @@ pub type CapabilityRegistry = class {
   // Validierung: Port 0–65535 (0 = Wildcard für UDP-Connect).
   pub fn ValidatePortOrWildcard(val: int64): pchar {
     if val < 0 || val > 65535 {
-      return "Port außerhalb des gültigen Bereichs 0-65535"c;
+      return "Port ausserhalb des gueltigen Bereichs 0-65535"c;
     }
     return 0 as pchar;
   }
@@ -348,7 +597,7 @@ pub type CapabilityRegistry = class {
   // Validierung: Bus/CS muss 0–255 sein.
   pub fn ValidateBus(val: int64): pchar {
     if val < 0 || val > 255 {
-      return "Bus-Nummer außerhalb des gültigen Bereichs 0-255"c;
+      return "Bus-Nummer ausserhalb des gueltigen Bereichs 0-255"c;
     }
     return 0 as pchar;
   }
@@ -356,9 +605,73 @@ pub type CapabilityRegistry = class {
   // Validierung: USB-Vendor/Product-ID muss 0–65535 sein.
   pub fn ValidateUsbId(val: int64): pchar {
     if val < 0 || val > 65535 {
-      return "USB-ID außerhalb des gültigen Bereichs 0-65535"c;
+      return "USB-ID ausserhalb des gueltigen Bereichs 0-65535"c;
     }
     return 0 as pchar;
+  }
+
+  // #1108: Kennt diese Capability den Argumentnamen ueberhaupt?
+  //
+  // Der Capability-NAME wurde seit jeher geprueft (`zzz.erfunden` → Fehler),
+  // der Argumentname nicht: `fs.read(zzz_arg: "x")` und `fs.read(pfad: "/tmp")`
+  // uebersetzten kommentarlos. ValidateArg prueft nur WERTEBEREICHE bekannter
+  // Schluessel und faellt fuer alles andere auf "in Ordnung" — der stille
+  // Default. Ein Tippfehler fiel damit doppelt nicht auf: nicht beim
+  // Uebersetzen, und zur Laufzeit ohnehin nicht, weil die Angabe folgenlos
+  // bleibt (siehe ebnf.md §20.1).
+  //
+  // Rueckgabe: 1 = Name gehoert zu dieser Capability, 0 = unbekannt.
+  pub fn IsKnownArg(capId: int64, argKey: pchar, argKeyLen: int64): int64 {
+    // Dateisystem und process.exec: `path`
+    if capId == CAP_FS_READ   || capId == CAP_FS_WRITE  || capId == CAP_FS_CREATE ||
+       capId == CAP_FS_DELETE || capId == CAP_FS_META   || capId == CAP_FS_EXEC   ||
+       capId == CAP_FS_PERM   || capId == CAP_PROCESS_EXEC {
+      if self._pathEqN("path"c, argKey, argKeyLen) { return 1; }
+      return 0;
+    }
+    // Netzwerk: `host` und `port`. Die zusammengesetzte Schreibweise
+    // "addr":port (NetworkTarget) steht als WERT hinter `host`.
+    if capId == CAP_NETWORK_TCP_BIND    || capId == CAP_NETWORK_TCP_CONNECT ||
+       capId == CAP_NETWORK_UDP_BIND    || capId == CAP_NETWORK_UDP_CONNECT ||
+       capId == CAP_NETWORK_UNIX        || capId == CAP_NETWORK_RAW {
+      if self._pathEqN("host"c, argKey, argKeyLen) { return 1; }
+      if self._pathEqN("port"c, argKey, argKeyLen) { return 1; }
+      return 0;
+    }
+    if capId == CAP_HARDWARE_GPIO {
+      if self._pathEqN("pin"c, argKey, argKeyLen) { return 1; }
+      return 0;
+    }
+    if capId == CAP_HARDWARE_I2C {
+      if self._pathEqN("bus"c, argKey, argKeyLen) { return 1; }
+      return 0;
+    }
+    if capId == CAP_HARDWARE_SPI {
+      if self._pathEqN("bus"c, argKey, argKeyLen) { return 1; }
+      if self._pathEqN("cs"c,  argKey, argKeyLen) { return 1; }
+      return 0;
+    }
+    if capId == CAP_HARDWARE_USB {
+      if self._pathEqN("vendor"c,  argKey, argKeyLen) { return 1; }
+      if self._pathEqN("product"c, argKey, argKeyLen) { return 1; }
+      return 0;
+    }
+    // Alle uebrigen Capabilities nehmen keine Argumente.
+    return 0;
+  }
+
+  // #1108: Nimmt diese Capability ueberhaupt Argumente? Trennt die Meldung
+  // "dieser Name gehoert nicht hierher" von "hier gibt es gar keine Argumente".
+  pub fn TakesArgs(capId: int64): int64 {
+    if capId == CAP_FS_READ   || capId == CAP_FS_WRITE  || capId == CAP_FS_CREATE ||
+       capId == CAP_FS_DELETE || capId == CAP_FS_META   || capId == CAP_FS_EXEC   ||
+       capId == CAP_FS_PERM   || capId == CAP_PROCESS_EXEC { return 1; }
+    if capId == CAP_NETWORK_TCP_BIND || capId == CAP_NETWORK_TCP_CONNECT ||
+       capId == CAP_NETWORK_UDP_BIND || capId == CAP_NETWORK_UDP_CONNECT ||
+       capId == CAP_NETWORK_UNIX     || capId == CAP_NETWORK_RAW { return 1; }
+    if capId == CAP_HARDWARE_GPIO || capId == CAP_HARDWARE_I2C ||
+       capId == CAP_HARDWARE_SPI  || capId == CAP_HARDWARE_USB { return 1; }
+    return 0;
   }
 
   // Validiert einen einzelnen Capability-Parameter.
@@ -375,14 +688,14 @@ pub type CapabilityRegistry = class {
     // network.tcp.*: port muss 1–65535 (Port 0 ungültig)
     if capId == CAP_NETWORK_TCP_BIND || capId == CAP_NETWORK_TCP_CONNECT {
       if self._pathEqN("port"c, argKey, argKeyLen) {
-        if argVal == 0 { return "Port 0 ist kein gültiger Port"c; }
+        if argVal == 0 { return "Port 0 ist kein gueltiger Port"c; }
         return self.ValidatePort(argVal);
       }
     }
     // network.udp.bind: port muss 1–65535
     if capId == CAP_NETWORK_UDP_BIND {
       if self._pathEqN("port"c, argKey, argKeyLen) {
-        if argVal == 0 { return "Port 0 ist kein gültiger Port"c; }
+        if argVal == 0 { return "Port 0 ist kein gueltiger Port"c; }
         return self.ValidatePort(argVal);
       }
     }

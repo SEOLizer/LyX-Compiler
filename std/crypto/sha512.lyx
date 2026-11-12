@@ -1,0 +1,317 @@
+// std/crypto/sha512.lyx — SHA-512 und SHA-384 nach FIPS PUB 180-4
+//
+// Teil von #2096 (natives TLS ohne OpenSSL): TLS 1.3 braucht SHA-384 fuer
+// TLS_AES_256_GCM_SHA384, dazu SHA-512 fuer Ed25519 und fuer RSA-PSS mit
+// SHA-512. Diese Unit ist die EINZIGE Stelle, an der die SHA-512-Kompression
+// gerechnet wird: std/hash.lyx (SHA512Init/Update/Final) ruft hierher
+// weiter, damit die Rechnung nicht zweimal im Baum steht.
+//
+// Oeffentliche API:
+//   Sha512CtxSize()                 — Groesse des Zustands in Byte
+//   Sha512Init(ctx) / Sha384Init(ctx)
+//   Sha512Update(ctx, data, len)    — fuer beide Varianten
+//   Sha512Final(ctx, out)           — 64 Byte
+//   Sha384Final(ctx, out)           — 48 Byte (abgeschnitten, FIPS 180-4 §6.5)
+//   Sha512(data, len, out) / Sha384(data, len, out) — Einzelaufruf
+//
+// Zustandslayout (208 Byte):
+//   +0    h0..h7            8 x int64
+//   +64   verarbeitete Byte (ohne Teilblock)
+//   +72   Fuellstand des Teilblocks
+//   +80   128-Byte-Blockpuffer
+
+unit std.crypto.sha512;
+
+import std.alloc;
+
+// ---------------------------------------------------------------------------
+// Interne Hilfen
+// ---------------------------------------------------------------------------
+
+con S512_H_OFF:    int64 := 0;
+con S512_LEN_OFF:  int64 := 64;
+con S512_FILL_OFF: int64 := 72;
+con S512_BUF_OFF:  int64 := 80;
+con S512_CTX_SIZE: int64 := 208;
+
+// #2094: sigma braucht den LOGISCHEN Rechtsshift. `>>` auf int64 ist
+// arithmetisch (SAR, #1125) — mit gesetztem Bit 63 fuellen Einsen die oberen
+// Bits und jeder Digest wird falsch, auch der der leeren Nachricht. Darum
+// `(x as uint64) >> n`. Rotationen ueber das Builtin rotr (#2190).
+fn s512Ch(x: int64, y: int64, z: int64): int64 {
+    return (x & y) ^ ((x ^ 0xFFFFFFFFFFFFFFFF) & z);
+}
+
+fn s512Maj(x: int64, y: int64, z: int64): int64 {
+    return (x & y) ^ (x & z) ^ (y & z);
+}
+
+fn s512S0(x: int64): int64 {
+    return rotr(x, 28) ^ rotr(x, 34) ^ rotr(x, 39);
+}
+
+fn s512S1(x: int64): int64 {
+    return rotr(x, 14) ^ rotr(x, 18) ^ rotr(x, 41);
+}
+
+fn s512G0(x: int64): int64 {
+    return rotr(x, 1) ^ rotr(x, 8) ^ ((x as uint64) >> 7);
+}
+
+fn s512G1(x: int64): int64 {
+    return rotr(x, 19) ^ rotr(x, 61) ^ ((x as uint64) >> 6);
+}
+
+// Die 80 Rundenkonstanten (FIPS 180-4 §4.2.3) und der Kratzpuffer fuer W
+// entstehen einmal je Programmlauf — wie in std/crypto/sha256.lyx nach #1318,
+// wo eine Allokation je Block der Hauptposten war. Praefix im Namen, weil
+// Globale sich ueber Unit-Grenzen hinweg den Namensraum teilen.
+var _s512K: int64 := 0;
+var _s512W: int64 := 0;
+
+fn s512InitK(K: int64): void {
+    poke64(K +   0, 0x428a2f98d728ae22); poke64(K +   8, 0x7137449123ef65cd);
+    poke64(K +  16, 0xb5c0fbcfec4d3b2f); poke64(K +  24, 0xe9b5dba58189dbbc);
+    poke64(K +  32, 0x3956c25bf348b538); poke64(K +  40, 0x59f111f1b605d019);
+    poke64(K +  48, 0x923f82a4af194f9b); poke64(K +  56, 0xab1c5ed5da6d8118);
+    poke64(K +  64, 0xd807aa98a3030242); poke64(K +  72, 0x12835b0145706fbe);
+    poke64(K +  80, 0x243185be4ee4b28c); poke64(K +  88, 0x550c7dc3d5ffb4e2);
+    poke64(K +  96, 0x72be5d74f27b896f); poke64(K + 104, 0x80deb1fe3b1696b1);
+    poke64(K + 112, 0x9bdc06a725c71235); poke64(K + 120, 0xc19bf174cf692694);
+    poke64(K + 128, 0xe49b69c19ef14ad2); poke64(K + 136, 0xefbe4786384f25e3);
+    poke64(K + 144, 0x0fc19dc68b8cd5b5); poke64(K + 152, 0x240ca1cc77ac9c65);
+    poke64(K + 160, 0x2de92c6f592b0275); poke64(K + 168, 0x4a7484aa6ea6e483);
+    poke64(K + 176, 0x5cb0a9dcbd41fbd4); poke64(K + 184, 0x76f988da831153b5);
+    poke64(K + 192, 0x983e5152ee66dfab); poke64(K + 200, 0xa831c66d2db43210);
+    poke64(K + 208, 0xb00327c898fb213f); poke64(K + 216, 0xbf597fc7beef0ee4);
+    poke64(K + 224, 0xc6e00bf33da88fc2); poke64(K + 232, 0xd5a79147930aa725);
+    poke64(K + 240, 0x06ca6351e003826f); poke64(K + 248, 0x142929670a0e6e70);
+    poke64(K + 256, 0x27b70a8546d22ffc); poke64(K + 264, 0x2e1b21385c26c926);
+    poke64(K + 272, 0x4d2c6dfc5ac42aed); poke64(K + 280, 0x53380d139d95b3df);
+    poke64(K + 288, 0x650a73548baf63de); poke64(K + 296, 0x766a0abb3c77b2a8);
+    poke64(K + 304, 0x81c2c92e47edaee6); poke64(K + 312, 0x92722c851482353b);
+    poke64(K + 320, 0xa2bfe8a14cf10364); poke64(K + 328, 0xa81a664bbc423001);
+    poke64(K + 336, 0xc24b8b70d0f89791); poke64(K + 344, 0xc76c51a30654be30);
+    poke64(K + 352, 0xd192e819d6ef5218); poke64(K + 360, 0xd69906245565a910);
+    poke64(K + 368, 0xf40e35855771202a); poke64(K + 376, 0x106aa07032bbd1b8);
+    poke64(K + 384, 0x19a4c116b8d2d0c8); poke64(K + 392, 0x1e376c085141ab53);
+    poke64(K + 400, 0x2748774cdf8eeb99); poke64(K + 408, 0x34b0bcb5e19b48a8);
+    poke64(K + 416, 0x391c0cb3c5c95a63); poke64(K + 424, 0x4ed8aa4ae3418acb);
+    poke64(K + 432, 0x5b9cca4f7763e373); poke64(K + 440, 0x682e6ff3d6b2b8a3);
+    poke64(K + 448, 0x748f82ee5defb2fc); poke64(K + 456, 0x78a5636f43172f60);
+    poke64(K + 464, 0x84c87814a1f0ab72); poke64(K + 472, 0x8cc702081a6439ec);
+    poke64(K + 480, 0x90befffa23631e28); poke64(K + 488, 0xa4506cebde82bde9);
+    poke64(K + 496, 0xbef9a3f7b2c67915); poke64(K + 504, 0xc67178f2e372532b);
+    poke64(K + 512, 0xca273eceea26619c); poke64(K + 520, 0xd186b8c721c0c207);
+    poke64(K + 528, 0xeada7dd6cde0eb1e); poke64(K + 536, 0xf57d4f7fee6ed178);
+    poke64(K + 544, 0x06f067aa72176fba); poke64(K + 552, 0x0a637dc5a2c898a6);
+    poke64(K + 560, 0x113f9804bef90dae); poke64(K + 568, 0x1b710b35131c471b);
+    poke64(K + 576, 0x28db77f523047d84); poke64(K + 584, 0x32caab7b40c72493);
+    poke64(K + 592, 0x3c9ebe0a15c9bebc); poke64(K + 600, 0x431d67c49c100d4c);
+    poke64(K + 608, 0x4cc5d4becb3e42b6); poke64(K + 616, 0x597f299cfc657e2a);
+    poke64(K + 624, 0x5fcb6fab3ad6faec); poke64(K + 632, 0x6c44198c4a475817);
+}
+
+fn s512Scratch(): int64 {
+    if (_s512K != 0) { return _s512K; }
+    var k: int64 := alloc(640);
+    if (k == 0) { return 0; }
+    s512InitK(k);
+    var w: int64 := alloc(640);
+    if (w == 0) { return 0; }
+    _s512K := k;
+    _s512W := w;
+    return k;
+}
+
+fn s512Compress(ctx: int64, block: int64): void {
+    if (s512Scratch() == 0) { panic("SHA-512: kein Speicher fuer die Rundentabelle"); }
+    var W: int64 := _s512W;
+    var K: int64 := _s512K;
+
+    var i: int64 := 0;
+    while (i < 16) {
+        var off: int64 := i * 8;
+        var val: int64 := (peek8(block + off)     << 56) | (peek8(block + off + 1) << 48)
+                        | (peek8(block + off + 2) << 40) | (peek8(block + off + 3) << 32)
+                        | (peek8(block + off + 4) << 24) | (peek8(block + off + 5) << 16)
+                        | (peek8(block + off + 6) <<  8) |  peek8(block + off + 7);
+        poke64(W + off, val);
+        i += 1;
+    }
+    while (i < 80) {
+        var w2:  int64 := peek64(W + (i -  2) * 8);
+        var w7:  int64 := peek64(W + (i -  7) * 8);
+        var w15: int64 := peek64(W + (i - 15) * 8);
+        var w16: int64 := peek64(W + (i - 16) * 8);
+        poke64(W + i * 8, s512G1(w2) + w7 + s512G0(w15) + w16);
+        i += 1;
+    }
+
+    var a: int64 := peek64(ctx + S512_H_OFF);
+    var b: int64 := peek64(ctx + S512_H_OFF +  8);
+    var c: int64 := peek64(ctx + S512_H_OFF + 16);
+    var d: int64 := peek64(ctx + S512_H_OFF + 24);
+    var e: int64 := peek64(ctx + S512_H_OFF + 32);
+    var f: int64 := peek64(ctx + S512_H_OFF + 40);
+    var g: int64 := peek64(ctx + S512_H_OFF + 48);
+    var h: int64 := peek64(ctx + S512_H_OFF + 56);
+
+    i := 0;
+    while (i < 80) {
+        var t1: int64 := h + s512S1(e) + s512Ch(e, f, g) + peek64(K + i * 8) + peek64(W + i * 8);
+        var t2: int64 := s512S0(a) + s512Maj(a, b, c);
+        h := g; g := f; f := e; e := d + t1;
+        d := c; c := b; b := a; a := t1 + t2;
+        i += 1;
+    }
+
+    poke64(ctx + S512_H_OFF,      peek64(ctx + S512_H_OFF)      + a);
+    poke64(ctx + S512_H_OFF +  8, peek64(ctx + S512_H_OFF +  8) + b);
+    poke64(ctx + S512_H_OFF + 16, peek64(ctx + S512_H_OFF + 16) + c);
+    poke64(ctx + S512_H_OFF + 24, peek64(ctx + S512_H_OFF + 24) + d);
+    poke64(ctx + S512_H_OFF + 32, peek64(ctx + S512_H_OFF + 32) + e);
+    poke64(ctx + S512_H_OFF + 40, peek64(ctx + S512_H_OFF + 40) + f);
+    poke64(ctx + S512_H_OFF + 48, peek64(ctx + S512_H_OFF + 48) + g);
+    poke64(ctx + S512_H_OFF + 56, peek64(ctx + S512_H_OFF + 56) + h);
+}
+
+// Gemeinsamer Abschluss: Padding rechnen, komprimieren, `words` Woerter
+// big-endian ausgeben (8 fuer SHA-512, 6 fuer SHA-384).
+fn s512Finish(ctx: int64, out: int64, outBytes: int64): void {
+    var fill: int64 := peek64(ctx + S512_FILL_OFF);
+    var totalLen: int64 := peek64(ctx + S512_LEN_OFF) + fill;
+    var bitLen: int64 := totalLen * 8;
+
+    poke8(ctx + S512_BUF_OFF + fill, 0x80);
+    fill += 1;
+    if (fill > 112) {
+        while (fill < 128) { poke8(ctx + S512_BUF_OFF + fill, 0); fill := fill + 1; }
+        s512Compress(ctx, ctx + S512_BUF_OFF);
+        fill := 0;
+    }
+    while (fill < 112) { poke8(ctx + S512_BUF_OFF + fill, 0); fill := fill + 1; }
+
+    // 128-Bit-Laengenfeld big-endian; die oberen 64 Bit sind 0, solange die
+    // Nachricht kuerzer als 2^61 Byte ist — darueber ist bitLen ohnehin nicht
+    // in int64 darstellbar.
+    var j: int64 := 0;
+    while (j < 8) { poke8(ctx + S512_BUF_OFF + 112 + j, 0); j := j + 1; }
+    j := 0;
+    while (j < 8) {
+        poke8(ctx + S512_BUF_OFF + 120 + (7 - j), ((bitLen as uint64) >> (j * 8)) & 0xFF);
+        j += 1;
+    }
+    s512Compress(ctx, ctx + S512_BUF_OFF);
+
+    var i: int64 := 0;
+    while (i < outBytes) {
+        var word: int64 := peek64(ctx + S512_H_OFF + (i / 8) * 8);
+        var shift: int64 := 56 - (i % 8) * 8;
+        poke8(out + i, ((word as uint64) >> shift) & 0xFF);
+        i += 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Oeffentliche API
+// ---------------------------------------------------------------------------
+
+// Groesse des Zustands in Byte. Als Funktion und nicht als `pub con`, weil ein
+// `pub con` ueber Unit-Grenzen still -1 liefern kann (#2102).
+pub fn Sha512CtxSize(): int64 {
+    return S512_CTX_SIZE;
+}
+
+pub fn Sha512Init(ctx: int64): void {
+    poke64(ctx + S512_H_OFF,      0x6a09e667f3bcc908);
+    poke64(ctx + S512_H_OFF +  8, 0xbb67ae8584caa73b);
+    poke64(ctx + S512_H_OFF + 16, 0x3c6ef372fe94f82b);
+    poke64(ctx + S512_H_OFF + 24, 0xa54ff53a5f1d36f1);
+    poke64(ctx + S512_H_OFF + 32, 0x510e527fade682d1);
+    poke64(ctx + S512_H_OFF + 40, 0x9b05688c2b3e6c1f);
+    poke64(ctx + S512_H_OFF + 48, 0x1f83d9abfb41bd6b);
+    poke64(ctx + S512_H_OFF + 56, 0x5be0cd19137e2179);
+    poke64(ctx + S512_LEN_OFF, 0);
+    poke64(ctx + S512_FILL_OFF, 0);
+}
+
+pub fn Sha384Init(ctx: int64): void {
+    poke64(ctx + S512_H_OFF,      0xcbbb9d5dc1059ed8);
+    poke64(ctx + S512_H_OFF +  8, 0x629a292a367cd507);
+    poke64(ctx + S512_H_OFF + 16, 0x9159015a3070dd17);
+    poke64(ctx + S512_H_OFF + 24, 0x152fecd8f70e5939);
+    poke64(ctx + S512_H_OFF + 32, 0x67332667ffc00b31);
+    poke64(ctx + S512_H_OFF + 40, 0x8eb44a8768581511);
+    poke64(ctx + S512_H_OFF + 48, 0xdb0c2e0d64f98fa7);
+    poke64(ctx + S512_H_OFF + 56, 0x47b5481dbefa4fa4);
+    poke64(ctx + S512_LEN_OFF, 0);
+    poke64(ctx + S512_FILL_OFF, 0);
+}
+
+// Gilt fuer SHA-512 und SHA-384 — beide haben 128-Byte-Bloecke.
+pub fn Sha512Update(ctx: int64, data: int64, len: int64): void {
+    if (len <= 0) { return; }
+    var fill: int64 := peek64(ctx + S512_FILL_OFF);
+    var pos: int64 := 0;
+
+    // Teilblock aus dem Vorlauf zuerst auffuellen.
+    if (fill > 0) {
+        while (fill < 128 && pos < len) {
+            poke8(ctx + S512_BUF_OFF + fill, peek8(data + pos));
+            fill += 1;
+            pos += 1;
+        }
+        if (fill == 128) {
+            s512Compress(ctx, ctx + S512_BUF_OFF);
+            poke64(ctx + S512_LEN_OFF, peek64(ctx + S512_LEN_OFF) + 128);
+            fill := 0;
+        }
+    }
+
+    // Volle Bloecke direkt aus der Eingabe, ohne Umkopieren.
+    while (pos + 128 <= len) {
+        s512Compress(ctx, data + pos);
+        poke64(ctx + S512_LEN_OFF, peek64(ctx + S512_LEN_OFF) + 128);
+        pos += 128;
+    }
+
+    while (pos < len) {
+        poke8(ctx + S512_BUF_OFF + fill, peek8(data + pos));
+        fill += 1;
+        pos += 1;
+    }
+    poke64(ctx + S512_FILL_OFF, fill);
+}
+
+// 64 Byte Digest. `out` muss 64 beschreibbare Byte haben.
+pub fn Sha512Final(ctx: int64, out: int64): void {
+    s512Finish(ctx, out, 64);
+}
+
+// 48 Byte Digest (FIPS 180-4 §6.5: die linken 384 Bit). Anders als
+// SHA512Final aus std/hash.lyx schreibt dies NUR 48 Byte — ein 48-Byte-Puffer
+// genuegt also.
+pub fn Sha384Final(ctx: int64, out: int64): void {
+    s512Finish(ctx, out, 48);
+}
+
+// Einzelaufruf: 64 Byte nach out.
+pub fn Sha512(data: int64, len: int64, out: int64): void {
+    var ctx: int64 := alloc(S512_CTX_SIZE);
+    if (ctx == 0) { panic("SHA-512: kein Speicher fuer den Zustand"); }
+    Sha512Init(ctx);
+    Sha512Update(ctx, data, len);
+    Sha512Final(ctx, out);
+    free(ctx, S512_CTX_SIZE);
+}
+
+// Einzelaufruf: 48 Byte nach out.
+pub fn Sha384(data: int64, len: int64, out: int64): void {
+    var ctx: int64 := alloc(S512_CTX_SIZE);
+    if (ctx == 0) { panic("SHA-384: kein Speicher fuer den Zustand"); }
+    Sha384Init(ctx);
+    Sha512Update(ctx, data, len);
+    Sha384Final(ctx, out);
+    free(ctx, S512_CTX_SIZE);
+}

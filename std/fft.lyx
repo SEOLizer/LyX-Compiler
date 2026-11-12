@@ -1,0 +1,681 @@
+// std/fft.lyx
+// Diskrete Fourier-Transformation: FFT, Faltung, Fensterfunktionen
+
+@description("Discrete Fourier transform: radix-2 FFT, Bluestein for arbitrary sizes, convolution, windows, spectra")
+@author("Andreas Roene")
+@copyright("2026 Andreas Roene")
+unit std.fft;
+
+import std.math;
+import std.math.constants;
+import std.alloc;
+
+// ── Darstellung komplexer Reihen ─────────────────────────────────────────────
+//
+// Eine komplexe Reihe besteht aus ZWEI f64-Feldern: Realteil und Imaginaerteil,
+// je n Werte, uebergeben als Adressen. Kein Struct mit zwei Feldern und kein
+// verzahntes Feld (re,im,re,im,...).
+//
+// Der Grund ist nicht Geschmack: ein Array VON Structs liefert in lyxc 1.0.19D
+// still 0 (#1109), Arrays als Parameter liefern Speichermuell (#1115). Getrennte
+// Felder haben ausserdem den praktischen Vorteil, dass eine reelle Eingabe ohne
+// Umkopieren als Realteil durchgereicht werden kann.
+//
+// Alle Transformationen arbeiten AN ORT UND STELLE. Wer die Eingabe behalten
+// will, kopiert sie vorher.
+//
+// ── Vorzeichen und Skalierung ────────────────────────────────────────────────
+//
+// Vorwaerts:  X[k] = sum_j x[j] * exp(-2*pi*i*j*k/n)   (Minus im Exponenten)
+// Rueckwaerts: x[j] = (1/n) * sum_k X[k] * exp(+2*pi*i*j*k/n)
+//
+// Der Faktor 1/n sitzt vollstaendig in der Ruecktransformation — die in
+// Signalverarbeitung uebliche Wahl. FftInverse(FftForward(x)) gibt x zurueck.
+//
+// ── f64-Fallstricke des Compilers ────────────────────────────────────────────
+//
+// Wie in std.prob: eine `con f64` als Operand und ein negatives Literal als
+// Operand werden falsch typisiert (#1499, #1496), und ein unaeres Minus auf
+// einer Variablen mitten im Ausdruck rechnet ganzzahlig auf dem Bitmuster
+// (#1512). Deshalb stehen Konstanten als Funktionen, und negiert wird ueber
+// _neg(). Wer diese Einheit erweitert, muss es genauso halten — die Fehler sind
+// still, ein FFT-Ergebnis sieht auch dann noch plausibel aus.
+//
+// ── Genauigkeit ──────────────────────────────────────────────────────────────
+//
+// Die Drehfaktoren kommen aus SinF64/CosF64 von std.math und tragen deren
+// Fehler. Gemessen ueber Hin- und Ruecktransformation: rund 1e-9 absolut bei
+// n = 1024. Fuer eine FFT ist die relevante Groesse ohnehin der Fehler relativ
+// zur Signalenergie, und der bleibt in derselben Groessenordnung.
+
+fn _pi(): f64      { return 3.141592653589793; }
+fn _twoPi(): f64   { return 6.283185307179586; }
+fn _zero(): f64    { return 0.0; }
+fn _one(): f64     { return 1.0; }
+fn _eps(): f64     { return 0.000000000000001; }
+
+// Negation ueber eine Funktion: `-x` mitten in einem Ausdruck liefert in
+// 1.0.19D das Bitmuster (#1512).
+fn _neg(x: f64): f64 { return 0.0 - x; }
+
+fn _get(p: int64, i: int64): f64 {
+  var v: f64 := peekf64(p + i * 8);
+  return v;
+}
+
+fn _put(p: int64, i: int64, v: f64): void {
+  pokef64(p + i * 8, v);
+}
+
+// ── Groessen ─────────────────────────────────────────────────────────────────
+
+pub fn FftIsPowerOfTwo(n: int64): bool {
+  if (n < 1) { return false; }
+  return (n & (n - 1)) == 0;
+}
+
+pub fn FftNextPowerOfTwo(n: int64): int64 {
+  if (n < 1) { return 1; }
+  var p: int64 := 1;
+  while (p < n) { p := p * 2; }
+  return p;
+}
+
+// log2 fuer Zweierpotenzen
+fn _log2(n: int64): int64 {
+  var k: int64 := 0;
+  var v: int64 := n;
+  while (v > 1) {
+    v := v / 2;
+    k := k + 1;
+  }
+  return k;
+}
+
+// ── Direkte DFT ──────────────────────────────────────────────────────────────
+
+// O(n^2), fuer beliebige n. Nicht als Arbeitspferd gedacht, sondern als
+// unabhaengige Gegenrechnung: die Tests vergleichen die FFT damit, und bei
+// kleinen n (unter etwa 32) ist sie schneller als der Aufbau der FFT.
+//
+// sign = -1 fuer vorwaerts, +1 fuer rueckwaerts; ohne Skalierung.
+pub fn FftDft(re: int64, im: int64, n: int64, sign: int64): bool {
+  if (n < 1) { return false; }
+
+  var ore: int64 := alloc(n * 8);
+  var oim: int64 := alloc(n * 8);
+  if (ore == 0) { return false; }
+  if (oim == 0) { free(ore, n * 8); return false; }
+
+  var s: f64 := _one();
+  if (sign < 0) { s := _neg(_one()); }
+
+  var k: int64 := 0;
+  while (k < n) {
+    var sumR: f64 := _zero();
+    var sumI: f64 := _zero();
+    var j: int64 := 0;
+    while (j < n) {
+      // Argument klein halten: (j*k) mod n statt j*k. Bei n = 4096 waere das
+      // Produkt sonst bis 1.7e7, und die Winkelreduktion in SinF64 verliert
+      // dort fuehrende Stellen.
+      var jk: int64 := (j * k) % n;
+      var ang: f64 := s * _twoPi() * (jk as f64) / (n as f64);
+      var c: f64 := CosF64(ang);
+      var sn: f64 := SinF64(ang);
+      var xr: f64 := _get(re, j);
+      var xi: f64 := _get(im, j);
+      sumR := sumR + xr * c - xi * sn;
+      sumI := sumI + xr * sn + xi * c;
+      j := j + 1;
+    }
+    _put(ore, k, sumR);
+    _put(oim, k, sumI);
+    k := k + 1;
+  }
+
+  var i: int64 := 0;
+  while (i < n) {
+    _put(re, i, _get(ore, i));
+    _put(im, i, _get(oim, i));
+    i := i + 1;
+  }
+  free(ore, n * 8);
+  free(oim, n * 8);
+  return true;
+}
+
+// ── Radix-2-FFT ──────────────────────────────────────────────────────────────
+
+// Umsortieren in Bit-Reversal-Reihenfolge.
+//
+// Der Index wird je Element direkt umgedreht, statt mit einem mitlaufenden
+// Zaehler fortgeschrieben. Die fortgeschriebene Fassung ist schneller und in
+// jeder FFT-Vorlage zu finden — sie ist aber auch die Stelle, an der sich beim
+// Abschreiben ein Fehler einnistet, den man erst am Spektrum bemerkt.
+fn _revIndex(i: int64, bits: int64): int64 {
+  var r: int64 := 0;
+  var v: int64 := i;
+  var b: int64 := 0;
+  while (b < bits) {
+    r := r * 2 + (v & 1);
+    v := v / 2;
+    b := b + 1;
+  }
+  return r;
+}
+
+fn _bitReverse(re: int64, im: int64, n: int64): void {
+  var bits: int64 := _log2(n);
+  var i: int64 := 0;
+  while (i < n) {
+    var j: int64 := _revIndex(i, bits);
+    if (i < j) {
+      var tr: f64 := _get(re, i);
+      var ti: f64 := _get(im, i);
+      _put(re, i, _get(re, j));
+      _put(im, i, _get(im, j));
+      _put(re, j, tr);
+      _put(im, j, ti);
+    }
+    i := i + 1;
+  }
+}
+
+// Iterative Cooley-Tukey, an Ort und Stelle. n MUSS eine Zweierpotenz sein.
+// sign = -1 vorwaerts, +1 rueckwaerts; ohne Skalierung.
+//
+// Die Drehfaktoren werden je Schmetterling direkt aus sin/cos berechnet, nicht
+// ueber die uebliche Rekurrenz w := w * wStep. Die Rekurrenz spart Rechenzeit,
+// sammelt aber ueber eine Stufe hinweg Fehler auf — bei n = 65536 sind das in
+// der letzten Stufe schon sichtbare Betraege. Direkt gerechnet bleibt der
+// Fehler bei dem, was sin/cos selbst mitbringen.
+pub fn FftRadix2(re: int64, im: int64, n: int64, sign: int64): bool {
+  if (!FftIsPowerOfTwo(n)) { return false; }
+  if (n == 1) { return true; }
+
+  _bitReverse(re, im, n);
+
+  var s: f64 := _one();
+  if (sign < 0) { s := _neg(_one()); }
+
+  var len: int64 := 2;
+  while (len <= n) {
+    var half: int64 := len / 2;
+    var i: int64 := 0;
+    while (i < n) {
+      var k: int64 := 0;
+      while (k < half) {
+        var ang: f64 := s * _twoPi() * (k as f64) / (len as f64);
+        var wr: f64 := CosF64(ang);
+        var wi: f64 := SinF64(ang);
+
+        var ur: f64 := _get(re, i + k);
+        var ui: f64 := _get(im, i + k);
+        var vr0: f64 := _get(re, i + k + half);
+        var vi0: f64 := _get(im, i + k + half);
+
+        var vr: f64 := vr0 * wr - vi0 * wi;
+        var vi: f64 := vr0 * wi + vi0 * wr;
+
+        _put(re, i + k, ur + vr);
+        _put(im, i + k, ui + vi);
+        _put(re, i + k + half, ur - vr);
+        _put(im, i + k + half, ui - vi);
+        k := k + 1;
+      }
+      i := i + len;
+    }
+    len := len * 2;
+  }
+  return true;
+}
+
+// ── Bluestein: beliebige Laengen ─────────────────────────────────────────────
+
+// Die Radix-2-FFT braucht eine Zweierpotenz. Der uebliche Ausweg — auf die
+// naechste Zweierpotenz mit Nullen auffuellen — beantwortet aber eine ANDERE
+// Frage: er liefert das Spektrum eines laengeren Signals mit anderen
+// Frequenzstuetzstellen, nicht die DFT der n Werte.
+//
+// Bluestein schreibt die DFT als Faltung um (Chirp-z):
+//   X[k] = exp(-i*pi*k^2/n) * sum_j ( x[j]*exp(-i*pi*j^2/n) ) * exp(+i*pi*(k-j)^2/n)
+// Die Summe ist eine Faltung, und die laeuft ueber eine Radix-2-FFT der Laenge
+// m >= 2n-1. Ergebnis ist die exakte DFT der n Werte, Aufwand O(n log n) statt
+// O(n^2) — nur mit groesserem Vorfaktor als die reine Zweierpotenz-FFT.
+pub fn FftBluestein(re: int64, im: int64, n: int64, sign: int64): bool {
+  if (n < 1) { return false; }
+  if (n == 1) { return true; }
+
+  var m: int64 := FftNextPowerOfTwo(2 * n - 1);
+
+  var ar: int64 := alloc(m * 8);   var ai: int64 := alloc(m * 8);
+  var br: int64 := alloc(m * 8);   var bi: int64 := alloc(m * 8);
+  var cr: int64 := alloc(n * 8);   var ci: int64 := alloc(n * 8);
+  if (ar == 0) { return false; }
+  if (ai == 0) { return false; }
+  if (br == 0) { return false; }
+  if (bi == 0) { return false; }
+  if (cr == 0) { return false; }
+  if (ci == 0) { return false; }
+
+  var s: f64 := _one();
+  if (sign < 0) { s := _neg(_one()); }
+
+  // Chirp exp(sign*i*pi*k^2/n). Der Winkel wird ueber (k*k) mod (2n) gebildet:
+  // k^2 waechst quadratisch, und ein Argument von 1e12 hat in sin/cos keine
+  // brauchbaren Stellen mehr. Modulo 2n ist der Winkel exakt derselbe.
+  var i: int64 := 0;
+  while (i < n) {
+    var kk: int64 := (i * i) % (2 * n);
+    var ang: f64 := s * _pi() * (kk as f64) / (n as f64);
+    var c: f64 := CosF64(ang);
+    var sn: f64 := SinF64(ang);
+    _put(cr, i, c);
+    _put(ci, i, sn);
+
+    var xr: f64 := _get(re, i);
+    var xi: f64 := _get(im, i);
+    _put(ar, i, xr * c - xi * sn);
+    _put(ai, i, xr * sn + xi * c);
+    i := i + 1;
+  }
+  while (i < m) {
+    _put(ar, i, _zero());
+    _put(ai, i, _zero());
+    i := i + 1;
+  }
+
+  // b ist der konjugierte Chirp, zyklisch gespiegelt
+  i := 0;
+  while (i < m) {
+    _put(br, i, _zero());
+    _put(bi, i, _zero());
+    i := i + 1;
+  }
+  i := 0;
+  while (i < n) {
+    var c: f64 := _get(cr, i);
+    var sn: f64 := _get(ci, i);
+    _put(br, i, c);
+    _put(bi, i, _neg(sn));
+    if (i > 0) {
+      _put(br, m - i, c);
+      _put(bi, m - i, _neg(sn));
+    }
+    i := i + 1;
+  }
+
+  // Faltung ueber die Zweierpotenz-FFT
+  FftRadix2(ar, ai, m, -1);
+  FftRadix2(br, bi, m, -1);
+  i := 0;
+  while (i < m) {
+    var xr: f64 := _get(ar, i);
+    var xi: f64 := _get(ai, i);
+    var yr: f64 := _get(br, i);
+    var yi: f64 := _get(bi, i);
+    _put(ar, i, xr * yr - xi * yi);
+    _put(ai, i, xr * yi + xi * yr);
+    i := i + 1;
+  }
+  FftRadix2(ar, ai, m, 1);
+
+  // Ruecktransformation skalieren und mit dem Chirp nachmultiplizieren
+  var inv: f64 := _one() / (m as f64);
+  i := 0;
+  while (i < n) {
+    var yr: f64 := _get(ar, i) * inv;
+    var yi: f64 := _get(ai, i) * inv;
+    var c: f64 := _get(cr, i);
+    var sn: f64 := _get(ci, i);
+    _put(re, i, yr * c - yi * sn);
+    _put(im, i, yr * sn + yi * c);
+    i := i + 1;
+  }
+
+  free(ar, m * 8);  free(ai, m * 8);
+  free(br, m * 8);  free(bi, m * 8);
+  free(cr, n * 8);  free(ci, n * 8);
+  return true;
+}
+
+// ── Allgemeine Schnittstelle ─────────────────────────────────────────────────
+
+// Vorwaertstransformation fuer BELIEBIGE n, an Ort und Stelle.
+// Zweierpotenzen laufen ueber Radix-2, alles andere ueber Bluestein.
+pub fn FftForward(re: int64, im: int64, n: int64): bool {
+  if (n < 1) { return false; }
+  if (FftIsPowerOfTwo(n)) { return FftRadix2(re, im, n, -1); }
+  return FftBluestein(re, im, n, -1);
+}
+
+// Ruecktransformation einschliesslich des Faktors 1/n.
+pub fn FftInverse(re: int64, im: int64, n: int64): bool {
+  if (n < 1) { return false; }
+
+  var ok: bool := false;
+  if (FftIsPowerOfTwo(n)) { ok := FftRadix2(re, im, n, 1); }
+  else { ok := FftBluestein(re, im, n, 1); }
+  if (!ok) { return false; }
+
+  var inv: f64 := _one() / (n as f64);
+  var i: int64 := 0;
+  while (i < n) {
+    _put(re, i, _get(re, i) * inv);
+    _put(im, i, _get(im, i) * inv);
+    i := i + 1;
+  }
+  return true;
+}
+
+// Reelles Eingangssignal: kopiert data in outRe, nullt outIm und transformiert.
+// Die Felder outRe/outIm muessen n Werte fassen.
+//
+// Fuer ein reelles Signal gilt X[n-k] = conj(X[k]) — die zweite Haelfte des
+// Spektrums traegt keine neue Information. Ausgegeben wird sie trotzdem, damit
+// FftInverse ohne Sonderbehandlung zurueckfuehrt.
+pub fn FftForwardReal(data: int64, n: int64, outRe: int64, outIm: int64): bool {
+  if (n < 1) { return false; }
+  if (outRe == 0) { return false; }
+  if (outIm == 0) { return false; }
+
+  var i: int64 := 0;
+  while (i < n) {
+    _put(outRe, i, _get(data, i));
+    _put(outIm, i, _zero());
+    i := i + 1;
+  }
+  return FftForward(outRe, outIm, n);
+}
+
+// ── Spektren ─────────────────────────────────────────────────────────────────
+
+// Betrag je Frequenzstuetzstelle
+pub fn FftMagnitude(re: int64, im: int64, n: int64, out: int64): bool {
+  if (out == 0) { return false; }
+  var i: int64 := 0;
+  while (i < n) {
+    var a: f64 := _get(re, i);
+    var b: f64 := _get(im, i);
+    _put(out, i, SqrtF64(a * a + b * b));
+    i := i + 1;
+  }
+  return true;
+}
+
+// Leistung (Betragsquadrat) — spart die Wurzel, wenn ohnehin nur verglichen
+// oder summiert wird.
+pub fn FftPower(re: int64, im: int64, n: int64, out: int64): bool {
+  if (out == 0) { return false; }
+  var i: int64 := 0;
+  while (i < n) {
+    var a: f64 := _get(re, i);
+    var b: f64 := _get(im, i);
+    _put(out, i, a * a + b * b);
+    i := i + 1;
+  }
+  return true;
+}
+
+// Phase in -pi..pi
+pub fn FftPhase(re: int64, im: int64, n: int64, out: int64): bool {
+  if (out == 0) { return false; }
+  var i: int64 := 0;
+  while (i < n) {
+    _put(out, i, Atan2F64(_get(im, i), _get(re, i)));
+    i := i + 1;
+  }
+  return true;
+}
+
+// Frequenz einer Stuetzstelle in Hz. Ab n/2 laufen die Stuetzstellen als
+// NEGATIVE Frequenzen zurueck — das ist keine Willkuer, sondern die Lage
+// oberhalb der Nyquist-Grenze.
+pub fn FftBinFrequency(bin: int64, n: int64, sampleRate: f64): f64 {
+  if (n < 1) { return _zero(); }
+  var k: int64 := bin;
+  if (k > n / 2) { k := k - n; }
+  return (k as f64) * sampleRate / (n as f64);
+}
+
+// Stuetzstelle mit dem groessten Betrag im Bereich 0..n/2 (die reelle Haelfte).
+// Bin 0 ist der Gleichanteil und wird uebersprungen — sonst gewinnt bei jedem
+// Signal mit Offset die 0.
+pub fn FftPeakBin(re: int64, im: int64, n: int64): int64 {
+  if (n < 2) { return 0; }
+  var best: int64 := 1;
+  var bestV: f64 := _neg(_one());
+  var i: int64 := 1;
+  var half: int64 := n / 2;
+  while (i <= half) {
+    var a: f64 := _get(re, i);
+    var b: f64 := _get(im, i);
+    var v: f64 := a * a + b * b;
+    if (v > bestV) {
+      bestV := v;
+      best := i;
+    }
+    i := i + 1;
+  }
+  return best;
+}
+
+// ── Faltung ──────────────────────────────────────────────────────────────────
+
+// Zyklische Faltung zweier komplexer Reihen gleicher Laenge, Ergebnis in a.
+pub fn FftConvolveCircular(are: int64, aim: int64, bre: int64, bim: int64, n: int64): bool {
+  if (n < 1) { return false; }
+
+  var tr: int64 := alloc(n * 8);
+  var ti: int64 := alloc(n * 8);
+  if (tr == 0) { return false; }
+  if (ti == 0) { free(tr, n * 8); return false; }
+
+  var i: int64 := 0;
+  while (i < n) {
+    _put(tr, i, _get(bre, i));
+    _put(ti, i, _get(bim, i));
+    i := i + 1;
+  }
+
+  FftForward(are, aim, n);
+  FftForward(tr, ti, n);
+
+  i := 0;
+  while (i < n) {
+    var xr: f64 := _get(are, i);
+    var xi: f64 := _get(aim, i);
+    var yr: f64 := _get(tr, i);
+    var yi: f64 := _get(ti, i);
+    _put(are, i, xr * yr - xi * yi);
+    _put(aim, i, xr * yi + xi * yr);
+    i := i + 1;
+  }
+
+  FftInverse(are, aim, n);
+  free(tr, n * 8);
+  free(ti, n * 8);
+  return true;
+}
+
+// Lineare Faltung zweier REELLER Reihen. out muss na + nb - 1 Werte fassen.
+//
+// Aufgefuellt wird auf eine Zweierpotenz >= na+nb-1, nicht auf na+nb: sonst
+// klappt das Ende der Faltung zyklisch auf den Anfang zurueck (time-domain
+// aliasing) und die ersten Werte sind still falsch.
+pub fn FftConvolveReal(a: int64, na: int64, b: int64, nb: int64, out: int64): bool {
+  if (na < 1) { return false; }
+  if (nb < 1) { return false; }
+  if (out == 0) { return false; }
+
+  var need: int64 := na + nb - 1;
+  var m: int64 := FftNextPowerOfTwo(need);
+
+  var ar: int64 := alloc(m * 8);  var ai: int64 := alloc(m * 8);
+  var br: int64 := alloc(m * 8);  var bi: int64 := alloc(m * 8);
+  if (ar == 0) { return false; }
+  if (ai == 0) { return false; }
+  if (br == 0) { return false; }
+  if (bi == 0) { return false; }
+
+  var i: int64 := 0;
+  while (i < m) {
+    var av: f64 := _zero();
+    var bv: f64 := _zero();
+    if (i < na) { av := _get(a, i); }
+    if (i < nb) { bv := _get(b, i); }
+    _put(ar, i, av);  _put(ai, i, _zero());
+    _put(br, i, bv);  _put(bi, i, _zero());
+    i := i + 1;
+  }
+
+  FftRadix2(ar, ai, m, -1);
+  FftRadix2(br, bi, m, -1);
+  i := 0;
+  while (i < m) {
+    var xr: f64 := _get(ar, i);
+    var xi: f64 := _get(ai, i);
+    var yr: f64 := _get(br, i);
+    var yi: f64 := _get(bi, i);
+    _put(ar, i, xr * yr - xi * yi);
+    _put(ai, i, xr * yi + xi * yr);
+    i := i + 1;
+  }
+  FftRadix2(ar, ai, m, 1);
+
+  var inv: f64 := _one() / (m as f64);
+  i := 0;
+  while (i < need) {
+    _put(out, i, _get(ar, i) * inv);
+    i := i + 1;
+  }
+
+  free(ar, m * 8);  free(ai, m * 8);
+  free(br, m * 8);  free(bi, m * 8);
+  return true;
+}
+
+// Kreuzkorrelation zweier reeller Reihen gleicher Laenge, zyklisch.
+// out fasst n Werte; out[k] ist die Uebereinstimmung bei Verschiebung um k.
+pub fn FftCorrelateReal(a: int64, b: int64, n: int64, out: int64): bool {
+  if (n < 1) { return false; }
+  if (out == 0) { return false; }
+
+  var ar: int64 := alloc(n * 8);  var ai: int64 := alloc(n * 8);
+  var br: int64 := alloc(n * 8);  var bi: int64 := alloc(n * 8);
+  if (ar == 0) { return false; }
+  if (ai == 0) { return false; }
+  if (br == 0) { return false; }
+  if (bi == 0) { return false; }
+
+  var i: int64 := 0;
+  while (i < n) {
+    _put(ar, i, _get(a, i));  _put(ai, i, _zero());
+    _put(br, i, _get(b, i));  _put(bi, i, _zero());
+    i := i + 1;
+  }
+
+  FftForward(ar, ai, n);
+  FftForward(br, bi, n);
+
+  // Korrelation ist Faltung mit dem KONJUGIERTEN Spektrum — der einzige
+  // Unterschied zur Faltung, und der, der die Richtung der Verschiebung
+  // festlegt.
+  i := 0;
+  while (i < n) {
+    var xr: f64 := _get(ar, i);
+    var xi: f64 := _get(ai, i);
+    var yr: f64 := _get(br, i);
+    var yi: f64 := _neg(_get(bi, i));
+    _put(ar, i, xr * yr - xi * yi);
+    _put(ai, i, xr * yi + xi * yr);
+    i := i + 1;
+  }
+  FftInverse(ar, ai, n);
+
+  i := 0;
+  while (i < n) {
+    _put(out, i, _get(ar, i));
+    i := i + 1;
+  }
+
+  free(ar, n * 8);  free(ai, n * 8);
+  free(br, n * 8);  free(bi, n * 8);
+  return true;
+}
+
+// ── Fensterfunktionen ────────────────────────────────────────────────────────
+//
+// Ein Signalausschnitt endlicher Laenge hat Spruenge an den Raendern, und die
+// verschmieren im Spektrum ueber alle Frequenzen (Leckeffekt). Ein Fenster
+// blendet die Raender weich aus. Erzeugt wird jeweils die symmetrische Form
+// (Teiler n-1), wie sie zur Analyse einzelner Ausschnitte passt.
+
+pub fn FftWindowHann(out: int64, n: int64): bool {
+  if (n < 1) { return false; }
+  if (out == 0) { return false; }
+  if (n == 1) { _put(out, 0, _one()); return true; }
+
+  var i: int64 := 0;
+  while (i < n) {
+    var v: f64 := 0.5 * (_one() - CosF64(_twoPi() * (i as f64) / ((n - 1) as f64)));
+    _put(out, i, v);
+    i := i + 1;
+  }
+  return true;
+}
+
+pub fn FftWindowHamming(out: int64, n: int64): bool {
+  if (n < 1) { return false; }
+  if (out == 0) { return false; }
+  if (n == 1) { _put(out, 0, _one()); return true; }
+
+  var i: int64 := 0;
+  while (i < n) {
+    var v: f64 := 0.54 - 0.46 * CosF64(_twoPi() * (i as f64) / ((n - 1) as f64));
+    _put(out, i, v);
+    i := i + 1;
+  }
+  return true;
+}
+
+pub fn FftWindowBlackman(out: int64, n: int64): bool {
+  if (n < 1) { return false; }
+  if (out == 0) { return false; }
+  if (n == 1) { _put(out, 0, _one()); return true; }
+
+  var i: int64 := 0;
+  while (i < n) {
+    var t: f64 := _twoPi() * (i as f64) / ((n - 1) as f64);
+    var v: f64 := 0.42 - 0.5 * CosF64(t) + 0.08 * CosF64(2.0 * t);
+    _put(out, i, v);
+    i := i + 1;
+  }
+  return true;
+}
+
+// Fenster punktweise anwenden (data := data * window)
+pub fn FftApplyWindow(data: int64, window: int64, n: int64): bool {
+  if (n < 1) { return false; }
+  var i: int64 := 0;
+  while (i < n) {
+    _put(data, i, _get(data, i) * _get(window, i));
+    i := i + 1;
+  }
+  return true;
+}
+
+// Kohaerenter Verstaerkungsfaktor eines Fensters (Mittelwert seiner Werte).
+// Damit rechnet man die Daempfung wieder heraus, die das Fenster in die
+// Amplituden bringt: gemessene Amplitude / Gain = wahre Amplitude.
+pub fn FftWindowGain(window: int64, n: int64): f64 {
+  if (n < 1) { return _one(); }
+  var s: f64 := _zero();
+  var i: int64 := 0;
+  while (i < n) {
+    s := s + _get(window, i);
+    i := i + 1;
+  }
+  return s / (n as f64);
+}

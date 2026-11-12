@@ -1,0 +1,313 @@
+// src/tools/lyx_cpu.lyx — CLI-Werkzeug `lyx-cpu` (#2402, Teil von #2396)
+//
+// Benutzt DIESELBEN Abfragen wie Compiler und Runtime (std.cpu.*), damit
+// Diagnose und Codeerzeugung nicht auseinanderdriften. Das vorhandene
+// src/tools/cpu_features_dump.lyx (#2384) bleibt als Testhelfer bestehen —
+// es gibt eine Zeile je CPUID-Bit aus, damit ein Test gegen /proc/cpuinfo
+// gegenlesen kann; ein Diagnosewerkzeug ist es nicht.
+//
+// Regeln fuer die Ausgabe (aus #2396/#2402):
+//   * Jedes Feld traegt Quelle und Status. Ein nicht verfuegbares Feld
+//     erscheint als `unsupported` / `permission_denied` / `not_exposed_by_vm`
+//     — nie als Zahl, nie weggelassen.
+//   * Unbekannter Unterbefehl oder Featurename scheitert LAUT mit Exit-Code
+//     ungleich 0 und nennt die zulaessigen Werte. Kein Catch-all, der `info`
+//     ausfuehrt.
+//
+// Uebersetzen: ./lyxc --std-path=. src/tools/lyx_cpu.lyx -o lyx-cpu
+@description("lyx-cpu: CPU-Diagnose auf std.cpu (Identitaet, Topologie, Caches, Energie, Takt)")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+
+import std.io;
+import std.string;
+import std.alloc;
+import std.systeminfo;
+import std.cpu.status;
+import std.cpu.features;
+import std.cpu.identity;
+import std.cpu.topology;
+import std.cpu.cache;
+import std.cpu.limits;
+import std.cpu.power;
+import std.cpu.clock;
+
+var jsonModus: int64 := 0;
+var jsonErstes: int64 := 1;
+
+// ── Ausgabehelfer ───────────────────────────────────────────────────────────
+
+fn zeileText(name: pchar, wert: pchar, quelle: pchar): int64 {
+  if (jsonModus != 0) {
+    if (jsonErstes == 0) { PrintStr(",\n"c); }
+    jsonErstes := 0;
+    PrintStr("  \""c); PrintStr(name); PrintStr("\": {\"value\": \""c); PrintStr(wert);
+    PrintStr("\", \"status\": \"ok\", \"source\": \""c); PrintStr(quelle); PrintStr("\"}"c);
+    return 0;
+  }
+  PrintStr(name); PrintStr(": "c); PrintStr(wert);
+  PrintStr("   ["c); PrintStr(quelle); PrintStrLn("]"c);
+  return 0;
+}
+
+// Ein Traeger als Zeile — mit Status, Quelle und Zeitpunkt. Fehlt der Wert,
+// steht der Status an seiner Stelle und NICHT eine Zahl.
+fn zeileWert(name: pchar, t: int64): int64 {
+  if (jsonModus != 0) {
+    if (jsonErstes == 0) { PrintStr(",\n"c); }
+    jsonErstes := 0;
+    PrintStr("  \""c); PrintStr(name); PrintStr("\": {"c);
+    if (CpuWertDa(t) != 0) {
+      PrintStr("\"value\": "c); PrintStr(IntToStr(CpuWert(t)));
+    } else {
+      PrintStr("\"value\": null"c);
+    }
+    PrintStr(", \"status\": \""c); PrintStr(CpuStatusName(CpuStatus(t)));
+    PrintStr("\", \"source\": \""c); PrintStr(CpuQuelle(t));
+    PrintStr("\", \"time_ns\": "c); PrintStr(IntToStr(CpuZeit(t)));
+    PrintStr("}"c);
+    return 0;
+  }
+  PrintStr(name); PrintStr(": "c);
+  if (CpuWertDa(t) != 0) { PrintStr(IntToStr(CpuWert(t))); }
+  else { PrintStr(CpuStatusName(CpuStatus(t))); }
+  PrintStr("   ["c); PrintStr(CpuQuelle(t)); PrintStrLn("]"c);
+  return 0;
+}
+
+fn jsonAuf(): int64 { if (jsonModus != 0) { PrintStrLn("{"c); jsonErstes := 1; } return 0; }
+fn jsonZu(): int64  { if (jsonModus != 0) { PrintStrLn(""c); PrintStrLn("}"c); } return 0;
+}
+
+fn abschnitt(nm: pchar): int64 {
+  if (jsonModus == 0) { PrintStrLn(""c); PrintStr("== "c); PrintStrLn(nm); }
+  return 0;
+}
+
+// ── Unterbefehle ────────────────────────────────────────────────────────────
+
+fn tuInfo(): int64 {
+  abschnitt("Identitaet"c);
+  zeileText("vendor"c, CpuVendor(), "cpuid.0"c);
+  zeileText("brand"c, CpuMarkenname(), "cpuid.80000002..4"c);
+  var fa: int64 := CpuWertNeu(); CpuWertSetzen(fa, CpuFamilie(), "cpuid.1 eax"c);
+  var mo: int64 := CpuWertNeu(); CpuWertSetzen(mo, CpuModell(), "cpuid.1 eax"c);
+  var st: int64 := CpuWertNeu(); CpuWertSetzen(st, CpuStepping(), "cpuid.1 eax"c);
+  zeileWert("family"c, fa); zeileWert("model"c, mo); zeileWert("stepping"c, st);
+  var ua: int64 := CpuWertNeu(); CpuMikroarchitektur(ua);
+  zeileWert("microarchitecture_model"c, ua);
+  if (CpuWertDa(ua) != 0) { zeileText("microarchitecture"c, CpuQuelle(ua), "cpuid.1 + Tabelle"c); }
+
+  abschnitt("Topologie"c);
+  var a: int64 := CpuWertNeu(); CpuThreadsJeKern(a);  zeileWert("threads_per_core"c, a);
+  var b: int64 := CpuWertNeu(); CpuThreadsJePaket(b); zeileWert("threads_per_package"c, b);
+  var c: int64 := CpuWertNeu(); CpuKerneJePaket(c);   zeileWert("cores_per_package"c, c);
+  var hy: int64 := CpuWertNeu(); CpuIstHybrid(hy);    zeileWert("hybrid"c, hy);
+  var kt: int64 := CpuWertNeu(); CpuKerntyp(kt);      zeileWert("core_type"c, kt);
+  var lc: int64 := CpuWertNeu(); CpuWertSetzen(lc, GetLogicalCores(), "/proc/cpuinfo"c);
+  zeileWert("logical_cores_kernel"c, lc);
+
+  abschnitt("Caches"c);
+  var n: int64 := CpuCacheAnzahl();
+  var i: int64 := 0;
+  while (i < n) {
+    var eb: int64 := CpuWertNeu(); CpuCacheEbene(i, eb);
+    var ty: int64 := CpuWertNeu(); CpuCacheTyp(i, ty);
+    var gr: int64 := CpuWertNeu(); CpuCacheGroesse(i, gr);
+    var zl: int64 := CpuWertNeu(); CpuCacheZeilenlaenge(i, zl);
+    var wg: int64 := CpuWertNeu(); CpuCacheAssoziativitaet(i, wg);
+    var th: int64 := CpuWertNeu(); CpuCacheTeilendeThreads(i, th);
+    var p: pchar := StrConcat("cache"c, IntToStr(i));
+    zeileWert(StrConcat(p, "_level"c), eb);
+    zeileWert(StrConcat(p, "_type"c), ty);
+    zeileWert(StrConcat(p, "_size_bytes"c), gr);
+    zeileWert(StrConcat(p, "_line_bytes"c), zl);
+    zeileWert(StrConcat(p, "_ways"c), wg);
+    zeileWert(StrConcat(p, "_sharing_threads"c), th);
+    i := i + 1;
+  }
+
+  abschnitt("Faehigkeiten (Hardware und nutzbar)"c);
+  tuFeatures();
+  return 0;
+}
+
+fn einFeature(nm: pchar, nl: int64): int64 {
+  var bit: int64 := CpuFeatureBitAusName(nm, nl);
+  if (bit == 0) { return 0; }
+  var grund: int64 := CpuFeatureUnusableReason(bit);
+  var t: int64 := CpuWertNeu();
+  var nutzbar: int64 := 0;
+  if (grund == CPU_NUTZBAR) { nutzbar := 1; }
+  CpuWertSetzen(t, nutzbar, CpuUnusableReasonName(grund));
+  zeileWert(StrConcat("usable_"c, nm), t);
+  return 0;
+}
+
+fn tuFeatures(): int64 {
+  einFeature("sse2"c, 4);       einFeature("sse4_1"c, 6);  einFeature("sse4_2"c, 6);
+  einFeature("popcnt"c, 6);     einFeature("abm"c, 3);     einFeature("avx"c, 3);
+  einFeature("avx2"c, 4);       einFeature("avx512f"c, 7); einFeature("fma"c, 3);
+  einFeature("bmi1"c, 4);       einFeature("bmi2"c, 4);    einFeature("aes"c, 3);
+  einFeature("pclmulqdq"c, 9);  einFeature("sha_ni"c, 6);  einFeature("vaes"c, 4);
+  einFeature("vpclmulqdq"c, 10); einFeature("rdrand"c, 6); einFeature("rdseed"c, 6);
+  einFeature("keylocker"c, 9);  einFeature("sha512"c, 6);  einFeature("sm3"c, 3);
+  einFeature("sm4"c, 3);
+  return 0;
+}
+
+fn tuState(): int64 {
+  abschnitt("Energieprofil (CPU 0)"c);
+  zeileText("scaling_driver"c, CpuTreiber(0), "cpufreq/scaling_driver"c);
+  zeileText("scaling_governor"c, CpuGovernor(0), "cpufreq/scaling_governor"c);
+  zeileText("energy_performance_preference"c, CpuEnergiePraeferenz(0), "cpufreq/energy_performance_preference"c);
+  zeileText("energy_performance_available"c, CpuEnergiePraeferenzZulaessig(0), "cpufreq/energy_performance_available_preferences"c);
+  var b: int64 := CpuWertNeu(); CpuBoostFrei(b); zeileWert("boost_allowed"c, b);
+
+  abschnitt("Taktgrenzen (CPU 0) -- KEIN gemessener Takt"c);
+  var nm: int64 := CpuWertNeu(); CpuNominalHz(0, nm);      zeileWert("nominal_hz"c, nm);
+  var mn: int64 := CpuWertNeu(); CpuErlaubtMinHz(0, mn);   zeileWert("allowed_min_hz"c, mn);
+  var mx: int64 := CpuWertNeu(); CpuErlaubtMaxHz(0, mx);   zeileWert("allowed_max_hz"c, mx);
+  var rq: int64 := CpuWertNeu(); CpuAngefordertHz(0, rq);  zeileWert("requested_hz"c, rq);
+
+  abschnitt("Prozessgrenzen"c);
+  var er: int64 := CpuWertNeu(); CpuErlaubteCpus(er);              zeileWert("allowed_cpus"c, er);
+  var ak: int64 := CpuWertNeu(); CpuAktuellerKern(ak);             zeileWert("current_cpu"c, ak);
+  var qu: int64 := CpuWertNeu(); CpuCgroupQuotaHundertstel(qu);    zeileWert("cgroup_quota_centicores"c, qu);
+  var pa: int64 := CpuWertNeu(); CpuVerfuegbareParallelitaet(pa);  zeileWert("available_parallelism"c, pa);
+  zeileText("binding_limit"c, CpuGrenzeName(CpuBindendeGrenze()), "min(affinitaet, quota)"c);
+  return 0;
+}
+
+fn tuMeasure(dauerNs: int64): int64 {
+  abschnitt("Gemessener Takt"c);
+  var hz: int64 := CpuWertNeu(); var fe: int64 := CpuWertNeu();
+  var zy: int64 := CpuWertNeu(); var ak: int64 := CpuWertNeu();
+  CpuSample(dauerNs, hz, fe, zy, ak);
+  zeileWert("effective_active_hz"c, hz);
+  zeileWert("measurement_window_ns"c, fe);
+  zeileWert("active_ns"c, ak);
+  zeileWert("cycles"c, zy);
+  var ms: int64 := CpuWertNeu(); CpuMsrAperfMperf(0, ms);
+  zeileWert("msr_aperf_mperf"c, ms);
+  if (jsonModus == 0) {
+    PrintStrLn("Hinweis: ohne Pinning (taskset) ist die Zahl ueber mehrere Kerne hinweg sinnlos,"c);
+    PrintStrLn("         wenn die Kerne unterschiedlich takten."c);
+  }
+  return 0;
+}
+
+fn tuMonitor(intervallMs: int64, runden: int64): int64 {
+  var r: int64 := 0;
+  while (r < runden) {
+    var hz: int64 := CpuWertNeu(); var fe: int64 := CpuWertNeu();
+    var zy: int64 := CpuWertNeu(); var ak: int64 := CpuWertNeu();
+    CpuSample(intervallMs * 1000000, hz, fe, zy, ak);
+    var rq: int64 := CpuWertNeu(); CpuAngefordertHz(0, rq);
+    PrintStr("runde="c); PrintStr(IntToStr(r));
+    PrintStr(" effective_active_hz="c);
+    if (CpuWertDa(hz) != 0) { PrintStr(IntToStr(CpuWert(hz))); } else { PrintStr(CpuStatusName(CpuStatus(hz))); }
+    PrintStr(" requested_hz="c);
+    if (CpuWertDa(rq) != 0) { PrintStr(IntToStr(CpuWert(rq))); } else { PrintStr(CpuStatusName(CpuStatus(rq))); }
+    PrintStr(" governor="c); PrintStrLn(CpuGovernor(0));
+    r := r + 1;
+  }
+  return 0;
+}
+
+fn tuExplain(nm: pchar): int64 {
+  var nl: int64 := StrLen(nm);
+  var bit: int64 := CpuFeatureBitAusName(nm, nl);
+  if (bit == 0) {
+    EPrintStr("lyx-cpu: unbekannter Faehigkeitsname '"c);
+    EPrintStr(nm);
+    EPrintStrLn("'"c);
+    EPrintStr("zulaessig: "c);
+    EPrintStrLn(CpuFeatureNamenListe());
+    return 2;
+  }
+  var grund: int64 := CpuFeatureUnusableReason(bit);
+  PrintStr(nm); PrintStr(": "c); PrintStrLn(CpuUnusableReasonName(grund));
+  if (grund != CPU_NUTZBAR) {
+    PrintStrLn("Ursachenkette:"c);
+    PrintStrLn("  1. Hardware-Bit (CPUID)"c);
+    PrintStrLn("  2. OSXSAVE (CPUID.1:ECX Bit 27)"c);
+    PrintStrLn("  3. XCR0-Bits des zustaendigen Registerzustands"c);
+    PrintStrLn("  4. Kernelparameter (z. B. noxsave)"c);
+    PrintStr("  erreicht bis: "c); PrintStrLn(CpuUnusableReasonName(grund));
+  }
+  return 0;
+}
+
+fn tuReport(): int64 {
+  jsonAuf();
+  tuInfo();
+  tuState();
+  tuMeasure(100000000);
+  jsonZu();
+  return 0;
+}
+
+fn hilfe(): int64 {
+  EPrintStrLn("lyx-cpu -- CPU-Diagnose (std.cpu, #2396)"c);
+  EPrintStrLn(""c);
+  EPrintStrLn("  lyx-cpu info                 Identitaet, Faehigkeiten, Topologie, Caches"c);
+  EPrintStrLn("  lyx-cpu state                Energieprofil, Taktgrenzen, Prozessgrenzen"c);
+  EPrintStrLn("  lyx-cpu monitor [runden]     wiederholte Momentaufnahmen (Vorgabe 3)"c);
+  EPrintStrLn("  lyx-cpu measure [ms]         gemessener Takt (Vorgabe 500 ms)"c);
+  EPrintStrLn("  lyx-cpu explain <feature>    nutzbar? falls nein: warum"c);
+  EPrintStrLn("  lyx-cpu report [--json]      alles, mit Quelle/Status/Zeitpunkt je Feld"c);
+  return 2;
+}
+
+fn gleich(a: pchar, b: pchar): int64 {
+  if (StrLen(a) != StrLen(b)) { return 0; }
+  if (StrCmp(a, b) == 0) { return 1; }
+  return 0;
+}
+
+fn main(): int64 {
+  var argc: int64 := GetArgC();
+  var argv: pchar := GetArgV();
+  if (argc < 2) { return hilfe(); }
+  var cmd: pchar := ArgvGet(argv, 1);
+
+  // --json darf an jeder Stelle stehen.
+  var i: int64 := 1;
+  while (i < argc) {
+    if (gleich(ArgvGet(argv, i), "--json"c) != 0) { jsonModus := 1; }
+    i := i + 1;
+  }
+
+  if (gleich(cmd, "info"c) != 0)   { jsonAuf(); tuInfo();  jsonZu(); return 0; }
+  if (gleich(cmd, "state"c) != 0)  { jsonAuf(); tuState(); jsonZu(); return 0; }
+  if (gleich(cmd, "report"c) != 0) { return tuReport(); }
+  if (gleich(cmd, "measure"c) != 0) {
+    var ms: int64 := 500;
+    if (argc > 2 && gleich(ArgvGet(argv, 2), "--json"c) == 0) {
+      var v: int64 := StrToInt(ArgvGet(argv, 2));
+      if (v > 0) { ms := v; }
+    }
+    jsonAuf(); tuMeasure(ms * 1000000); jsonZu(); return 0;
+  }
+  if (gleich(cmd, "monitor"c) != 0) {
+    var r: int64 := 3;
+    if (argc > 2) { var v2: int64 := StrToInt(ArgvGet(argv, 2)); if (v2 > 0) { r := v2; } }
+    return tuMonitor(200, r);
+  }
+  if (gleich(cmd, "explain"c) != 0) {
+    if (argc < 3) {
+      EPrintStrLn("lyx-cpu explain: Faehigkeitsname fehlt"c);
+      EPrintStr("zulaessig: "c); EPrintStrLn(CpuFeatureNamenListe());
+      return 2;
+    }
+    return tuExplain(ArgvGet(argv, 2));
+  }
+
+  // Kein Catch-all: ein unbekannter Unterbefehl fuehrt NICHT `info` aus.
+  EPrintStr("lyx-cpu: unbekannter Unterbefehl '"c);
+  EPrintStr(cmd);
+  EPrintStrLn("'"c);
+  hilfe();
+  return 2;
+}

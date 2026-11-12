@@ -10,7 +10,8 @@
 
 set -euo pipefail
 
-LYXC="$(cd "$(dirname "$0")/.." && pwd)/lyxc"
+LYXC="${LYXC:-$(cd "$(dirname "$0")/.." && pwd)/lyxc}"
+_g="$(dirname "$0")/lib/lyxc_guard.sh"; [ -f "$_g" ] || _g="$(dirname "$0")/../lib/lyxc_guard.sh"; . "$_g"   # #1294
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
@@ -20,7 +21,10 @@ FAIL=0
 _pass() { echo "PASS $1"; PASS=$((PASS+1)); }
 _fail() { echo "FAIL $1: $2"; FAIL=$((FAIL+1)); }
 
-RAND_LYX="lyx-compiler/usr/include/lyx/units/std/crypto/rand.lyx"
+# #2447: zeigte auf die Kopie im Paketbaum. Das Paket liefert keinen
+# Quellcode mehr aus; massgeblich ist ohnehin die kanonische Quelle unter
+# std/ -- die Kopie war nur eine zweite Ablage derselben Datei.
+RAND_LYX="std/crypto/rand.lyx"
 
 # ── A: Regression — RandBytes/RandBytesExact weiterhin korrekt ───────────────
 

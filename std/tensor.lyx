@@ -1,0 +1,999 @@
+// std/tensor.lyx
+// Komplexe Tensoren: Kontraktion, Permutation, partielle Spur, Quantengatter
+
+@description("Complex tensors: general contraction, index permutation, partial trace, Kronecker product, quantum state and gate operations")
+@author("Andreas Roene")
+@copyright("2026 Andreas Roene")
+unit std.tensor;
+
+import std.math;
+import std.alloc;
+
+// ── Worum es geht ────────────────────────────────────────────────────────────
+//
+// Ein Tensor ist ein Feld mit mehreren Achsen; die Kontraktion ist die
+// Verallgemeinerung der Matrixmultiplikation auf beliebige Achsenpaare. Bei
+// zwei Matrizen und einer kontrahierten Achse ist es genau das Matrixprodukt —
+// bei einem Zustand mit zwanzig Qubits und einem Zwei-Qubit-Gatter ist es die
+// Rechnung, die das Gatter anwendet, ohne die 2^20 Amplituden als eine grosse
+// Matrix anzufassen.
+//
+// ── Alles komplex ────────────────────────────────────────────────────────────
+//
+// Diese Einheit rechnet durchgehend komplex. Das ist keine Vorratshaltung: die
+// Amplituden eines Quantenzustands SIND komplex, und ohne Phase gibt es keine
+// Interferenz — der Hadamard-Zustand (|0> + |1>)/sqrt(2) und (|0> - |1>)/sqrt(2)
+// waeren sonst ununterscheidbar, und genau ihr Unterschied traegt jeden
+// Quantenalgorithmus.
+//
+// Real- und Imaginaerteil liegen in ZWEI getrennten f64-Feldern, wie schon in
+// std.fft. Ein Feld aus Paaren waere naheliegender, aber ein Array VON Structs
+// liefert in lyxc 1.0.19D still 0 (#1109); getrennte Felder sind zudem die
+// Form, in der ein reeller Tensor ohne Umkopieren durchgereicht werden kann.
+//
+// ── Achsen und Speicheranordnung ─────────────────────────────────────────────
+//
+// Die Form (shape) ist ein int64-Feld mit rank Eintraegen. Gespeichert wird
+// ZEILENWEISE (row-major, letzte Achse am schnellsten), wie in std.linalg:
+// das Element (i0, i1, ..., i_{r-1}) liegt bei
+//
+//     i0 * s0 + i1 * s1 + ... ,   s_{r-1} = 1,  s_k = s_{k+1} * shape_{k+1}
+//
+// Der Aufrufer legt den Speicher an; die Groesse liefert TenSize().
+//
+// ── f64-Fallstricke des Compilers ────────────────────────────────────────────
+//
+// Wie in den uebrigen Units: `con f64` als Operand (#1499), negatives Literal
+// als Operand (#1496) und unaeres Minus auf einer Variablen im Ausdruck
+// (#1512) rechnen still falsch. Konstanten stehen als Funktionen, negiert wird
+// ueber _neg().
+
+fn _zero(): f64 { return 0.0; }
+fn _one(): f64  { return 1.0; }
+fn _neg(x: f64): f64 { return 0.0 - x; }
+fn _eps(): f64  { return 0.000000000001; }
+
+fn _g(p: int64, i: int64): f64 {
+  var v: f64 := peekf64(p + i * 8);
+  return v;
+}
+
+fn _p(p: int64, i: int64, v: f64): void {
+  pokef64(p + i * 8, v);
+}
+
+// ── Form und Indizes ─────────────────────────────────────────────────────────
+
+// Zahl der Elemente. Ein Tensor vom Rang 0 (Skalar) hat ein Element.
+pub fn TenSize(shape: int64, rank: int64): int64 {
+  var n: int64 := 1;
+  var i: int64 := 0;
+  while (i < rank) {
+    var d: int64 := peek64(shape + i * 8);
+    if (d < 1) { return 0; }
+    n := n * d;
+    i := i + 1;
+  }
+  return n;
+}
+
+// Schrittweiten zur Form. outStrides fasst rank Werte.
+pub fn TenStrides(shape: int64, rank: int64, outStrides: int64): bool {
+  if (rank < 1) { return false; }
+  var acc: int64 := 1;
+  var i: int64 := rank - 1;
+  while (i >= 0) {
+    poke64(outStrides + i * 8, acc);
+    acc := acc * peek64(shape + i * 8);
+    i := i - 1;
+  }
+  return true;
+}
+
+// Mehrfachindex in flachen Index
+pub fn TenFlatIndex(strides: int64, idx: int64, rank: int64): int64 {
+  var f: int64 := 0;
+  var i: int64 := 0;
+  while (i < rank) {
+    f := f + peek64(idx + i * 8) * peek64(strides + i * 8);
+    i := i + 1;
+  }
+  return f;
+}
+
+// Flachen Index in Mehrfachindex zerlegen
+pub fn TenUnflatten(flat: int64, shape: int64, rank: int64, outIdx: int64): void {
+  var rest: int64 := flat;
+  var i: int64 := rank - 1;
+  while (i >= 0) {
+    var d: int64 := peek64(shape + i * 8);
+    poke64(outIdx + i * 8, rest % d);
+    rest := rest / d;
+    i := i - 1;
+  }
+}
+
+// ── Elementweise Operationen ─────────────────────────────────────────────────
+
+pub fn TenZero(re: int64, im: int64, size: int64): void {
+  var i: int64 := 0;
+  while (i < size) {
+    _p(re, i, _zero());
+    _p(im, i, _zero());
+    i := i + 1;
+  }
+}
+
+pub fn TenCopy(sre: int64, sim: int64, dre: int64, dim2: int64, size: int64): void {
+  var i: int64 := 0;
+  while (i < size) {
+    _p(dre, i, _g(sre, i));
+    _p(dim2, i, _g(sim, i));
+    i := i + 1;
+  }
+}
+
+pub fn TenAdd(are: int64, aim: int64, bre: int64, bim: int64,
+              ore: int64, oim: int64, size: int64): void {
+  var i: int64 := 0;
+  while (i < size) {
+    _p(ore, i, _g(are, i) + _g(bre, i));
+    _p(oim, i, _g(aim, i) + _g(bim, i));
+    i := i + 1;
+  }
+}
+
+pub fn TenSub(are: int64, aim: int64, bre: int64, bim: int64,
+              ore: int64, oim: int64, size: int64): void {
+  var i: int64 := 0;
+  while (i < size) {
+    _p(ore, i, _g(are, i) - _g(bre, i));
+    _p(oim, i, _g(aim, i) - _g(bim, i));
+    i := i + 1;
+  }
+}
+
+// Mit einer komplexen Zahl multiplizieren
+pub fn TenScale(re: int64, im: int64, size: int64, sr: f64, si: f64): void {
+  var i: int64 := 0;
+  while (i < size) {
+    var a: f64 := _g(re, i);
+    var b: f64 := _g(im, i);
+    _p(re, i, a * sr - b * si);
+    _p(im, i, a * si + b * sr);
+    i := i + 1;
+  }
+}
+
+// Komplex konjugieren
+pub fn TenConj(re: int64, im: int64, size: int64): void {
+  var i: int64 := 0;
+  while (i < size) {
+    _p(im, i, _neg(_g(im, i)));
+    i := i + 1;
+  }
+}
+
+// Quadratsumme der Betraege
+pub fn TenNormSq(re: int64, im: int64, size: int64): f64 {
+  var s: f64 := _zero();
+  var i: int64 := 0;
+  while (i < size) {
+    var a: f64 := _g(re, i);
+    var b: f64 := _g(im, i);
+    s := s + a * a + b * b;
+    i := i + 1;
+  }
+  return s;
+}
+
+pub fn TenNorm(re: int64, im: int64, size: int64): f64 {
+  return SqrtF64(TenNormSq(re, im, size));
+}
+
+// Skalarprodukt <a|b> mit konjugiertem a — die Reihenfolge ist Konvention,
+// aber keine beliebige: in der Physik ist das linke Argument das konjugierte,
+// und mit ihr stimmt <a|a> mit dem Quadrat der Norm ueberein.
+pub fn TenInner(are: int64, aim: int64, bre: int64, bim: int64, size: int64,
+                outRe: int64, outIm: int64): void {
+  var sr: f64 := _zero();
+  var si: f64 := _zero();
+  var i: int64 := 0;
+  while (i < size) {
+    var ar: f64 := _g(are, i);
+    var ai: f64 := _g(aim, i);
+    var br: f64 := _g(bre, i);
+    var bi: f64 := _g(bim, i);
+    // conj(a) * b
+    sr := sr + ar * br + ai * bi;
+    si := si + ar * bi - ai * br;
+    i := i + 1;
+  }
+  if (outRe != 0) { pokef64(outRe, sr); }
+  if (outIm != 0) { pokef64(outIm, si); }
+}
+
+// ── Achsen vertauschen ───────────────────────────────────────────────────────
+
+// perm ist eine Permutation der Achsennummern: perm[k] gibt an, WELCHE Achse
+// der Eingabe zur Achse k der Ausgabe wird. outShape wird mitgeschrieben.
+pub fn TenPermute(are: int64, aim: int64, shape: int64, rank: int64, perm: int64,
+                  ore: int64, oim: int64, outShape: int64): bool {
+  if (rank < 1) { return false; }
+  if (ore == are) { return false; }
+
+  var size: int64 := TenSize(shape, rank);
+  if (size < 1) { return false; }
+
+  var inStr: int64 := alloc(rank * 8);
+  var outStr: int64 := alloc(rank * 8);
+  var idx: int64 := alloc(rank * 8);
+  if (inStr == 0) { return false; }
+  if (outStr == 0) { return false; }
+  if (idx == 0) { return false; }
+
+  // Zielform aus der Permutation
+  var seen: int64 := alloc(rank * 8);
+  var k: int64 := 0;
+  while (k < rank) {
+    poke64(seen + k * 8, 0);
+    k := k + 1;
+  }
+  var ok: bool := true;
+  k := 0;
+  while (k < rank) {
+    var src: int64 := peek64(perm + k * 8);
+    if (src < 0) { ok := false; }
+    else {
+      if (src >= rank) { ok := false; }
+      else {
+        if (peek64(seen + src * 8) == 1) { ok := false; }
+        poke64(seen + src * 8, 1);
+        poke64(outShape + k * 8, peek64(shape + src * 8));
+      }
+    }
+    k := k + 1;
+  }
+  free(seen, rank * 8);
+
+  if (ok) {
+    TenStrides(shape, rank, inStr);
+    TenStrides(outShape, rank, outStr);
+
+    var f: int64 := 0;
+    while (f < size) {
+      // Zielindex zerlegen, ueber die Permutation auf die Quelle abbilden
+      TenUnflatten(f, outShape, rank, idx);
+      var src: int64 := 0;
+      var j: int64 := 0;
+      while (j < rank) {
+        var axis: int64 := peek64(perm + j * 8);
+        src := src + peek64(idx + j * 8) * peek64(inStr + axis * 8);
+        j := j + 1;
+      }
+      _p(ore, f, _g(are, src));
+      _p(oim, f, _g(aim, src));
+      f := f + 1;
+    }
+  }
+
+  free(inStr, rank * 8);
+  free(outStr, rank * 8);
+  free(idx, rank * 8);
+  return ok;
+}
+
+// ── Kontraktion ──────────────────────────────────────────────────────────────
+
+// Verallgemeinerte Matrixmultiplikation: summiert ueber nAxes Achsenpaare.
+// axesA und axesB sind int64-Felder mit den zu kontrahierenden Achsennummern;
+// die Dimensionen der gepaarten Achsen muessen uebereinstimmen.
+//
+// Die Ausgabeform ist [freie Achsen von A, freie Achsen von B] in der
+// urspruenglichen Reihenfolge — dieselbe Festlegung wie bei numpy.tensordot.
+// outShape fasst rankA + rankB - 2*nAxes Werte.
+//
+// Gerechnet wird direkt ueber verschachtelte Zaehler, nicht ueber den in
+// Bibliotheken uebliche Weg "Achsen permutieren, als Matrix multiplizieren,
+// zurueckformen". Der waere schneller, weil er ein optimiertes Matrixprodukt
+// nutzen kann; er braucht dafuer zwei vollstaendige Zwischenkopien. Bei
+// Zustandsvektoren mit 2^20 Amplituden ist der Speicher die knappere Groesse.
+pub fn TenContract(are: int64, aim: int64, shapeA: int64, rankA: int64,
+                   bre: int64, bim: int64, shapeB: int64, rankB: int64,
+                   axesA: int64, axesB: int64, nAxes: int64,
+                   ore: int64, oim: int64, outShape: int64): bool {
+  if (rankA < 1) { return false; }
+  if (rankB < 1) { return false; }
+  if (nAxes < 0) { return false; }
+  if (nAxes > rankA) { return false; }
+  if (nAxes > rankB) { return false; }
+
+  // gepaarte Dimensionen pruefen
+  var c: int64 := 0;
+  while (c < nAxes) {
+    var ia: int64 := peek64(axesA + c * 8);
+    var ib: int64 := peek64(axesB + c * 8);
+    if (ia < 0) { return false; }
+    if (ib < 0) { return false; }
+    if (ia >= rankA) { return false; }
+    if (ib >= rankB) { return false; }
+    if (peek64(shapeA + ia * 8) != peek64(shapeB + ib * 8)) { return false; }
+    c := c + 1;
+  }
+
+  var strA: int64 := alloc(rankA * 8);
+  var strB: int64 := alloc(rankB * 8);
+  TenStrides(shapeA, rankA, strA);
+  TenStrides(shapeB, rankB, strB);
+
+  // freie Achsen sammeln
+  var freeA: int64 := alloc(rankA * 8);
+  var freeB: int64 := alloc(rankB * 8);
+  var nFreeA: int64 := 0;
+  var nFreeB: int64 := 0;
+
+  var i: int64 := 0;
+  while (i < rankA) {
+    var used: bool := false;
+    c := 0;
+    while (c < nAxes) {
+      if (peek64(axesA + c * 8) == i) { used := true; }
+      c := c + 1;
+    }
+    if (!used) {
+      poke64(freeA + nFreeA * 8, i);
+      nFreeA := nFreeA + 1;
+    }
+    i := i + 1;
+  }
+  i := 0;
+  while (i < rankB) {
+    var used2: bool := false;
+    c := 0;
+    while (c < nAxes) {
+      if (peek64(axesB + c * 8) == i) { used2 := true; }
+      c := c + 1;
+    }
+    if (!used2) {
+      poke64(freeB + nFreeB * 8, i);
+      nFreeB := nFreeB + 1;
+    }
+    i := i + 1;
+  }
+
+  // Ausgabeform
+  var outRank: int64 := nFreeA + nFreeB;
+  i := 0;
+  while (i < nFreeA) {
+    poke64(outShape + i * 8, peek64(shapeA + peek64(freeA + i * 8) * 8));
+    i := i + 1;
+  }
+  i := 0;
+  while (i < nFreeB) {
+    poke64(outShape + (nFreeA + i) * 8, peek64(shapeB + peek64(freeB + i * 8) * 8));
+    i := i + 1;
+  }
+
+  var outSize: int64 := 1;
+  i := 0;
+  while (i < outRank) {
+    outSize := outSize * peek64(outShape + i * 8);
+    i := i + 1;
+  }
+
+  // Groesse des Summationsraums
+  var sumSize: int64 := 1;
+  c := 0;
+  while (c < nAxes) {
+    sumSize := sumSize * peek64(shapeA + peek64(axesA + c * 8) * 8);
+    c := c + 1;
+  }
+
+  var outIdx: int64 := alloc(outRank * 8 + 8);
+  var sumIdx: int64 := alloc(nAxes * 8 + 8);
+  var sumShape: int64 := alloc(nAxes * 8 + 8);
+  c := 0;
+  while (c < nAxes) {
+    poke64(sumShape + c * 8, peek64(shapeA + peek64(axesA + c * 8) * 8));
+    c := c + 1;
+  }
+
+  var o: int64 := 0;
+  while (o < outSize) {
+    if (outRank > 0) { TenUnflatten(o, outShape, outRank, outIdx); }
+
+    // Grundversatz aus den freien Achsen
+    var baseA: int64 := 0;
+    var baseB: int64 := 0;
+    i := 0;
+    while (i < nFreeA) {
+      baseA := baseA + peek64(outIdx + i * 8) * peek64(strA + peek64(freeA + i * 8) * 8);
+      i := i + 1;
+    }
+    i := 0;
+    while (i < nFreeB) {
+      baseB := baseB + peek64(outIdx + (nFreeA + i) * 8) * peek64(strB + peek64(freeB + i * 8) * 8);
+      i := i + 1;
+    }
+
+    var accR: f64 := _zero();
+    var accI: f64 := _zero();
+
+    var s: int64 := 0;
+    while (s < sumSize) {
+      if (nAxes > 0) { TenUnflatten(s, sumShape, nAxes, sumIdx); }
+
+      var offA: int64 := baseA;
+      var offB: int64 := baseB;
+      c := 0;
+      while (c < nAxes) {
+        var v: int64 := peek64(sumIdx + c * 8);
+        offA := offA + v * peek64(strA + peek64(axesA + c * 8) * 8);
+        offB := offB + v * peek64(strB + peek64(axesB + c * 8) * 8);
+        c := c + 1;
+      }
+
+      var ar: f64 := _g(are, offA);
+      var ai: f64 := _g(aim, offA);
+      var br: f64 := _g(bre, offB);
+      var bi: f64 := _g(bim, offB);
+      accR := accR + ar * br - ai * bi;
+      accI := accI + ar * bi + ai * br;
+
+      s := s + 1;
+    }
+
+    _p(ore, o, accR);
+    _p(oim, o, accI);
+    o := o + 1;
+  }
+
+  free(strA, rankA * 8);   free(strB, rankB * 8);
+  free(freeA, rankA * 8);  free(freeB, rankB * 8);
+  free(outIdx, outRank * 8 + 8);
+  free(sumIdx, nAxes * 8 + 8);
+  free(sumShape, nAxes * 8 + 8);
+  return true;
+}
+
+// Rang der Ausgabe einer Kontraktion — damit der Aufrufer den Speicher
+// bemessen kann, bevor er sie ausfuehrt.
+pub fn TenContractRank(rankA: int64, rankB: int64, nAxes: int64): int64 {
+  return rankA + rankB - 2 * nAxes;
+}
+
+// Tensorprodukt ohne Kontraktion: alle Achsen von A, dann alle von B.
+// Fuer zwei Matrizen ist das das Kronecker-Produkt — in der Quantenmechanik
+// die Zusammensetzung unabhaengiger Teilsysteme.
+pub fn TenOuter(are: int64, aim: int64, shapeA: int64, rankA: int64,
+                bre: int64, bim: int64, shapeB: int64, rankB: int64,
+                ore: int64, oim: int64, outShape: int64): bool {
+  var dummy: int64 := alloc(8);
+  var ok: bool := TenContract(are, aim, shapeA, rankA, bre, bim, shapeB, rankB,
+                              dummy, dummy, 0, ore, oim, outShape);
+  free(dummy, 8);
+  return ok;
+}
+
+// ── Spur und partielle Spur ──────────────────────────────────────────────────
+
+// Spur ueber zwei Achsen gleicher Dimension: summiert die Diagonale und
+// entfernt beide Achsen.
+//
+// In der Quantenmechanik ist das die REDUZIERTE Beschreibung eines
+// Teilsystems: wer ein Qubit ausspurt, erhaelt den Zustand des Rests so, wie
+// er sich ohne Zugriff auf das ausgespurte darstellt. Bei verschraenkten
+// Zustaenden ist das Ergebnis kein reiner Zustand mehr — genau daran misst man
+// Verschraenkung.
+pub fn TenPartialTrace(are: int64, aim: int64, shape: int64, rank: int64,
+                       ax1: int64, ax2: int64,
+                       ore: int64, oim: int64, outShape: int64): bool {
+  if (rank < 2) { return false; }
+  if (ax1 == ax2) { return false; }
+  if (ax1 < 0) { return false; }
+  if (ax2 < 0) { return false; }
+  if (ax1 >= rank) { return false; }
+  if (ax2 >= rank) { return false; }
+
+  var d: int64 := peek64(shape + ax1 * 8);
+  if (peek64(shape + ax2 * 8) != d) { return false; }
+
+  var str: int64 := alloc(rank * 8);
+  TenStrides(shape, rank, str);
+
+  // verbleibende Achsen
+  var keep: int64 := alloc(rank * 8);
+  var nKeep: int64 := 0;
+  var i: int64 := 0;
+  while (i < rank) {
+    if (i != ax1) {
+      if (i != ax2) {
+        poke64(keep + nKeep * 8, i);
+        poke64(outShape + nKeep * 8, peek64(shape + i * 8));
+        nKeep := nKeep + 1;
+      }
+    }
+    i := i + 1;
+  }
+
+  var outSize: int64 := 1;
+  i := 0;
+  while (i < nKeep) {
+    outSize := outSize * peek64(outShape + i * 8);
+    i := i + 1;
+  }
+
+  var idx: int64 := alloc(nKeep * 8 + 8);
+  var o: int64 := 0;
+  while (o < outSize) {
+    if (nKeep > 0) { TenUnflatten(o, outShape, nKeep, idx); }
+
+    var base: int64 := 0;
+    i := 0;
+    while (i < nKeep) {
+      base := base + peek64(idx + i * 8) * peek64(str + peek64(keep + i * 8) * 8);
+      i := i + 1;
+    }
+
+    var sr: f64 := _zero();
+    var si: f64 := _zero();
+    var k: int64 := 0;
+    while (k < d) {
+      var off: int64 := base + k * peek64(str + ax1 * 8) + k * peek64(str + ax2 * 8);
+      sr := sr + _g(are, off);
+      si := si + _g(aim, off);
+      k := k + 1;
+    }
+    _p(ore, o, sr);
+    _p(oim, o, si);
+    o := o + 1;
+  }
+
+  free(str, rank * 8);
+  free(keep, rank * 8);
+  free(idx, nKeep * 8 + 8);
+  return true;
+}
+
+// ── Quantenzustaende ─────────────────────────────────────────────────────────
+//
+// Ein Zustand aus n Qubits ist ein Tensor mit n Achsen der Dimension 2, also
+// 2^n komplexe Amplituden. Gespeichert wird er flach; Qubit 0 ist das
+// hoechstwertige Bit des Index — dieselbe Ordnung, in der man |q0 q1 ... > ,
+// schreibt und in der ein Basiszustand als Binaerzahl gelesen wird.
+//
+// Die Zahl der Amplituden verdoppelt sich mit jedem Qubit. Bei 20 Qubits sind
+// es eine Million, bei 30 eine Milliarde — der Grund, warum die Simulation
+// eines Quantenrechners auf klassischer Hardware bei etwa 30 Qubits endet, und
+// zugleich der Grund fuer das Interesse an Tensornetzen, die eben nicht den
+// vollen Zustand speichern.
+
+pub fn QuStateSize(nQubits: int64): int64 {
+  if (nQubits < 1) { return 0; }
+  if (nQubits > 30) { return 0; }
+  var s: int64 := 1;
+  var i: int64 := 0;
+  while (i < nQubits) {
+    s := s * 2;
+    i := i + 1;
+  }
+  return s;
+}
+
+// |00...0>
+pub fn QuStateZero(re: int64, im: int64, nQubits: int64): bool {
+  var size: int64 := QuStateSize(nQubits);
+  if (size < 1) { return false; }
+  TenZero(re, im, size);
+  _p(re, 0, _one());
+  return true;
+}
+
+// Basiszustand |b> mit b als Binaerzahl
+pub fn QuStateBasis(re: int64, im: int64, nQubits: int64, basis: int64): bool {
+  var size: int64 := QuStateSize(nQubits);
+  if (size < 1) { return false; }
+  if (basis < 0) { return false; }
+  if (basis >= size) { return false; }
+  TenZero(re, im, size);
+  _p(re, basis, _one());
+  return true;
+}
+
+// Ein-Qubit-Gatter anwenden. gateRe/gateIm sind 2x2 zeilenweise.
+//
+// Gerechnet wird direkt auf den Amplitudenpaaren, die sich nur im Bit des
+// Zielqubits unterscheiden — das ist die Kontraktion des Gatters mit der
+// betreffenden Achse, ausgeschrieben. Der Aufwand ist O(2^n) je Gatter,
+// unabhaengig davon, welches Qubit betroffen ist.
+pub fn QuApply1(re: int64, im: int64, nQubits: int64, target: int64,
+                gateRe: int64, gateIm: int64): bool {
+  var size: int64 := QuStateSize(nQubits);
+  if (size < 1) { return false; }
+  if (target < 0) { return false; }
+  if (target >= nQubits) { return false; }
+
+  // Qubit 0 ist das hoechstwertige Bit
+  var bit: int64 := 1;
+  var sh: int64 := 0;
+  while (sh < nQubits - 1 - target) {
+    bit := bit * 2;
+    sh := sh + 1;
+  }
+
+  var g00r: f64 := _g(gateRe, 0);  var g00i: f64 := _g(gateIm, 0);
+  var g01r: f64 := _g(gateRe, 1);  var g01i: f64 := _g(gateIm, 1);
+  var g10r: f64 := _g(gateRe, 2);  var g10i: f64 := _g(gateIm, 2);
+  var g11r: f64 := _g(gateRe, 3);  var g11i: f64 := _g(gateIm, 3);
+
+  var i: int64 := 0;
+  while (i < size) {
+    // nur die Haelfte der Indizes anfassen, in der das Zielbit 0 ist —
+    // sonst wuerde jedes Paar zweimal bearbeitet
+    if ((i & bit) == 0) {
+      var j: int64 := i | bit;
+
+      var a0r: f64 := _g(re, i);   var a0i: f64 := _g(im, i);
+      var a1r: f64 := _g(re, j);   var a1i: f64 := _g(im, j);
+
+      _p(re, i, g00r * a0r - g00i * a0i + g01r * a1r - g01i * a1i);
+      _p(im, i, g00r * a0i + g00i * a0r + g01r * a1i + g01i * a1r);
+      _p(re, j, g10r * a0r - g10i * a0i + g11r * a1r - g11i * a1i);
+      _p(im, j, g10r * a0i + g10i * a0r + g11r * a1i + g11i * a1r);
+    }
+    i := i + 1;
+  }
+  return true;
+}
+
+// Zwei-Qubit-Gatter, 4x4 zeilenweise. Die Basisreihenfolge ist
+// |q1 q2> = |00>, |01>, |10>, |11> mit q1 als hoeherwertigem Bit.
+pub fn QuApply2(re: int64, im: int64, nQubits: int64, q1: int64, q2: int64,
+                gateRe: int64, gateIm: int64): bool {
+  var size: int64 := QuStateSize(nQubits);
+  if (size < 1) { return false; }
+  if (q1 == q2) { return false; }
+  if (q1 < 0) { return false; }
+  if (q2 < 0) { return false; }
+  if (q1 >= nQubits) { return false; }
+  if (q2 >= nQubits) { return false; }
+
+  var b1: int64 := 1;
+  var s1: int64 := 0;
+  while (s1 < nQubits - 1 - q1) {
+    b1 := b1 * 2;
+    s1 := s1 + 1;
+  }
+  var b2: int64 := 1;
+  var s2: int64 := 0;
+  while (s2 < nQubits - 1 - q2) {
+    b2 := b2 * 2;
+    s2 := s2 + 1;
+  }
+
+  var ar: int64 := alloc(4 * 8);
+  var ai: int64 := alloc(4 * 8);
+  if (ar == 0) { return false; }
+  if (ai == 0) { return false; }
+
+  var i: int64 := 0;
+  while (i < size) {
+    var m1: int64 := i & b1;
+    var m2: int64 := i & b2;
+    if (m1 == 0) {
+      if (m2 == 0) {
+        // die vier Indizes eines Blocks
+        var i00: int64 := i;
+        var i01: int64 := i | b2;
+        var i10: int64 := i | b1;
+        var i11: int64 := i | b1 | b2;
+
+        _p(ar, 0, _g(re, i00));  _p(ai, 0, _g(im, i00));
+        _p(ar, 1, _g(re, i01));  _p(ai, 1, _g(im, i01));
+        _p(ar, 2, _g(re, i10));  _p(ai, 2, _g(im, i10));
+        _p(ar, 3, _g(re, i11));  _p(ai, 3, _g(im, i11));
+
+        var r: int64 := 0;
+        while (r < 4) {
+          var accR: f64 := _zero();
+          var accI: f64 := _zero();
+          var cc: int64 := 0;
+          while (cc < 4) {
+            var gr: f64 := _g(gateRe, r * 4 + cc);
+            var gi: f64 := _g(gateIm, r * 4 + cc);
+            var vr: f64 := _g(ar, cc);
+            var vi: f64 := _g(ai, cc);
+            accR := accR + gr * vr - gi * vi;
+            accI := accI + gr * vi + gi * vr;
+            cc := cc + 1;
+          }
+          var dst: int64 := i00;
+          if (r == 1) { dst := i01; }
+          if (r == 2) { dst := i10; }
+          if (r == 3) { dst := i11; }
+          _p(re, dst, accR);
+          _p(im, dst, accI);
+          r := r + 1;
+        }
+      }
+    }
+    i := i + 1;
+  }
+
+  free(ar, 4 * 8);
+  free(ai, 4 * 8);
+  return true;
+}
+
+// ── Standardgatter ───────────────────────────────────────────────────────────
+//
+// Alle als 2x2 (bzw. 4x4) zeilenweise in zwei Feldern. Der Aufrufer legt sie
+// an; die Erzeuger fuellen sie.
+
+fn _setG(re: int64, im: int64, i: int64, r: f64, m: f64): void {
+  _p(re, i, r);
+  _p(im, i, m);
+}
+
+// Hadamard: erzeugt aus |0> die gleichgewichtige Ueberlagerung
+pub fn QuGateH(re: int64, im: int64): void {
+  var s: f64 := _one() / SqrtF64(2.0);
+  _setG(re, im, 0, s, _zero());
+  _setG(re, im, 1, s, _zero());
+  _setG(re, im, 2, s, _zero());
+  _setG(re, im, 3, _neg(s), _zero());
+}
+
+pub fn QuGateX(re: int64, im: int64): void {
+  _setG(re, im, 0, _zero(), _zero());
+  _setG(re, im, 1, _one(), _zero());
+  _setG(re, im, 2, _one(), _zero());
+  _setG(re, im, 3, _zero(), _zero());
+}
+
+// Y ist rein imaginaer — der Fall, an dem sich zeigt, ob eine Implementierung
+// wirklich komplex rechnet
+pub fn QuGateY(re: int64, im: int64): void {
+  _setG(re, im, 0, _zero(), _zero());
+  _setG(re, im, 1, _zero(), _neg(_one()));
+  _setG(re, im, 2, _zero(), _one());
+  _setG(re, im, 3, _zero(), _zero());
+}
+
+pub fn QuGateZ(re: int64, im: int64): void {
+  _setG(re, im, 0, _one(), _zero());
+  _setG(re, im, 1, _zero(), _zero());
+  _setG(re, im, 2, _zero(), _zero());
+  _setG(re, im, 3, _neg(_one()), _zero());
+}
+
+// Phasengatter S = diag(1, i)
+pub fn QuGateS(re: int64, im: int64): void {
+  _setG(re, im, 0, _one(), _zero());
+  _setG(re, im, 1, _zero(), _zero());
+  _setG(re, im, 2, _zero(), _zero());
+  _setG(re, im, 3, _zero(), _one());
+}
+
+// T = diag(1, e^{i pi/4})
+pub fn QuGateT(re: int64, im: int64): void {
+  var c: f64 := _one() / SqrtF64(2.0);
+  _setG(re, im, 0, _one(), _zero());
+  _setG(re, im, 1, _zero(), _zero());
+  _setG(re, im, 2, _zero(), _zero());
+  _setG(re, im, 3, c, c);
+}
+
+// Drehungen um die Achsen der Blochkugel. Der halbe Winkel ist kein
+// Schreibfehler: eine Drehung um 2*pi bildet den Zustand auf sein Negatives ab,
+// erst 4*pi fuehren zurueck.
+pub fn QuGateRX(re: int64, im: int64, theta: f64): void {
+  var c: f64 := CosF64(theta / 2.0);
+  var s: f64 := SinF64(theta / 2.0);
+  _setG(re, im, 0, c, _zero());
+  _setG(re, im, 1, _zero(), _neg(s));
+  _setG(re, im, 2, _zero(), _neg(s));
+  _setG(re, im, 3, c, _zero());
+}
+
+pub fn QuGateRY(re: int64, im: int64, theta: f64): void {
+  var c: f64 := CosF64(theta / 2.0);
+  var s: f64 := SinF64(theta / 2.0);
+  _setG(re, im, 0, c, _zero());
+  _setG(re, im, 1, _neg(s), _zero());
+  _setG(re, im, 2, s, _zero());
+  _setG(re, im, 3, c, _zero());
+}
+
+pub fn QuGateRZ(re: int64, im: int64, theta: f64): void {
+  var c: f64 := CosF64(theta / 2.0);
+  var s: f64 := SinF64(theta / 2.0);
+  _setG(re, im, 0, c, _neg(s));
+  _setG(re, im, 1, _zero(), _zero());
+  _setG(re, im, 2, _zero(), _zero());
+  _setG(re, im, 3, c, s);
+}
+
+// CNOT als 4x4: Kontrolle ist das erste, Ziel das zweite Qubit
+pub fn QuGateCNOT(re: int64, im: int64): void {
+  var i: int64 := 0;
+  while (i < 16) {
+    _p(re, i, _zero());
+    _p(im, i, _zero());
+    i := i + 1;
+  }
+  _p(re, 0, _one());          // |00> -> |00>
+  _p(re, 1 * 4 + 1, _one());  // |01> -> |01>
+  _p(re, 2 * 4 + 3, _one());  // |10> -> |11>
+  _p(re, 3 * 4 + 2, _one());  // |11> -> |10>
+}
+
+// Kontrolliertes Z — symmetrisch in beiden Qubits, anders als CNOT
+pub fn QuGateCZ(re: int64, im: int64): void {
+  var i: int64 := 0;
+  while (i < 16) {
+    _p(re, i, _zero());
+    _p(im, i, _zero());
+    i := i + 1;
+  }
+  _p(re, 0, _one());
+  _p(re, 1 * 4 + 1, _one());
+  _p(re, 2 * 4 + 2, _one());
+  _p(re, 3 * 4 + 3, _neg(_one()));
+}
+
+// Tauscht zwei Qubits
+pub fn QuGateSWAP(re: int64, im: int64): void {
+  var i: int64 := 0;
+  while (i < 16) {
+    _p(re, i, _zero());
+    _p(im, i, _zero());
+    i := i + 1;
+  }
+  _p(re, 0, _one());
+  _p(re, 1 * 4 + 2, _one());
+  _p(re, 2 * 4 + 1, _one());
+  _p(re, 3 * 4 + 3, _one());
+}
+
+// ── Messung und Auswertung ───────────────────────────────────────────────────
+
+// Wahrscheinlichkeit eines Basiszustands: das Betragsquadrat der Amplitude.
+pub fn QuProbability(re: int64, im: int64, nQubits: int64, basis: int64): f64 {
+  var size: int64 := QuStateSize(nQubits);
+  if (basis < 0) { return _zero(); }
+  if (basis >= size) { return _zero(); }
+  var a: f64 := _g(re, basis);
+  var b: f64 := _g(im, basis);
+  return a * a + b * b;
+}
+
+// Wahrscheinlichkeit, ein einzelnes Qubit als 1 zu messen: Summe ueber alle
+// Basiszustaende, in denen das betreffende Bit gesetzt ist.
+pub fn QuProbQubitOne(re: int64, im: int64, nQubits: int64, qubit: int64): f64 {
+  var size: int64 := QuStateSize(nQubits);
+  if (size < 1) { return _zero(); }
+  if (qubit < 0) { return _zero(); }
+  if (qubit >= nQubits) { return _zero(); }
+
+  var bit: int64 := 1;
+  var sh: int64 := 0;
+  while (sh < nQubits - 1 - qubit) {
+    bit := bit * 2;
+    sh := sh + 1;
+  }
+
+  var s: f64 := _zero();
+  var i: int64 := 0;
+  while (i < size) {
+    if ((i & bit) != 0) {
+      var a: f64 := _g(re, i);
+      var b: f64 := _g(im, i);
+      s := s + a * a + b * b;
+    }
+    i := i + 1;
+  }
+  return s;
+}
+
+// Zustand auf Norm 1 bringen. Rundungsfehler summieren sich ueber viele
+// Gatter; die Wahrscheinlichkeiten muessen sich aber zu eins addieren.
+pub fn QuNormalize(re: int64, im: int64, nQubits: int64): bool {
+  var size: int64 := QuStateSize(nQubits);
+  if (size < 1) { return false; }
+  var n: f64 := TenNorm(re, im, size);
+  if (n < _eps()) { return false; }
+  TenScale(re, im, size, _one() / n, _zero());
+  return true;
+}
+
+// Reduzierte Dichtematrix eines einzelnen Qubits (2x2, zeilenweise).
+//
+// Sie beantwortet die Frage: wie sieht dieses Qubit aus, wenn man auf die
+// anderen keinen Zugriff hat? Bei einem unverschraenkten Zustand ist das
+// Ergebnis ein reiner Zustand (Spur des Quadrats gleich 1), bei maximaler
+// Verschraenkung die halbe Einheitsmatrix — dann traegt das einzelne Qubit
+// keine Information mehr, sie steckt vollstaendig in der Korrelation.
+pub fn QuReducedDensity(re: int64, im: int64, nQubits: int64, qubit: int64,
+                        outRe: int64, outIm: int64): bool {
+  var size: int64 := QuStateSize(nQubits);
+  if (size < 1) { return false; }
+  if (qubit < 0) { return false; }
+  if (qubit >= nQubits) { return false; }
+
+  var bit: int64 := 1;
+  var sh: int64 := 0;
+  while (sh < nQubits - 1 - qubit) {
+    bit := bit * 2;
+    sh := sh + 1;
+  }
+
+  var i: int64 := 0;
+  while (i < 4) {
+    _p(outRe, i, _zero());
+    _p(outIm, i, _zero());
+    i := i + 1;
+  }
+
+  // rho[a][b] = sum ueber alle uebrigen Konfigurationen von amp[a] * conj(amp[b])
+  i := 0;
+  while (i < size) {
+    if ((i & bit) == 0) {
+      var j: int64 := i | bit;
+      var a0r: f64 := _g(re, i);   var a0i: f64 := _g(im, i);
+      var a1r: f64 := _g(re, j);   var a1i: f64 := _g(im, j);
+
+      _p(outRe, 0, _g(outRe, 0) + a0r * a0r + a0i * a0i);
+      _p(outRe, 3, _g(outRe, 3) + a1r * a1r + a1i * a1i);
+      // rho01 = a0 * conj(a1)
+      _p(outRe, 1, _g(outRe, 1) + a0r * a1r + a0i * a1i);
+      _p(outIm, 1, _g(outIm, 1) + a0i * a1r - a0r * a1i);
+      // rho10 = conj(rho01)
+      _p(outRe, 2, _g(outRe, 2) + a0r * a1r + a0i * a1i);
+      _p(outIm, 2, _g(outIm, 2) - (a0i * a1r - a0r * a1i));
+    }
+    i := i + 1;
+  }
+  return true;
+}
+
+// Von-Neumann-Entropie eines Qubits, in Bit. 0 bedeutet unverschraenkt, 1
+// maximal verschraenkt.
+//
+// Genauigkeit: rund 1e-7, geerbt von LogF64. Das genuegt, um verschraenkt von
+// unverschraenkt zu unterscheiden, nicht aber fuer feine Vergleiche knapp
+// benachbarter Zustaende.
+//
+// Die Eigenwerte einer hermiteschen 2x2-Matrix stehen geschlossen da —
+// (Spur +- sqrt(Spur^2 - 4*det))/2 —, ein Eigenwertverfahren ist dafuer nicht
+// noetig. Fuer groessere Teilsysteme waere es das, dann ueber die reelle
+// Einbettung einer hermiteschen Matrix und LinEigenSym aus std.linalg.
+pub fn QuEntanglementEntropy(re: int64, im: int64, nQubits: int64, qubit: int64): f64 {
+  var rr: int64 := alloc(4 * 8);
+  var ri: int64 := alloc(4 * 8);
+  if (rr == 0) { return _zero(); }
+  if (ri == 0) { return _zero(); }
+
+  var ent: f64 := _zero();
+  if (QuReducedDensity(re, im, nQubits, qubit, rr, ri)) {
+    var tr: f64 := _g(rr, 0) + _g(rr, 3);
+    // det = rho00*rho11 - |rho01|^2
+    var r01r: f64 := _g(rr, 1);
+    var r01i: f64 := _g(ri, 1);
+    var det: f64 := _g(rr, 0) * _g(rr, 3) - (r01r * r01r + r01i * r01i);
+
+    var disc: f64 := tr * tr - 4.0 * det;
+    if (disc < _zero()) { disc := _zero(); }
+    var root: f64 := SqrtF64(disc);
+    var l1: f64 := (tr + root) / 2.0;
+    var l2: f64 := (tr - root) / 2.0;
+
+    var ln2: f64 := LogF64(2.0);
+    if (l1 > _eps()) { ent := ent - l1 * LogF64(l1) / ln2; }
+    if (l2 > _eps()) { ent := ent - l2 * LogF64(l2) / ln2; }
+  }
+
+  free(rr, 4 * 8);
+  free(ri, 4 * 8);
+  return ent;
+}

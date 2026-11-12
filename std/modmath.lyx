@@ -1,0 +1,543 @@
+// std/modmath.lyx
+// Modulo-Arithmetik (Restklassenringe Z/mZ)
+
+@description("Modular arithmetic over Z/mZ: residues, inverses, CRT, order, square roots")
+@author("Andreas Roene")
+@copyright("2026 Andreas Roene")
+unit std.modmath;
+
+// alloc/free sind keine Builtins (#1356) — die kleinen Puffer fuer die
+// Ausgabeparameter des erweiterten Euklid kommen aus std.alloc.
+import std.alloc;
+
+// ── Wertebereich ─────────────────────────────────────────────────────────────
+//
+// Alle Rechnungen laufen auf int64. Ein Produkt zweier Restklassen wuerde
+// dabei ueberlaufen, sobald der Modul groesser als 2^31 ist — und ein
+// int64-Ueberlauf ist in Lyx still, er wrappt (4000000000 * 4000000000 liefert
+// -2446744073709551616 statt eines Fehlers). Deshalb multipliziert diese
+// Einheit ueber Verdoppeln-und-Addieren, sobald der Modul das erfordert; dabei
+// bleibt jede Zwischensumme unter 2*m.
+//
+// Daraus folgt die harte Obergrenze: MOD_MAX = 2^62 - 1. Groessere Moduln
+// werden abgewiesen, statt still falsch zu rechnen.
+//
+// ── Vorzeichen ───────────────────────────────────────────────────────────────
+//
+// Lyx' `%` schneidet Richtung Null ab: -7 % 3 ist -1, nicht 2. Der Rest traegt
+// also das Vorzeichen des Dividenden. Fuer Restklassen ist das die falsche
+// Konvention — jede Funktion hier liefert den Repraesentanten aus 0..m-1 und
+// normalisiert ihre Eingaben selbst. Wer roh mit `%` weiterrechnet, muss
+// ModNorm() davorsetzen.
+//
+// ── Fehlerkonvention ─────────────────────────────────────────────────────────
+//
+// Kein Ergebnis (kein Inverses, keine Wurzel, unvertraegliche Kongruenzen,
+// unzulaessiger Modul) wird als MOD_ERR = -1 gemeldet. Das ist eindeutig, weil
+// jedes gueltige Ergebnis in 0..m-1 liegt. Rueckgabewerte MUESSEN geprueft
+// werden — -1 rechnet sich sonst stumm weiter.
+//
+// Bewusst nicht enthalten: ein Ring-Typ, der den Modul mitfuehrt. `struct` hat
+// in lyxc 1.0.19C keine Wertsemantik (#1351) — `var b: R := a` teilt den
+// Speicher mit a, eine Zuweisung an b.mod aendert auch a. Ein Typ, der genau
+// darauf baut, waere eine Falle. Der Modul wird deshalb bei jedem Aufruf
+// uebergeben.
+
+pub con MOD_ERR: int64 := -1;
+pub con MOD_MAX: int64 := 4611686018427387903;   // 2^62 - 1
+
+// Ab hier wuerde a*b als int64 ueberlaufen; darunter darf direkt multipliziert
+// werden (2^31 - 1, also (2^31-1)^2 < 2^62).
+con MOD_DIRECT: int64 := 2147483647;
+
+pub fn ModIsValidModulus(m: int64): bool {
+  if (m < 1) { return false; }
+  if (m > MOD_MAX) { return false; }
+  return true;
+}
+
+// ── Grundoperationen ─────────────────────────────────────────────────────────
+
+// Repraesentant von a in 0..m-1.
+pub fn ModNorm(a: int64, m: int64): int64 {
+  if (!ModIsValidModulus(m)) { return MOD_ERR; }
+  var r: int64 := a % m;
+  if (r < 0) { r := r + m; }
+  return r;
+}
+
+// Liegen a und b in derselben Restklasse?
+pub fn ModEq(a: int64, b: int64, m: int64): bool {
+  if (!ModIsValidModulus(m)) { return false; }
+  return ModNorm(a, m) == ModNorm(b, m);
+}
+
+pub fn ModAdd(a: int64, b: int64, m: int64): int64 {
+  if (!ModIsValidModulus(m)) { return MOD_ERR; }
+  var x: int64 := ModNorm(a, m);
+  var y: int64 := ModNorm(b, m);
+  // x + y < 2m <= 2^63 - 1: kein Ueberlauf, deshalb reicht ein Vergleich
+  // statt eines weiteren `%`.
+  var s: int64 := x + y;
+  if (s >= m) { s := s - m; }
+  return s;
+}
+
+pub fn ModSub(a: int64, b: int64, m: int64): int64 {
+  if (!ModIsValidModulus(m)) { return MOD_ERR; }
+  var x: int64 := ModNorm(a, m);
+  var y: int64 := ModNorm(b, m);
+  var d: int64 := x - y;
+  if (d < 0) { d := d + m; }
+  return d;
+}
+
+pub fn ModNeg(a: int64, m: int64): int64 {
+  return ModSub(0, a, m);
+}
+
+// Ueberlaufsichere Multiplikation. Unterhalb von MOD_DIRECT direkt, darueber
+// per Verdoppeln-und-Addieren (russische Bauernmultiplikation): 62 Runden,
+// jede Zwischensumme < 2m.
+pub fn ModMul(a: int64, b: int64, m: int64): int64 {
+  if (!ModIsValidModulus(m)) { return MOD_ERR; }
+  if (m == 1) { return 0; }
+  var x: int64 := ModNorm(a, m);
+  var y: int64 := ModNorm(b, m);
+  if (m <= MOD_DIRECT) { return (x * y) % m; }
+
+  var r: int64 := 0;
+  while (y > 0) {
+    if ((y & 1) == 1) {
+      r := r + x;
+      if (r >= m) { r := r - m; }
+    }
+    x := x + x;
+    if (x >= m) { x := x - m; }
+    y := y >> 1;
+  }
+  return r;
+}
+
+// a^e mod m. Negatives e wird ueber das Inverse aufgeloest und liefert
+// MOD_ERR, wenn a nicht invertierbar ist.
+pub fn ModPow(a: int64, e: int64, m: int64): int64 {
+  if (!ModIsValidModulus(m)) { return MOD_ERR; }
+  if (m == 1) { return 0; }
+
+  var base: int64 := ModNorm(a, m);
+  var exp: int64 := e;
+  if (exp < 0) {
+    base := ModInv(base, m);
+    if (base == MOD_ERR) { return MOD_ERR; }
+    exp := -exp;
+  }
+
+  var r: int64 := 1;
+  while (exp > 0) {
+    if ((exp & 1) == 1) { r := ModMul(r, base, m); }
+    base := ModMul(base, base, m);
+    exp := exp >> 1;
+  }
+  return r;
+}
+
+// ── Erweiterter euklidischer Algorithmus ─────────────────────────────────────
+//
+// Liefert g = gcd(a,b) und schreibt die Bezout-Koeffizienten x,y mit
+// a*x + b*y = g an die uebergebenen Adressen. outX/outY duerfen 0 sein, dann
+// wird der jeweilige Koeffizient verworfen.
+//
+// Adressen statt Rueckgabetupel: Tupel aus mehr als zwei Werten gibt es nicht,
+// und ein Struct als Rueckgabe faellt unter #1351. Adresse + poke64 ist der
+// Weg, den die Einheiten des Bestands ohnehin gehen.
+pub fn ModGcdExt(a: int64, b: int64, outX: int64, outY: int64): int64 {
+  var oldR: int64 := a;   var r: int64 := b;
+  var oldS: int64 := 1;   var s: int64 := 0;
+  var oldT: int64 := 0;   var t: int64 := 1;
+
+  while (r != 0) {
+    var q: int64 := oldR / r;
+
+    var tmp: int64 := oldR - q * r;
+    oldR := r;  r := tmp;
+
+    tmp := oldS - q * s;
+    oldS := s;  s := tmp;
+
+    tmp := oldT - q * t;
+    oldT := t;  t := tmp;
+  }
+
+  // gcd wird positiv gefuehrt; bei negativem a oder b kippt sonst auch das
+  // Vorzeichen der Koeffizienten und ModInv liefert einen negativen Wert.
+  if (oldR < 0) {
+    oldR := -oldR;  oldS := -oldS;  oldT := -oldT;
+  }
+
+  if (outX != 0) { poke64(outX, oldS); }
+  if (outY != 0) { poke64(outY, oldT); }
+  return oldR;
+}
+
+pub fn ModGcd(a: int64, b: int64): int64 {
+  return ModGcdExt(a, b, 0, 0);
+}
+
+// Multiplikatives Inverses von a modulo m, oder MOD_ERR falls gcd(a,m) != 1.
+pub fn ModInv(a: int64, m: int64): int64 {
+  if (!ModIsValidModulus(m)) { return MOD_ERR; }
+  if (m == 1) { return 0; }
+
+  var xbuf: int64 := alloc(8);
+  if (xbuf == 0) { return MOD_ERR; }
+  var g: int64 := ModGcdExt(ModNorm(a, m), m, xbuf, 0);
+  var x: int64 := peek64(xbuf);
+  free(xbuf, 8);
+
+  if (g != 1) { return MOD_ERR; }
+  return ModNorm(x, m);
+}
+
+// a / b mod m, also a * b^-1. MOD_ERR falls b nicht invertierbar ist.
+pub fn ModDiv(a: int64, b: int64, m: int64): int64 {
+  var inv: int64 := ModInv(b, m);
+  if (inv == MOD_ERR) { return MOD_ERR; }
+  return ModMul(a, inv, m);
+}
+
+// Ist a invertierbar, liegt also eine Einheit des Rings vor?
+pub fn ModIsUnit(a: int64, m: int64): bool {
+  if (!ModIsValidModulus(m)) { return false; }
+  return ModGcd(ModNorm(a, m), m) == 1;
+}
+
+// ── Lineare Kongruenzen und CRT ──────────────────────────────────────────────
+
+// Loest a*x = b (mod m). Schreibt die kleinste nichtnegative Loesung nach outX
+// und den Modul der Loesungsmenge (m/g) nach outMod; die vollstaendige
+// Loesungsmenge ist x + k*(m/g).
+//
+// Rueckgabe: Anzahl der Loesungen modulo m (= g), oder MOD_ERR wenn unloesbar.
+pub fn ModSolveLinear(a: int64, b: int64, m: int64, outX: int64, outMod: int64): int64 {
+  if (!ModIsValidModulus(m)) { return MOD_ERR; }
+
+  var an: int64 := ModNorm(a, m);
+  var bn: int64 := ModNorm(b, m);
+
+  var pbuf: int64 := alloc(8);
+  if (pbuf == 0) { return MOD_ERR; }
+  var g: int64 := ModGcdExt(an, m, pbuf, 0);
+  var p: int64 := peek64(pbuf);
+  free(pbuf, 8);
+
+  if ((bn % g) != 0) { return MOD_ERR; }
+
+  var mg: int64 := m / g;
+  // p ist Inverses von a/g modulo m/g.
+  var x: int64 := ModMul(ModNorm(p, mg), ModNorm(bn / g, mg), mg);
+
+  if (outX != 0)   { poke64(outX, x); }
+  if (outMod != 0) { poke64(outMod, mg); }
+  return g;
+}
+
+// Chinesischer Restsatz fuer zwei Kongruenzen, auch fuer nicht teilerfremde
+// Moduln. Schreibt die Loesung nach outR und gibt den gemeinsamen Modul
+// lcm(m1,m2) zurueck; MOD_ERR, wenn die Kongruenzen einander widersprechen
+// (r1 != r2 modulo gcd(m1,m2)).
+pub fn ModCrt2(r1: int64, m1: int64, r2: int64, m2: int64, outR: int64): int64 {
+  if (!ModIsValidModulus(m1)) { return MOD_ERR; }
+  if (!ModIsValidModulus(m2)) { return MOD_ERR; }
+
+  var a1: int64 := ModNorm(r1, m1);
+  var a2: int64 := ModNorm(r2, m2);
+
+  var pbuf: int64 := alloc(8);
+  if (pbuf == 0) { return MOD_ERR; }
+  var g: int64 := ModGcdExt(m1, m2, pbuf, 0);
+  var p: int64 := peek64(pbuf);   // p*m1 + q*m2 = g
+  free(pbuf, 8);
+
+  var diff: int64 := a2 - a1;
+  if ((diff % g) != 0) { return MOD_ERR; }
+
+  var m2g: int64 := m2 / g;
+  // lcm zuerst pruefen: m1 * m2g kann ueber MOD_MAX hinauslaufen, und ein
+  // stiller Wrap waere hier besonders heimtueckisch — das Ergebnis saehe
+  // gueltig aus.
+  if (m2g > MOD_MAX / m1) { return MOD_ERR; }
+  var lcm: int64 := m1 * m2g;
+
+  // k = (diff/g) * p mod (m2/g); x = a1 + m1*k liegt dann unter lcm.
+  var k: int64 := ModMul(ModNorm(diff / g, m2g), ModNorm(p, m2g), m2g);
+  var x: int64 := ModAdd(a1, ModMul(m1, k, lcm), lcm);
+
+  if (outR != 0) { poke64(outR, x); }
+  return lcm;
+}
+
+// CRT ueber n Kongruenzen. resids und mods sind Adressen zweier Felder mit je
+// n int64-Werten (Aufrufer legt sie mit alloc an). Ergebnis wie ModCrt2.
+//
+// Felder als Adressen statt als Array-Parameter: Arrays als Parameter liefern
+// in lyxc 1.0.19C Speichermuell (#1115).
+pub fn ModCrtN(resids: int64, mods: int64, n: int64, outR: int64): int64 {
+  if (n <= 0) { return MOD_ERR; }
+  if (resids == 0) { return MOD_ERR; }
+  if (mods == 0) { return MOD_ERR; }
+
+  var accR: int64 := ModNorm(peek64(resids), peek64(mods));
+  var accM: int64 := peek64(mods);
+  if (accR == MOD_ERR) { return MOD_ERR; }
+
+  var rbuf: int64 := alloc(8);
+  if (rbuf == 0) { return MOD_ERR; }
+
+  var i: int64 := 1;
+  while (i < n) {
+    var lcm: int64 := ModCrt2(accR, accM, peek64(resids + i * 8), peek64(mods + i * 8), rbuf);
+    if (lcm == MOD_ERR) {
+      free(rbuf, 8);
+      return MOD_ERR;
+    }
+    accR := peek64(rbuf);
+    accM := lcm;
+    i := i + 1;
+  }
+  free(rbuf, 8);
+
+  if (outR != 0) { poke64(outR, accR); }
+  return accM;
+}
+
+// ── Struktur des Rings ───────────────────────────────────────────────────────
+
+// Eulersche Phi-Funktion: Anzahl der Einheiten in Z/nZ. Probedivision bis
+// sqrt(n), also O(sqrt(n)) — fuer Moduln jenseits von etwa 10^12 spuerbar.
+pub fn ModEulerPhi(n: int64): int64 {
+  if (n < 1) { return MOD_ERR; }
+  if (n == 1) { return 1; }
+
+  var result: int64 := n;
+  var rest: int64 := n;
+  var p: int64 := 2;
+
+  while (p * p <= rest) {
+    if ((rest % p) == 0) {
+      while ((rest % p) == 0) { rest := rest / p; }
+      result := result - result / p;
+    }
+    if (p == 2) { p := 3; }
+    else { p := p + 2; }
+  }
+  if (rest > 1) { result := result - result / rest; }
+  return result;
+}
+
+// Miller-Rabin mit den 12 Basen, die fuer alle Werte unter 3.3*10^24
+// deterministisch sind — im int64-Bereich also ein Beweis, kein Test.
+pub fn ModIsPrime(n: int64): bool {
+  if (n < 2) { return false; }
+  if (n > MOD_MAX) { return false; }
+
+  var small: int64 := 2;
+  while (small <= 37) {
+    if (n == small) { return true; }
+    if ((n % small) == 0) { return false; }
+    small := small + 1;
+  }
+
+  // n-1 = d * 2^s mit ungeradem d
+  var d: int64 := n - 1;
+  var s: int64 := 0;
+  while ((d & 1) == 0) {
+    d := d >> 1;
+    s := s + 1;
+  }
+
+  var bases: int64 := alloc(12 * 8);
+  if (bases == 0) { return false; }
+  poke64(bases,       2);   poke64(bases +  8,  3);   poke64(bases + 16,  5);
+  poke64(bases + 24,  7);   poke64(bases + 32, 11);   poke64(bases + 40, 13);
+  poke64(bases + 48, 17);   poke64(bases + 56, 19);   poke64(bases + 64, 23);
+  poke64(bases + 72, 29);   poke64(bases + 80, 31);   poke64(bases + 88, 37);
+
+  var probablyPrime: bool := true;
+  var i: int64 := 0;
+  while (i < 12) {
+    var a: int64 := peek64(bases + i * 8);
+    var x: int64 := ModPow(a, d, n);
+
+    if ((x != 1) and (x != n - 1)) {
+      var witness: bool := true;
+      var r: int64 := 1;
+      while (r < s) {
+        x := ModMul(x, x, n);
+        if (x == n - 1) {
+          witness := false;
+          r := s;               // Schleife beenden, ohne break im Zweig
+        }
+        else { r := r + 1; }
+      }
+      if (witness) {
+        probablyPrime := false;
+        i := 12;                // restliche Basen erübrigen sich
+      }
+    }
+    if (probablyPrime) { i := i + 1; }
+  }
+  free(bases, 12 * 8);
+  return probablyPrime;
+}
+
+// Multiplikative Ordnung von a modulo m: kleinstes k > 0 mit a^k = 1.
+// MOD_ERR, wenn a keine Einheit ist. Kostet eine Phi-Berechnung, also
+// O(sqrt(m)).
+pub fn ModOrder(a: int64, m: int64): int64 {
+  if (!ModIsValidModulus(m)) { return MOD_ERR; }
+  if (m == 1) { return 1; }
+  var an: int64 := ModNorm(a, m);
+  if (ModGcd(an, m) != 1) { return MOD_ERR; }
+
+  // Die Ordnung teilt phi(m). Von phi ausgehend jeden Primfaktor so oft
+  // herauskuerzen, wie a^(ord/p) noch 1 bleibt.
+  var ord: int64 := ModEulerPhi(m);
+  var rest: int64 := ord;
+  var p: int64 := 2;
+
+  while (p * p <= rest) {
+    if ((rest % p) == 0) {
+      while ((rest % p) == 0) { rest := rest / p; }
+      while ((ord % p) == 0) {
+        if (ModPow(an, ord / p, m) == 1) { ord := ord / p; }
+        else { rest := 1; p := ord + 1; }   // dieser Faktor ist ausgereizt
+      }
+    }
+    if (p == 2) { p := 3; }
+    else { p := p + 2; }
+  }
+  if (rest > 1) {
+    while ((ord % rest) == 0) {
+      if (ModPow(an, ord / rest, m) == 1) { ord := ord / rest; }
+      else { rest := ord + 1; }
+    }
+  }
+  return ord;
+}
+
+// Ist a eine Primitivwurzel modulo m, erzeugt es also die volle Einheitengruppe?
+pub fn ModIsPrimitiveRoot(a: int64, m: int64): bool {
+  var ord: int64 := ModOrder(a, m);
+  if (ord == MOD_ERR) { return false; }
+  return ord == ModEulerPhi(m);
+}
+
+// Kleinste Primitivwurzel modulo m, oder MOD_ERR wenn keine existiert
+// (die Einheitengruppe ist nur fuer m = 1,2,4,p^k,2p^k zyklisch).
+pub fn ModPrimitiveRoot(m: int64): int64 {
+  if (!ModIsValidModulus(m)) { return MOD_ERR; }
+  if (m == 1) { return 0; }
+
+  var phi: int64 := ModEulerPhi(m);
+  var g: int64 := 1;
+  while (g < m) {
+    if (ModGcd(g, m) == 1) {
+      if (ModOrder(g, m) == phi) { return g; }
+    }
+    g := g + 1;
+  }
+  return MOD_ERR;
+}
+
+// ── Quadratische Reste ───────────────────────────────────────────────────────
+
+// Legendre-Symbol (a/p) fuer ungerade Primzahlen p: 1 Rest, -1 Nichtrest,
+// 0 wenn p die Zahl a teilt.
+pub fn ModLegendre(a: int64, p: int64): int64 {
+  if (p < 3) { return MOD_ERR; }
+  var an: int64 := ModNorm(a, p);
+  if (an == 0) { return 0; }
+  var r: int64 := ModPow(an, (p - 1) / 2, p);
+  if (r == 1) { return 1; }
+  return -1;
+}
+
+// Jacobi-Symbol (a/n) fuer ungerade n > 0 — verallgemeinert Legendre auf
+// zusammengesetzte Nenner und braucht keine Faktorisierung.
+pub fn ModJacobi(a: int64, n: int64): int64 {
+  if (n < 1) { return MOD_ERR; }
+  if ((n & 1) == 0) { return MOD_ERR; }
+
+  var x: int64 := ModNorm(a, n);
+  var m: int64 := n;
+  var result: int64 := 1;
+
+  while (x != 0) {
+    while ((x & 1) == 0) {
+      x := x >> 1;
+      var r8: int64 := m % 8;
+      if ((r8 == 3) or (r8 == 5)) { result := -result; }
+    }
+    // Reziprozitaet: tauschen, Vorzeichen kippt, wenn beide 3 mod 4 sind
+    var tmp: int64 := x;  x := m;  m := tmp;
+    if (((x % 4) == 3) and ((m % 4) == 3)) { result := -result; }
+    x := x % m;
+  }
+  if (m != 1) { return 0; }
+  return result;
+}
+
+// Quadratwurzel modulo einer Primzahl p (Tonelli-Shanks). Liefert eine der
+// beiden Wurzeln — die andere ist p - r. MOD_ERR, wenn a kein quadratischer
+// Rest ist oder p keine Primzahl.
+pub fn ModSqrt(a: int64, p: int64): int64 {
+  if (p < 2) { return MOD_ERR; }
+  var an: int64 := ModNorm(a, p);
+  if (p == 2) { return an; }
+  if (an == 0) { return 0; }
+  if (ModLegendre(an, p) != 1) { return MOD_ERR; }
+
+  // p = 3 (mod 4): geschlossene Formel, der haeufige Fall
+  if ((p % 4) == 3) { return ModPow(an, (p + 1) / 4, p); }
+
+  // p - 1 = q * 2^s mit ungeradem q
+  var q: int64 := p - 1;
+  var s: int64 := 0;
+  while ((q & 1) == 0) {
+    q := q >> 1;
+    s := s + 1;
+  }
+
+  // irgendein Nichtrest z
+  var z: int64 := 2;
+  while (ModLegendre(z, p) != -1) { z := z + 1; }
+
+  var m: int64 := s;
+  var c: int64 := ModPow(z, q, p);
+  var t: int64 := ModPow(an, q, p);
+  var r: int64 := ModPow(an, (q + 1) / 2, p);
+
+  while (t != 1) {
+    // kleinstes i mit t^(2^i) = 1
+    var i: int64 := 0;
+    var t2: int64 := t;
+    while (t2 != 1) {
+      t2 := ModMul(t2, t2, p);
+      i := i + 1;
+    }
+
+    var b: int64 := c;
+    var j: int64 := 0;
+    while (j < m - i - 1) {
+      b := ModMul(b, b, p);
+      j := j + 1;
+    }
+
+    m := i;
+    c := ModMul(b, b, p);
+    t := ModMul(t, c, p);
+    r := ModMul(r, b, p);
+  }
+  return r;
+}

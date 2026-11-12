@@ -1,0 +1,202 @@
+// tests/regression/mqtt/test_mqtt_wire.lyx
+// Drahtformat und inkrementelles Framing.
+// Gemessen wird der WERT bzw. die WIRKUNG, nicht das Vorhandensein:
+// Varint-Grenzwerte beidseitig, Fragmentierung an JEDER Bytegrenze,
+// mehrere Pakete in einem Lesevorgang, Groessengrenze vor dem Rumpf.
+import std.io;
+import std.mqtt.wire;
+
+var fehler: int64 := 0;
+
+fn chk(name: pchar, ist: int64, soll: int64) {
+  if (ist != soll) {
+    fehler := fehler + 1;
+    Print("FAIL "); Print(name); Print(" ist="); PrintInt(ist);
+    Print(" soll="); PrintInt(soll); Print("\n");
+  }
+}
+
+// Varint hin und zurueck: erwartete Bytelaenge und exakt derselbe Wert.
+fn varintRund(name: pchar, v: int64, sollLen: int64) {
+  var buf: int64 := alloc(8);
+  var ende: int64 := MqVarintSchreib(buf, 8, 0, v);
+  chk(name, ende, sollLen);
+  var aus: int64 := alloc(8);
+  var np: int64 := MqVarintLies(buf, ende, 0, aus);
+  chk(name, np, sollLen);
+  chk(name, peek64(aus), v);
+  free(aus, 8);
+  free(buf, 8);
+}
+
+fn main(): int64 {
+  // --- Varint: Grenzwerte beider Richtungen -------------------------------
+  varintRund("varint 0", 0, 1);
+  varintRund("varint 127", 127, 1);
+  varintRund("varint 128", 128, 2);
+  varintRund("varint 16383", 16383, 2);
+  varintRund("varint 16384", 16384, 3);
+  varintRund("varint 2097151", 2097151, 3);
+  varintRund("varint 2097152", 2097152, 4);
+  varintRund("varint max", MQ_VARINT_MAX, 4);
+  chk("varint len ueber max", MqVarintLen(MQ_VARINT_MAX + 1), -1);
+  var b8: int64 := alloc(8);
+  chk("varint schreib ueber max",
+      MqVarintSchreib(b8, 8, 0, MQ_VARINT_MAX + 1), MQ_E_VARINT_WERT);
+  chk("varint schreib negativ", MqVarintSchreib(b8, 8, 0, -1), MQ_E_VARINT_WERT);
+  chk("varint puffer klein", MqVarintSchreib(b8, 1, 0, 128), MQ_E_PUFFER_KLEIN);
+  // Vier Bytes mit gesetztem Fortsetzungsbit: laut abweisen, nicht raten.
+  poke8(b8+0, 0xFF); poke8(b8+1, 0xFF); poke8(b8+2, 0xFF); poke8(b8+3, 0xFF);
+  chk("varint 5 bytes", MqVarintLies(b8, 4, 0, 0), MQ_E_VARINT_LANG);
+  // Abgeschnitten: unvollstaendig, kein Teilwert als Ergebnis.
+  poke8(b8+0, 0x80);
+  chk("varint abgeschnitten", MqVarintLies(b8, 1, 0, 0), MQ_E_UNVOLLSTAENDIG);
+
+  // --- Festbreite ---------------------------------------------------------
+  var buf: int64 := alloc(64);
+  chk("u16 schreib", MqU16Schreib(buf, 64, 0, 65535), 2);
+  chk("u16 byte0", peek8(buf + 0) & 0xFF, 255);
+  chk("u16 byte1", peek8(buf + 1) & 0xFF, 255);
+  var aus: int64 := alloc(16);
+  chk("u16 lies pos", MqU16Lies(buf, 2, 0, aus), 2);
+  // 0xFFFF darf NICHT negativ herauskommen (peek16-Vorzeichenfalle).
+  chk("u16 wert", peek64(aus), 65535);
+  chk("u16 ueber max", MqU16Schreib(buf, 64, 0, 65536), MQ_E_LAENGE);
+  chk("u16 unvollstaendig", MqU16Lies(buf, 1, 0, aus), MQ_E_UNVOLLSTAENDIG);
+  chk("u32 schreib", MqU32Schreib(buf, 64, 0, 4294967295), 4);
+  chk("u32 lies", MqU32Lies(buf, 4, 0, aus), 4);
+  chk("u32 wert", peek64(aus), 4294967295);
+  chk("u32 ueber max", MqU32Schreib(buf, 64, 0, 4294967296), MQ_E_LAENGE);
+
+  // --- Bin/Str ------------------------------------------------------------
+  var txt: pchar := "haus/kueche";
+  var tp: int64 := txt as int64;
+  chk("str schreib", MqStrSchreib(buf, 64, 0, tp, 11), 13);
+  chk("str laenge hi", peek8(buf + 0) & 0xFF, 0);
+  chk("str laenge lo", peek8(buf + 1) & 0xFF, 11);
+  chk("str lies", MqStrLies(buf, 13, 0, aus), 13);
+  chk("str off", peek64(aus + 0), 2);
+  chk("str len", peek64(aus + 8), 11);
+  // Laengenpraefix behauptet mehr Bytes als vorliegen.
+  poke8(buf + 1, 200);
+  chk("str zu kurz", MqStrLies(buf, 13, 0, aus), MQ_E_UNVOLLSTAENDIG);
+  poke8(buf + 1, 11);
+  // Leere Nutzlast ist gueltig (F-01).
+  chk("bin leer schreib", MqBinSchreib(buf, 64, 0, tp, 0), 2);
+  chk("bin leer lies", MqBinLies(buf, 2, 0, aus), 2);
+  chk("bin leer len", peek64(aus + 8), 0);
+
+  // --- Fixed-Header-Flags, beide Seiten -----------------------------------
+  chk("flags publish qos0", MqFlagsPruefe(MQ_PUBLISH, 0x00), MQ_OK);
+  chk("flags publish qos3", MqFlagsPruefe(MQ_PUBLISH, 0x06), MQ_E_FLAGS);
+  chk("flags pubrel 2", MqFlagsPruefe(MQ_PUBREL, 0x02), MQ_OK);
+  chk("flags pubrel 0", MqFlagsPruefe(MQ_PUBREL, 0x00), MQ_E_FLAGS);
+  chk("flags subscribe 0", MqFlagsPruefe(MQ_SUBSCRIBE, 0x00), MQ_E_FLAGS);
+  chk("flags connect 0", MqFlagsPruefe(MQ_CONNECT, 0x00), MQ_OK);
+  chk("flags connect 1", MqFlagsPruefe(MQ_CONNECT, 0x01), MQ_E_FLAGS);
+  chk("flags typ 0", MqFlagsPruefe(0, 0x00), MQ_E_TYP);
+  chk("auth in v5", MqTypGueltig(MQ_AUTH, MQ_V5) as int64, 1);
+  chk("auth in v311", MqTypGueltig(MQ_AUTH, MQ_V311) as int64, 0);
+  chk("typ 0 ungueltig", MqTypGueltig(0, MQ_V5) as int64, 0);
+
+  // --- Framing: PUBLISH mit 300 Byte Rumpf (2-Byte-Remaining-Length) ------
+  var pkt: int64 := alloc(512);
+  var rumpfLen: int64 := 300;
+  poke8(pkt + 0, 0x32);                      // PUBLISH, QoS 1
+  var p: int64 := MqVarintSchreib(pkt, 512, 1, rumpfLen);
+  chk("rahmen remlen bytes", p, 3);
+  var i: int64 := 0;
+  while (i < rumpfLen) {
+    poke8(pkt + p + i, (i & 0x7F));
+    i := i + 1;
+  }
+  var pktLen: int64 := p + rumpfLen;
+
+  var rpuf: int64 := alloc(1024);
+  var z: int64 := alloc(MqRahmenGroesse());
+  var verbr: int64 := alloc(8);
+
+  // (a) alles in einem Stueck
+  MqRahmenNeu(z, rpuf, 1024, 1048576);
+  chk("rahmen ganz", MqRahmenFuettere(z, pkt, pktLen, verbr), MQ_RAHMEN_FERTIG);
+  chk("rahmen ganz verbraucht", peek64(verbr), pktLen);
+  chk("rahmen typ", MqRahmenTyp(z), MQ_PUBLISH);
+  chk("rahmen flags", MqRahmenFlags(z), 0x02);
+  chk("rahmen rumpflen", MqRahmenRumpfLen(z), rumpfLen);
+  chk("rahmen rumpf byte0", peek8(MqRahmenRumpf(z) + 0) & 0xFF, 0);
+  chk("rahmen rumpf byte299", peek8(MqRahmenRumpf(z) + 299) & 0xFF, 299 & 0x7F);
+
+  // (b) Fragmentierung an JEDER Bytegrenze: Ergebnis muss identisch sein
+  var schnitt: int64 := 1;
+  while (schnitt < pktLen) {
+    MqRahmenNeu(z, rpuf, 1024, 1048576);
+    var r1: int64 := MqRahmenFuettere(z, pkt, schnitt, verbr);
+    if (r1 != MQ_RAHMEN_TEIL) {
+      fehler := fehler + 1;
+      Print("FAIL teil1 bei schnitt="); PrintInt(schnitt);
+      Print(" rc="); PrintInt(r1); Print("\n");
+    }
+    var r2: int64 := MqRahmenFuettere(z, pkt + schnitt, pktLen - schnitt, verbr);
+    if (r2 != MQ_RAHMEN_FERTIG || MqRahmenRumpfLen(z) != rumpfLen ||
+        MqRahmenTyp(z) != MQ_PUBLISH ||
+        (peek8(MqRahmenRumpf(z) + 299) & 0xFF) != (299 & 0x7F)) {
+      fehler := fehler + 1;
+      Print("FAIL teil2 bei schnitt="); PrintInt(schnitt);
+      Print(" rc="); PrintInt(r2); Print("\n");
+    }
+    schnitt := schnitt + 1;
+  }
+
+  // (c) byteweise gefuettert: erst das letzte Byte macht fertig
+  MqRahmenNeu(z, rpuf, 1024, 1048576);
+  i := 0;
+  var frueh: int64 := 0;
+  while (i < pktLen) {
+    var rc: int64 := MqRahmenFuettere(z, pkt + i, 1, verbr);
+    if (i < pktLen - 1 && rc != MQ_RAHMEN_TEIL) { frueh := frueh + 1; }
+    if (i == pktLen - 1 && rc != MQ_RAHMEN_FERTIG) { frueh := frueh + 1; }
+    i := i + 1;
+  }
+  chk("rahmen byteweise", frueh, 0);
+
+  // (d) zwei Pakete in einem Lesevorgang: Rest bleibt stehen
+  var zwei: int64 := alloc(16);
+  poke8(zwei + 0, 0xC0); poke8(zwei + 1, 0x00);    // PINGREQ
+  poke8(zwei + 2, 0xD0); poke8(zwei + 3, 0x00);    // PINGRESP
+  MqRahmenNeu(z, rpuf, 1024, 1048576);
+  chk("zwei pakete erstes", MqRahmenFuettere(z, zwei, 4, verbr), MQ_RAHMEN_FERTIG);
+  chk("zwei pakete verbraucht", peek64(verbr), 2);
+  chk("zwei pakete typ1", MqRahmenTyp(z), MQ_PINGREQ);
+  MqRahmenWeiter(z);
+  chk("zwei pakete zweites",
+      MqRahmenFuettere(z, zwei + 2, 2, verbr), MQ_RAHMEN_FERTIG);
+  chk("zwei pakete typ2", MqRahmenTyp(z), MQ_PINGRESP);
+
+  // (e) Groessengrenze greift VOR dem Rumpf: nur Kopf+Laenge gefuettert
+  MqRahmenNeu(z, rpuf, 1024, 64);                  // maxPaket 64
+  chk("grenze vor rumpf", MqRahmenFuettere(z, pkt, 3, verbr), MQ_E_PAKET_GROSS);
+  chk("grenze nach 3 bytes", peek64(verbr), 3);
+  chk("grenze kein rumpf gelesen", peek64(z + MQ_RZ_GELESEN), 0);
+
+  // (f) Rumpfpuffer zu klein wird gemeldet, nicht stillschweigend gekuerzt
+  MqRahmenNeu(z, rpuf, 100, 1048576);
+  chk("rumpf klein", MqRahmenFuettere(z, pkt, 3, verbr), MQ_E_RUMPF_KLEIN);
+
+  // (g) reservierter Typ 0
+  var null0: int64 := alloc(8);
+  poke8(null0 + 0, 0x00); poke8(null0 + 1, 0x00);
+  MqRahmenNeu(z, rpuf, 1024, 1048576);
+  chk("typ 0 im rahmen", MqRahmenFuettere(z, null0, 2, verbr), MQ_E_TYP);
+
+  // (h) Remaining Length mit 5 Byte Fortsetzung
+  var lang: int64 := alloc(8);
+  poke8(lang + 0, 0x30);
+  poke8(lang + 1, 0xFF); poke8(lang + 2, 0xFF);
+  poke8(lang + 3, 0xFF); poke8(lang + 4, 0xFF);
+  MqRahmenNeu(z, rpuf, 1024, 1048576);
+  chk("remlen 5 bytes", MqRahmenFuettere(z, lang, 5, verbr), MQ_E_VARINT_LANG);
+
+  if (fehler == 0) { Print("ALL PASS\n"); return 0; }
+  Print("FAILS: "); PrintInt(fehler); Print("\n");
+  return 1;
+}

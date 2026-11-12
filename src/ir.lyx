@@ -80,7 +80,7 @@ pub con IRO_BITOR:   int64 := 56;
 pub con IRO_BITXOR:  int64 := 57;
 pub con IRO_BITNOT:  int64 := 58;
 pub con IRO_SHL:     int64 := 59;
-pub con IRO_SHR:     int64 := 60;
+pub con IRO_SHR:     int64 := 60;   // #2236: LOGISCHER Rechtsshift (vorzeichenlos)
 
 // Memory Load/Store (61-69)
 pub con IRO_LOAD_LOCAL:     int64 := 61;
@@ -126,6 +126,21 @@ pub con IRO_JMP:      int64 := 90;
 pub con IRO_BR_TRUE:  int64 := 91;
 pub con IRO_BR_FALSE: int64 := 92;
 pub con IRO_LABEL:    int64 := 93;
+
+// #1388: Am unteren Ende jedes Rahmens liegen acht Slots, die KEINER Variablen
+// gehoeren. Sie sind der Ablageplatz fuer Aufrufargumente, die per Konvention
+// "Slots 0..N-1" uebergeben werden — Builtins und indirekte Aufrufe tun das.
+//
+// Ohne diesen Streifen lagen dort die Parameter und Temporaeren der Funktion
+// selbst: ein `StrLen(s)` mitten in einer Bibliotheksfunktion ueberschrieb
+// deren erstes Argument. Auf arm64 lieferte `fn f(p) { StrLen("abcd"c); return p; }`
+// fuer f(9) den Wert 44. Der x86-Weg ist nicht betroffen, er geht nicht durch
+// ir_lower.
+//
+// Warum acht: mehr Argumente nimmt keine der beteiligten Konventionen in
+// Registern entgegen (AAPCS64 x0-x7, System-V sechs). Wer mehr uebergibt,
+// braucht ohnehin einen eigenen Weg.
+pub con IR_BARG_SLOTS: int64 := 8;
 pub con IRO_FUNC_EXIT:int64 := 94;
 pub con IRO_RETURN_STRUCT:int64 := 95;
 
@@ -174,6 +189,19 @@ pub con IRO_SIMD_CMP_GT:     int64 := 134;
 pub con IRO_SIMD_CMP_GE:     int64 := 135;
 pub con IRO_SIMD_LOAD_ELEM:  int64 := 136;
 pub con IRO_SIMD_STORE_ELEM: int64 := 137;
+pub con IRO_SIMD_NEW:        int64 := 165;  // parallel Array<f32>(n): aligned-mmap, count@ptr-8
+pub con IRO_FUNC_ADDR:       int64 := 166;  // dest = Adresse von Funktion funcId (lea rip+rel; A1 fn-ptr)
+pub con IRO_ASM:             int64 := 167;  // WSP-05: inline-asm-Mnemonic; imm = asmId → feste x86-Bytes
+// #2160: f32-Felder liegen mit vier Byte im Speicher, im Register als double.
+pub con IRO_F64_ZU_F32:      int64 := 168;  // dest = f32-Bitmuster (untere 32 Bit, Rest 0) von f64 src1
+pub con IRO_F32_ZU_F64:      int64 := 169;  // dest = f64 aus dem f32-Bitmuster in den unteren 32 Bit von src1
+// #2236: ARITHMETISCHER Rechtsshift (Vorzeichen bleibt). Bis 1.2.19N gab es
+// nur IRO_SHR, und jedes Backend legte ihn anders aus: arm64 als ASR, riscv,
+// arm-cm, xtensa und lyxos als logischen Shift. x86 (eigener Codegen)
+// unterscheidet nach dem Vorzeichen des linken Operanden (cg_isUnsignedExpr):
+// `(x as uint64) >> 60` war auf arm64 -1 statt 15, `x >> 60` mit negativem x
+// auf riscv 15 statt -1. ir_lower waehlt jetzt dieselbe Form wie x86.
+pub con IRO_SAR:     int64 := 170;
 
 // Map/Set (138-149)
 pub con IRO_MAP_NEW:       int64 := 138;
@@ -325,6 +353,19 @@ pub con IR_MOD_OFF_PROVENANCE:  int64 := 184;
 pub con IR_MOD_OFF_CURASTNODE:  int64 := 192;
 pub con IR_MOD_OFF_ASTNODEBUF:  int64 := 200;
 pub con IR_MOD_OFF_ASTNODEBUFC: int64 := 208;
+// #2270: physische Slots je Funktion (ir_lower._slotRecNeu). PHYSBUF ist
+// eine Tabelle funcIdx -> Satzzeiger, 0 = kein Satz (z. B. aus einer .lyu);
+// das Backend bildet dann jeden Slot auf sich selbst ab.
+//   Satz: +0 physTop, +8 physAnz, +16 cap, +24 map (phys je virtuellem Slot),
+//         +32 rel (Befehlsindex der Freigabe, -1 = nie), +40 virtAnz
+pub con IR_MOD_OFF_PHYSBUF:     int64 := 216;
+pub con IR_MOD_OFF_PHYSCAP:     int64 := 224;
+pub con IR_SLOT_OFF_TOP:  int64 := 0;
+pub con IR_SLOT_OFF_ANZ:  int64 := 8;
+pub con IR_SLOT_OFF_CAP:  int64 := 16;
+pub con IR_SLOT_OFF_MAP:  int64 := 24;
+pub con IR_SLOT_OFF_REL:  int64 := 32;
+pub con IR_SLOT_OFF_VIRT: int64 := 40;
 
 pub type IRModule = class {
   
@@ -370,6 +411,11 @@ pub type IRModule = class {
   astNodeBuf:      int64;
   astNodeBufCap:   int64;
 
+  // #2270: physische Slots (IR_MOD_OFF_PHYSBUF/PHYSCAP) — am Ende, damit die
+  // Versaetze davor gleich bleiben.
+  physBuf:         int64;
+  physCap:         int64;
+
   // ------------------------------------------------------------------
   // Initialization
   // ------------------------------------------------------------------
@@ -411,6 +457,8 @@ pub type IRModule = class {
     self.curAstNode     := -1;
     self.astNodeBuf     := 0;
     self.astNodeBufCap  := 0;
+    self.physBuf        := 0;   // #2270
+    self.physCap        := 0;
   }
   
   // ------------------------------------------------------------------
@@ -494,7 +542,7 @@ pub type IRModule = class {
     // callMode (initialize to 0)
     poke64(self.instrBuffer + off + IR_INSTR_OFF_CALLMODE, 0);
     
-    self.instrLen := self.instrLen + IR_INSTR_SIZE;
+    self.instrLen += IR_INSTR_SIZE;
 
     // WP-BC-44: record source line in side table
     if (self.irSourceMap) {
@@ -762,6 +810,10 @@ pub type IRModule = class {
   
   fn irShr(dest: int64, src1: int64, src2: int64): int64 {
     return self.addInstruction(IRO_SHR, dest, src1, src2, -1, 0);
+  }
+
+  fn irSar(dest: int64, src1: int64, src2: int64): int64 {
+    return self.addInstruction(IRO_SAR, dest, src1, src2, -1, 0);
   }
   
   // Memory operations
@@ -1160,6 +1212,7 @@ pub type IRModule = class {
     else if (op == IRO_BITNOT) { return "irBitNot"; }
     else if (op == IRO_SHL) { return "irShl"; }
     else if (op == IRO_SHR) { return "irShr"; }
+    else if (op == IRO_SAR) { return "irSar"; }
     else if (op == IRO_LOAD_LOCAL) { return "irLoadLocal"; }
     else if (op == IRO_STORE_LOCAL) { return "irStoreLocal"; }
     else if (op == IRO_LOAD_LOCAL_ADDR) { return "irLoadLocalAddr"; }
@@ -1234,6 +1287,8 @@ pub type IRModule = class {
     else if (op == IRO_INSPECT) { return "irInspect"; }
     else if (op == IRO_MOVE) { return "irMove"; }
     else if (op == IRO_FSQRT) { return "irFSqrt"; }
+    else if (op == IRO_F64_ZU_F32) { return "irF64ZuF32"; }
+    else if (op == IRO_F32_ZU_F64) { return "irF32ZuF64"; }
     else if (op == IRO_LOAD_STRUCT_ADDR) { return "irLoadStructAddr"; }
     else if (op == IRO_ASSERT_BOUNDS) { return "irAssertBounds"; }
     else if (op == IRO_ASSERT_NOT_NULL) { return "irAssertNotNull"; }
@@ -1302,7 +1357,7 @@ pub type IRModule = class {
         }
       }
       PrintStr("\n");
-      i := i + 1;
+      i += 1;
     }
     PrintStr("--- End IR dump ---\n");
   }
@@ -1329,7 +1384,7 @@ pub type IRModule = class {
       while (i < self.funcLen) {
         var j: int64 := 0;
         memcpy(nb + i * IR_FUNC_SIZE, self.funcBuffer + i * IR_FUNC_SIZE, IR_FUNC_SIZE);
-        i := i + 1;
+        i += 1;
       }
       self.funcBuffer := nb;
       self.funcCap := newCap;
@@ -1348,7 +1403,7 @@ pub type IRModule = class {
     self.setFuncStaticLink(idx,    0);
     
     // Increment funcLen by 1 (function count)
-    self.funcLen := self.funcLen + 1;
+    self.funcLen += 1;
     PrintStr("addFunc: funcLen after="); PrintInt(self.funcLen); PrintStr("\n");
     
     return idx;
@@ -1454,3 +1509,111 @@ pub type IRModule = class {
   }
 }
 ;
+
+// ===========================================================================
+// #2451: Erreichbare Funktionen eines IR-Moduls
+// ===========================================================================
+//
+// Beim Import ueber die .lyu haengt ir_lower das IR der GANZEN Unit an das
+// Modul (#1977), und `emit()` der Backends laeuft ueber jede Funktion darin.
+// Zwei gemessene Folgen:
+//
+//   * Groesse. `import std.io; PrintLn("x")` ergab auf arm64 ein Erzeugnis von
+//     112 048 Byte -- fuer einen Einzeiler.
+//   * Fehler aus TOTEM Code. `import std.fs; return SEEK_END` scheiterte mit
+//     "arm64: Builtin-ID 236 wird im Linux-Zweig nicht behandelt", obwohl das
+//     Programm keine Funktion aus std.fs ruft: die Luecke steckt in einer
+//     Funktion, die niemand braucht.
+//
+// Diese Funktion markiert, was von einem Einstieg aus erreichbar ist. Der
+// Aufrufer entscheidet, ob er das benutzt -- sie aendert nichts am Modul.
+//
+// WELCHE KANTEN ES GIBT, abgelesen an ir_lower und nicht geraten:
+//
+//   IRO_CALL        src1 = Index in funcBuffer (direkter Aufruf)
+//   IRO_FUNC_ADDR   src1 = Index in funcBuffer (Funktionszeiger, Closure)
+//
+// Alles andere fuehrt keinen Funktionsindex: IRO_CALL_EXTERN nennt Bibliothek
+// und Namen als strBuf-Offsets, IRO_CALL_INDIRECT ruft ueber einen Temp, und
+// der kommt aus IRO_FUNC_ADDR -- damit ist das Ziel schon markiert.
+//
+// VIRTUELLE METHODEN brauchen hier NICHTS Eigenes, und das ist der Grund,
+// warum diese Rechnung so kurz sein darf: auf dem IR-Weg gibt es keine VMT im
+// Speicher. `ir_lower` senkt einen virtuellen Aufruf als Vergleichskette ueber
+// die type-id mit je einem DIREKTEN IRO_CALL auf jedes Override (siehe
+// lowerCall, "VIRTUELLE Switch-Dispatch ueber type-id"). Jedes Ziel steht also
+// als Aufruf im Befehlsstrom. Wer das aendert und Methodenadressen in eine
+// Tabelle legt, muss diese Tabelle hier als Wurzel nachtragen -- sonst
+// verschwinden Methoden, die nur ueber sie erreichbar sind.
+//
+// Der Einstieg `main` ruft `__lyx_modinit` selbst (#2123), die Initialisierer
+// kommen also ueber eine gewoehnliche Kante mit.
+//
+// Rueckgabe: Puffer mit einem Byte je Funktion (1 = erreichbar), oder 0, wenn
+// der Einstieg nicht gefunden wurde. 0 heisst fuer den Aufrufer: NICHTS
+// weglassen. Lieber ein zu grosses Erzeugnis als ein fehlender Rumpf.
+pub fn IrErreichbare(irMod: int64, startName: pchar, startLen: int64): int64 {
+  if irMod == 0 { return 0; }
+  var funcBuf:  int64 := peek64(irMod + IR_MOD_OFF_FUNCBUF);
+  var funcN:    int64 := peek64(irMod + IR_MOD_OFF_FUNCLEN);
+  var instrBuf: int64 := peek64(irMod + IR_MOD_OFF_INSTRBUF);
+  var strBuf:   int64 := peek64(irMod + IR_MOD_OFF_STRBUF);
+  if funcN <= 0 { return 0; }
+
+  // Einstieg suchen. Gibt es ihn nicht, wird nicht geraten.
+  var start: int64 := 0 - 1;
+  var fi: int64 := 0;
+  while fi < funcN {
+    var nOff: int64 := peek64(funcBuf + fi * IR_FUNC_SIZE);
+    var nLen: int64 := peek64(funcBuf + fi * IR_FUNC_SIZE + IR_FUNC_OFF_NAMELEN);
+    if nLen == startLen {
+      var gleich: int64 := 1;
+      var k: int64 := 0;
+      while k < nLen {
+        if peek8(strBuf + nOff + k) != (StrCharAt(startName, k) & 255) { gleich := 0; k := nLen; }
+        k := k + 1;
+      }
+      if gleich != 0 { start := fi; fi := funcN; }
+    }
+    fi := fi + 1;
+  }
+  if start < 0 { return 0; }
+
+  var lebt: int64 := alloc(funcN);
+  var z: int64 := 0;
+  while z < funcN { poke8(lebt + z, 0); z := z + 1; }
+
+  // Arbeitsliste statt Rekursion: eine Unit kann tausende Funktionen fuehren,
+  // und eine Rekursion darueber steht unter `ulimit -v` als erstes am Rand.
+  var liste: int64 := alloc(funcN * 8);
+  var n: int64 := 0;
+  poke8(lebt + start, 1);
+  poke64(liste, start);
+  n := 1;
+
+  while n > 0 {
+    n := n - 1;
+    var f: int64 := peek64(liste + n * 8);
+    var iOff: int64 := peek64(funcBuf + f * IR_FUNC_SIZE + IR_FUNC_OFF_INSTRSOFF);
+    var iCnt: int64 := peek64(funcBuf + f * IR_FUNC_SIZE + IR_FUNC_OFF_INSTRCOUNT);
+    var j: int64 := 0;
+    while j < iCnt {
+      var ins: int64 := instrBuf + (iOff + j) * IR_INSTR_SIZE;
+      var op:  int64 := peek64(ins);
+      if (op == IRO_CALL || op == IRO_FUNC_ADDR) {
+        var ziel: int64 := peek64(ins + IR_INSTR_OFF_SRC1);
+        if (ziel >= 0 && ziel < funcN) {
+          if peek8(lebt + ziel) == 0 {
+            poke8(lebt + ziel, 1);
+            poke64(liste + n * 8, ziel);
+            n := n + 1;
+          }
+        }
+      }
+      j := j + 1;
+    }
+  }
+
+  free(liste, funcN * 8);
+  return lebt;
+}

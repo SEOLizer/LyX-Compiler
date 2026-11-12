@@ -1,0 +1,1247 @@
+// std/prob.lyx
+// Statistik und Wahrscheinlichkeitsrechnung in f64
+
+@description("Statistics and probability: descriptive measures, special functions, distributions, tests, sampling")
+@author("Andreas Roene")
+@copyright("2026 Andreas Roene")
+unit std.prob;
+
+import std.math;
+import std.mathx;
+import std.alloc;
+
+// ── Abgrenzung zu std.stats ──────────────────────────────────────────────────
+//
+// std.stats rechnet durchgehend in int64. Fuer Zaehlwerte ist das richtig, fuer
+// Messwerte nicht: ArrayVariance() teilt ganzzahlig, die Varianz von 1,2,3,4
+// wird dort zu 1 statt 1.25, und jede Standardabweichung unter 1 wird zu 0.
+// Diese Einheit ist die f64-Seite davon und ergaenzt, was in std.stats gar
+// nicht vorkommt: Verteilungen, Spezialfunktionen, Tests, Stichprobenziehung.
+//
+// ── Datenuebergabe ───────────────────────────────────────────────────────────
+//
+// Reihen kommen als Adresse eines f64-Feldes plus Laenge (`data: int64,
+// n: int64`), Zugriff ueber peekf64/pokef64. Arrays als Parameter liefern in
+// lyxc 1.0.19D Speichermuell (#1115), und ein Array VON Werten in einem Struct
+// faellt unter #1109 — die Adressform ist hier nicht Stilfrage, sondern die
+// einzige, die traegt. Mehrere Rueckgabewerte gehen denselben Weg (out-Adresse,
+// 0 = verwerfen), weil Tupel aus mehr als zwei Werten fehlen.
+//
+// ── f64-Fallstricke des Compilers ────────────────────────────────────────────
+//
+// Zwei stille Fehler in 1.0.19D bestimmen den Stil dieser Datei (Issues #1496,
+// #1499):
+//
+//   1. Eine `con f64` wird als Operand NICHT als f64 typisiert. Mit
+//      `con C: f64 := 1e-12` ist `1.0 < C` wahr und `C * C` negativ.
+//   2. Ein NEGATIVES f64-Literal wird als Operand zum rohen Bitmuster. Mit
+//      `var d: f64 := -1.0` ist `d <= -1.0` falsch.
+//
+// Beide verschwinden, sobald der Wert aus einer Variablen oder aus einer
+// Funktion mit deklariertem f64-Rueckgabetyp kommt. Deshalb steht hier jede
+// Konstante als kleine Funktion (_pi(), _half() ...), und negative Schranken
+// werden vor dem Vergleich in eine Variable gelegt. Wer diese Einheit erweitert,
+// muss es genauso halten.
+//
+// ── Genauigkeit ──────────────────────────────────────────────────────────────
+//
+// Die Reihenentwicklungen hier sind auf etwa 1e-12 relativ ausgelegt. Erreicht
+// werden rund 1e-8, weil ExpF64/LogF64 aus std.math nicht genauer sind — auf
+// einem exp/log-Rundgang wurden 8e-8 gemessen. Das ist die Schranke des
+// Unterbaus, nicht der Verfahren; die Tests pruefen entsprechend gegen 1e-8.
+
+// ── Konstanten (immer ueber Funktionen lesen, s. o.) ─────────────────────────
+
+pub con PROB_ERR: f64 := 0.0;   // Rueckgabe bei unzulaessigen Argumenten, s. Doku
+
+fn _pi(): f64      { return 3.141592653589793; }
+fn _twoPi(): f64   { return 6.283185307179586; }
+fn _sqrtTwoPi(): f64 { return 2.5066282746310002; }
+fn _sqrtTwo(): f64 { return 1.4142135623730951; }
+fn _lnSqrtTwoPi(): f64 { return 0.9189385332046727; }   // ln(sqrt(2*pi))
+fn _eps(): f64     { return 0.000000000000001; }        // 1e-15
+fn _tiny(): f64    { return 0.000000000000000000000000000001; }   // 1e-30
+fn _one(): f64     { return 1.0; }
+fn _negOne(): f64  { return -1.0; }
+fn _zero(): f64    { return 0.0; }
+fn _twoPow53(): f64 { return 9007199254740992.0; }
+
+// Drittes Glied derselben Familie wie #1496/#1499, hier neu gefunden: ein
+// UNAERES Minus auf einer f64-Variablen liefert das rohe Bitmuster, sobald das
+// Ergebnis weiterverrechnet wird.
+//
+//   var a: f64 := 1.0;  var b: f64 := 0.5;
+//   -a         ->  -1.0            (richtig, wenn es allein steht)
+//   -a - b     ->  -4.6e18         (die Bits von -1.0 als int64)
+//   -a * b     ->  -2.3e18         (dieselben Bits, ganzzahlig halbiert)
+//   0.0 - a - b -> -1.5            (richtig)
+//
+// Deshalb steht in dieser Datei nirgends ein unaeres Minus mitten in einem
+// Ausdruck; negiert wird ueber _neg() oder ueber 0.0 - x.
+fn _neg(x: f64): f64 { return 0.0 - x; }
+
+con MAX_ITER: int64 := 300;
+
+// ── Hilfsfunktionen ──────────────────────────────────────────────────────────
+
+// Korrekturterm nach Neumaier fuer s + x = t: der bei dieser Addition
+// verlorene Rest. Alle Summenschleifen hier fuehren ihn mit und rechnen ihn am
+// Ende ein — bei 10^6 Summanden bleiben sonst von sechzehn Stellen zwoelf.
+// Ausfuehrlich samt Nachweisen in std.sum.
+fn _corr(s: f64, x: f64, t: f64): f64 {
+  if (AbsF64(s) >= AbsF64(x)) { return (s - t) + x; }
+  return (x - t) + s;
+}
+
+fn _get(data: int64, i: int64): f64 {
+  var v: f64 := peekf64(data + i * 8);
+  return v;
+}
+
+fn _put(data: int64, i: int64, v: f64): void {
+  pokef64(data + i * 8, v);
+}
+
+// Kopie eines f64-Feldes; der Aufrufer gibt sie mit free(p, n*8) frei.
+fn _copy(data: int64, n: int64): int64 {
+  var p: int64 := alloc(n * 8);
+  if (p == 0) { return 0; }
+  var i: int64 := 0;
+  while (i < n) {
+    _put(p, i, _get(data, i));
+    i := i + 1;
+  }
+  return p;
+}
+
+// ── Deskriptive Statistik ────────────────────────────────────────────────────
+
+// Summe mit Kompensation nach Neumaier. Die naive Schleife verliert bei
+// gemischten Groessenordnungen genau das, was man in Statistik braucht: die
+// kleinen Summanden. Der Korrekturterm faengt sie auf und kostet zwei
+// Rechenschritte je Element.
+pub fn ProbSum(data: int64, n: int64): f64 {
+  if (n <= 0) { return _zero(); }
+
+  var sum: f64 := _get(data, 0);
+  var comp: f64 := _zero();
+  var i: int64 := 1;
+
+  while (i < n) {
+    var x: f64 := _get(data, i);
+    var t: f64 := sum + x;
+    if (AbsF64(sum) >= AbsF64(x)) { comp := comp + ((sum - t) + x); }
+    else                          { comp := comp + ((x - t) + sum); }
+    sum := t;
+    i := i + 1;
+  }
+  return sum + comp;
+}
+
+pub fn ProbMean(data: int64, n: int64): f64 {
+  if (n <= 0) { return _zero(); }
+  return ProbSum(data, n) / (n as f64);
+}
+
+// Varianz der Grundgesamtheit (Teiler n), einlaeufig nach Welford.
+//
+// Die Lehrbuchformel E[x^2] - E[x]^2 ist hier bewusst NICHT verwendet: bei
+// Werten mit grossem Mittel und kleiner Streuung (Sensorreihen um 1000 mit
+// Streuung 0.01) loeschen sich die beiden Terme gegenseitig aus, und heraus
+// kommen negative Varianzen. Welford rechnet mit Abweichungen statt mit
+// Quadratsummen und hat das Problem nicht.
+pub fn ProbVarianceP(data: int64, n: int64): f64 {
+  if (n <= 0) { return _zero(); }
+
+  var mean: f64 := _zero();
+  var m2: f64 := _zero();
+  var i: int64 := 0;
+
+  while (i < n) {
+    var x: f64 := _get(data, i);
+    var cnt: f64 := (i + 1) as f64;
+    var d: f64 := x - mean;
+    mean := mean + d / cnt;
+    var d2: f64 := x - mean;
+    m2 := m2 + d * d2;
+    i := i + 1;
+  }
+  return m2 / (n as f64);
+}
+
+// Stichprobenvarianz (Teiler n-1, erwartungstreu). Braucht mindestens zwei Werte.
+pub fn ProbVarianceS(data: int64, n: int64): f64 {
+  if (n < 2) { return _zero(); }
+  return ProbVarianceP(data, n) * (n as f64) / ((n - 1) as f64);
+}
+
+pub fn ProbStdDevP(data: int64, n: int64): f64 {
+  return SqrtF64(ProbVarianceP(data, n));
+}
+
+pub fn ProbStdDevS(data: int64, n: int64): f64 {
+  return SqrtF64(ProbVarianceS(data, n));
+}
+
+pub fn ProbMin(data: int64, n: int64): f64 {
+  if (n <= 0) { return _zero(); }
+  var m: f64 := _get(data, 0);
+  var i: int64 := 1;
+  while (i < n) {
+    var x: f64 := _get(data, i);
+    if (x < m) { m := x; }
+    i := i + 1;
+  }
+  return m;
+}
+
+pub fn ProbMax(data: int64, n: int64): f64 {
+  if (n <= 0) { return _zero(); }
+  var m: f64 := _get(data, 0);
+  var i: int64 := 1;
+  while (i < n) {
+    var x: f64 := _get(data, i);
+    if (x > m) { m := x; }
+    i := i + 1;
+  }
+  return m;
+}
+
+pub fn ProbRange(data: int64, n: int64): f64 {
+  return ProbMax(data, n) - ProbMin(data, n);
+}
+
+// Aufsteigend sortieren, an Ort und Stelle (Shellsort mit Ciura-Abstaenden).
+// Kein Quicksort: der braucht Rekursion oder einen eigenen Stapel, und
+// Shellsort ist bei den Reihenlaengen, um die es hier geht, nicht langsamer.
+pub fn ProbSortF64(data: int64, n: int64): void {
+  if (n < 2) { return; }
+
+  var gaps: int64 := alloc(8 * 8);
+  if (gaps == 0) { return; }
+  poke64(gaps,      701);  poke64(gaps +  8, 301);  poke64(gaps + 16, 132);
+  poke64(gaps + 24,  57);  poke64(gaps + 32,  23);  poke64(gaps + 40,  10);
+  poke64(gaps + 48,   4);  poke64(gaps + 56,   1);
+
+  var g: int64 := 0;
+  while (g < 8) {
+    var gap: int64 := peek64(gaps + g * 8);
+    if (gap < n) {
+      var i: int64 := gap;
+      while (i < n) {
+        var tmp: f64 := _get(data, i);
+        var j: int64 := i;
+        while (j >= gap) {
+          var prev: f64 := _get(data, j - gap);
+          if (prev > tmp) {
+            _put(data, j, prev);
+            j := j - gap;
+          }
+          else { j := -1 - j; }        // Schleife verlassen, ohne break im Zweig
+        }
+        if (j < 0) { j := -1 - j; }    // Ausstiegsmarke zuruecknehmen
+        _put(data, j, tmp);
+        i := i + 1;
+      }
+    }
+    g := g + 1;
+  }
+  free(gaps, 8 * 8);
+}
+
+// Quantil zum Anteil p (0..1) nach der linearen Methode (Typ 7, wie R und
+// numpy voreingestellt). Arbeitet auf einer Kopie, die Reihe des Aufrufers
+// bleibt unsortiert.
+pub fn ProbQuantile(data: int64, n: int64, p: f64): f64 {
+  if (n <= 0) { return _zero(); }
+  if (n == 1) { return _get(data, 0); }
+
+  var pp: f64 := p;
+  if (pp < _zero()) { pp := _zero(); }
+  if (pp > _one())  { pp := _one(); }
+
+  var c: int64 := _copy(data, n);
+  if (c == 0) { return _zero(); }
+  ProbSortF64(c, n);
+
+  var h: f64 := pp * ((n - 1) as f64);
+  var lo: int64 := h as int64;
+  var hi: int64 := lo + 1;
+  if (hi > n - 1) { hi := n - 1; }
+
+  var frac: f64 := h - (lo as f64);
+  var a: f64 := _get(c, lo);
+  var b: f64 := _get(c, hi);
+  free(c, n * 8);
+  return a + frac * (b - a);
+}
+
+pub fn ProbMedian(data: int64, n: int64): f64 {
+  return ProbQuantile(data, n, 0.5);
+}
+
+// Interquartilsabstand
+pub fn ProbIQR(data: int64, n: int64): f64 {
+  return ProbQuantile(data, n, 0.75) - ProbQuantile(data, n, 0.25);
+}
+
+// Schiefe der Stichprobe (Fisher-Pearson, ohne Korrekturfaktor: g1)
+pub fn ProbSkewness(data: int64, n: int64): f64 {
+  if (n < 2) { return _zero(); }
+  var mean: f64 := ProbMean(data, n);
+  var sd: f64 := ProbStdDevP(data, n);
+  if (sd < _eps()) { return _zero(); }
+
+  var s: f64 := _zero();
+  var c: f64 := _zero();
+  var i: int64 := 0;
+  while (i < n) {
+    var d: f64 := (_get(data, i) - mean) / sd;
+    var x: f64 := d * d * d;
+    var t: f64 := s + x;
+    c := c + _corr(s, x, t);
+    s := t;
+    i := i + 1;
+  }
+  return (s + c) / (n as f64);
+}
+
+// Woelbung als UeBERSCHUSS (Normalverteilung = 0, nicht 3)
+pub fn ProbKurtosisExcess(data: int64, n: int64): f64 {
+  if (n < 2) { return _zero(); }
+  var mean: f64 := ProbMean(data, n);
+  var sd: f64 := ProbStdDevP(data, n);
+  if (sd < _eps()) { return _zero(); }
+
+  var s: f64 := _zero();
+  var c: f64 := _zero();
+  var i: int64 := 0;
+  while (i < n) {
+    var d: f64 := (_get(data, i) - mean) / sd;
+    var x: f64 := d * d * d * d;
+    var t: f64 := s + x;
+    c := c + _corr(s, x, t);
+    s := t;
+    i := i + 1;
+  }
+  return (s + c) / (n as f64) - 3.0;
+}
+
+// Stichprobenkovarianz (Teiler n-1)
+pub fn ProbCovariance(x: int64, y: int64, n: int64): f64 {
+  if (n < 2) { return _zero(); }
+  var mx: f64 := ProbMean(x, n);
+  var my: f64 := ProbMean(y, n);
+
+  var s: f64 := _zero();
+  var c: f64 := _zero();
+  var i: int64 := 0;
+  while (i < n) {
+    var p: f64 := (_get(x, i) - mx) * (_get(y, i) - my);
+    var t: f64 := s + p;
+    c := c + _corr(s, p, t);
+    s := t;
+    i := i + 1;
+  }
+  return (s + c) / ((n - 1) as f64);
+}
+
+// Pearson-Korrelation, -1..1. Bei konstanter Reihe (Streuung 0) ist sie nicht
+// definiert; dann kommt 0 zurueck.
+pub fn ProbCorrelation(x: int64, y: int64, n: int64): f64 {
+  if (n < 2) { return _zero(); }
+  var sx: f64 := ProbStdDevS(x, n);
+  var sy: f64 := ProbStdDevS(y, n);
+  if (sx < _eps()) { return _zero(); }
+  if (sy < _eps()) { return _zero(); }
+  return ProbCovariance(x, y, n) / (sx * sy);
+}
+
+// Lineare Regression y = a + b*x nach kleinsten Quadraten. Schreibt Steigung,
+// Achsenabschnitt und Bestimmtheitsmass an die drei Adressen (je 0 = verwerfen).
+// false, wenn x keine Streuung hat — dann gibt es keine Gerade.
+pub fn ProbLinRegress(x: int64, y: int64, n: int64,
+                      outSlope: int64, outIntercept: int64, outR2: int64): bool {
+  if (n < 2) { return false; }
+
+  var mx: f64 := ProbMean(x, n);
+  var my: f64 := ProbMean(y, n);
+
+  var sxx: f64 := _zero();
+  var sxy: f64 := _zero();
+  var syy: f64 := _zero();
+  var i: int64 := 0;
+  while (i < n) {
+    var dx: f64 := _get(x, i) - mx;
+    var dy: f64 := _get(y, i) - my;
+    sxx := sxx + dx * dx;
+    sxy := sxy + dx * dy;
+    syy := syy + dy * dy;
+    i := i + 1;
+  }
+  if (sxx < _eps()) { return false; }
+
+  var b: f64 := sxy / sxx;
+  var a: f64 := my - b * mx;
+
+  var r2: f64 := _zero();
+  if (syy > _eps()) { r2 := (sxy * sxy) / (sxx * syy); }
+
+  if (outSlope != 0)     { pokef64(outSlope, b); }
+  if (outIntercept != 0) { pokef64(outIntercept, a); }
+  if (outR2 != 0)        { pokef64(outR2, r2); }
+  return true;
+}
+
+// ── Spezialfunktionen ────────────────────────────────────────────────────────
+
+// ln(Gamma(x)) nach Lanczos (g = 7, 9 Koeffizienten). Fuer x < 0.5 ueber die
+// Spiegelungsformel, damit auch negative Argumente gehen.
+//
+// Der Logarithmus ist die eigentliche Groesse: Gamma selbst laeuft schon bei
+// x = 172 ueber, ln(Gamma) bleibt bis 1e300 brauchbar. Alle Verteilungen hier
+// rechnen deshalb mit lgamma und exponieren erst am Ende.
+pub fn ProbLogGamma(x: f64): f64 {
+  if (x < 0.5) {
+    // ln|Gamma(x)| = ln(pi / |sin(pi x)|) - ln Gamma(1-x)
+    var s: f64 := SinF64(_pi() * x);
+    var abs_s: f64 := AbsF64(s);
+    if (abs_s < _tiny()) { return _zero(); }
+    return MxLog(_pi() / abs_s) - ProbLogGamma(_one() - x);
+  }
+
+  var g: f64 := 7.0;
+  var z: f64 := x - _one();
+
+  var a: f64 := 0.99999999999980993;
+  var c1: f64 := 676.5203681218851;
+  var c2: f64 := 1259.1392167224028;
+  var c3: f64 := 771.32342877765313;
+  var c4: f64 := 176.61502916214059;
+  var c5: f64 := 12.507343278686905;
+  var c6: f64 := 0.13857109526572012;
+  var c7: f64 := 0.0000099843695780195716;
+  var c8: f64 := 0.00000015056327351493116;
+
+  a := a + c1 / (z + 1.0);
+  a := a - c2 / (z + 2.0);
+  a := a + c3 / (z + 3.0);
+  a := a - c4 / (z + 4.0);
+  a := a + c5 / (z + 5.0);
+  a := a - c6 / (z + 6.0);
+  a := a + c7 / (z + 7.0);
+  a := a - c8 / (z + 8.0);
+
+  var t: f64 := z + g + 0.5;
+  return _lnSqrtTwoPi() + (z + 0.5) * MxLog(t) - t + MxLog(a);
+}
+
+// Gamma(x). Ueber x = 171 gibt es kein f64-Ergebnis mehr — dort kommt 0
+// zurueck, nicht Unendlich, damit der Fehler nicht stumm weiterrechnet.
+pub fn ProbGamma(x: f64): f64 {
+  if (x > 171.61) { return _zero(); }
+
+  var lg: f64 := ProbLogGamma(x);
+  var r: f64 := MxExp(lg);
+
+  // Gamma ist zwischen den Polstellen bei negativen ganzen Zahlen abwechselnd
+  // negativ; ln|Gamma| verliert dieses Vorzeichen.
+  if (x > _zero()) { return r; }
+  var k: int64 := x as int64;
+  if ((k % 2) == 0) { return -r; }
+  return r;
+}
+
+pub fn ProbBeta(a: f64, b: f64): f64 {
+  return MxExp(ProbLogGamma(a) + ProbLogGamma(b) - ProbLogGamma(a + b));
+}
+
+// Regularisierte unvollstaendige Gammafunktion P(a,x) — zugleich die
+// Verteilungsfunktion von Chi-Quadrat und Poisson.
+//
+// Zwei Verfahren, weil keines auf dem ganzen Bereich taugt: die Reihe
+// konvergiert gut fuer x < a+1, der Kettenbruch (Lentz) fuer grosse x. An der
+// Nahtstelle stimmen beide auf Rechengenauigkeit ueberein.
+pub fn ProbGammaP(a: f64, x: f64): f64 {
+  if (a <= _zero()) { return _zero(); }
+  if (x <= _zero()) { return _zero(); }
+
+  if (x < a + _one()) {
+    // Reihe
+    var ap: f64 := a;
+    var sum: f64 := _one() / a;
+    var del: f64 := sum;
+    var i: int64 := 0;
+    while (i < MAX_ITER) {
+      ap := ap + _one();
+      del := del * x / ap;
+      sum := sum + del;
+      if (AbsF64(del) < AbsF64(sum) * _eps()) { i := MAX_ITER; }
+      else { i := i + 1; }
+    }
+    return sum * MxExp(_neg(x) + a * MxLog(x) - ProbLogGamma(a));
+  }
+
+  // Kettenbruch fuer Q(a,x), dann P = 1 - Q
+  var b: f64 := x + _one() - a;
+  var c: f64 := _one() / _tiny();
+  var d: f64 := _one() / b;
+  var h: f64 := d;
+
+  var i: int64 := 1;
+  while (i <= MAX_ITER) {
+    var an: f64 := (0.0 - (i as f64)) * ((i as f64) - a);
+    b := b + 2.0;
+    d := an * d + b;
+    if (AbsF64(d) < _tiny()) { d := _tiny(); }
+    c := b + an / c;
+    if (AbsF64(c) < _tiny()) { c := _tiny(); }
+    d := _one() / d;
+    var del: f64 := d * c;
+    h := h * del;
+    if (AbsF64(del - _one()) < _eps()) { i := MAX_ITER + 1; }
+    else { i := i + 1; }
+  }
+  var q: f64 := MxExp(_neg(x) + a * MxLog(x) - ProbLogGamma(a)) * h;
+  return _one() - q;
+}
+
+// Regularisierte obere unvollstaendige Gammafunktion Q(a,x) = 1 - P(a,x)
+pub fn ProbGammaQ(a: f64, x: f64): f64 {
+  return _one() - ProbGammaP(a, x);
+}
+
+// Regularisierte unvollstaendige Betafunktion I_x(a,b) — traegt die
+// Verteilungsfunktionen von Student-t, F und Binomial.
+pub fn ProbBetaI(a: f64, b: f64, x: f64): f64 {
+  if (x <= _zero()) { return _zero(); }
+  if (x >= _one())  { return _one(); }
+
+  var bt: f64 := MxExp(ProbLogGamma(a + b) - ProbLogGamma(a) - ProbLogGamma(b)
+                        + a * MxLog(x) + b * MxLog(_one() - x));
+
+  // Der Kettenbruch konvergiert nur auf der linken Seite gut; rechts davon
+  // ueber die Symmetrie I_x(a,b) = 1 - I_(1-x)(b,a).
+  if (x < (a + _one()) / (a + b + 2.0)) {
+    return bt * _betaCF(a, b, x) / a;
+  }
+  return _one() - bt * _betaCF(b, a, _one() - x) / b;
+}
+
+// Kettenbruch nach Lentz fuer die unvollstaendige Betafunktion
+fn _betaCF(a: f64, b: f64, x: f64): f64 {
+  var qab: f64 := a + b;
+  var qap: f64 := a + _one();
+  var qam: f64 := a - _one();
+
+  var c: f64 := _one();
+  var d: f64 := _one() - qab * x / qap;
+  if (AbsF64(d) < _tiny()) { d := _tiny(); }
+  d := _one() / d;
+  var h: f64 := d;
+
+  var m: int64 := 1;
+  while (m <= MAX_ITER) {
+    var mf: f64 := m as f64;
+    var m2: f64 := 2.0 * mf;
+
+    // gerader Schritt
+    var aa: f64 := mf * (b - mf) * x / ((qam + m2) * (a + m2));
+    d := _one() + aa * d;
+    if (AbsF64(d) < _tiny()) { d := _tiny(); }
+    c := _one() + aa / c;
+    if (AbsF64(c) < _tiny()) { c := _tiny(); }
+    d := _one() / d;
+    h := h * d * c;
+
+    // ungerader Schritt
+    aa := (0.0 - (a + mf)) * (qab + mf) * x / ((a + m2) * (qap + m2));
+    d := _one() + aa * d;
+    if (AbsF64(d) < _tiny()) { d := _tiny(); }
+    c := _one() + aa / c;
+    if (AbsF64(c) < _tiny()) { c := _tiny(); }
+    d := _one() / d;
+    var del: f64 := d * c;
+    h := h * del;
+
+    if (AbsF64(del - _one()) < _eps()) { m := MAX_ITER + 1; }
+    else { m := m + 1; }
+  }
+  return h;
+}
+
+// Fehlerfunktion und ihr Komplement, beide ueber die unvollstaendige
+// Gammafunktion: erf(x) = P(1/2, x^2) fuer x >= 0.
+pub fn ProbErf(x: f64): f64 {
+  if (x < _zero()) { return -ProbGammaP(0.5, x * x); }
+  return ProbGammaP(0.5, x * x);
+}
+
+pub fn ProbErfc(x: f64): f64 {
+  return _one() - ProbErf(x);
+}
+
+// ── Normalverteilung ─────────────────────────────────────────────────────────
+
+pub fn ProbNormalPdf(x: f64, mu: f64, sigma: f64): f64 {
+  if (sigma <= _zero()) { return _zero(); }
+  var z: f64 := (x - mu) / sigma;
+  var e: f64 := _neg(0.5 * z * z);
+  return MxExp(e) / (sigma * _sqrtTwoPi());
+}
+
+pub fn ProbNormalCdf(x: f64, mu: f64, sigma: f64): f64 {
+  if (sigma <= _zero()) { return _zero(); }
+  var z: f64 := (x - mu) / (sigma * _sqrtTwo());
+  return 0.5 * (_one() + ProbErf(z));
+}
+
+// Quantil (Umkehrung der Verteilungsfunktion) nach Acklam, anschliessend ein
+// Newton-Schritt gegen die eigene Verteilungsfunktion. Die Naeherung allein
+// traegt rund 1e-9; der Newton-Schritt holt sie auf die Genauigkeit der
+// Verteilungsfunktion herunter und kostet einen Aufruf.
+pub fn ProbNormalQuantile(p: f64, mu: f64, sigma: f64): f64 {
+  if (p <= _zero()) { return _zero(); }
+  if (p >= _one())  { return _zero(); }
+  if (sigma <= _zero()) { return _zero(); }
+
+  var a1: f64 := -39.69683028665376;   var a2: f64 := 220.9460984245205;
+  var a3: f64 := -275.9285104469687;   var a4: f64 := 138.3577518672690;
+  var a5: f64 := -30.66479806614716;   var a6: f64 := 2.506628277459239;
+  var b1: f64 := -54.47609879822406;   var b2: f64 := 161.5858368580409;
+  var b3: f64 := -155.6989798598866;   var b4: f64 := 66.80131188771972;
+  var b5: f64 := -13.28068155288572;
+  var c1: f64 := -0.007784894002430293; var c2: f64 := -0.3223964580411365;
+  var c3: f64 := -2.400758277161838;    var c4: f64 := -2.549732539343734;
+  var c5: f64 := 4.374664141464968;     var c6: f64 := 2.938163982698783;
+  var d1: f64 := 0.007784695709041462;  var d2: f64 := 0.3224671290700398;
+  var d3: f64 := 2.445134137142996;     var d4: f64 := 3.754408661907416;
+
+  var pLow: f64 := 0.02425;
+  var pHigh: f64 := _one() - pLow;
+  var z: f64 := _zero();
+
+  if (p < pLow) {
+    var q: f64 := SqrtF64(_neg(2.0 * MxLog(p)));
+    z := (((((c1 * q + c2) * q + c3) * q + c4) * q + c5) * q + c6) /
+         ((((d1 * q + d2) * q + d3) * q + d4) * q + _one());
+  }
+  else {
+    if (p <= pHigh) {
+      var q: f64 := p - 0.5;
+      var r: f64 := q * q;
+      z := (((((a1 * r + a2) * r + a3) * r + a4) * r + a5) * r + a6) * q /
+           (((((b1 * r + b2) * r + b3) * r + b4) * r + b5) * r + _one());
+    }
+    else {
+      var q: f64 := SqrtF64(_neg(2.0 * MxLog(_one() - p)));
+      z := _neg((((((c1 * q + c2) * q + c3) * q + c4) * q + c5) * q + c6) /
+                ((((d1 * q + d2) * q + d3) * q + d4) * q + _one()));
+    }
+  }
+
+  // Newton: z := z - (Phi(z) - p) / phi(z)
+  var pdf: f64 := ProbNormalPdf(z, _zero(), _one());
+  if (pdf > _tiny()) {
+    z := z - (ProbNormalCdf(z, _zero(), _one()) - p) / pdf;
+  }
+  return mu + sigma * z;
+}
+
+// ── Log-Normalverteilung ─────────────────────────────────────────────────────
+
+pub fn ProbLogNormalPdf(x: f64, mu: f64, sigma: f64): f64 {
+  if (x <= _zero()) { return _zero(); }
+  if (sigma <= _zero()) { return _zero(); }
+  var z: f64 := (MxLog(x) - mu) / sigma;
+  var e: f64 := _neg(0.5 * z * z);
+  return MxExp(e) / (x * sigma * _sqrtTwoPi());
+}
+
+pub fn ProbLogNormalCdf(x: f64, mu: f64, sigma: f64): f64 {
+  if (x <= _zero()) { return _zero(); }
+  return ProbNormalCdf(MxLog(x), mu, sigma);
+}
+
+pub fn ProbLogNormalQuantile(p: f64, mu: f64, sigma: f64): f64 {
+  return MxExp(ProbNormalQuantile(p, mu, sigma));
+}
+
+// ── Gleichverteilung ─────────────────────────────────────────────────────────
+
+pub fn ProbUniformPdf(x: f64, a: f64, b: f64): f64 {
+  if (b <= a) { return _zero(); }
+  if (x < a)  { return _zero(); }
+  if (x > b)  { return _zero(); }
+  return _one() / (b - a);
+}
+
+pub fn ProbUniformCdf(x: f64, a: f64, b: f64): f64 {
+  if (b <= a) { return _zero(); }
+  if (x <= a) { return _zero(); }
+  if (x >= b) { return _one(); }
+  return (x - a) / (b - a);
+}
+
+pub fn ProbUniformQuantile(p: f64, a: f64, b: f64): f64 {
+  if (p < _zero()) { return a; }
+  if (p > _one())  { return b; }
+  return a + p * (b - a);
+}
+
+// ── Exponentialverteilung ────────────────────────────────────────────────────
+
+pub fn ProbExponentialPdf(x: f64, lambda: f64): f64 {
+  if (lambda <= _zero()) { return _zero(); }
+  if (x < _zero()) { return _zero(); }
+  return lambda * MxExp(_neg(lambda * x));
+}
+
+pub fn ProbExponentialCdf(x: f64, lambda: f64): f64 {
+  if (lambda <= _zero()) { return _zero(); }
+  if (x <= _zero()) { return _zero(); }
+  return _one() - MxExp(_neg(lambda * x));
+}
+
+pub fn ProbExponentialQuantile(p: f64, lambda: f64): f64 {
+  if (lambda <= _zero()) { return _zero(); }
+  if (p <= _zero()) { return _zero(); }
+  if (p >= _one())  { return _zero(); }
+  return _neg(MxLog(_one() - p)) / lambda;
+}
+
+// ── Binomialverteilung ───────────────────────────────────────────────────────
+
+// Binomialkoeffizient als Logarithmus — n ueber k laeuft sonst schon bei
+// n = 67 ueber.
+pub fn ProbLogBinom(n: int64, k: int64): f64 {
+  if (k < 0) { return _zero(); }
+  if (k > n) { return _zero(); }
+  return ProbLogGamma((n + 1) as f64) - ProbLogGamma((k + 1) as f64)
+         - ProbLogGamma((n - k + 1) as f64);
+}
+
+pub fn ProbBinomialPmf(k: int64, n: int64, p: f64): f64 {
+  if (n < 0) { return _zero(); }
+  if (k < 0) { return _zero(); }
+  if (k > n) { return _zero(); }
+  if (p < _zero()) { return _zero(); }
+  if (p > _one())  { return _zero(); }
+
+  if (p < _tiny()) {
+    if (k == 0) { return _one(); }
+    return _zero();
+  }
+  if (p > _one() - _tiny()) {
+    if (k == n) { return _one(); }
+    return _zero();
+  }
+
+  var lg: f64 := ProbLogBinom(n, k) + (k as f64) * MxLog(p)
+                 + ((n - k) as f64) * MxLog(_one() - p);
+  return MxExp(lg);
+}
+
+// P(X <= k). Ueber die unvollstaendige Betafunktion statt ueber eine Summe:
+// bei n = 10^6 waere die Summe nicht nur langsam, sie sammelte auch
+// Rundungsfehler ueber Millionen Terme.
+pub fn ProbBinomialCdf(k: int64, n: int64, p: f64): f64 {
+  if (k < 0)  { return _zero(); }
+  if (k >= n) { return _one(); }
+  return ProbBetaI((n - k) as f64, (k + 1) as f64, _one() - p);
+}
+
+// Kleinstes k mit P(X <= k) >= q. Binaere Suche, weil die Verteilung diskret
+// ist und ein Newton-Verfahren hier nichts zu greifen hat.
+pub fn ProbBinomialQuantile(q: f64, n: int64, p: f64): int64 {
+  if (q <= _zero()) { return 0; }
+  if (q >= _one())  { return n; }
+
+  var lo: int64 := 0;
+  var hi: int64 := n;
+  while (lo < hi) {
+    var mid: int64 := lo + (hi - lo) / 2;
+    if (ProbBinomialCdf(mid, n, p) >= q) { hi := mid; }
+    else { lo := mid + 1; }
+  }
+  return lo;
+}
+
+// ── Poissonverteilung ────────────────────────────────────────────────────────
+
+pub fn ProbPoissonPmf(k: int64, lambda: f64): f64 {
+  if (k < 0) { return _zero(); }
+  if (lambda <= _zero()) { return _zero(); }
+  var lg: f64 := (k as f64) * MxLog(lambda) - lambda - ProbLogGamma((k + 1) as f64);
+  return MxExp(lg);
+}
+
+// P(X <= k) = Q(k+1, lambda)
+pub fn ProbPoissonCdf(k: int64, lambda: f64): f64 {
+  if (k < 0) { return _zero(); }
+  if (lambda <= _zero()) { return _one(); }
+  return ProbGammaQ((k + 1) as f64, lambda);
+}
+
+pub fn ProbPoissonQuantile(q: f64, lambda: f64): int64 {
+  if (q <= _zero()) { return 0; }
+  if (q >= _one())  { return 0; }
+
+  // Obergrenze suchen, dann binaer schachteln
+  var hi: int64 := 1;
+  while (ProbPoissonCdf(hi, lambda) < q) {
+    hi := hi * 2;
+    if (hi > 1000000000) { return hi; }
+  }
+  var lo: int64 := 0;
+  while (lo < hi) {
+    var mid: int64 := lo + (hi - lo) / 2;
+    if (ProbPoissonCdf(mid, lambda) >= q) { hi := mid; }
+    else { lo := mid + 1; }
+  }
+  return lo;
+}
+
+// ── Student-t-Verteilung ─────────────────────────────────────────────────────
+
+pub fn ProbStudentTPdf(x: f64, df: f64): f64 {
+  if (df <= _zero()) { return _zero(); }
+  var lg: f64 := ProbLogGamma((df + _one()) / 2.0) - ProbLogGamma(df / 2.0)
+                 - 0.5 * MxLog(df * _pi())
+                 - ((df + _one()) / 2.0) * MxLog(_one() + x * x / df);
+  return MxExp(lg);
+}
+
+// Grenze fuer die Betafunktion: ab hier wird die Normalverteilung genommen.
+//
+// Der Grund liegt nicht im Verfahren, sondern im Unterbau: I_x(df/2, 1/2)
+// braucht die Differenz zweier grosser Logarithmen der Gammafunktion. Bei
+// df = 100000 sind beide rund 5e5; der relative Fehler von LogF64 (1e-7)
+// wird darin absolut 0.05, und exp() davon verfehlt das Ergebnis um Prozente.
+// Gemessen: bei df = 1000 stimmt die Verteilungsfunktion auf 1e-7, bei
+// df = 100000 nur noch auf 1.3e-4.
+//
+// Die t-Verteilung geht ohnehin in die Normalverteilung ueber. Der Unterschied
+// betraegt bei df = 10000 rund 1e-5 und faellt weiter — also weniger als der
+// Fehler, den die Betafunktion dort schon macht. Der Wechsel verbessert das
+// Ergebnis, er verschlechtert es nicht.
+fn _tLargeDf(): f64 { return 10000.0; }
+
+pub fn ProbStudentTCdf(x: f64, df: f64): f64 {
+  if (df <= _zero()) { return _zero(); }
+  if (df > _tLargeDf()) { return ProbNormalCdf(x, _zero(), _one()); }
+  var xt: f64 := df / (df + x * x);
+  var half: f64 := 0.5 * ProbBetaI(df / 2.0, 0.5, xt);
+  if (x > _zero()) { return _one() - half; }
+  return half;
+}
+
+pub fn ProbStudentTQuantile(p: f64, df: f64): f64 {
+  if (df <= _zero()) { return _zero(); }
+  if (p <= _zero()) { return _zero(); }
+  if (p >= _one())  { return _zero(); }
+  return _invertCdfT(p, df);
+}
+
+// Zweiseitiger p-Wert zu einer t-Statistik
+pub fn ProbStudentTPTwoSided(t: f64, df: f64): f64 {
+  return 2.0 * (_one() - ProbStudentTCdf(AbsF64(t), df));
+}
+
+// ── Chi-Quadrat-Verteilung ───────────────────────────────────────────────────
+
+pub fn ProbChiSqPdf(x: f64, df: f64): f64 {
+  if (df <= _zero()) { return _zero(); }
+  if (x <= _zero())  { return _zero(); }
+  var k: f64 := df / 2.0;
+  var lg: f64 := (k - _one()) * MxLog(x) - x / 2.0 - k * MxLog(2.0) - ProbLogGamma(k);
+  return MxExp(lg);
+}
+
+pub fn ProbChiSqCdf(x: f64, df: f64): f64 {
+  if (df <= _zero()) { return _zero(); }
+  if (x <= _zero())  { return _zero(); }
+  return ProbGammaP(df / 2.0, x / 2.0);
+}
+
+pub fn ProbChiSqQuantile(p: f64, df: f64): f64 {
+  if (df <= _zero()) { return _zero(); }
+  if (p <= _zero())  { return _zero(); }
+  if (p >= _one())   { return _zero(); }
+  return _invertCdfChi(p, df);
+}
+
+// Oberer p-Wert: P(X > x), der bei Anpassungstests gebrauchte
+pub fn ProbChiSqPUpper(x: f64, df: f64): f64 {
+  return _one() - ProbChiSqCdf(x, df);
+}
+
+// ── F-Verteilung ─────────────────────────────────────────────────────────────
+
+pub fn ProbFPdf(x: f64, d1: f64, d2: f64): f64 {
+  if (x <= _zero())  { return _zero(); }
+  if (d1 <= _zero()) { return _zero(); }
+  if (d2 <= _zero()) { return _zero(); }
+
+  var lg: f64 := (d1 / 2.0) * MxLog(d1) + (d2 / 2.0) * MxLog(d2)
+                 + (d1 / 2.0 - _one()) * MxLog(x)
+                 - ((d1 + d2) / 2.0) * MxLog(d2 + d1 * x)
+                 + ProbLogGamma((d1 + d2) / 2.0)
+                 - ProbLogGamma(d1 / 2.0) - ProbLogGamma(d2 / 2.0);
+  return MxExp(lg);
+}
+
+pub fn ProbFCdf(x: f64, d1: f64, d2: f64): f64 {
+  if (x <= _zero())  { return _zero(); }
+  if (d1 <= _zero()) { return _zero(); }
+  if (d2 <= _zero()) { return _zero(); }
+  return ProbBetaI(d1 / 2.0, d2 / 2.0, d1 * x / (d1 * x + d2));
+}
+
+pub fn ProbFQuantile(p: f64, d1: f64, d2: f64): f64 {
+  if (p <= _zero()) { return _zero(); }
+  if (p >= _one())  { return _zero(); }
+  return _invertCdfF(p, d1, d2);
+}
+
+// ── Umkehrung stetiger Verteilungsfunktionen ─────────────────────────────────
+//
+// Drei fast gleiche Bisektionen statt einer allgemeinen: es gibt keine
+// Funktionszeiger-Uebergabe, auf die man sich hier verlassen koennte
+// (Methodenzeiger als lokale Variable segfaultet, #1106). Die Wiederholung ist
+// der Preis dafuer — jede Fassung setzt ihre eigene Startspanne, was der
+// gemeinsamen Fassung ohnehin gefehlt haette.
+
+fn _invertCdfT(p: f64, df: f64): f64 {
+  var lo: f64 := -1000.0;
+  var hi: f64 := 1000.0;
+  var i: int64 := 0;
+  while (i < 200) {
+    var mid: f64 := (lo + hi) / 2.0;
+    if (ProbStudentTCdf(mid, df) < p) { lo := mid; }
+    else { hi := mid; }
+    i := i + 1;
+  }
+  return (lo + hi) / 2.0;
+}
+
+fn _invertCdfChi(p: f64, df: f64): f64 {
+  var lo: f64 := _zero();
+  var hi: f64 := df * 10.0 + 100.0;
+  var i: int64 := 0;
+  while (i < 200) {
+    var mid: f64 := (lo + hi) / 2.0;
+    if (ProbChiSqCdf(mid, df) < p) { lo := mid; }
+    else { hi := mid; }
+    i := i + 1;
+  }
+  return (lo + hi) / 2.0;
+}
+
+fn _invertCdfF(p: f64, d1: f64, d2: f64): f64 {
+  var lo: f64 := _zero();
+  var hi: f64 := 10000.0;
+  var i: int64 := 0;
+  while (i < 200) {
+    var mid: f64 := (lo + hi) / 2.0;
+    if (ProbFCdf(mid, d1, d2) < p) { lo := mid; }
+    else { hi := mid; }
+    i := i + 1;
+  }
+  return (lo + hi) / 2.0;
+}
+
+// ── Tests und Schaetzer ──────────────────────────────────────────────────────
+
+// Einstichproben-t-Test gegen den Erwartungswert mu0. Schreibt Teststatistik
+// und Freiheitsgrade an die Ausgabeadressen und gibt den zweiseitigen p-Wert
+// zurueck; -1 bei zu wenigen Werten oder verschwindender Streuung.
+pub fn ProbTTestOneSample(data: int64, n: int64, mu0: f64,
+                          outT: int64, outDf: int64): f64 {
+  var fail: f64 := _negOne();
+  if (n < 2) { return fail; }
+
+  var sd: f64 := ProbStdDevS(data, n);
+  if (sd < _eps()) { return fail; }
+
+  var mean: f64 := ProbMean(data, n);
+  var t: f64 := (mean - mu0) / (sd / SqrtF64(n as f64));
+  var df: f64 := (n - 1) as f64;
+
+  if (outT != 0)  { pokef64(outT, t); }
+  if (outDf != 0) { pokef64(outDf, df); }
+  return ProbStudentTPTwoSided(t, df);
+}
+
+// Zweistichproben-t-Test nach Welch — OHNE die Annahme gleicher Varianzen.
+//
+// Bewusst nicht der Student-Test mit gepoolter Varianz: dessen Voraussetzung
+// (gleiche Streuung in beiden Gruppen) wird in der Praxis selten geprueft und
+// noch seltener erfuellt, und wenn sie verletzt ist, faellt der p-Wert zu klein
+// aus. Welch kostet nichts ausser der Formel fuer die Freiheitsgrade
+// (Welch-Satterthwaite) und ist im Grenzfall gleicher Varianzen praktisch
+// deckungsgleich.
+pub fn ProbTTestTwoSample(x: int64, nx: int64, y: int64, ny: int64,
+                          outT: int64, outDf: int64): f64 {
+  var fail: f64 := _negOne();
+  if (nx < 2) { return fail; }
+  if (ny < 2) { return fail; }
+
+  var vx: f64 := ProbVarianceS(x, nx) / (nx as f64);
+  var vy: f64 := ProbVarianceS(y, ny) / (ny as f64);
+  var denom: f64 := vx + vy;
+  if (denom < _tiny()) { return fail; }
+
+  var t: f64 := (ProbMean(x, nx) - ProbMean(y, ny)) / SqrtF64(denom);
+  var df: f64 := (denom * denom) /
+                 (vx * vx / ((nx - 1) as f64) + vy * vy / ((ny - 1) as f64));
+
+  if (outT != 0)  { pokef64(outT, t); }
+  if (outDf != 0) { pokef64(outDf, df); }
+  return ProbStudentTPTwoSided(t, df);
+}
+
+// Chi-Quadrat-Anpassungstest: beobachtete gegen erwartete Haeufigkeiten.
+// Freiheitsgrade = n - 1 - estimated (Zahl der aus den Daten geschaetzten
+// Parameter). Rueckgabe ist der obere p-Wert; -1 bei unzulaessigen Eingaben.
+//
+// Erwartete Haeufigkeiten unter 5 machen die Naeherung unzuverlaessig — das
+// prueft die Funktion NICHT, weil die uebliche Antwort (Klassen zusammenlegen)
+// eine fachliche Entscheidung ist. ProbChiSqMinExpected() liefert die Zahl,
+// um es selbst zu pruefen.
+pub fn ProbChiSqGof(observed: int64, expected: int64, n: int64, estimated: int64,
+                    outChi2: int64, outDf: int64): f64 {
+  var fail: f64 := _negOne();
+  if (n < 2) { return fail; }
+
+  var df: int64 := n - 1 - estimated;
+  if (df < 1) { return fail; }
+
+  var chi2: f64 := _zero();
+  var i: int64 := 0;
+  while (i < n) {
+    var e: f64 := _get(expected, i);
+    if (e <= _zero()) { return fail; }
+    var d: f64 := _get(observed, i) - e;
+    chi2 := chi2 + d * d / e;
+    i := i + 1;
+  }
+
+  if (outChi2 != 0) { pokef64(outChi2, chi2); }
+  if (outDf != 0)   { pokef64(outDf, df as f64); }
+  return ProbChiSqPUpper(chi2, df as f64);
+}
+
+pub fn ProbChiSqMinExpected(expected: int64, n: int64): f64 {
+  return ProbMin(expected, n);
+}
+
+// Konfidenzintervall fuer den Mittelwert (t-Verteilung, unbekannte Varianz).
+// conf ist das Niveau, also 0.95 fuer 95 Prozent.
+pub fn ProbConfIntervalMean(data: int64, n: int64, conf: f64,
+                            outLo: int64, outHi: int64): bool {
+  if (n < 2) { return false; }
+  if (conf <= _zero()) { return false; }
+  if (conf >= _one())  { return false; }
+
+  var mean: f64 := ProbMean(data, n);
+  var se: f64 := ProbStdDevS(data, n) / SqrtF64(n as f64);
+  var alpha: f64 := _one() - conf;
+  var tcrit: f64 := ProbStudentTQuantile(_one() - alpha / 2.0, (n - 1) as f64);
+
+  if (outLo != 0) { pokef64(outLo, mean - tcrit * se); }
+  if (outHi != 0) { pokef64(outHi, mean + tcrit * se); }
+  return true;
+}
+
+// Standardfehler des Mittelwerts
+pub fn ProbStandardError(data: int64, n: int64): f64 {
+  if (n < 2) { return _zero(); }
+  return ProbStdDevS(data, n) / SqrtF64(n as f64);
+}
+
+// z-Standardisierung einer Reihe in ein Zielfeld (darf dasselbe sein).
+pub fn ProbZScores(data: int64, n: int64, out: int64): bool {
+  if (n < 2) { return false; }
+  if (out == 0) { return false; }
+  var mean: f64 := ProbMean(data, n);
+  var sd: f64 := ProbStdDevP(data, n);
+  if (sd < _eps()) { return false; }
+
+  var i: int64 := 0;
+  while (i < n) {
+    _put(out, i, (_get(data, i) - mean) / sd);
+    i := i + 1;
+  }
+  return true;
+}
+
+// ── Zufallszahlen ────────────────────────────────────────────────────────────
+//
+// Ein linearer Kongruenzgenerator (Knuth-MMIX-Parameter) mit 64-Bit-Zustand.
+// Die Multiplikation laeuft absichtlich ueber — der stille int64-Ueberlauf IST
+// hier die Rechnung modulo 2^64.
+//
+// Nicht fuer Kryptographie. Wer Schluessel braucht, nimmt std.crypto.rand
+// (getrandom). Dieser Generator ist fuer Simulationen gedacht, wo
+// Reproduzierbarkeit zaehlt: gleicher Seed, gleiche Folge.
+//
+// Ausgegeben werden die oberen Bits. Die unteren Bits eines LCG haben sehr
+// kurze Perioden (das letzte Bit wechselt stur ab), sie sind fuer nichts zu
+// gebrauchen.
+
+var _rngState: int64 := 88172645463325252;
+var _normalSpare: f64 := 0.0;
+// int64 statt bool: eine globale bool-Variable mit Startwert weist der Codegen
+// ab ("Startwert ist zur Uebersetzungszeit nicht bekannt"), obwohl
+// --compile-unit die Datei durchwinkt.
+var _hasSpare: int64 := 0;
+
+pub fn ProbSeed(seed: int64): void {
+  _rngState := seed;
+  _hasSpare := 0;
+  // Ein paar Schritte leer drehen: kleine Seeds ergaben sonst kleine erste
+  // Ausgaben.
+  var i: int64 := 0;
+  while (i < 8) {
+    _rngState := _rngState * 6364136223846793005 + 1442695040888963407;
+    i := i + 1;
+  }
+}
+
+// 53 zufaellige Bits aus dem oberen Bereich des Zustands.
+fn _next53(): int64 {
+  _rngState := _rngState * 6364136223846793005 + 1442695040888963407;
+  var s: int64 := _rngState & 9223372036854775807;   // Vorzeichenbit weg
+  return s >> 10;
+}
+
+// Ganzzahl in 0..2^53-1
+pub fn ProbRandBits(): int64 {
+  return _next53();
+}
+
+// Gleichverteilt in [0,1)
+pub fn ProbRandUniform(): f64 {
+  return (_next53() as f64) / _twoPow53();
+}
+
+// Gleichverteilt in [a,b)
+pub fn ProbRandRange(a: f64, b: f64): f64 {
+  return a + ProbRandUniform() * (b - a);
+}
+
+// Ganzzahl in lo..hi (beide einschliesslich)
+pub fn ProbRandInt(lo: int64, hi: int64): int64 {
+  if (hi <= lo) { return lo; }
+  var span: int64 := hi - lo + 1;
+  return lo + (_next53() % span);
+}
+
+// Normalverteilt, Box-Muller in der Polarform. Jeder Durchlauf liefert zwei
+// unabhaengige Werte — der zweite wird aufgehoben, sonst waere die Haelfte der
+// Arbeit weggeworfen.
+pub fn ProbRandNormal(mu: f64, sigma: f64): f64 {
+  if (_hasSpare == 1) {
+    _hasSpare := 0;
+    return mu + sigma * _normalSpare;
+  }
+
+  var u: f64 := _zero();
+  var v: f64 := _zero();
+  var s: f64 := _zero();
+  var done: bool := false;
+
+  while (!done) {
+    u := ProbRandUniform() * 2.0 - _one();
+    v := ProbRandUniform() * 2.0 - _one();
+    s := u * u + v * v;
+    if (s > _zero()) {
+      if (s < _one()) { done := true; }
+    }
+  }
+
+  var f: f64 := SqrtF64(_neg(2.0 * MxLog(s) / s));
+  _normalSpare := v * f;
+  _hasSpare := 1;
+  return mu + sigma * (u * f);
+}
+
+// Exponentialverteilt (Inversionsmethode)
+pub fn ProbRandExponential(lambda: f64): f64 {
+  if (lambda <= _zero()) { return _zero(); }
+  var u: f64 := ProbRandUniform();
+  if (u <= _zero()) { u := _eps(); }
+  return _neg(MxLog(u)) / lambda;
+}
+
+// Poissonverteilt. Bis lambda = 30 nach Knuth (Produkt gleichverteilter
+// Zahlen), darueber ueber die Quantilfunktion — das Produktverfahren braucht
+// im Mittel lambda Durchlaeufe und wird dort teuer.
+pub fn ProbRandPoisson(lambda: f64): int64 {
+  if (lambda <= _zero()) { return 0; }
+
+  if (lambda < 30.0) {
+    var l: f64 := MxExp(_neg(lambda));
+    var k: int64 := 0;
+    var p: f64 := _one();
+    var run: bool := true;
+    while (run) {
+      p := p * ProbRandUniform();
+      if (p <= l) { run := false; }
+      else { k := k + 1; }
+    }
+    return k;
+  }
+  return ProbPoissonQuantile(ProbRandUniform(), lambda);
+}
+
+// Binomialverteilt. Fuer kleine n direkt ueber n Bernoulli-Versuche, sonst
+// ueber die Quantilfunktion.
+pub fn ProbRandBinomial(n: int64, p: f64): int64 {
+  if (n <= 0) { return 0; }
+  if (p <= _zero()) { return 0; }
+  if (p >= _one())  { return n; }
+
+  if (n <= 64) {
+    var k: int64 := 0;
+    var i: int64 := 0;
+    while (i < n) {
+      if (ProbRandUniform() < p) { k := k + 1; }
+      i := i + 1;
+    }
+    return k;
+  }
+  return ProbBinomialQuantile(ProbRandUniform(), n, p);
+}
+
+// Stichprobe der Groesse n aus einer Verteilung in ein Feld schreiben —
+// spart dem Aufrufer die Schleife und macht Testreihen kurz.
+pub fn ProbFillNormal(out: int64, n: int64, mu: f64, sigma: f64): void {
+  var i: int64 := 0;
+  while (i < n) {
+    _put(out, i, ProbRandNormal(mu, sigma));
+    i := i + 1;
+  }
+}
+
+pub fn ProbFillUniform(out: int64, n: int64, a: f64, b: f64): void {
+  var i: int64 := 0;
+  while (i < n) {
+    _put(out, i, ProbRandRange(a, b));
+    i := i + 1;
+  }
+}
+
+// Zufaellige Umordnung an Ort und Stelle (Fisher-Yates, rueckwaerts).
+pub fn ProbShuffle(data: int64, n: int64): void {
+  if (n < 2) { return; }
+  var i: int64 := n - 1;
+  while (i > 0) {
+    var j: int64 := ProbRandInt(0, i);
+    var tmp: f64 := _get(data, i);
+    _put(data, i, _get(data, j));
+    _put(data, j, tmp);
+    i := i - 1;
+  }
+}

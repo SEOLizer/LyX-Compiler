@@ -1,0 +1,250 @@
+// std/gzip.lyx — gzip-Container (RFC 1952) auf der vorhandenen DEFLATE-Basis
+//
+// Der Codec lag schon da: DEFLATE in beide Richtungen (std/zlib.lyx) und die
+// reflektierte CRC-32, die seit PR #799 gegen Referenzvektoren geprueft ist.
+// Es fehlte nur der Rahmen darum — Issue #1070.
+//
+// Der Aufwand steckt entsprechend nicht im Komprimieren, sondern in drei
+// Kleinigkeiten, die man leicht falsch macht:
+//
+//  1. Die OPTIONALEN Kopffelder. Nach FLG koennen FEXTRA (Laenge + Daten),
+//     FNAME und FCOMMENT (nullterminiert) und FHCRC (2 Byte) folgen. Wer sie
+//     nicht ueberspringt, setzt den DEFLATE-Strom an der falschen Stelle an
+//     und dekodiert Muell — ohne dass irgendetwas auffaellt, bis der Trailer
+//     nicht passt.
+//  2. Der Trailer wird GEPRUEFT, nicht nur gelesen. Eine ungeprueft
+//     mitgefuehrte Pruefsumme ist schlimmer als gar keine: sie erweckt den
+//     Eindruck, der Inhalt sei abgesichert.
+//  3. Mehrere aneinandergehaengte Member sind zulaessig (`cat a.gz b.gz`).
+//     Ohne Unterstuetzung gaebe es genau ein Ergebnis: der erste Member wird
+//     ausgepackt, der Rest still verschluckt.
+//
+// Konformitaet gegen RFC 1952 §2.3.1.2:
+//
+//   Ein konformer Kompressor muss ID1, ID2, CM, CRC32 und ISIZE richtig
+//   setzen und darf alle uebrigen Kopffelder auf Vorgabewerte lassen
+//   (255 fuer OS, 0 sonst) — genau das tut GzipCompress.
+//
+//   Ein konformer Dekompressor muss ID1, ID2 und CM pruefen, FEXTRA/XLEN,
+//   FNAME, FCOMMENT und FHCRC wenigstens ueberspringen koennen und bei einem
+//   gesetzten RESERVIERTEN Flag-Bit einen Fehler melden — weil ein solches
+//   Bit ein neues Feld ankuendigen koennte, das alles Folgende verschiebt.
+//   Alles drei ist umgesetzt; FHCRC wird darueber hinaus geprueft, nicht nur
+//   uebersprungen.
+//
+// Nicht enthalten: FDICT gibt es in gzip nicht, und die Kompression schreibt
+// keine optionalen Felder (kein Dateiname, kein Zeitstempel) — beim Auspacken
+// werden sie dagegen alle uebersprungen. MTIME=0 heisst laut RFC ausdruecklich
+// "kein Zeitstempel vorhanden"; ein echter Zeitstempel waere eine verdeckte
+// Abhaengigkeit von der Uhr und machte die Ausgabe unreproduzierbar.
+
+unit std.gzip;
+
+import std.alloc;
+import std.io;
+import std.zlib;
+
+pub con GZIP_OK:       int64 := 0;
+pub con GZIP_ERR:      int64 := 0 - 1;   // kein gzip, verstuemmelt, Pruefsumme
+pub con GZIP_OVERFLOW: int64 := 0 - 2;   // Ausgabepuffer zu klein
+
+// Flag-Bits im FLG-Byte (RFC 1952 §2.3.1)
+con GZ_FTEXT:    int64 := 1;
+con GZ_FHCRC:    int64 := 2;
+con GZ_FEXTRA:   int64 := 4;
+con GZ_FNAME:    int64 := 8;
+con GZ_FCOMMENT: int64 := 16;
+
+fn gzReadLE32(p: int64): int64 {
+    return peek8(p) | (peek8(p + 1) << 8) | (peek8(p + 2) << 16) | (peek8(p + 3) << 24);
+}
+
+fn gzWriteLE32(p: int64, v: int64): void {
+    poke8(p,     v & 0xFF);
+    poke8(p + 1, (v >> 8) & 0xFF);
+    poke8(p + 2, (v >> 16) & 0xFF);
+    poke8(p + 3, (v >> 24) & 0xFF);
+}
+
+// Laenge des Kopfes eines Members ab src, oder -1 bei Fehler.
+// Prueft dabei Magic und Kompressionsverfahren und ueberspringt alle
+// optionalen Felder.
+fn gzHeaderLen(src: int64, len: int64): int64 {
+    if (len < 10) { return 0 - 1; }
+    if (peek8(src) != 0x1F)     { return 0 - 1; }
+    if (peek8(src + 1) != 0x8B) { return 0 - 1; }
+    if (peek8(src + 2) != 8)    { return 0 - 1; }   // CM: nur DEFLATE
+
+    var flg: int64 := peek8(src + 3);
+    // Bits 5..7 sind reserviert und muessen null sein. Ein gesetztes Bit heisst
+    // laut RFC, dass der Strom nicht dekodiert werden darf.
+    if ((flg & 0xE0) != 0) { return 0 - 1; }
+
+    var pos: int64 := 10;   // Magic(2) CM(1) FLG(1) MTIME(4) XFL(1) OS(1)
+
+    if ((flg & GZ_FEXTRA) != 0) {
+        if (pos + 2 > len) { return 0 - 1; }
+        var xlen: int64 := peek8(src + pos) | (peek8(src + pos + 1) << 8);
+        pos := pos + 2 + xlen;
+        if (pos > len) { return 0 - 1; }
+    }
+    if ((flg & GZ_FNAME) != 0) {
+        var found: int64 := 0;
+        while ((pos < len) & (found == 0)) {
+            if (peek8(src + pos) == 0) { found := 1; }
+            pos := pos + 1;
+        }
+        if (found == 0) { return 0 - 1; }
+    }
+    if ((flg & GZ_FCOMMENT) != 0) {
+        var found2: int64 := 0;
+        while ((pos < len) & (found2 == 0)) {
+            if (peek8(src + pos) == 0) { found2 := 1; }
+            pos := pos + 1;
+        }
+        if (found2 == 0) { return 0 - 1; }
+    }
+    if ((flg & GZ_FHCRC) != 0) {
+        if (pos + 2 > len) { return 0 - 1; }
+        // RFC 1952 §2.3.1: CRC16 sind die beiden UNTEREN Byte des CRC-32 ueber
+        // alle Kopfbytes bis ausschliesslich dieses Feld. Der RFC erlaubt es,
+        // das Feld nur zu ueberspringen -- aber eine mitgefuehrte und nicht
+        // gepruefte Pruefsumme ist schlimmer als gar keine: sie erweckt den
+        // Eindruck, der Kopf sei abgesichert.
+        var wantHdr: int64 := peek8(src + pos) | (peek8(src + pos + 1) << 8);
+        var gotHdr:  int64 := CRC32(src as pchar, pos) & 0xFFFF;
+        if (wantHdr != gotHdr) { return 0 - 1; }
+        pos := pos + 2;
+    }
+    if (pos + 8 > len) { return 0 - 1; }   // Trailer muss noch hineinpassen
+    return pos;
+}
+
+// Entpackt einen gzip-Strom nach dst. Gibt die Zahl der geschriebenen Bytes
+// zurueck, GZIP_ERR bei ungueltigem Strom oder falscher Pruefsumme,
+// GZIP_OVERFLOW, wenn dstMax nicht reicht.
+//
+// Mehrere aneinandergehaengte Member werden nacheinander ausgepackt und
+// aneinandergehaengt — so verhaelt sich auch `gzip -d`.
+pub fn GzipDecompress(src: int64, srcLen: int64, dst: int64, dstMax: int64): int64 {
+    if ((src == 0) | (dst == 0)) { return GZIP_ERR; }
+    if (srcLen < 18) { return GZIP_ERR; }   // kleinstmoeglicher Member
+
+    var inPos:  int64 := 0;
+    var outPos: int64 := 0;
+    var consumedBox: int64 := alloc(8);
+
+    while (inPos < srcLen) {
+        // Faengt hier kein Member mehr an, darf nur noch Fuellung folgen.
+        //
+        // ABWEICHUNG VOM RFC, bewusst: RFC 1952 §2.2 sagt, die Member folgen
+        // "with no additional information before, between, or after them" --
+        // nachlaufende Nullbytes sind danach also unzulaessig. In der Praxis
+        // kommen sie staendig vor (Bandarchive, auf Blockgroesse aufgefuellte
+        // Dateien), und `gzip -d` nimmt sie kommentarlos an. Wir tun dasselbe,
+        // aber NUR fuer Nullbytes; alles andere hinter dem letzten Member ist
+        // ein Fehler.
+        var isMember: int64 := 0;
+        if (srcLen - inPos >= 18) {
+            if ((peek8(src + inPos) == 0x1F) & (peek8(src + inPos + 1) == 0x8B)) { isMember := 1; }
+        }
+        if (isMember == 0) {
+            // Der Rest wird genau EINMAL geprueft, nicht je Member -- sonst
+            // waere die Schleife bei vielen Membern quadratisch.
+            var z: int64 := inPos;
+            while (z < srcLen) {
+                if (peek8(src + z) != 0) { free(consumedBox, 8); return GZIP_ERR; }
+                z := z + 1;
+            }
+            inPos := srcLen;
+        } else {
+            var hdr: int64 := gzHeaderLen(src + inPos, srcLen - inPos);
+            if (hdr < 0) { free(consumedBox, 8); return GZIP_ERR; }
+
+            poke64(consumedBox, 0);
+            var space: int64 := dstMax - outPos;
+            if (space <= 0) { free(consumedBox, 8); return GZIP_OVERFLOW; }
+
+            var n: int64 := InflateDEFLATEBounded((src + inPos + hdr) as pchar,
+                                                  srcLen - inPos - hdr,
+                                                  (dst + outPos) as pchar,
+                                                  space, consumedBox);
+            if (n < 0) {
+                // -2 heisst: an der Puffergrenze abgebrochen. Das ist kein
+                // Datenverfall und darf dem Aufrufer nicht als solcher
+                // gemeldet werden -- er kann mit mehr Platz wiederkommen.
+                free(consumedBox, 8);
+                if (n == 0 - 2) { return GZIP_OVERFLOW; }
+                return GZIP_ERR;
+            }
+
+            var used: int64 := peek64(consumedBox);
+            var trailer: int64 := inPos + hdr + used;
+            if (trailer + 8 > srcLen) { free(consumedBox, 8); return GZIP_ERR; }
+
+            // Trailer PRUEFEN, nicht nur lesen.
+            var wantCrc:  int64 := gzReadLE32(src + trailer) & 0xFFFFFFFF;
+            var wantSize: int64 := gzReadLE32(src + trailer + 4) & 0xFFFFFFFF;
+            var gotCrc:   int64 := CRC32((dst + outPos) as pchar, n) & 0xFFFFFFFF;
+            var gotSize:  int64 := n & 0xFFFFFFFF;
+            if (wantCrc != gotCrc)   { free(consumedBox, 8); return GZIP_ERR; }
+            if (wantSize != gotSize) { free(consumedBox, 8); return GZIP_ERR; }
+
+            outPos := outPos + n;
+            inPos  := trailer + 8;
+        }
+    }
+
+    free(consumedBox, 8);
+    return outPos;
+}
+
+// Groesse, die GzipCompress hoechstens schreibt.
+pub fn GzipCompressBound(srcLen: int64): int64 {
+    // Kopf 10 + Trailer 8 + DEFLATE im schlimmsten Fall etwas groesser als die
+    // Eingabe (fixed Huffman kann pro Byte 9 Bit brauchen).
+    return srcLen + srcLen / 8 + 128;
+}
+
+// Packt src nach dst als gzip-Member. Gibt die Zahl der geschriebenen Bytes
+// zurueck oder GZIP_OVERFLOW, wenn dstMax nicht reicht.
+//
+// Geschrieben wird der schlanke Kopf ohne optionale Felder: kein Dateiname,
+// kein Zeitstempel. Ein Zeitstempel waere hier eine verdeckte Abhaengigkeit
+// von der Uhr und machte die Ausgabe unreproduzierbar; MTIME=0 heisst laut
+// RFC 1952 ausdruecklich "nicht vorhanden".
+pub fn GzipCompress(src: int64, srcLen: int64, dst: int64, dstMax: int64): int64 {
+    if ((src == 0) | (dst == 0)) { return GZIP_ERR; }
+    if (srcLen < 0) { return GZIP_ERR; }
+    if (dstMax < GzipCompressBound(srcLen)) { return GZIP_OVERFLOW; }
+
+    var pos: int64 := 0;
+    poke8(dst + pos, 0x1F); pos := pos + 1;
+    poke8(dst + pos, 0x8B); pos := pos + 1;
+    poke8(dst + pos, 8);    pos := pos + 1;   // CM = DEFLATE
+    poke8(dst + pos, 0);    pos := pos + 1;   // FLG = keine optionalen Felder
+    poke8(dst + pos, 0); poke8(dst + pos + 1, 0);
+    poke8(dst + pos + 2, 0); poke8(dst + pos + 3, 0);
+    pos := pos + 4;                            // MTIME = 0 (nicht vorhanden)
+    poke8(dst + pos, 0);    pos := pos + 1;   // XFL
+    poke8(dst + pos, 255);  pos := pos + 1;   // OS = unbekannt
+
+    var body: int64 := 0;
+    if (srcLen > 0) {
+        body := DeflateCompressLZ77(src as pchar, srcLen, (dst + pos) as pchar);
+        if (body <= 0) { return GZIP_ERR; }
+    } else {
+        // Leere Eingabe: ein einzelner leerer Block mit BFINAL. Fixed Huffman,
+        // nur das Endsymbol 256 (7 Nullbits) -> 0x03 0x00.
+        poke8(dst + pos,     0x03);
+        poke8(dst + pos + 1, 0x00);
+        body := 2;
+    }
+    pos := pos + body;
+
+    gzWriteLE32(dst + pos,     CRC32(src as pchar, srcLen) & 0xFFFFFFFF);
+    gzWriteLE32(dst + pos + 4, srcLen & 0xFFFFFFFF);
+    pos := pos + 8;
+
+    return pos;
+}

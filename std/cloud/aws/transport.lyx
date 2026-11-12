@@ -1,5 +1,6 @@
 // std/cloud/aws/transport.lyx — AWS HTTP Transport + Retry + Protocol Helpers
 // WP-AWS-03 + WP-AWS-05 (protocol helpers)
+@capabilities([fs.create, fs.delete, fs.meta, fs.perm, fs.read, fs.write, network.tcp.bind, network.tcp.connect, network.udp.connect, system.env, system.time])
 
 unit std.cloud.aws.transport;
 
@@ -7,6 +8,7 @@ import std.cloud.aws.core;
 import std.cloud.aws.sigv4;
 import std.cloud.aws.xml;
 import std.net.http;
+import std.net.https;
 import std.net.socket;
 import std.net.dns;
 import std.net.tls;
@@ -50,7 +52,7 @@ pub type AWSResponse = struct {
 pub fn AWSResponseFree(r: AWSResponse) {
     if (r.body != 0) {
         // body came from HTTPResponse.bodyPtr — free via munmap
-        sys_munmap(r.body, r.bodyLen + 1);
+        munmap(r.body, r.bodyLen + 1);
     }
     if (r.requestId    != 0) { free(r.requestId,    StrLen(r.requestId    as pchar)+1); }
     if (r.errorCode    != 0) { free(r.errorCode,    StrLen(r.errorCode    as pchar)+1); }
@@ -90,9 +92,9 @@ fn jsonExtract(json: int64, key: pchar): int64 {
     var i: int64 := 0;
     while (i < jl - kl - 3) {
         if ((peek8(json+i) & 0xFF) == 34) { // '"'
-            var match: int64 := 1; var j: int64 := 0;
-            while(j<kl){if(peek8(json+i+1+j)!=(StrCharAt(key,j)&0xFF)){match:=0;break;}j:=j+1;}
-            if (match==1 && (peek8(json+i+1+kl)&0xFF)==34) {
+            var isMatch: int64 := 1; var j: int64 := 0;
+            while(j<kl){if(peek8(json+i+1+j)!=(StrCharAt(key,j)&0xFF)){isMatch:=0;break;}j:=j+1;}
+            if (isMatch==1 && (peek8(json+i+1+kl)&0xFF)==34) {
                 var k: int64 := i+kl+2;
                 while(k<jl && peek8(json+k)==32){k:=k+1;}
                 if ((peek8(json+k)&0xFF)==58) {
@@ -119,10 +121,10 @@ fn jsonExtractField(json: int64, key: pchar): int64 {
     var i: int64 := 0;
     while (i < jl) {
         if ((peek8(json+i) & 0xFF) == 34) {
-            var match: int64 := 1; var j: int64 := 0;
+            var isMatch: int64 := 1; var j: int64 := 0;
             if (i+kl+1 < jl) {
-                while(j<kl){if(peek8(json+i+1+j)!=(StrCharAt(key,j)&0xFF)){match:=0;break;}j:=j+1;}
-                if (match==1 && (peek8(json+i+1+kl)&0xFF)==34) {
+                while(j<kl){if(peek8(json+i+1+j)!=(StrCharAt(key,j)&0xFF)){isMatch:=0;break;}j:=j+1;}
+                if (isMatch==1 && (peek8(json+i+1+kl)&0xFF)==34) {
                     var k: int64 := i+kl+2;
                     while(k<jl && peek8(json+k)==32){k:=k+1;}
                     if (k<jl && (peek8(json+k)&0xFF)==58) {
@@ -173,28 +175,18 @@ pub fn AWSParseXMLError(body: int64, bodyLen: int64, resp: int64) {
 // ── TLS send ─────────────────────────────────────────────────────────────────
 
 fn doTLSSend(host: pchar, req: HTTPRequest): HTTPResponse {
-    var emptyResp: HTTPResponse;
-    emptyResp.statusCode := 0; emptyResp.bodyPtr := 0; emptyResp.bodySize := 0;
-    emptyResp.headers := 0; emptyResp.headerCount := 0;
-
-    var ip: int64 := DNSResolve(host);
-    if (ip == 0) { return emptyResp; }
-    var conn: TCPConn := TCPConnect(ip, 443);
-    if (conn.fd < 0) { return emptyResp; }
-    var tlsCtx: TLSContext := TLSInit();
-    var tlsConn: TLSConn := TLSConnect(tlsCtx, conn.fd, host);
-    if (tlsConn.connected == 0) { TLSFree(tlsCtx); return emptyResp; }
-
-    var reqBuf: int64 := HTTPRequestBuild(req);
-    var allocSz: int64 := peek64(reqBuf);
-    var reqSz: int64   := peek64(reqBuf + 8);
-    TLSWrite(tlsConn, reqBuf + 16, reqSz);
-    free(reqBuf, allocSz);
-
-    var resp: HTTPResponse := HTTPSend(tlsConn, conn);
-    TLSClose(tlsConn);
-    TLSFree(tlsCtx);
-    return resp;
+    // #1264: Hier stand ein selbst zusammengesetzter TLS-Weg, der zwei
+    // Funktionen mit falscher Stelligkeit rief: `DNSResolve(host)` hat VIER
+    // Parameter (Name, Laenge, DNS-Server, Ergebnispuffer) und `HTTPSend`
+    // genau EINEN (den Request). Beides uebersetzte, weil die Signaturpruefung
+    // an der Unit-Grenze endete — zur Laufzeit kamen die fehlenden Werte vom
+    // Stack, die "IP" war Muell und die Antwort wurde nie gelesen. Der Pfad
+    // hat also nie getragen.
+    //
+    // Jetzt uebernimmt std.net.https den ganzen Ablauf: Namensaufloesung,
+    // TCP, Handschlag, Senden, vollstaendiges Lesen bis zum Stream-Ende und
+    // Auswerten der Antwort. Derselbe Weg, den HTTPSGet seit jeher geht.
+    return HTTPSSend(req);
 }
 
 // ── Main send function ────────────────────────────────────────────────────────
@@ -280,18 +272,39 @@ pub fn AWSSend(req: AWSRequest): AWSResponse {
         while (hi < req.headerCount) {
             poke64(extraHeaders + nh*16,     peek64(req.headers + hi*16));
             poke64(extraHeaders + nh*16 + 8, peek64(req.headers + hi*16 + 8));
-            nh := nh + 1; hi := hi + 1;
+            nh += 1; hi := hi + 1;
         }
     }
 
+    // #1573: Hier standen Zuweisungen an Felder, die HTTPRequest gar nicht hat
+    // (headerCount, bodyLen), und `headers` bekam den Zeiger auf das PAARFELD,
+    // wo der Vertrag eine fertige Kopfzeilen-Kette verlangt. Beides fiel bis
+    // 1.1.0A durch, weil unbekannte Felder an importierten Typen ungeprueft
+    // blieben: die Koerperlaenge ging verloren (kein Content-Length, also nie
+    // ein Rumpf) und `method` als Zeichenkette traf ein Feld, das eine
+    // HTTP_*-Konstante fuehrt — der Vergleich in HTTPRequestBuild schlug damit
+    // immer fehl. Der Weg hat, wie #1264 schon fuer die Stelligkeit
+    // festgehalten hat, nie getragen.
+    var hdrStr: int64 := HTTPHeaderPairsToStr(extraHeaders, nh);
+    var mth: int64 := HTTPMethodFromStr(req.method as pchar);
+    if (mth < 0) {
+        EPrintStr("AWS: unbekanntes HTTP-Verfahren '"c);
+        EPrintStr(req.method as pchar);
+        EPrintStrLn("'"c);
+        r.statusCode := 0;
+        free(authBuf, 512); free(dateBuf, 16); free(dateTimeBuf, 24);
+        free(extraHeaders, 16*16); free(payHash, 65);
+        if (hdrStr != 0) { free(hdrStr, 1); }
+        return r;
+    }
     var httpReq: HTTPRequest;
-    httpReq.method      := req.method as pchar;
+    httpReq.method      := mth;
     httpReq.host        := req.host   as pchar;
     httpReq.path        := req.path   as pchar;
-    httpReq.headers     := extraHeaders;
-    httpReq.headerCount := nh;
+    httpReq.port        := 443;
+    httpReq.headers     := hdrStr;
     httpReq.body        := req.body;
-    httpReq.bodyLen     := req.bodyLen;
+    httpReq.bodySize    := req.bodyLen;
 
     var httpResp: HTTPResponse := doTLSSend(req.host as pchar, httpReq);
     free(authBuf, 512);
@@ -300,8 +313,11 @@ pub fn AWSSend(req: AWSRequest): AWSResponse {
     free(extraHeaders, 16*16);
     free(payHash, 65);
 
+    if (hdrStr != 0) { free(hdrStr, 1); }
     r.statusCode  := httpResp.statusCode;
-    r.headers     := httpResp.headers;
+    // #1573: HTTPResponse fuehrt keine `headers` — die Rohkopfzeilen stehen in
+    // headersRaw (WP-C6). Bisher stand hier still eine 0.
+    r.headers     := httpResp.headersRaw;
     r.headerCount := httpResp.headerCount;
     r.body        := httpResp.bodyPtr;
     r.bodyLen     := httpResp.bodySize;
@@ -325,7 +341,12 @@ pub fn AWSSend(req: AWSRequest): AWSResponse {
     // Extract request ID from headers
     // (skipping header search for brevity — requestId remains 0)
 
-    HTTPHeadersFree(httpResp);
+    // #1343: Hier stand `HTTPHeadersFree(httpResp)` — die Funktion erwartet aber
+    // den KOPFZEILEN-Zeiger und ruft darauf munmap. Uebergeben wurde die ganze
+    // Antwortstruktur; freigegeben wurde also nicht der Kopfzeilenpuffer,
+    // sondern die Struktur selbst. Gefunden von der Typpruefung ueber
+    // Unit-Grenzen (Klasse 4 "Nutzertyp" gegen Klasse 1 "Ganzzahl").
+    HTTPHeadersFree(httpResp.headersRaw);
     return r;
 }
 
@@ -335,7 +356,7 @@ pub fn AWSSendWithRetry(req: AWSRequest, maxRetries: int64): AWSResponse {
     var delayMs: int64 := 100;
 
     while (attempt <= maxRetries) {
-        r = AWSSend(req);
+        r := AWSSend(req);
         // Success or non-retryable error
         if (r.statusCode > 0 && r.statusCode != 429 &&
             r.statusCode != 500 && r.statusCode != 502 &&
@@ -344,11 +365,11 @@ pub fn AWSSendWithRetry(req: AWSRequest, maxRetries: int64): AWSResponse {
         }
         if (attempt < maxRetries) {
             AWSResponseFree(r);
-            r = emptyResponse();
+            r := emptyResponse();
             Sleep(delayMs);
             delayMs := delayMs * 2;
         }
-        attempt := attempt + 1;
+        attempt += 1;
     }
     return r;
 }
@@ -363,16 +384,16 @@ pub fn AWSResponseGetHeader(resp: AWSResponse, name: pchar): pchar {
         if (hName != 0 as pchar) {
             var hl: int64 := StrLen(hName);
             if (hl == nl) {
-                var match: int64 := 1; var j: int64 := 0;
+                var isMatch: int64 := 1; var j: int64 := 0;
                 while(j<nl){
                     var a: int64 := StrCharAt(hName, j) & 0xFF;
                     var b: int64 := StrCharAt(name,  j) & 0xFF;
                     if (a >= 65 && a <= 90) { a := a+32; }
                     if (b >= 65 && b <= 90) { b := b+32; }
-                    if (a != b) { match:=0; break; }
+                    if (a != b) { isMatch:=0; break; }
                     j:=j+1;
                 }
-                if (match == 1) { return hVal; }
+                if (isMatch == 1) { return hVal; }
             }
         }
         i:=i+1;

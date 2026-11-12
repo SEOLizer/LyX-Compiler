@@ -1,0 +1,706 @@
+// std/fs/ntfs.lyx — NTFS LESEN
+//
+// Vierte Unit der Dateisystem-Sammlung, und die mit dem groessten Abstand zu
+// den anderen. FAT, exFAT und ext4 haben alle irgendwo eine Tabelle, die
+// Bloecke aufzaehlt. NTFS hat statt dessen die MASTER FILE TABLE: eine
+// Datei, in der jede Datei — auch die MFT selbst — einen Satz besitzt, und
+// jeder Satz besteht aus benannten ATTRIBUTEN. Der Inhalt einer Datei ist
+// nur eines davon ($DATA), und bei kleinen Dateien steht er MITTEN IM SATZ
+// statt in Bloecken.
+//
+// DREI Eigenheiten, ohne die ein Leser still falsch liest:
+//
+//   1. FIXUPS (Update Sequence Array). Die letzten zwei Bytes JEDES Sektors
+//      eines Satzes werden beim Schreiben durch eine Pruefzahl ersetzt; die
+//      echten Werte stehen gesammelt am Satzanfang. Wer den Satz roh
+//      auswertet, hat alle 512 Byte zwei falsche — mitten in einer
+//      Laufwerksliste, mitten in einem Namen. Der Schaden faellt bei kleinen
+//      Saetzen NICHT auf, weil dort nur der erste Sektor benutzt wird.
+//   2. DATENLAEUFE (mapping pairs). Ein nicht-residentes Attribut nennt seine
+//      Cluster als Folge von Paaren aus Laenge und RELATIVEM Versatz. Der
+//      Versatz ist VORZEICHENBEHAFTET und baut auf dem vorigen auf — ein
+//      Lauf kann rueckwaerts zeigen. Wer ihn ohne Vorzeichen liest, landet
+//      irgendwo auf dem Datentraeger.
+//   3. RESIDENTE ATTRIBUTE. Eine Datei unter etwa 700 Byte hat gar keine
+//      Cluster; ihr Inhalt liegt im MFT-Satz. Wer nur den nicht-residenten
+//      Fall kann, liest fuer sie Nullen — und die sehen aus wie eine leere
+//      Datei.
+//
+// ZUGANG wie in den Schwester-Units: Deskriptor, blockweise Lesezugriffe,
+// Byte-Versatz fuer den Anfang des Volumes.
+//
+// NUR LESEN. Schreiben verlangt hier zusaetzlich die Pflege des $LogFile
+// (NTFS fuehrt ein Journal), der $Bitmap und der Indexbaeume.
+//
+// NICHT enthalten und im Zweifel GEMELDET: komprimierte und verschluesselte
+// Attribute, alternative Datenstroeme unter Namen, $ATTRIBUTE_LIST (ein Satz,
+// dessen Attribute nicht mehr in einen Satz passen), Reparse Points,
+// $LogFile-Wiedergabe. Namen werden nach ASCII gelesen; alles darueber wird
+// zu '?' — dieselbe Angabe wie in den Schwester-Units.
+
+@description("NTFS lesen: Bootsektor, MFT mit Fixups, Datenlaeufe, Indexe, Dateien")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+@capabilities([fs.read, fs.meta, system.memory.heap])
+
+unit std.fs.ntfs;
+
+import std.alloc;
+import std.io;
+
+pub con NTFS_ERR: int64 := 0 - 1;
+
+// Feste Satznummern der Systemdateien.
+pub con NTFS_MFT_SELF:  int64 := 0;
+pub con NTFS_MFT_ROOT:  int64 := 5;   // das Wurzelverzeichnis
+pub con NTFS_MFT_VOLUME: int64 := 3;  // traegt $VOLUME_NAME
+
+pub con NTFS_AT_STANDARD:   int64 := 0x10;
+pub con NTFS_AT_FILE_NAME:  int64 := 0x30;
+pub con NTFS_AT_VOLUME_NAME: int64 := 0x60;
+pub con NTFS_AT_DATA:       int64 := 0x80;
+pub con NTFS_AT_INDEX_ROOT: int64 := 0x90;
+pub con NTFS_AT_INDEX_ALLOC: int64 := 0xA0;
+pub con NTFS_AT_END:        int64 := 0xFFFFFFFF;
+
+pub con NTFS_FLAG_INUSE: int64 := 1;
+pub con NTFS_FLAG_DIR:   int64 := 2;
+
+// Ein Lauf, der auf keine Cluster zeigt (duenn belegter Bereich).
+pub con NTFS_LCN_LOCH: int64 := 0 - 1;
+
+pub type NtfsVolume = struct {
+  fd:            int64;
+  partOffset:    int64;
+  bytesPerSector: int64;
+  sectorsPerClus: int64;
+  clusterBytes:  int64;
+  totalSectors:  int64;
+  mftLcn:        int64;
+  recordSize:    int64;   // Bytes je MFT-Satz
+  indexSize:     int64;   // Bytes je Indexblock
+  mftRuns:       int64;   // Laufliste der MFT: je 24 Byte (vcn, lcn, len)
+  mftRunCount:   int64;
+  gueltig:       bool;
+}
+
+pub type NtfsAttr = struct {
+  typ:        int64;
+  nonResident: bool;
+  // resident: Zeiger auf den Wert IM Satzpuffer, und seine Laenge
+  wertPtr:    int64;
+  wertLen:    int64;
+  // nicht-resident: Laufliste (je 24 Byte) und die echte Groesse
+  runs:       int64;
+  runCount:   int64;
+  realSize:   int64;
+  gefunden:   bool;
+}
+
+pub type NtfsEntry = struct {
+  mftRef:  int64;
+  size:    int64;
+  isDir:   bool;
+}
+
+// ── Kleine Helfer ─────────────────────────────────────────────────────────
+
+fn _u8(p: int64, off: int64): int64 { return peek8(p + off) & 255; }
+
+fn _u16(p: int64, off: int64): int64 {
+  return (peek8(p + off) & 255) | ((peek8(p + off + 1) & 255) << 8);
+}
+
+fn _u32(p: int64, off: int64): int64 {
+  return (peek8(p + off)     & 255)
+       | ((peek8(p + off + 1) & 255) << 8)
+       | ((peek8(p + off + 2) & 255) << 16)
+       | ((peek8(p + off + 3) & 255) << 24);
+}
+
+fn _u64(p: int64, off: int64): int64 {
+  return _u32(p, off) | (_u32(p, off + 4) << 32);
+}
+
+fn _leseBytes(vol: NtfsVolume, pos: int64, puffer: int64, n: int64): int64 {
+  var p: int64 := vol.partOffset + pos;
+  if (lseek(vol.fd, p, 0) != p) { return 0; }
+  if (read(vol.fd, puffer as pchar, n) != n) { return 0; }
+  return 1;
+}
+
+pub fn NtfsValid(vol: NtfsVolume): bool { return vol.gueltig; }
+
+// ── Fixups ────────────────────────────────────────────────────────────────
+//
+// Die letzten zwei Byte jedes Sektors eines Satzes tragen beim Schreiben eine
+// PRUEFZAHL; die echten Werte stehen im Update Sequence Array am Satzanfang.
+// Diese Funktion setzt sie zurueck und prueft dabei die Zahl — stimmt sie
+// nicht, ist der Satz halb geschrieben worden, und das ist eine Auskunft,
+// keine Nebensache.
+fn _fixups(vol: NtfsVolume, satz: int64, groesse: int64): int64 {
+  var usaOff: int64 := _u16(satz, 4);
+  var usaCnt: int64 := _u16(satz, 6);
+  if (usaCnt < 1) { return 0; }
+  if (usaOff + usaCnt * 2 > groesse) { return 0; }
+  var pruef: int64 := _u16(satz, usaOff);
+  var i: int64 := 1;
+  while (i < usaCnt) {
+    var sektorEnde: int64 := i * vol.bytesPerSector - 2;
+    if (sektorEnde + 2 > groesse) { return 0; }
+    if (_u16(satz, sektorEnde) != pruef) { return 0; }   // Satz ist unvollstaendig
+    poke8(satz + sektorEnde,     peek8(satz + usaOff + i * 2));
+    poke8(satz + sektorEnde + 1, peek8(satz + usaOff + i * 2 + 1));
+    i := i + 1;
+  }
+  return 1;
+}
+
+// ── Datenlaeufe ───────────────────────────────────────────────────────────
+//
+// Ein Paar besteht aus einem Kopfbyte (untere Haelfte: Bytezahl der LAENGE,
+// obere: Bytezahl des VERSATZES), dann der Laenge und dem Versatz. Der
+// Versatz ist VORZEICHENBEHAFTET und wird auf den vorigen Startcluster
+// AUFADDIERT — ein Lauf darf rueckwaerts zeigen. Versatzbreite 0 heisst:
+// der Bereich hat keine Cluster (duenn belegt).
+//
+// Rueckgabe: Anzahl der Laeufe; `ziel` bekommt je Lauf 24 Byte
+// (vcn, lcn, laenge). NTFS_LCN_LOCH als lcn markiert den duennen Fall.
+fn _leseLaeufe(p: int64, maxBytes: int64, ziel: int64, maxLaeufe: int64): int64 {
+  var i: int64 := 0;
+  var vcn: int64 := 0;
+  var lcn: int64 := 0;
+  var n: int64 := 0;
+  while (i < maxBytes && n < maxLaeufe) {
+    var kopf: int64 := _u8(p, i);
+    if (kopf == 0) { return n; }
+    var lenSize: int64 := kopf & 15;
+    var offSize: int64 := (kopf >> 4) & 15;
+    if (lenSize == 0 || lenSize > 8 || offSize > 8) { return n; }
+    i := i + 1;
+
+    var laenge: int64 := 0;
+    var k: int64 := 0;
+    while (k < lenSize) { laenge := laenge | (_u8(p, i + k) << (k * 8)); k := k + 1; }
+    i := i + lenSize;
+
+    var istLoch: bool := offSize == 0;
+    if (!istLoch) {
+      var delta: int64 := 0;
+      k := 0;
+      while (k < offSize) { delta := delta | (_u8(p, i + k) << (k * 8)); k := k + 1; }
+      // Vorzeichen ergaenzen: das oberste Bit des letzten Bytes entscheidet.
+      var vorz: int64 := _u8(p, i + offSize - 1);
+      if ((vorz & 128) != 0) {
+        var breite: int64 := offSize * 8;
+        var eins: int64 := 1;
+        var maske: int64 := 0;
+        var b: int64 := 0;
+        while (b < breite) { maske := maske | (eins << b); b := b + 1; }
+        delta := delta - (maske + 1);
+      }
+      i := i + offSize;
+      lcn := lcn + delta;
+    }
+
+    var e: int64 := ziel + n * 24;
+    poke64(e, vcn);
+    if (istLoch) { poke64(e + 8, NTFS_LCN_LOCH); } else { poke64(e + 8, lcn); }
+    poke64(e + 16, laenge);
+    vcn := vcn + laenge;
+    n := n + 1;
+  }
+  return n;
+}
+
+// Cluster zu einem virtuellen Cluster. NTFS_LCN_LOCH = duenn, NTFS_ERR = nicht
+// abgedeckt.
+fn _lcnVon(runs: int64, count: int64, vcn: int64): int64 {
+  var i: int64 := 0;
+  while (i < count) {
+    var e: int64 := runs + i * 24;
+    var v0: int64 := peek64(e);
+    var l:  int64 := peek64(e + 8);
+    var n:  int64 := peek64(e + 16);
+    if (vcn >= v0 && vcn < v0 + n) {
+      if (l == NTFS_LCN_LOCH) { return NTFS_LCN_LOCH; }
+      return l + (vcn - v0);
+    }
+    i := i + 1;
+  }
+  return NTFS_ERR;
+}
+
+// ── Einhaengen ────────────────────────────────────────────────────────────
+
+fn _zweiHoch(n: int64): int64 {
+  var r: int64 := 1; var i: int64 := 0;
+  while (i < n) { r := r * 2; i := i + 1; }
+  return r;
+}
+
+// Die beiden Groessenfelder sind VORZEICHENBEHAFTET: ein positiver Wert zaehlt
+// Cluster, ein negativer ist der Zweierlogarithmus der Byte-Groesse. Wer das
+// Byte ohne Vorzeichen liest, bekommt aus -10 die Zahl 246 und rechnet eine
+// Satzgroesse von 246 Clustern.
+fn _groesseAus(b: int64, clusterBytes: int64): int64 {
+  if (b < 128) { return b * clusterBytes; }
+  return _zweiHoch(256 - b);
+}
+
+pub fn NtfsMount(fd: int64, byteOffset: int64): NtfsVolume {
+  var vol: NtfsVolume;
+  vol.fd := fd;
+  vol.partOffset := byteOffset;
+  vol.gueltig := false;
+  vol.mftRuns := 0;
+  vol.mftRunCount := 0;
+  vol.bytesPerSector := 0;
+
+  var bs: int64 := alloc(512);
+  if (_leseBytes(vol, 0, bs, 512) == 0) { free(bs, 512); return vol; }
+
+  // Kennung "NTFS    " bei Offset 3.
+  if (_u8(bs, 3) != 78 || _u8(bs, 4) != 84 || _u8(bs, 5) != 70 || _u8(bs, 6) != 83) {
+    free(bs, 512); return vol;
+  }
+  if (_u8(bs, 510) != 0x55 || _u8(bs, 511) != 0xAA) { free(bs, 512); return vol; }
+
+  var bps: int64 := _u16(bs, 11);
+  var spc: int64 := _u8(bs, 13);
+  if (bps != 512 && bps != 1024 && bps != 2048 && bps != 4096) { free(bs, 512); return vol; }
+  if (spc == 0 || spc > 128) { free(bs, 512); return vol; }
+
+  vol.bytesPerSector := bps;
+  vol.sectorsPerClus := spc;
+  vol.clusterBytes   := bps * spc;
+  vol.totalSectors   := _u64(bs, 40);
+  vol.mftLcn         := _u64(bs, 48);
+  vol.recordSize     := _groesseAus(_u8(bs, 64), vol.clusterBytes);
+  vol.indexSize      := _groesseAus(_u8(bs, 68), vol.clusterBytes);
+  free(bs, 512);
+
+  if (vol.recordSize < 512 || vol.recordSize > 65536) { return vol; }
+  if (vol.indexSize < 512 || vol.indexSize > 1048576) { return vol; }
+  if (vol.mftLcn == 0) { return vol; }
+
+  // Satz 0 beschreibt die MFT selbst. Bis seine Laufliste steht, ist die MFT
+  // nur ueber ihren Anfang erreichbar — genau dafuer nennt der Bootsektor
+  // mftLcn. Danach gilt die Laufliste, denn die MFT kann fragmentiert sein.
+  var satz: int64 := alloc(vol.recordSize);
+  if (_leseBytes(vol, vol.mftLcn * vol.clusterBytes, satz, vol.recordSize) == 0) {
+    free(satz, vol.recordSize); return vol;
+  }
+  if (_u8(satz, 0) != 70 || _u8(satz, 1) != 73 || _u8(satz, 2) != 76 || _u8(satz, 3) != 69) {
+    free(satz, vol.recordSize); return vol;   // "FILE"
+  }
+  vol.gueltig := true;   // fuer _fixups: bytesPerSector muss stehen
+  if (_fixups(vol, satz, vol.recordSize) == 0) {
+    vol.gueltig := false; free(satz, vol.recordSize); return vol;
+  }
+
+  // $DATA von Satz 0 suchen und seine Laeufe merken.
+  var runs: int64 := alloc(64 * 24);
+  var anzahl: int64 := 0;
+  var off: int64 := _u16(satz, 20);
+  var weiter: bool := true;
+  while (weiter && off + 8 <= vol.recordSize) {
+    var typ: int64 := _u32(satz, off);
+    if (typ == NTFS_AT_END) { weiter := false; }
+    else {
+      var len: int64 := _u32(satz, off + 4);
+      if (len < 16) { weiter := false; }
+      else {
+        if (typ == NTFS_AT_DATA && _u8(satz, off + 8) != 0) {
+          var mpOff: int64 := _u16(satz, off + 32);
+          anzahl := _leseLaeufe(satz + off + mpOff, len - mpOff, runs, 64);
+          weiter := false;
+        }
+        off := off + len;
+      }
+    }
+  }
+  free(satz, vol.recordSize);
+
+  if (anzahl == 0) { free(runs, 64 * 24); vol.gueltig := false; return vol; }
+  vol.mftRuns := runs;
+  vol.mftRunCount := anzahl;
+  return vol;
+}
+
+pub fn NtfsUnmount(ref vol: NtfsVolume): void {
+  if (vol.mftRuns != 0) { free(vol.mftRuns, 64 * 24); vol.mftRuns := 0; }
+  vol.gueltig := false;
+}
+
+// ── MFT-Saetze ────────────────────────────────────────────────────────────
+
+// Satz `nr` in `puffer` (Groesse vol.recordSize) lesen, Fixups angewandt.
+pub fn NtfsReadRecord(vol: NtfsVolume, nr: int64, puffer: int64): int64 {
+  if (!vol.gueltig) { return NTFS_ERR; }
+  if (nr < 0) { return NTFS_ERR; }
+  var byteOff: int64 := nr * vol.recordSize;
+  var vcn: int64 := byteOff / vol.clusterBytes;
+  var inCluster: int64 := byteOff - vcn * vol.clusterBytes;
+  var lcn: int64 := _lcnVon(vol.mftRuns, vol.mftRunCount, vcn);
+  if (lcn == NTFS_ERR || lcn == NTFS_LCN_LOCH) { return NTFS_ERR; }
+  var pos: int64 := lcn * vol.clusterBytes + inCluster;
+  if (_leseBytes(vol, pos, puffer, vol.recordSize) == 0) { return NTFS_ERR; }
+  if (_u8(puffer, 0) != 70 || _u8(puffer, 1) != 73
+      || _u8(puffer, 2) != 76 || _u8(puffer, 3) != 69) { return NTFS_ERR; }
+  if (_fixups(vol, puffer, vol.recordSize) == 0) { return NTFS_ERR; }
+  return 1;
+}
+
+pub fn NtfsRecordInUse(satz: int64): bool { return (_u16(satz, 22) & NTFS_FLAG_INUSE) != 0; }
+pub fn NtfsRecordIsDir(satz: int64): bool { return (_u16(satz, 22) & NTFS_FLAG_DIR) != 0; }
+
+// Ein Attribut im Satz suchen. Der Aufrufer gibt einen Puffer fuer die
+// Laufliste mit (64 * 24 Byte reichen fuer jede uebliche Datei).
+pub fn NtfsFindAttr(vol: NtfsVolume, satz: int64, typ: int64,
+                    runPuffer: int64, ref a: NtfsAttr): int64 {
+  a.gefunden := false;
+  a.runs := runPuffer;
+  a.runCount := 0;
+  a.wertPtr := 0;
+  a.wertLen := 0;
+  a.realSize := 0;
+  a.nonResident := false;
+  if (!vol.gueltig) { return NTFS_ERR; }
+
+  var off: int64 := _u16(satz, 20);
+  while (off + 8 <= vol.recordSize) {
+    var t: int64 := _u32(satz, off);
+    if (t == NTFS_AT_END) { return 0; }
+    var len: int64 := _u32(satz, off + 4);
+    if (len < 16 || off + len > vol.recordSize) { return 0; }
+    if (t == typ) {
+      a.typ := t;
+      if (_u8(satz, off + 8) == 0) {
+        // RESIDENT: der Wert steht im Satz. Genau dieser Fall macht kleine
+        // Dateien aus, und wer ihn nicht kennt, liest fuer sie nichts.
+        a.nonResident := false;
+        a.wertLen := _u32(satz, off + 16);
+        a.wertPtr := satz + off + _u16(satz, off + 20);
+        a.realSize := a.wertLen;
+      } else {
+        a.nonResident := true;
+        a.realSize := _u64(satz, off + 48);
+        var mpOff: int64 := _u16(satz, off + 32);
+        a.runCount := _leseLaeufe(satz + off + mpOff, len - mpOff, runPuffer, 64);
+      }
+      a.gefunden := true;
+      return 1;
+    }
+    off := off + len;
+  }
+  return 0;
+}
+
+// ── Lesen ─────────────────────────────────────────────────────────────────
+
+// Den Wert eines Attributs lesen — residenter wie nicht-residenter Fall.
+pub fn NtfsReadAttr(vol: NtfsVolume, a: NtfsAttr, buf: int64, max: int64): int64 {
+  if (!vol.gueltig || !a.gefunden) { return NTFS_ERR; }
+  var wollen: int64 := a.realSize;
+  if (wollen > max) { wollen := max; }
+  if (wollen <= 0) { return 0; }
+
+  if (!a.nonResident) {
+    var i: int64 := 0;
+    while (i < wollen) { poke8(buf + i, peek8(a.wertPtr + i)); i := i + 1; }
+    return wollen;
+  }
+
+  var cl: int64 := alloc(vol.clusterBytes);
+  var geschrieben: int64 := 0;
+  var vcn: int64 := 0;
+  while (geschrieben < wollen) {
+    var lcn: int64 := _lcnVon(a.runs, a.runCount, vcn);
+    if (lcn == NTFS_ERR) { free(cl, vol.clusterBytes); return NTFS_ERR; }
+    var k: int64 := 0;
+    if (lcn == NTFS_LCN_LOCH) {
+      // Duenn belegt: der Bereich hat keine Cluster und liest sich als
+      // Nullen. Kein Fehler — dieselbe Unterscheidung wie in std.fs.ext4.
+      while (k < vol.clusterBytes && geschrieben < wollen) {
+        poke8(buf + geschrieben, 0); geschrieben := geschrieben + 1; k := k + 1;
+      }
+    } else {
+      if (_leseBytes(vol, lcn * vol.clusterBytes, cl, vol.clusterBytes) == 0) {
+        free(cl, vol.clusterBytes); return NTFS_ERR;
+      }
+      while (k < vol.clusterBytes && geschrieben < wollen) {
+        poke8(buf + geschrieben, peek8(cl + k));
+        geschrieben := geschrieben + 1; k := k + 1;
+      }
+    }
+    vcn := vcn + 1;
+  }
+  free(cl, vol.clusterBytes);
+  return geschrieben;
+}
+
+// Den Inhalt einer Datei ueber ihre Satznummer lesen.
+pub fn NtfsReadFile(vol: NtfsVolume, mftNr: int64, buf: int64, max: int64): int64 {
+  if (!vol.gueltig) { return NTFS_ERR; }
+  var satz: int64 := alloc(vol.recordSize);
+  if (NtfsReadRecord(vol, mftNr, satz) != 1) { free(satz, vol.recordSize); return NTFS_ERR; }
+  if (NtfsRecordIsDir(satz)) { free(satz, vol.recordSize); return NTFS_ERR; }
+  var runs: int64 := alloc(64 * 24);
+  var a: NtfsAttr;
+  var r: int64 := NtfsFindAttr(vol, satz, NTFS_AT_DATA, runs, a);
+  if (r != 1) { free(runs, 64 * 24); free(satz, vol.recordSize); return NTFS_ERR; }
+  var n: int64 := NtfsReadAttr(vol, a, buf, max);
+  free(runs, 64 * 24);
+  free(satz, vol.recordSize);
+  return n;
+}
+
+pub fn NtfsFileSize(vol: NtfsVolume, mftNr: int64): int64 {
+  if (!vol.gueltig) { return NTFS_ERR; }
+  var satz: int64 := alloc(vol.recordSize);
+  if (NtfsReadRecord(vol, mftNr, satz) != 1) { free(satz, vol.recordSize); return NTFS_ERR; }
+  var runs: int64 := alloc(64 * 24);
+  var a: NtfsAttr;
+  var r: int64 := NtfsFindAttr(vol, satz, NTFS_AT_DATA, runs, a);
+  var s: int64 := NTFS_ERR;
+  if (r == 1) { s := a.realSize; }
+  free(runs, 64 * 24);
+  free(satz, vol.recordSize);
+  return s;
+}
+
+// ── Verzeichnisse ─────────────────────────────────────────────────────────
+//
+// Ein Verzeichnis ist ein B-Baum aus Indexeintraegen. Die Wurzel steht
+// resident in $INDEX_ROOT; passt sie nicht mehr hinein, liegen die weiteren
+// Knoten als INDX-Bloecke in $INDEX_ALLOCATION — mit EIGENEN Fixups.
+//
+// Diese Unit laeuft die Eintraege LINEAR ab: erst die der Wurzel, dann die
+// aller INDX-Bloecke. Fuer das Auflisten und Suchen ist das vollstaendig und
+// richtig; der Baum wird dabei nicht als Baum benutzt, sondern als Behaelter.
+// Eine sortierte Suche waere schneller, nicht genauer.
+
+// Einen Namen aus einem Indexeintrag holen. Rueckgabe: 1 = Eintrag gefuellt,
+// 0 = letzter Eintrag der Liste.
+fn _indexEintrag(p: int64, ref e: NtfsEntry, nameBuf: int64, nameMax: int64): int64 {
+  var flags: int64 := _u16(p, 12);
+  // Bit 1 sagt: dies ist der Abschluss der Liste, er traegt keinen Namen.
+  if ((flags & 2) != 0) { return 0; }
+  // Der Indexeintrag ist 16 Byte lang, danach folgt eine EINGEBETTETE Kopie
+  // des $FILE_NAME-Attributs. Alle Felder unten sind deshalb um diese 16 Byte
+  // versetzt: reale Groesse bei +64, Merkmale bei +72, Namenslaenge bei +80.
+  // Die Verwechslung von "belegt" (+56) und "real" (+64) ist der haeufigste
+  // Fehler an dieser Stelle — sie liefert die auf Cluster aufgerundete Zahl,
+  // und die sieht wie eine gueltige Dateigroesse aus.
+  var nameLen: int64 := _u8(p, 80);
+  var nameSpace: int64 := _u8(p, 81);
+  e.mftRef := _u64(p, 0) & 0xFFFFFFFFFFFF;   // untere 48 Bit sind die Nummer
+  e.size := _u64(p, 64);
+  e.isDir := (_u32(p, 72) & 0x10000000) != 0;
+  // Namensraum 2 ist die DOS-Kurzfassung (8.3). Sie steht als zusaetzlicher
+  // Eintrag neben dem langen Namen — wer sie mitliefert, zeigt jede Datei
+  // zweimal.
+  if (nameSpace == 2) { return 2; }
+  // Der Eintrag "." ist das Verzeichnis selbst — dieselbe Verankerung wie in
+  // ext4, und aus demselben Grund uebergangen: wer ihn mitliefert, laeuft bei
+  // jedem rekursiven Gang im Kreis. Die SYSTEMDATEIEN ($MFT, $LogFile, …)
+  // bleiben dagegen sichtbar: sie zu verbergen ist eine Entscheidung der
+  // Oberflaeche, nicht des Dateisystems.
+  if (nameLen == 1 && _u8(p, 82) == 46 && _u8(p, 83) == 0) { return 2; }
+  var n: int64 := 0;
+  while (n < nameLen && n < nameMax - 1) {
+    var hi: int64 := _u8(p, 83 + n * 2);
+    var lo: int64 := _u8(p, 82 + n * 2);
+    if (hi != 0) { poke8(nameBuf + n, 63); } else { poke8(nameBuf + n, lo); }
+    n := n + 1;
+  }
+  poke8(nameBuf + n, 0);
+  return 1;
+}
+
+// Alle Eintraege eines Verzeichnisses durchlaufen und den gesuchten Namen
+// finden. `name` = 0 bedeutet: nur zaehlen (der Zaehler kommt zurueck).
+fn _indexDurchlauf(vol: NtfsVolume, dirNr: int64, name: pchar,
+                   ref treffer: NtfsEntry, nurZaehlen: bool): int64 {
+  var satz: int64 := alloc(vol.recordSize);
+  if (NtfsReadRecord(vol, dirNr, satz) != 1) { free(satz, vol.recordSize); return NTFS_ERR; }
+
+  var runs: int64 := alloc(64 * 24);
+  var wurzel: NtfsAttr;
+  if (NtfsFindAttr(vol, satz, NTFS_AT_INDEX_ROOT, runs, wurzel) != 1) {
+    free(runs, 64 * 24); free(satz, vol.recordSize); return NTFS_ERR;
+  }
+
+  var nameBuf: int64 := alloc(600);
+  var gefunden: int64 := 0;
+  var anzahl: int64 := 0;
+
+  // 1) Die Eintraege der Wurzel. Der Indexkopf beginnt 16 Byte nach dem
+  //    Attributwert; sein Feld bei +0 nennt den ersten Eintrag.
+  var ih: int64 := wurzel.wertPtr + 16;
+  var p: int64 := ih + _u32(ih, 0);
+  var ende: int64 := ih + _u32(ih, 4);
+  var e: NtfsEntry;
+  while (p + 82 <= ende && gefunden == 0) {
+    var laenge: int64 := _u16(p, 8);
+    if (laenge < 16) { p := ende; }
+    else {
+      var r: int64 := _indexEintrag(p, e, nameBuf, 600);
+      if (r == 0) { p := ende; }
+      else {
+        if (r == 1) {
+          anzahl := anzahl + 1;
+          if (!nurZaehlen) {
+            var i: int64 := 0;
+            var gleich: bool := true;
+            while (gleich && i < 300) {
+              var ca: int64 := peek8(nameBuf + i) & 255;
+              var cb: int64 := StrCharAt(name, i) & 255;
+              if (ca != cb) { gleich := false; }
+              else { if (ca == 0) { i := 300; } else { i := i + 1; } }
+            }
+            if (gleich) { treffer := e; gefunden := 1; }
+          }
+        }
+        p := p + laenge;
+      }
+    }
+  }
+
+  // 2) Die INDX-Bloecke, falls es welche gibt.
+  var runs2: int64 := alloc(64 * 24);
+  var alloc2: NtfsAttr;
+  if (gefunden == 0 && NtfsFindAttr(vol, satz, NTFS_AT_INDEX_ALLOC, runs2, alloc2) == 1) {
+    var blockPuf: int64 := alloc(vol.indexSize);
+    var vcnProBlock: int64 := vol.indexSize / vol.clusterBytes;
+    if (vcnProBlock < 1) { vcnProBlock := 1; }
+    var bl: int64 := 0;
+    var maxBl: int64 := alloc2.realSize / vol.indexSize;
+    while (bl < maxBl && gefunden == 0) {
+      var lcn: int64 := _lcnVon(alloc2.runs, alloc2.runCount, bl * vcnProBlock);
+      if (lcn != NTFS_ERR && lcn != NTFS_LCN_LOCH) {
+        if (_leseBytes(vol, lcn * vol.clusterBytes, blockPuf, vol.indexSize) != 0) {
+          // "INDX" — und eigene Fixups. Ohne sie sind alle 512 Byte zwei
+          // Bytes falsch, mitten in den Namen.
+          if (_u8(blockPuf, 0) == 73 && _u8(blockPuf, 1) == 78
+              && _u8(blockPuf, 2) == 68 && _u8(blockPuf, 3) == 88) {
+            if (_fixups(vol, blockPuf, vol.indexSize) != 0) {
+              var ih2: int64 := blockPuf + 24;
+              var p2: int64 := ih2 + _u32(ih2, 0);
+              var ende2: int64 := ih2 + _u32(ih2, 4);
+              while (p2 + 82 <= ende2 && gefunden == 0) {
+                var laenge2: int64 := _u16(p2, 8);
+                if (laenge2 < 16) { p2 := ende2; }
+                else {
+                  var r2: int64 := _indexEintrag(p2, e, nameBuf, 600);
+                  if (r2 == 0) { p2 := ende2; }
+                  else {
+                    if (r2 == 1) {
+                      anzahl := anzahl + 1;
+                      if (!nurZaehlen) {
+                        var i2: int64 := 0;
+                        var gleich2: bool := true;
+                        while (gleich2 && i2 < 300) {
+                          var ca2: int64 := peek8(nameBuf + i2) & 255;
+                          var cb2: int64 := StrCharAt(name, i2) & 255;
+                          if (ca2 != cb2) { gleich2 := false; }
+                          else { if (ca2 == 0) { i2 := 300; } else { i2 := i2 + 1; } }
+                        }
+                        if (gleich2) { treffer := e; gefunden := 1; }
+                      }
+                    }
+                    p2 := p2 + laenge2;
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+      bl := bl + 1;
+    }
+    free(blockPuf, vol.indexSize);
+  }
+
+  free(runs2, 64 * 24);
+  free(nameBuf, 600);
+  free(runs, 64 * 24);
+  free(satz, vol.recordSize);
+  if (nurZaehlen) { return anzahl; }
+  return gefunden;
+}
+
+// Anzahl der Eintraege eines Verzeichnisses (ohne DOS-Kurznamen).
+pub fn NtfsDirCount(vol: NtfsVolume, dirNr: int64): int64 {
+  var e: NtfsEntry;
+  return _indexDurchlauf(vol, dirNr, 0 as pchar, e, true);
+}
+
+// Einen Namen in einem Verzeichnis suchen. 1 = gefunden, 0 = nicht da.
+pub fn NtfsFindInDir(vol: NtfsVolume, dirNr: int64, name: pchar,
+                     ref e: NtfsEntry): int64 {
+  return _indexDurchlauf(vol, dirNr, name, e, false);
+}
+
+// Einen Pfad aufloesen. Rueckgabe: Satznummer, 0 = nicht da, NTFS_ERR.
+pub fn NtfsFindPath(vol: NtfsVolume, path: pchar): int64 {
+  if (!vol.gueltig) { return NTFS_ERR; }
+  var len: int64 := StrLen(path);
+  var teil: int64 := alloc(300);
+  var akt: int64 := NTFS_MFT_ROOT;
+  var i: int64 := 0;
+  var ergebnis: int64 := akt;
+  var abbruch: bool := false;
+  var e: NtfsEntry;
+
+  while (i < len && !abbruch) {
+    var c: int64 := StrCharAt(path, i) & 255;
+    if (c == 47 || c == 92) { i := i + 1; }
+    else {
+      var n: int64 := 0;
+      var imTeil: bool := true;
+      while (i < len && imTeil) {
+        var c2: int64 := StrCharAt(path, i) & 255;
+        if (c2 == 47 || c2 == 92) { imTeil := false; }
+        else {
+          if (n < 299) { poke8(teil + n, c2); n := n + 1; }
+          i := i + 1;
+        }
+      }
+      poke8(teil + n, 0);
+      var r: int64 := NtfsFindInDir(vol, akt, teil as pchar, e);
+      if (r == NTFS_ERR) { ergebnis := NTFS_ERR; abbruch := true; }
+      else if (r == 0) { ergebnis := 0; abbruch := true; }
+      else { akt := e.mftRef; ergebnis := akt; }
+    }
+  }
+  free(teil, 300);
+  return ergebnis;
+}
+
+// ── Datentraegerkennung ───────────────────────────────────────────────────
+
+pub fn NtfsVolumeLabel(vol: NtfsVolume, buf: int64, max: int64): int64 {
+  if (!vol.gueltig) { return NTFS_ERR; }
+  var satz: int64 := alloc(vol.recordSize);
+  if (NtfsReadRecord(vol, NTFS_MFT_VOLUME, satz) != 1) {
+    free(satz, vol.recordSize); return NTFS_ERR;
+  }
+  var runs: int64 := alloc(64 * 24);
+  var a: NtfsAttr;
+  var n: int64 := 0;
+  if (NtfsFindAttr(vol, satz, NTFS_AT_VOLUME_NAME, runs, a) == 1) {
+    var zeichen: int64 := a.wertLen / 2;
+    while (n < zeichen && n < max - 1) {
+      var hi: int64 := _u8(a.wertPtr, n * 2 + 1);
+      var lo: int64 := _u8(a.wertPtr, n * 2);
+      if (hi != 0) { poke8(buf + n, 63); } else { poke8(buf + n, lo); }
+      n := n + 1;
+    }
+  }
+  poke8(buf + n, 0);
+  free(runs, 64 * 24);
+  free(satz, vol.recordSize);
+  return n;
+}

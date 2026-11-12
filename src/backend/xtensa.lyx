@@ -35,6 +35,7 @@
 // ============================================================================
 
 
+import src.emit_write;
 import src.std.alloc;
 con XT_A0: int64 := 0;    // return address in CALL0 ABI
 con XT_SP: int64 := 1;    // a1 = stack pointer
@@ -42,6 +43,8 @@ con XT_RV: int64 := 2;    // a2 = return value / arg0
 con XT_A3: int64 := 3;
 con XT_A4: int64 := 4;
 con XT_A5: int64 := 5;
+con XT_A6: int64 := 6;    // #1789: Dividend rein / Quotient raus
+con XT_A7: int64 := 7;    // #1789: Divisor rein / Rest raus
 con XT_T0: int64 := 8;    // a8 = primary scratch temp
 con XT_T1: int64 := 9;    // a9 = secondary scratch temp
 con XT_T2: int64 := 10;   // a10 = tertiary scratch temp
@@ -69,6 +72,29 @@ pub type EmitXtensa = class {
   patchBuf:   int64;
   patchCount: int64;
   funcAddrs:  int64;
+  xtMainOff:  int64;   // #1782: Code-Offset von main (-1 = nicht gefunden)
+  // #1786: PC-relative Adressierung. Xtensa hat keinen Befehl, der den
+  // Programmzaehler liest — der uebliche Weg ist ein CALL0 auf eine Marke,
+  // die sofort zurueckspringt: die Rueckkehradresse landet in a0.
+  //
+  // Der Literal-Pool haelt dann nur noch ABSTAENDE (Ziel minus dieser
+  // Adresse), keine absoluten Adressen. Damit laeuft dasselbe Abbild an
+  // jedem Ladeort — und die Pruefhuelle darf es verschieben.
+  poolOff:    int64;   // Code-Offset des Pools (er steht ganz vorn)
+  poolCount:  int64;   // belegte Eintraege
+  poolCap:    int64;   // reservierte Eintraege
+  poolFix:    int64;   // je Eintrag: {poolIdx, Bezugsadresse, Zielart, Zielnummer} a 32 Byte
+  poolFixN:   int64;
+  getpcOff:   int64;   // Code-Offset der Rueckspring-Marke
+  xt_divOff:  int64;   // #1789: Code-Offset der Divisionsroutine
+  xt_mulOff:  int64;   // #1790: Code-Offset der Multiplikationsroutine
+  strDatBuf:  int64;   // gesammelte Zeichenketten-Bytes
+  strDatLen:  int64;
+  strDatCap:  int64;
+  strIdxBuf:  int64;   // je Literal: Byte-Offset in strDatBuf
+  strIdxN:    int64;
+  globDatOff: int64;   // Code-Offset des Bereichs fuer globale Variablen
+  wort32Merker: int64; // #2239: _irWort32Merker-Tabelle (0 = keine)
   funcCount:  int64;
 
   // WP-D3: offsets of helper subroutines in codeBuf (prepended before user code)
@@ -93,6 +119,21 @@ pub type EmitXtensa = class {
   }
 
   // NOP = OR a0, a0, a0
+  // #1786: einzelne Bytes (Zeichenkettenliterale, Pool-Worte, Datenbereich).
+  fn xt_e1(v: int64) {
+    poke8(self.codeBuf + self.codeLen, v & 0xFF);
+    self.codeLen := self.codeLen + 1;
+  }
+  fn xt_e32(v: int64) {
+    self.xt_e1(v); self.xt_e1(v >> 8); self.xt_e1(v >> 16); self.xt_e1(v >> 24);
+  }
+  fn xt_poke32at(off: int64, v: int64) {
+    poke8(self.codeBuf + off,     v & 0xFF);
+    poke8(self.codeBuf + off + 1, (v >> 8) & 0xFF);
+    poke8(self.codeBuf + off + 2, (v >> 16) & 0xFF);
+    poke8(self.codeBuf + off + 3, (v >> 24) & 0xFF);
+  }
+
   fn xt_NOP() { self.xt_e3(0x00, 0x00, 0x20); }
 
   // --------------------------------------------------------------------------
@@ -120,48 +161,74 @@ pub type EmitXtensa = class {
   fn xt_MOV(ar: int64, as_: int64) {
     self.xt_OR(ar, as_, as_);                       // OR ar, as, as
   }
+  // #1786: MULL ist op2=2, op1=8 — im Backend stand 8/8, was auf einem Kern
+  // mit FPU als `ldx` dekodiert. NICHT gegen den Emulator geprueft: keiner der
+  // verfuegbaren qemu-Kerne (dc232b, dc233c, de212, de233_fpu, dsp3400, lx106,
+  // sample_controller) hat die Mul32-Option, ESP32s LX6 dagegen schon. Diese
+  // eine Kodierung steht also nach Konstruktion da, nicht nach Ausfuehrung.
   fn xt_MULL(ar: int64, as_: int64, at: int64) {
-    self.xt_e3(at << 4, (ar << 4) | as_, 0x88);   // op2=8, op1=8 (MUL32)
+    self.xt_e3(at << 4, (ar << 4) | as_, 0x28);   // op2=2, op1=8 (MUL32)
   }
 
-  // Shift-amount setup: SSL as → SAR:=32-as (for SLL), SSR as → SAR:=as (for SRL)
-  fn xt_SSL(as_: int64) { self.xt_e3(0x00, as_, 0x03); }  // op2=0, op1=3
-  fn xt_SSR(as_: int64) { self.xt_e3(0x00, as_, 0x13); }  // op2=1, op1=3
+  // #1786: SSL/SSR sind op2=4, op1=0 und unterscheiden sich im r-Feld (1 bzw.
+  // 0). Im Backend standen op1=3 mit op2 0/1 — das ist etwas anderes.
+  // Gegengelesen mit qemus Disassembler.
+  fn xt_SSL(as_: int64) { self.xt_e3(0x00, 0x10 | as_, 0x40); }  // op2=4, r=1
+  fn xt_SSR(as_: int64) { self.xt_e3(0x00, as_, 0x40); }         // op2=4, r=0
 
-  // Shift using SAR register
+  // Schieben ueber SAR. SLL nimmt die Quelle im s-Feld, SRL/SRA im t-Feld.
   fn xt_SLL(ar: int64, as_: int64) { self.xt_e3(0x00, (ar << 4) | as_, 0xA1); }  // op2=0xA, op1=1
-  fn xt_SRL(ar: int64, as_: int64) { self.xt_e3(0x00, (ar << 4) | as_, 0x91); }  // op2=9, op1=1
+  fn xt_SRL(ar: int64, at: int64) { self.xt_e3(at << 4, ar << 4, 0x91); }        // op2=9, op1=1
+  fn xt_SRA(ar: int64, at: int64) { self.xt_e3(at << 4, ar << 4, 0xB1); }        // op2=0xB, op1=1
 
   // --------------------------------------------------------------------------
-  // RRI8-format: b0=(t<<4)|2, b1=((im&0xF)<<4)|s, b2=(op1<<4)|(im>>4)
+  // #1786: RRI8 ist b0=(t<<4)|2, b1=(r<<4)|s, b2=imm8 — im Backend waren b1
+  // und b2 vertauscht: der Unteropcode landete in den oberen Bits des
+  // Immediates und umgekehrt. Nichts davon war ein gueltiger Befehl.
+  //
+  // r waehlt die Form: L8UI=0, L32I=2, S8I=4, S32I=6, ADDI=0xC, ADDMI=0xD.
+  // Bei L32I/S32I zaehlt b2 in WORTEN (Byte-Versatz / 4), bei L8UI/S8I in Byte.
+  // Alle Formen gegen qemus Disassembler gegengelesen.
   // --------------------------------------------------------------------------
+
+  fn xt_RRI8(r: int64, at: int64, as_: int64, imm8: int64) {
+    // #2149: Der Direktwert hat acht Bit — vorzeichenbehaftet (ADDI, ADDMI)
+    // oder als Wort-/Halbwortversatz vorzeichenlos (L32I, S32I, L16UI …).
+    // Bis 1.2.16E wurde ein groesserer Wert still auf acht Bit gekuerzt, ein
+    // Feldversatz von 1024 Byte landete damit bei 0.
+    if imm8 < 0 - 128 || imm8 > 255 {
+      EPrintStr("error: xtensa: Direktwert "c); EPrintInt(imm8);
+      EPrintStrLn(" passt nicht in die acht Bit eines RRI8-Befehls (#2149)."c);
+      exit(1);
+    }
+    self.xt_e3((at << 4) | 2, (r << 4) | as_, imm8 & 0xFF);
+  }
 
   fn xt_ADDI(ar: int64, as_: int64, imm: int64) {
-    var im: int64 := imm & 0xFF;
-    self.xt_e3((ar << 4) | 2, ((im & 0xF) << 4) | as_, 0xC0 | (im >> 4));
+    self.xt_RRI8(0xC, ar, as_, imm);
   }
   fn xt_ADDMI(ar: int64, as_: int64, imm: int64) {
-    var im: int64 := imm & 0xFF;
-    self.xt_e3((ar << 4) | 2, ((im & 0xF) << 4) | as_, 0xD0 | (im >> 4));
+    self.xt_RRI8(0xD, ar, as_, imm);
   }
 
-  // L32I ar, as, woff  (woff = byte_offset/4, range 0..255)
+  // L32I ar, as, woff  (woff = Byte-Versatz / 4, Bereich 0..255)
   fn xt_L32I(ar: int64, as_: int64, woff: int64) {
-    self.xt_e3((ar << 4) | 2, ((woff & 0xF) << 4) | as_, 0x20 | (woff >> 4));
+    self.xt_RRI8(0x2, ar, as_, woff);
   }
   // S32I at, as, woff
   fn xt_S32I(at: int64, as_: int64, woff: int64) {
-    self.xt_e3((at << 4) | 2, ((woff & 0xF) << 4) | as_, 0x60 | (woff >> 4));
+    self.xt_RRI8(0x6, at, as_, woff);
   }
 
   // --------------------------------------------------------------------------
-  // MOVI ar, simm12  (RI12 format, op0=6, op1=0xA)
-  // b0=(ar<<4)|6, b1=im12[7:0], b2=0xA0|(im12[11:8])
+  // #1786: MOVI ist eine RRI8-Form mit op0=2 und r=0xA — im Backend stand
+  // op0=6, und b1/b2 waren vertauscht. Die oberen vier Bit des Immediates
+  // stehen im s-Feld, die unteren acht in b2.
   // --------------------------------------------------------------------------
 
   fn xt_MOVI(ar: int64, imm: int64) {
     var im12: int64 := imm & 0xFFF;
-    self.xt_e3((ar << 4) | 6, im12 & 0xFF, 0xA0 | ((im12 >> 8) & 0xF));
+    self.xt_e3((ar << 4) | 2, 0xA0 | ((im12 >> 8) & 0xF), im12 & 0xFF);
   }
 
   // Load any immediate: MOVI for 12-bit, MOVI+ADDMI for 20-bit, fallback to 0
@@ -181,14 +248,72 @@ pub type EmitXtensa = class {
           return;
         }
       }
-      self.xt_MOVI(ar, 0);  // fallback for values out of 20-bit range
+      // #2149: Hier stand `MOVI ar, 0` — ein Wert ausserhalb dieser Formen
+      // wurde still zu 0. Jetzt fuer jeden 32-Bit-Wert:
+      //   ar = hoch << 12;  ar += a << 8 (ADDMI);  ar += b (ADDI)
+      // mit lo = v & 0xFFF = a*256 + b, b in [-128, 127]. `hoch` entsteht
+      // auf demselben Weg (rekursiv). Die Zielarchitektur rechnet in 32 Bit;
+      // ein Wert, der nicht hineinpasst, wird laut abgewiesen.
+      var v32: int64 := imm & 0xFFFFFFFF;
+      if (v32 & 0x80000000) != 0 { v32 := v32 - 4294967296; }
+      if v32 != imm && imm != (imm & 0xFFFFFFFF) {
+        EPrintStr("error: xtensa: Konstante "c); EPrintInt(imm);
+        EPrintStrLn(" passt nicht in 32 Bit (#2149)."c);
+        exit(1);
+      }
+      var lo: int64 := v32 & 0xFFF;
+      var hoch: int64 := (v32 - lo) >> 12;
+      var a: int64 := (lo + 128) >> 8;
+      var b: int64 := lo - a * 256;
+      self.xt_li(ar, hoch);
+      self.xt_SLLI(ar, ar, 12);
+      if a != 0 { self.xt_ADDMI(ar, ar, a); }
+      if b != 0 { self.xt_ADDI(ar, ar, b); }
     }
+  }
+
+  // #2149: SLLI ar, as, sa (1..31). RRR, op1 = 1, op2 = 000x mit x =
+  // (32-sa) Bit 4, t = (32-sa) Bit 3..0 — dieselbe Byte-Anordnung wie xt_SLL.
+  fn xt_SLLI(ar: int64, as_: int64, sa: int64) {
+    var s2: int64 := 32 - sa;
+    self.xt_e3((s2 & 15) << 4, (ar << 4) | as_, (((s2 >> 4) & 1) << 4) | 1);
+  }
+
+  // #2228: Schiebe- und Trichterbefehle fuer die Bit-Rechenwerke (255-262).
+  // Alle drei gehoeren zum KERN der Xtensa-ISA, nicht zu einer Option
+  // (anders als MULL/NSAU) — sie laufen also auf jedem Kern, und die Tests
+  // fuehren sie unter qemu aus (tests/bit_builtins_alle_ziele_test.sh).
+  //
+  // SRLI ar, at, sa (sa 0..15): RRR op1 = 1, op2 = 4, s = sa.
+  fn xt_SRLI(ar: int64, at: int64, sa: int64) {
+    if sa < 0 || sa > 15 {
+      EPrintStr("error: xtensa: SRLI-Weite "c); EPrintInt(sa); EPrintStrLn(" ausserhalb 0..15."c);
+      exit(1);
+    }
+    self.xt_e3(at << 4, (ar << 4) | sa, 0x41);
+  }
+  // Logisch schieben um 0..31: SRLI traegt nur vier Bit Weite, groessere
+  // Weiten in zwei Schritten.
+  fn xt_srl_k(ar: int64, at: int64, sa: int64) {
+    if sa > 30 { self.xt_SRLI(ar, at, 15); self.xt_SRLI(ar, ar, 15); self.xt_SRLI(ar, ar, sa - 30); }
+    else if sa > 15 { self.xt_SRLI(ar, at, 15); self.xt_SRLI(ar, ar, sa - 15); }
+    else { self.xt_SRLI(ar, at, sa); }
+  }
+  // SRAI ar, at, sa (sa 0..31): RRR op1 = 1, op2 = 001x mit x = sa Bit 4.
+  fn xt_SRAI(ar: int64, at: int64, sa: int64) {
+    self.xt_e3(at << 4, (ar << 4) | (sa & 15), ((2 | ((sa >> 4) & 1)) << 4) | 1);
+  }
+  // SRC ar, as, at: ar = untere 32 Bit von (as:at) >> SAR. RRR op1 = 1, op2 = 8.
+  // Mit as == at ist das eine Rechtsrotation um SAR.
+  fn xt_SRC(ar: int64, as_: int64, at: int64) {
+    self.xt_e3(at << 4, (ar << 4) | as_, 0x81);
   }
 
   // --------------------------------------------------------------------------
   // CALL format: b0=((off18&3)<<6)|(n<<4)|op0
-  // CALL0 (op0=5, n=0): off18 = (target - ((callPC+4)&~3)) / 4
-  // J     (op0=6):      same offset formula, 4-byte aligned target
+  // #1786, beide gegen den Disassembler gegengelesen:
+  //   CALL0 (op0=5): Ziel = ((PC & ~3) + 4) + off18 * 4   — off18 zaehlt WORTE
+  //   J     (op0=6): Ziel = PC + 4 + off18                — off18 zaehlt BYTE
   // --------------------------------------------------------------------------
 
   fn xt_CALL0(off18: int64) {
@@ -198,18 +323,31 @@ pub type EmitXtensa = class {
     self.xt_e3(((off18 & 3) << 6) | 6, (off18 >> 2) & 0xFF, (off18 >> 10) & 0xFF);
   }
 
-  // JX a0: return from CALL0 function (RRR, op2=0xD, s=a0, r=0, t=0, op0=0)
-  fn xt_JX_A0() { self.xt_e3(0x00, 0x00, 0xD0); }
+  // #1786: Der Ruecksprung stand als (0x00,0x00,0xD0) da — das ist `subx2`.
+  // RET ist t=8 im CALLX-Raum (op0=0, op1=0, op2=0, r=0, s=0); JX as waere
+  // t=10 mit s=as. Beide gegen den Disassembler gegengelesen.
+  fn xt_JX_A0() { self.xt_e3(0x80, 0x00, 0x00); }   // RET (= JX a0)
 
   // --------------------------------------------------------------------------
-  // BRI12 format: b0=(m<<4)|7, b1=((im12&0xF)<<4)|s, b2=(im12>>4)&0xFF
-  // target = PC + 3 + sign_extend(offset12)   (PC_next = PC+3 for 3-byte instr)
-  // BEQZ(m=1), BNEZ(m=5), BLTZ(m=9), BGEZ(m=13=0xD)
+  // #1786: BRI12 hat op0 = 6, nicht 7. Die m-Werte (1/5/9/13) stimmten, b1 und
+  // b2 ebenfalls — nur der Opcode war falsch, und damit der ganze Befehl.
+  //
+  // Und das Ziel liegt bei PC + 4, nicht PC + 3: der Kommentar rechnete mit
+  // der Befehlslaenge, die Hardware rechnet mit einem festen Versatz.
+  // Gegengelesen: BEQZ(1), BNEZ(5), BLTZ(9), BGEZ(13).
   // --------------------------------------------------------------------------
 
-  fn xt_BRI12(m: int64, as_: int64, imm12: int64) {
-    var im12: int64 := imm12 & 0xFFF;
-    self.xt_e3((m << 4) | 7, ((im12 & 0xF) << 4) | as_, (im12 >> 4) & 0xFF);
+  // `weite` zaehlt ab dem ENDE dieses Befehls — so, wie die Aufrufstellen es
+  // lesen („+3 ueberspringt das folgende MOVI"). Die Hardware rechnet ab
+  // PC + 4, also ein Byte weiter; die Differenz zieht diese Stelle ab, damit
+  // sie nicht an siebzehn Aufrufstellen einzeln stehen muss.
+  //
+  // #1786: Vorher rechnete der Emitter mit PC + 3 und traf damit die MITTE des
+  // naechsten Drei-Byte-Befehls. Im Trace sah man den Sprung auf 0x4010f7,
+  // waehrend der Befehl bei 0x4010f6 beginnt.
+  fn xt_BRI12(m: int64, as_: int64, weite: int64) {
+    var im12: int64 := (weite - 1) & 0xFFF;
+    self.xt_e3((m << 4) | 6, ((im12 & 0xF) << 4) | as_, (im12 >> 4) & 0xFF);
   }
   fn xt_BEQZ(as_: int64, imm12: int64) { self.xt_BRI12(1,  as_, imm12); }
   fn xt_BNEZ(as_: int64, imm12: int64) { self.xt_BRI12(5,  as_, imm12); }
@@ -284,27 +422,46 @@ pub type EmitXtensa = class {
       var labelId: int64 := peek64(base + 8);
       var ptype:   int64 := peek64(base + 16);
       var target:  int64 := -1;
+      // #1782: -2 heisst „schon gepatcht" — der Schlussdurchlauf in emit()
+      // sieht dieselbe Liste noch einmal.
+      if labelId != -2 {
       if ptype == XT_PATCH_CALL0 {
-        if labelId < 256 { target := peek64(self.funcAddrs + labelId * 8); }
+        // #1782: funcAddrs kommt aus alloc und ist null. Ein Ziel 0 ist nur
+        // fuer die ZUERST erzeugte Funktion echt; sonst heisst es „noch nicht
+        // erzeugt". Hier stehen ausserdem Hilfsroutinen vor dem Nutzercode,
+        // Offset 0 gehoert also ohnehin keiner Funktion.
+        if labelId < 256 {
+          target := peek64(self.funcAddrs + labelId * 8);
+          if target == 0 { target := -1; }
+        }
       } else {
         if labelId < 1024 { target := peek64(self.labelAddrs + labelId * 8); }
       }
       if target >= 0 {
-        if ptype == XT_PATCH_CALL0 || ptype == XT_PATCH_J {
-          var op0: int64 := 5;
-          if ptype == XT_PATCH_J { op0 := 6; }
-          var aligned: int64 := (codeOff + 4) & -4;
-          var off18: int64 := (target - aligned) >> 2;
-          self.xt_poke3(codeOff, ((off18 & 3) << 6) | op0, (off18 >> 2) & 0xFF, (off18 >> 10) & 0xFF);
+        if ptype == XT_PATCH_CALL0 {
+          // #1786: CALL0 zaehlt in WORTEN und rechnet ab (PC & ~3) + 4 — nicht
+          // ab (PC + 4) & ~3. Weil ein Xtensa-Befehl drei Byte lang ist, steht
+          // der Zaehler meistens SCHIEF, und dann sind die beiden Ausdruecke
+          // verschieden. Gegengelesen: off18 = 4 landet 16 Byte weiter.
+          var alignedC: int64 := (codeOff & -4) + 4;
+          var off18C:   int64 := (target - alignedC) >> 2;
+          self.xt_poke3(codeOff, ((off18C & 3) << 6) | 5, (off18C >> 2) & 0xFF, (off18C >> 10) & 0xFF);
+        } else if ptype == XT_PATCH_J {
+          // #1786: J zaehlt dagegen in BYTE und rechnet ab PC + 4.
+          var off18J: int64 := target - (codeOff + 4);
+          self.xt_poke3(codeOff, ((off18J & 3) << 6) | 6, (off18J >> 2) & 0xFF, (off18J >> 10) & 0xFF);
         } else {
-          // BRI12: extract original register from placeholder byte[1] lower nibble
+          // BRI12: das Register steckt im unteren Nibble des Platzhalters.
+          // #1786: op0 ist 6, und das Ziel liegt bei PC + 4.
           var orig_b1: int64 := peek8(self.codeBuf + codeOff + 1);
           var as_: int64 := orig_b1 & 0xF;
-          var im12: int64 := (target - (codeOff + 3)) & 0xFFF;
+          var im12: int64 := (target - (codeOff + 4)) & 0xFFF;
           var m: int64 := 1;
           if ptype == XT_PATCH_BNEZ { m := 5; }
-          self.xt_poke3(codeOff, (m << 4) | 7, ((im12 & 0xF) << 4) | as_, (im12 >> 4) & 0xFF);
+          self.xt_poke3(codeOff, (m << 4) | 6, ((im12 & 0xF) << 4) | as_, (im12 >> 4) & 0xFF);
         }
+        poke64(base + 8, -2);   // #1782: aufgeloest
+      }
       }
       i := i + 1;
     }
@@ -314,7 +471,50 @@ pub type EmitXtensa = class {
   // Instruction dispatch
   // --------------------------------------------------------------------------
 
+    // #1339: Der Dispatcher unten ist eine flache Liste aus `if op == X`
+  // ohne else und ohne Default. Ein Opcode, den keine Zeile trifft, erzeugte
+  // damit GAR NICHTS und verschwand lautlos aus dem Programm — bei
+  // IRO_PANIC hiess das: nach einer erkannten Verletzung laeuft es weiter.
+  //
+  // Diese Liste nennt die Opcodes, die xtensa tatsaechlich behandelt. Sie ist
+  // aus dem Dispatcher erhoben und wird gegen ihn geprueft. Weicht sie ab,
+  // scheitert der Lauf LAUT — die Abweichung faellt damit beim Uebersetzen
+  // auf und nicht erst im erzeugten Programm.
+  fn xt_opBehandelt(op: int64): int64 {
+    // #1339: die vier Zusicherungen — ir_lower erzeugt sie (ASSERT_NOT_ZERO
+    // steht vor jeder Division), und bis 1.0.18B behandelte sie ausser lyxos
+    // kein Backend.
+    if (op == IRO_ASSERT_NOT_NULL || op == IRO_ASSERT_NOT_ZERO) { return 1; }
+    if (op == IRO_ASSERT_TRUE || op == IRO_ASSERT_BOUNDS) { return 1; }
+    if (op == IRO_CONST_STR) { return 1; }   // #1339 (laut abgewiesen)
+    if (op == IRO_F64_ZU_F32 || op == IRO_F32_ZU_F64) { return 1; }   // #2160
+    if (op == 167 || op == IRO_ADD || op == IRO_ALLOC || op == IRO_AND) { return 1; }
+    if (op == IRO_PANIC) { return 1; }   // #1339: behandelt = laut abgewiesen
+    if (op == IRO_BITAND || op == IRO_BITNOT || op == IRO_BITOR || op == IRO_BITXOR) { return 1; }
+    if (op == IRO_BR_FALSE || op == IRO_BR_TRUE || op == IRO_CALL || op == IRO_CALL_BUILTIN) { return 1; }
+    if (op == IRO_CAST || op == IRO_CMP_EQ || op == IRO_CMP_GE || op == IRO_CMP_GT) { return 1; }
+    if (op == IRO_CMP_LE || op == IRO_CMP_LT || op == IRO_CMP_NEQ || op == IRO_CONST_FLOAT) { return 1; }
+    if (op == IRO_CONST_INT || op == IRO_DIV || op == IRO_FREE || op == IRO_FTOI) { return 1; }
+    if (op == IRO_FUNC_EXIT || op == IRO_ITOF || op == IRO_JMP || op == IRO_LABEL) { return 1; }
+    if (op == IRO_LOAD_FIELD || op == IRO_LOAD_FIELD_HEAP || op == IRO_LOAD_GLOBAL || op == IRO_LOAD_LOCAL) { return 1; }
+    if (op == IRO_MOD || op == IRO_MUL || op == IRO_NEG || op == IRO_NOT) { return 1; }
+    if (op == IRO_OR || op == IRO_SEXT || op == IRO_SHL || op == IRO_SHR || op == IRO_SAR) { return 1; }
+    if (op == IRO_STORE_FIELD || op == IRO_STORE_FIELD_HEAP || op == IRO_STORE_GLOBAL || op == IRO_STORE_LOCAL) { return 1; }
+    if (op == IRO_SUB || op == IRO_THROW || op == IRO_TRUNC || op == IRO_XOR) { return 1; }
+    if (op == IRO_ZEXT) { return 1; }
+    return 0;
+  }
+
   fn emitInstr(funcId: int64, idx: int64) {
+    var opRoh: int64 := self.getInstrOp(idx);
+    if (self.xt_opBehandelt(opRoh) == 0) {
+      EPrintStr("error: xtensa-Backend kennt Opcode "c);
+      EPrintInt(opRoh);
+      EPrintStrLn(" nicht -- er wuerde stillschweigend verschwinden (#1339)."c);
+      EPrintStrLn("  Entweder den Opcode hier umsetzen oder ihn in ir_lower fuer dieses Ziel abweisen."c);
+      exit(1);
+    }
+
     var op:   int64 := self.getInstrOp(idx);
     var dest: int64 := self.getInstrDest(idx);
     var src1: int64 := self.getInstrSrc1(idx);
@@ -336,16 +536,46 @@ pub type EmitXtensa = class {
       self.xt_loadSlot(src1); self.xt_loadSlot2(src2);
       self.xt_SUB(XT_T0, XT_T0, XT_T1); self.xt_storeSlot(dest);
     }
+    // #1790: Multiplikation. MULL gehoert zur Mul32-OPTION — die hat der ESP32,
+    // aber KEINER der hier verfuegbaren qemu-Kerne (dc232b, dc233c, de212,
+    // de233_fpu, dsp3400, lx106, sample_controller). Die Kodierung waere damit
+    // nur durch Konstruktion belegt, nicht durch Ausfuehrung.
+    //
+    // Was das wert ist, hat #1789 gezeigt: dort stand bei IRO_DIV ein
+    // `MOVI T0, 0`, das jede Pruefung ausser der Ausfuehrung ueberstanden hat.
+    // Deshalb hier dieselbe Entscheidung wie bei der Division — eine
+    // Softwareroutine. Sie ist auf JEDEM Xtensa-Kern richtig, nicht nur auf
+    // denen mit der Option, und sie ist hier nachweisbar.
     if op == IRO_MUL {
-      self.xt_loadSlot(src1); self.xt_loadSlot2(src2);
-      self.xt_MULL(XT_T0, XT_T0, XT_T1); self.xt_storeSlot(dest);
+      self.xt_loadSlot(src1);
+      self.xt_MOV(XT_A6, XT_T0);
+      self.xt_loadSlot2(src2);
+      self.xt_MOV(XT_A7, XT_T1);
+      var mPC:  int64 := self.codeLen;
+      var mOff: int64 := (self.xt_mulOff - ((mPC & -4) + 4)) >> 2;
+      self.xt_CALL0(mOff);                    // a6 = Produkt
+      self.xt_MOV(XT_T0, XT_A6);
+      self.xt_storeSlot(dest);
     }
-    if op == IRO_DIV {
-      // No hardware div in Xtensa base ISA — stub
-      self.xt_MOVI(XT_T0, 0); self.xt_storeSlot(dest);
-    }
-    if op == IRO_MOD {
-      self.xt_MOVI(XT_T0, 0); self.xt_storeSlot(dest);
+    // #1789: Division und Rest. Die Basis-ISA hat KEINEN Divisionsbefehl —
+    // DIV32 (QUOS/REMS) ist eine Option, die hier ebenso wenig pruefbar ist wie
+    // Mul32 (#1790). Also eine Softwareroutine, und die ist damit auf jedem
+    // Xtensa-Kern richtig, nicht nur auf denen mit der Option.
+    //
+    // Bis 1.1.10F stand hier `MOVI T0, 0`: JEDE Division lieferte still 0. Der
+    // laute Opcode-Waechter griff nicht, weil IRO_DIV als „behandelt" gefuehrt
+    // war — behandelt wurde er ja, nur falsch. Verdeckt hat es allein, dass die
+    // Zusicherung davor den Uebersetzer abbrechen liess.
+    if op == IRO_DIV || op == IRO_MOD {
+      self.xt_loadSlot(src1);
+      self.xt_MOV(XT_A6, XT_T0);              // a6 = Dividend
+      self.xt_loadSlot2(src2);
+      self.xt_MOV(XT_A7, XT_T1);              // a7 = Divisor
+      var dPC:  int64 := self.codeLen;
+      var dOff: int64 := (self.xt_divOff - ((dPC & -4) + 4)) >> 2;
+      self.xt_CALL0(dOff);                    // a6 = Quotient, a7 = Rest
+      if op == IRO_DIV { self.xt_MOV(XT_T0, XT_A6); } else { self.xt_MOV(XT_T0, XT_A7); }
+      self.xt_storeSlot(dest);
     }
     if op == IRO_NEG {
       self.xt_loadSlot(src1);
@@ -383,6 +613,13 @@ pub type EmitXtensa = class {
       self.xt_SSR(XT_T0);                  // SAR = shift_amount
       self.xt_loadSlot(src1);
       self.xt_SRL(XT_T0, XT_T0);
+      self.xt_storeSlot(dest);
+    }
+    if op == IRO_SAR {                     // #2236: arithmetisch
+      self.xt_loadSlot(src2);
+      self.xt_SSR(XT_T0);
+      self.xt_loadSlot(src1);
+      self.xt_SRA(XT_T0, XT_T0);
       self.xt_storeSlot(dest);
     }
 
@@ -444,50 +681,189 @@ pub type EmitXtensa = class {
     if op == IRO_LOAD_LOCAL || op == IRO_STORE_LOCAL {
       self.xt_loadSlot(src1); self.xt_storeSlot(dest);
     }
+    // #1782: Hier standen zwei stille Stummel — Lesen lieferte 0, Schreiben tat
+    // gar nichts, beides ohne ein Wort. Ein Programm mit globalen Variablen
+    // rechnete damit stillschweigend falsch.
+    //
+    // Die Adressierung ist auf diesem Ziel eine eigene Frage: xtensa erreicht
+    // eine feste Adresse nur ueber einen L32R-Literal-Pool, und der muss VOR
+    // dem Befehl liegen (#1786). Solange die Bauform nicht steht, wird die
+    // Luecke gemeldet statt geraten.
+    // #1786: Die Adresse entsteht PC-relativ wie beim Zeichenkettenliteral —
+    // nur ist der Abstand hier zu gross fuer ADDI, denn der Datenbereich haengt
+    // hinter dem gesamten Code. Deshalb der Umweg ueber den Literal-Pool:
+    // L32R liest ihn PC-relativ, und sein INHALT ist ein Abstand, keine
+    // absolute Adresse — damit bleibt das Abbild ladeortfrei.
+    //
+    // Bis 1.1.9M standen hier zwei stille Stummel: Lesen lieferte 0, Schreiben
+    // tat gar nichts, beides ohne ein Wort.
     if op == IRO_LOAD_GLOBAL {
-      // Stub: 32-bit absolute addressing not implemented
-      self.xt_MOVI(XT_T0, 0); self.xt_storeSlot(dest);
+      // #2239: Anfangswert passte nicht in ein Wort und es wurde noch nicht
+      // geschrieben → Abbruch statt eines still gekuerzten Werts.
+      var lMerk: int64 := _irWort32MerkerFuer(self.wort32Merker, src1);
+      if lMerk >= 0 {
+        self.xt_adresseNachT0(1, lMerk);
+        self.xt_L32I(XT_T0, XT_T0, 0);
+        var mOff: int64 := self.codeLen;
+        self.xt_BNEZ(XT_T0, 0);          // gesetzt → weiter
+        self.xt_ILL();
+        self.xt_patchBRI12(mOff, 5, self.codeLen);
+      }
+      self.xt_adresseNachT0(1, src1);
+      self.xt_L32I(XT_T0, XT_T0, 0);
+      self.xt_storeSlot(dest);
     }
-    if op == IRO_STORE_GLOBAL { }  // no-op stub
+    // ir_lower legt den globalIdx bei STORE_GLOBAL ins DEST-Feld, den Slot mit
+    // dem Wert nach src1 — so wie lyxos, arm64 und riscv es lesen.
+    if op == IRO_STORE_GLOBAL {
+      self.xt_adresseNachT0(1, dest);
+      self.xt_MOV(XT_T2, XT_T0);
+      self.xt_loadSlot(src1);
+      self.xt_S32I(XT_T0, XT_T2, 0);
+      var sMerk: int64 := _irWort32MerkerFuer(self.wort32Merker, dest);
+      if sMerk >= 0 {                    // #2239: ab jetzt ist der Wert gueltig
+        self.xt_adresseNachT0(1, sMerk);
+        self.xt_li(XT_T1, 1);
+        self.xt_S32I(XT_T1, XT_T0, 0);
+      }
+    }
 
     // --- Struct field access ---
-    if op == IRO_LOAD_FIELD || op == IRO_LOAD_FIELD_HEAP {
+    // #1782: Der Feld-Offset steht bei LOAD_FIELD in src2 und bei STORE_FIELD
+    // im DEST-Feld — nicht in imm. ir_lower erzeugt (dest, src1 = Basis,
+    // src2 = Offset) bzw. (dest = Offset, src1 = Wert, src2 = Basis), so wie
+    // lyxos, arm64 und riscv es lesen. Aus imm kam hier immer 0.
+    // #2147: Feld schmaler als ein Wort (imm = Breite | Vorzeichen << 8, wie
+    // emitLoadFieldArt in emit_arm64.lyx). Bis 1.2.16C immer ein ganzes Wort.
+    // Ein Versatz ausserhalb des RRI8-Bereichs scheitert laut (#2149 betrifft
+    // dieselbe Grenze beim Wortzugriff).
+    if (op == IRO_LOAD_FIELD || op == IRO_LOAD_FIELD_HEAP) && ((imm & 255) == 1 || (imm & 255) == 2) {
       self.xt_loadSlot(src1);
-      var woff: int64 := imm >> 2;
-      if woff >= 0 && woff <= 255 {
-        self.xt_L32I(XT_T0, XT_T0, woff);
+      var nlW: int64 := imm & 255;
+      var nlVz: int64 := (imm >> 8) & 1;
+      var nlE: int64 := src2;
+      if nlW == 2 { nlE := src2 >> 1; }
+      if src2 < 0 || nlE > 255 || (nlW == 2 && (src2 & 1) != 0) {
+        EPrintStr("error: xtensa: Feldversatz "c); EPrintInt(src2); EPrintStrLn(" fuer schmalen Zugriff ausserhalb des RRI8-Bereichs (#2147)."c);
+        exit(1);
+      }
+      if nlW == 1 {
+        self.xt_L8UI(XT_T0, XT_T0, src2);
+        if nlVz != 0 {
+          // (x ^ 0x80) - 0x80 erweitert ein Byte vorzeichenrichtig.
+          self.xt_MOVI(XT_T1, 128);
+          self.xt_XOR(XT_T0, XT_T0, XT_T1);
+          self.xt_ADDI(XT_T0, XT_T0, 0 - 128);
+        }
       } else {
-        self.xt_MOVI(XT_T0, 0);
+        if nlVz != 0 { self.xt_RRI8(0x9, XT_T0, XT_T0, src2 >> 1); }   // L16SI
+        else { self.xt_L16UI(XT_T0, XT_T0, src2); }
       }
       self.xt_storeSlot(dest);
     }
-    if op == IRO_STORE_FIELD || op == IRO_STORE_FIELD_HEAP {
+    else if (op == IRO_STORE_FIELD || op == IRO_STORE_FIELD_HEAP) && ((imm & 255) == 1 || (imm & 255) == 2) {
+      self.xt_loadSlot2(src2);
+      self.xt_MOV(XT_T2, XT_T1);
+      self.xt_loadSlot(src1);
+      var nsW: int64 := imm & 255;
+      var nsE: int64 := dest;
+      if nsW == 2 { nsE := dest >> 1; }
+      if dest < 0 || nsE > 255 || (nsW == 2 && (dest & 1) != 0) {
+        EPrintStr("error: xtensa: Feldversatz "c); EPrintInt(dest); EPrintStrLn(" fuer schmalen Zugriff ausserhalb des RRI8-Bereichs (#2147)."c);
+        exit(1);
+      }
+      if nsW == 1 { self.xt_S8I(XT_T0, XT_T2, dest); } else { self.xt_S16I(XT_T0, XT_T2, dest); }
+    }
+    else if op == IRO_LOAD_FIELD || op == IRO_LOAD_FIELD_HEAP {
+      self.xt_loadSlot(src1);
+      var woff: int64 := src2 >> 2;
+      if woff >= 0 && woff <= 255 && (src2 & 3) == 0 {
+        self.xt_L32I(XT_T0, XT_T0, woff);
+      } else {
+        // #2149: Hier stand `MOVI T0, 0` — ein Feld jenseits von 1020 Byte
+        // las still 0. Jetzt die Adresse rechnen (xt_li meldet sich, wenn
+        // auch das nicht reicht).
+        self.xt_li(XT_T1, src2);
+        self.xt_ADD(XT_T0, XT_T0, XT_T1);
+        self.xt_L32I(XT_T0, XT_T0, 0);
+      }
+      self.xt_storeSlot(dest);
+    }
+    else if op == IRO_STORE_FIELD || op == IRO_STORE_FIELD_HEAP {
       self.xt_loadSlot2(src2);              // T1 = base pointer
       self.xt_MOV(XT_T2, XT_T1);           // T2 = base (preserved across loadSlot)
       self.xt_loadSlot(src1);               // T0 = value
-      var woff: int64 := imm >> 2;
-      if woff >= 0 && woff <= 255 {
+      var woff: int64 := dest >> 2;
+      if woff >= 0 && woff <= 255 && (dest & 3) == 0 {
         self.xt_S32I(XT_T0, XT_T2, woff);
+      } else {
+        // #2149: der Store entfiel hier still.
+        self.xt_li(XT_T1, dest);
+        self.xt_ADD(XT_T2, XT_T2, XT_T1);
+        self.xt_S32I(XT_T0, XT_T2, 0);
       }
     }
 
     // --- Function calls (CALL0: a2-a5 for args 0-3) ---
     if op == IRO_CALL {
+      // #1782: Die Argumente liegen im reservierten Block ab src2 (argBase),
+      // nicht in den Slots 0..N-1 — die gehoeren den Locals des Aufrufers.
+      // xtensa las sie bis hierher aus Slot 0 und uebergab damit irgendeinen
+      // fremden Wert; arm64, lyxos, riscv und arm-cm rechnen laengst ab
+      // argBase.
+      //
+      // Die CALL0-Konvention haelt sechs Argumente in a2..a7; ab dem
+      // siebten geht es ueber den Stapel, 4-Byte-Plaetze ab dem sp des
+      // Aufrufers zum Zeitpunkt des CALL0 (#2140; bis 1.2.16A abgewiesen,
+      // davor still verworfen — `while ai < 4`, vgl. #1761 auf lyxos).
+      // Der Platz wird am Stueck angelegt und nach dem Aufruf freigegeben.
+      // Die Slots sind sp-relativ, deshalb liest dieser Weg sie ueber a10
+      // (= sp VOR dem Anlegen). Das Gegenstueck im Callee steht in emitFunc
+      // — die beiden muessen uebereinstimmen.
       var argCount: int64 := imm;
+      var argBase:  int64 := src2;
+      if argBase < 0 { argBase := 0; }
+      var stBytes: int64 := 0;
+      if argCount > 6 {
+        stBytes := (argCount - 6) * 4;
+        if (stBytes & 15) != 0 { stBytes := (stBytes + 16) & -16; }
+        // ADDI traegt acht Bit Direktwert; xt_adjustSP nimmt fuer mehr a10,
+        // das hier die alte Basis haelt.
+        if stBytes > 112 {
+          EPrintStr("error: xtensa: Aufruf mit "c);
+          EPrintInt(argCount);
+          EPrintStrLn(" Argumenten -- mehr als 28 Stapelargumente werden nicht erzeugt (#2140)."c);
+          exit(1);
+        }
+        if argBase + argCount + 1 > 255 {
+          EPrintStrLn("error: xtensa: Argumentblock jenseits von 255 Worten -- L32I erreicht ihn nicht (#2140)."c);
+          exit(1);
+        }
+        self.xt_MOV(XT_T2, XT_SP);              // a10 = sp vor dem Anlegen
+        self.xt_ADDI(XT_SP, XT_SP, 0 - stBytes);
+        var sk: int64 := 6;
+        while sk < argCount {
+          self.xt_L32I(XT_T0, XT_T2, argBase + sk + 1);
+          self.xt_S32I(XT_T0, XT_SP, sk - 6);
+          sk := sk + 1;
+        }
+      }
       var ai: int64 := 0;
-      while ai < argCount && ai < 4 {
-        self.xt_loadSlot(ai);
-        self.xt_MOV(XT_RV + ai, XT_T0);   // move to a2..a5
+      while ai < argCount && ai < 6 {
+        if stBytes > 0 { self.xt_L32I(XT_T0, XT_T2, argBase + ai + 1); }
+        else { self.xt_loadSlot(argBase + ai); }
+        self.xt_MOV(XT_RV + ai, XT_T0);   // a2..a7
         ai := ai + 1;
       }
       var patchOff: int64 := self.codeLen;
       self.xt_CALL0(0);   // placeholder
       self.addPatch(patchOff, src1, XT_PATCH_CALL0);
+      if stBytes > 0 { self.xt_ADDI(XT_SP, XT_SP, stBytes); }   // #2140: Stapelargumente abraeumen
       self.xt_MOV(XT_T0, XT_RV);          // T0 = return value from a2
       self.xt_storeSlot(dest);
     }
     if op == IRO_CALL_BUILTIN {
-      self.emitBuiltinCall(imm, dest);
+      self.emitBuiltinCall(imm, src1, dest);
     }
 
     // --- Control flow ---
@@ -523,13 +899,141 @@ pub type EmitXtensa = class {
 
     // --- Alloc / free (bare-metal stubs) ---
     if op == IRO_ALLOC {
-      self.xt_MOVI(XT_T0, 0); self.xt_storeSlot(dest);
+      // #1848: Bis hierher stand ein stiller Nullzeiger — `new` uebersetzte
+      // klaglos und lieferte 0, der erste Feldzugriff faultete irgendwo
+      // spaeter. Dasselbe stand bis 1.1.9K auf arm-cm und wurde mit #1783
+      // lautgestellt; hier war es beim Alten geblieben. Ein freistehendes Ziel
+      // hat kein Betriebssystem, keinen Allokator und keine Quelle fuer
+      // Speicher, der den Aufruf ueberlebt — also melden statt tun.
+      EPrintStrLn("error: xtensa: alloc/new gibt es auf einem freistehenden Ziel nicht."c);
+      EPrintStrLn("  Kein Betriebssystem, kein Allokator, keine Quelle fuer Speicher,"c);
+      EPrintStrLn("  der den Aufruf ueberlebt. Bis 1.1.12H lieferte diese Stelle still"c);
+      EPrintStrLn("  einen Nullzeiger (#1848, wie #1783 auf arm-cm)."c);
+      EPrintStrLn("  Behelf: Puffer selbst mitgeben -- IntToStrIn/StrSubIn aus"c);
+      EPrintStrLn("  std.string_in, oder eine feste Adresse im RAM."c);
+      exit(1);
     }
     if op == IRO_FREE { }
 
     // --- Type conversions: pass-through (no FP hardware) ---
-    if op == IRO_ITOF || op == IRO_FTOI || op == IRO_CAST || op == IRO_SEXT || op == IRO_ZEXT || op == IRO_TRUNC {
+    // #2160: wie ITOF/FTOI hier — dieses Ziel rechnet Gleitkomma nicht
+    // (keine FPU-Befehle im Backend), der Wert wird durchgereicht.
+    if op == IRO_F64_ZU_F32 || op == IRO_F32_ZU_F64 || op == IRO_ITOF || op == IRO_FTOI || op == IRO_CAST || op == IRO_SEXT || op == IRO_ZEXT || op == IRO_TRUNC {
       self.xt_loadSlot(src1); self.xt_storeSlot(dest);
+    }
+
+    // #1281: IRO_THROW. Auf den anderen Zielen ist der unbehandelte throw ein
+    // Abbruch (Exit-Syscall bzw. `bkpt`); hier fehlt die dafuer noetige
+    // Kodierung — dieses Backend fuehrt ausser `nop` keine gegen die eigene
+    // Byte-Konvention geprueften Befehle. Eine erfundene Trap-Kodierung waere
+    // schlimmer als die Meldung: sie liefe im Ernstfall irgendwohin. Bis
+    // 1.0.16G erzeugte `throw` hier gar nichts und lief still weiter.
+    // #1786: IRO_CONST_STR — Zeichenkettenliteral, PC-relativ.
+    //
+    // Xtensa hat keinen Befehl, der den Programmzaehler liest. Der uebliche
+    // Weg ist ein CALL0 auf eine Marke, die sofort zurueckspringt: CALL0 legt
+    // die Rueckkehradresse in a0, und das ist genau die Adresse HINTER dem
+    // Aufruf. Von dort ist der Abstand zu den inline abgelegten Bytes eine
+    // beim Erzeugen bekannte kleine Zahl.
+    //
+    // a0 darf hier benutzt werden: der Prolog hat die Rueckkehradresse nach
+    // [SP+0] gelegt, der Epilog holt sie von dort zurueck.
+    //
+    // Absolute Adressen waeren auf dem ESP32 eine Zeile weniger (L32R auf
+    // einen Pool mit der IRAM-Adresse). Sie binden das Abbild aber an genau
+    // einen Ladeort — und der User-Mode-Emulator kann 0x40080000 nicht
+    // abbilden (qemu deckelt den reservierten Adressraum bei 0x3fffffff), das
+    // Erzeugnis waere also nicht ausfuehrbar pruefbar. PC-relativ ist beides:
+    // ladeortfrei und hier nachweisbar.
+    if op == IRO_CONST_STR {
+      var strBufX: int64 := peek64(self.ir + 32);
+      var spX:  int64 := strBufX + imm;
+    // #1968: Die Laenge steht im VORSPANN vor der Zeichenkette (acht Byte bei
+    // off-8, von irAddString gelegt), nicht in der Nullterminierung. `StrLen`
+    // schnitt hier alles ab dem ersten Nullbyte im INHALT ab — bei einer
+    // eingebetteten Datei (#1961) blieb davon ein Bruchstueck plus Fremdbytes
+    // aus dem anschliessenden Speicher. Die Null wird weiterhin MITgeschrieben,
+    // die Laufzeit erwartet sie bei pchar; sie ist nur nicht mehr das Mass.
+      var lenX: int64 := _irStrLenVorspann(strBufX, imm);
+      var gesX: int64 := lenX + 1;
+      var padX: int64 := (4 - (gesX & 3)) & 3;   // Ausrichtung fuer den Code danach
+      var pcX:  int64 := self.codeLen;
+      var offX: int64 := (self.getpcOff - ((pcX & -4) + 4)) >> 2;
+      self.xt_CALL0(offX);
+      // a0 zeigt jetzt hierher; die Bytes folgen hinter ADDI und J.
+      self.xt_ADDI(XT_T0, XT_A0, 6);
+      self.xt_J(gesX + padX - 1);                // ueber die Bytes hinweg (Ziel = PC + 4 + imm)
+      var iX: int64 := 0;
+      while iX < lenX { self.xt_e1(peek8(spX + iX)); iX := iX + 1; }
+      self.xt_e1(0);
+      var pX: int64 := 0;
+      while pX < padX { self.xt_e1(0); pX := pX + 1; }
+      self.xt_storeSlot(dest);
+    }
+
+    // #1789: Die Zusicherungen. Sie brauchen einen Vergleich, einen Sprung und
+    // einen Abbruch. Bis 1.1.10F fehlte dafuer die gepruefte Kodierung und der
+    // Uebersetzer brach ab — die Begruendung ist mit #1786 hinfaellig geworden:
+    // BRI12 und J sind seither gegen den Disassembler belegt und tragen die
+    // StrLen-Schleife, und ILL ist als Falle im Lauf nachgewiesen (SIGILL).
+    //
+    // Aufbau: Wert laden, im GUTEN Fall ueber die Falle springen. Die Weite
+    // wird nachgetragen, nicht gezaehlt.
+    if op == IRO_ASSERT_NOT_NULL || op == IRO_ASSERT_NOT_ZERO || op == IRO_ASSERT_TRUE {
+      self.xt_loadSlot(src1);
+      var aOff: int64 := self.codeLen;
+      self.xt_BNEZ(XT_T0, 0);          // != 0 → weiter
+      self.xt_ILL();
+      self.xt_patchBRI12(aOff, 5, self.codeLen);
+      return;
+    }
+    // ASSERT_BOUNDS: src1 = Index, src2 = Laenge. Geprueft wird BEIDES —
+    // Index >= 0 und Index < Laenge. Ein einzelner vorzeichenbehafteter
+    // Vergleich gegen die Laenge wuerde einen negativen Index durchlassen,
+    // weil er kleiner ist; genau dafuer ist die Pruefung ja da.
+    if op == IRO_ASSERT_BOUNDS {
+      self.xt_loadSlot(src1);
+      self.xt_MOV(XT_T2, XT_T0);                 // T2 = Index
+      var bNeg: int64 := self.codeLen;
+      self.xt_BGEZ(XT_T2, 0);                    // >= 0 → zweite Pruefung
+      self.xt_ILL();
+      self.xt_patchBRI12(bNeg, 13, self.codeLen);
+      self.xt_loadSlot2(src2);                   // T1 = Laenge
+      self.xt_SUB(XT_T0, XT_T2, XT_T1);          // Index - Laenge
+      var bLen: int64 := self.codeLen;
+      self.xt_BLTZ(XT_T0, 0);                    // < 0 → im Bereich
+      self.xt_ILL();
+      self.xt_patchBRI12(bLen, 9, self.codeLen);
+      return;
+    }
+
+    // #1339: IRO_PANIC. Dieselbe Lage wie bei IRO_THROW darunter — dieses
+    // Backend hat ausser `nop` keine gegen die eigene Byte-Konvention
+    // geprueften Befehle, und eine erfundene Trap-Kodierung liefe im Ernstfall
+    // irgendwohin. Deshalb der Abbruch beim UEBERSETZEN statt ein No-op im
+    // erzeugten Programm: bis 1.0.17I verschwand ein `panic("...")` hier
+    // spurlos, und das Programm lief nach der erkannten Verletzung weiter.
+    if op == IRO_PANIC {
+      EPrintStrLn("error: panic ist fuer xtensa nicht umgesetzt (#1339)"c);
+      EPrintStrLn("  Das Backend hat keine gepruefte Trap-Kodierung; ein No-op waere gefaehrlicher als der Abbruch."c);
+      exit(1);
+    }
+
+    if op == IRO_THROW {
+      EPrintStrLn("error: throw ist fuer xtensa nicht umgesetzt (#1281)"c);
+      EPrintStrLn("  Es fehlt eine gepruefte Trap-Kodierung; ein Abbruch laesst sich nicht erzeugen."c);
+      exit(1);
+    }
+
+    // --- WSP-05: Inline-Assembly. Nur `nop` (id 0) ist gegen die Backend-eigene
+    // Byte-Konvention verifizierbar (xt_NOP); ir_lower lässt für xtensa nichts
+    // anderes durch, das else bleibt daher fail-closed unerreichbar. ---
+    if op == 167 {
+      if imm == 0 { self.xt_NOP(); }
+      else {
+        EPrintStrLn("error: asm: Mnemonic auf xtensa nicht unterstuetzt"c);
+        exit(1);
+      }
     }
   }
 
@@ -538,14 +1042,47 @@ pub type EmitXtensa = class {
   // Placed here (after BRI12 etc.) so forward-ref issues are avoided.
   // --------------------------------------------------------------------------
 
+  // #1786: dieselbe vertauschte RRI8-Form wie oben. r = 0 fuer L8UI, 4 fuer S8I.
   fn xt_L8UI(ar: int64, as_: int64, off: int64) {
-    var im: int64 := off & 0xFF;
-    self.xt_e3((ar << 4) | 2, ((im & 0xF) << 4) | as_, im >> 4);
+    self.xt_RRI8(0x0, ar, as_, off);
   }
 
   fn xt_S8I(at: int64, as_: int64, off: int64) {
-    var im: int64 := off & 0xFF;
-    self.xt_e3((at << 4) | 2, ((im & 0xF) << 4) | as_, 0x40 | (im >> 4));
+    self.xt_RRI8(0x4, at, as_, off);
+  }
+
+  // #1786: L16UI / S16I — der Versatz zaehlt in HALBWORTEN.
+  fn xt_L16UI(ar: int64, as_: int64, off: int64) {
+    self.xt_RRI8(0x1, ar, as_, off >> 1);
+  }
+  fn xt_S16I(at: int64, as_: int64, off: int64) {
+    self.xt_RRI8(0x5, at, as_, off >> 1);
+  }
+
+  // #1786: eine BEQZ-Weite nachtragen, statt sie zu zaehlen. Die Hardware
+  // rechnet ab PC + 4; das Register steckt im unteren Nibble des Platzhalters.
+  // #1789: ILL — der kontrollierte Abbruch. Gegen qemus Disassembler geprueft
+  // (dekodiert als `ill`) und im Lauf belegt (SIGILL, rc=132). Auf dem ESP32
+  // loest er eine Ausnahme aus und landet im Panik-Handler, statt weiterzulaufen.
+  // Eine erfundene Trap-Kodierung waere hier besonders gefaehrlich: eine
+  // Zusicherung, die nicht ausloest, laesst das Programm genau dort weiterlaufen,
+  // wo es abbrechen sollte.
+  fn xt_ILL() { self.xt_e3(0x00, 0x00, 0x00); }
+
+  // #1789: Weite einer BRI12-Form nachtragen. m waehlt die Form
+  // (BEQZ 1, BNEZ 5, BLTZ 9, BGEZ 13); das Register steckt im unteren Nibble
+  // des Platzhalters. Gezaehlt wird nicht — dreimal in dieser Sitzung war eine
+  // handgezaehlte Weite falsch.
+  fn xt_patchBRI12(off: int64, m: int64, ziel: int64) {
+    var as2: int64 := peek8(self.codeBuf + off + 1) & 0xF;
+    var im12: int64 := (ziel - (off + 4)) & 0xFFF;
+    self.xt_poke3(off, (m << 4) | 6, ((im12 & 0xF) << 4) | as2, (im12 >> 4) & 0xFF);
+  }
+
+  fn xt_patchBEQZ(off: int64, ziel: int64) {
+    var as2: int64 := peek8(self.codeBuf + off + 1) & 0xF;
+    var im12: int64 := (ziel - (off + 4)) & 0xFFF;
+    self.xt_poke3(off, (1 << 4) | 6, ((im12 & 0xF) << 4) | as2, (im12 >> 4) & 0xFF);
   }
 
   // --------------------------------------------------------------------------
@@ -611,6 +1148,130 @@ pub type EmitXtensa = class {
     // 37 × 3 = 111 bytes ✓
   }
 
+  // #1789: vorzeichenbehaftete Division durch wiederholtes Abziehen mit
+  // Verdopplung (restoring division), 32 Schritte.
+  //
+  //   a6 = Dividend rein, Quotient raus
+  //   a7 = Divisor rein, Rest raus
+  //
+  // Benutzt a2..a5 als Kratzregister und rettet a0 auf den Stapel, weil CALL0
+  // die Rueckkehradresse dort ablegt und die Schleife selbst nicht ruft.
+  //
+  // Vorzeichen: es wird MIT BETRAEGEN gerechnet und am Ende korrigiert. Das
+  // Vorzeichen des Restes folgt dem Dividenden, wie bei / und % ueblich (und
+  // wie es der x86-Pfad tut — die beiden muessen uebereinstimmen, sonst rechnet
+  // dasselbe Programm je nach Ziel anders).
+  //
+  // Division durch 0 kommt hier nicht an: ir_lower stellt vor jede Division
+  // ein IRO_ASSERT_NOT_ZERO, und das ist seit #1789 umgesetzt.
+  // #1790: Multiplikation durch Verschieben und Addieren, 32 Schritte.
+  //
+  //   a6 = Faktor rein, Produkt raus
+  //   a7 = Faktor rein (wird verbraucht)
+  //
+  // Vorzeichen brauchen KEINE Sonderbehandlung: im Zweierkomplement ist das
+  // untere 32-Bit-Ergebnis fuer vorzeichenbehaftete und vorzeichenlose
+  // Multiplikation dasselbe. Das ist der Unterschied zur Division, wo mit
+  // Betraegen gerechnet und am Ende korrigiert werden muss.
+  fn xt_emitMulHelper() {
+    self.xt_ADDI(XT_SP, XT_SP, -16);
+    self.xt_S32I(XT_A0, XT_SP, 0);
+    self.xt_MOVI(XT_A4, 0);                  // a4 = Produkt
+    self.xt_MOVI(XT_T0, 32);                 // Zaehler
+    var mTop: int64 := self.codeLen;
+    // unterstes Bit von a7 gesetzt? → a6 aufaddieren
+    self.xt_MOVI(XT_T1, 1);
+    self.xt_AND(XT_T2, XT_A7, XT_T1);
+    var mKein: int64 := self.codeLen;
+    self.xt_BEQZ(XT_T2, 0);
+    self.xt_ADD(XT_A4, XT_A4, XT_A6);
+    self.xt_patchBEQZ(mKein, self.codeLen);
+    // a6 <<= 1, a7 >>= 1 (logisch)
+    self.xt_MOVI(XT_T1, 1);
+    self.xt_SSL(XT_T1);
+    self.xt_SLL(XT_A6, XT_A6);
+    self.xt_MOVI(XT_T1, 1);
+    self.xt_SSR(XT_T1);
+    self.xt_SRL(XT_A7, XT_A7);
+    self.xt_ADDI(XT_T0, XT_T0, -1);
+    var mEnde: int64 := self.codeLen;
+    self.xt_BEQZ(XT_T0, 0);
+    self.xt_J(mTop - (self.codeLen + 4));
+    self.xt_patchBEQZ(mEnde, self.codeLen);
+    self.xt_MOV(XT_A6, XT_A4);
+    self.xt_L32I(XT_A0, XT_SP, 0);
+    self.xt_ADDI(XT_SP, XT_SP, 16);
+    self.xt_JX_A0();
+  }
+
+  fn xt_emitDivHelper() {
+    self.xt_ADDI(XT_SP, XT_SP, -16);
+    self.xt_S32I(XT_A0, XT_SP, 0);
+    // a2 = Vorzeichen des Quotienten, a3 = Vorzeichen des Restes
+    self.xt_MOVI(XT_RV, 0);
+    self.xt_MOVI(XT_A3, 0);
+    // Dividend negativ? → Betrag, beide Vorzeichen merken
+    var vD: int64 := self.codeLen;
+    self.xt_BGEZ(XT_A6, 0);
+    self.xt_NEG(XT_A6, XT_A6);
+    self.xt_MOVI(XT_RV, 1);
+    self.xt_MOVI(XT_A3, 1);
+    self.xt_patchBRI12(vD, 13, self.codeLen);
+    // Divisor negativ? → Betrag, Quotientenvorzeichen kippen
+    var vS: int64 := self.codeLen;
+    self.xt_BGEZ(XT_A7, 0);
+    self.xt_NEG(XT_A7, XT_A7);
+    self.xt_MOVI(XT_A4, 1);
+    self.xt_XOR(XT_RV, XT_RV, XT_A4);
+    self.xt_patchBRI12(vS, 13, self.codeLen);
+    // a4 = Quotient, a5 = Rest, Schleifenzaehler in a8 (T0)
+    self.xt_MOVI(XT_A4, 0);
+    self.xt_MOVI(XT_A5, 0);
+    self.xt_MOVI(XT_T0, 32);
+    var lTop: int64 := self.codeLen;
+    // Rest << 1 | oberstes Bit des Dividenden
+    self.xt_MOVI(XT_T1, 1);
+    self.xt_SSL(XT_T1);
+    self.xt_SLL(XT_A5, XT_A5);
+    self.xt_SLL(XT_A4, XT_A4);
+    self.xt_MOVI(XT_T1, 31);
+    self.xt_SSR(XT_T1);
+    self.xt_SRL(XT_T2, XT_A6);            // T2 = Dividend >> 31 (oberstes Bit)
+    self.xt_MOVI(XT_T1, 1);
+    self.xt_AND(XT_T2, XT_T2, XT_T1);
+    self.xt_OR(XT_A5, XT_A5, XT_T2);
+    self.xt_MOVI(XT_T1, 1);
+    self.xt_SSL(XT_T1);
+    self.xt_SLL(XT_A6, XT_A6);
+    // Rest >= Divisor? → abziehen, Quotientenbit setzen
+    self.xt_SUB(XT_T2, XT_A5, XT_A7);
+    var lKein: int64 := self.codeLen;
+    self.xt_BLTZ(XT_T2, 0);
+    self.xt_MOV(XT_A5, XT_T2);
+    self.xt_MOVI(XT_T1, 1);
+    self.xt_OR(XT_A4, XT_A4, XT_T1);
+    self.xt_patchBRI12(lKein, 9, self.codeLen);
+    self.xt_ADDI(XT_T0, XT_T0, -1);
+    var lEnde: int64 := self.codeLen;
+    self.xt_BEQZ(XT_T0, 0);
+    self.xt_J(lTop - (self.codeLen + 4));
+    self.xt_patchBEQZ(lEnde, self.codeLen);
+    // Vorzeichen setzen
+    var vQ: int64 := self.codeLen;
+    self.xt_BEQZ(XT_RV, 0);
+    self.xt_NEG(XT_A4, XT_A4);
+    self.xt_patchBEQZ(vQ, self.codeLen);
+    var vR: int64 := self.codeLen;
+    self.xt_BEQZ(XT_A3, 0);
+    self.xt_NEG(XT_A5, XT_A5);
+    self.xt_patchBEQZ(vR, self.codeLen);
+    self.xt_MOV(XT_A6, XT_A4);
+    self.xt_MOV(XT_A7, XT_A5);
+    self.xt_L32I(XT_A0, XT_SP, 0);
+    self.xt_ADDI(XT_SP, XT_SP, 16);
+    self.xt_JX_A0();
+  }
+
   fn xt_emitHelpers() {
     while (self.codeLen & 3) != 0 { self.xt_NOP(); }
     self.xt_printstrOff := self.codeLen;
@@ -621,9 +1282,76 @@ pub type EmitXtensa = class {
     self.xt_emitPrintIntHelper();
 
     while (self.codeLen & 3) != 0 { self.xt_NOP(); }
+    self.xt_divOff := self.codeLen;
+    self.xt_emitDivHelper();
+
+    while (self.codeLen & 3) != 0 { self.xt_NOP(); }
+    self.xt_mulOff := self.codeLen;
+    self.xt_emitMulHelper();
+
+    while (self.codeLen & 3) != 0 { self.xt_NOP(); }
   }
 
-  fn emitBuiltinCall(id: int64, dest: int64) {
+  // #1786: argBase — die Argumente stehen NICHT in Slot 0, sondern in einem
+  // reservierten Block, dessen erster Slot als src1 mitkommt. Dieselbe
+  // Konvention wie bei arm-cm (#1388) und lyxos (#839).
+  fn emitBuiltinCall(id: int64, argBase: int64, dest: int64) {
+    var sB: int64 := argBase;
+    if sB < 0 { sB := 0; }
+    // Speicherzugriffe. Xtensa ist hier 32-bittig; peek64/poke64 arbeiten wie
+    // auf Cortex-M auf dem unteren Wort.
+    if id == 200 || id == 208 || id == 201 || id == 202 {
+      self.xt_loadSlot(sB);
+      if id == 200 { self.xt_L8UI(XT_T0, XT_T0, 0); }
+      if id == 208 { self.xt_L16UI(XT_T0, XT_T0, 0); }
+      if id == 201 || id == 202 { self.xt_L32I(XT_T0, XT_T0, 0); }
+      self.xt_storeSlot(dest);
+      return;
+    }
+    if id == 203 || id == 209 || id == 204 || id == 205 {
+      self.xt_loadSlot(sB);
+      self.xt_MOV(XT_T2, XT_T0);           // T2 = Adresse
+      self.xt_loadSlot(sB + 1);            // T0 = Wert
+      if id == 203 { self.xt_S8I(XT_T0, XT_T2, 0); }
+      if id == 209 { self.xt_S16I(XT_T0, XT_T2, 0); }
+      if id == 204 || id == 205 { self.xt_S32I(XT_T0, XT_T2, 0); }
+      return;
+    }
+    // StrLen: Zeichen bis zur Null zaehlen. Braucht kein Betriebssystem und
+    // gehoert deshalb auch auf ein freistehendes Ziel. Sprungweiten werden
+    // NICHT gezaehlt, sondern nachgetragen — dreimal in dieser Sitzung war
+    // eine handgezaehlte Weite falsch (riscv, Thumb-2, xtensa selbst).
+    if id == 15 {
+      self.xt_loadSlot(sB);
+      self.xt_MOV(XT_T2, XT_T0);           // T2 = Zeiger
+      self.xt_MOVI(XT_T1, 0);              // T1 = Zaehler
+      var sl: int64 := self.codeLen;
+      self.xt_L8UI(XT_T0, XT_T2, 0);
+      var bEnde: int64 := self.codeLen;
+      self.xt_BEQZ(XT_T0, 0);              // -> fertig, nachgetragen
+      self.xt_ADDI(XT_T2, XT_T2, 1);
+      self.xt_ADDI(XT_T1, XT_T1, 1);
+      self.xt_J(sl - (self.codeLen + 4));
+      var lEnde: int64 := self.codeLen;
+      self.xt_patchBEQZ(bEnde, lEnde);
+      self.xt_MOV(XT_T0, XT_T1);
+      self.xt_storeSlot(dest);
+      return;
+    }
+    // StrCharAt(s, i): ein Byte lesen.
+    if id == 206 {
+      self.xt_loadSlot(sB);
+      self.xt_MOV(XT_T2, XT_T0);
+      self.xt_loadSlot(sB + 1);
+      self.xt_ADD(XT_T2, XT_T2, XT_T0);
+      self.xt_L8UI(XT_T0, XT_T2, 0);
+      self.xt_storeSlot(dest);
+      return;
+    }
+    if id >= 255 && id <= 262 {
+      self.xt_emitBitBuiltin(id, sB, dest);
+      return;
+    }
     if id == 1 {
       // PrintStr: a2 = pchar from slot 0, call printstr helper
       self.xt_loadSlot(0);                    // T0 (a8) = slot[0] = str ptr
@@ -641,11 +1369,153 @@ pub type EmitXtensa = class {
       var off18_2: int64 := (self.xt_printintOff - aligned2) >> 2;
       self.xt_CALL0(off18_2);               // call printint helper
     } else {
-      // Other builtins: stub returning 0
-      self.xt_MOVI(XT_T0, 0);
-      self.xt_storeSlot(dest);
+      // #1388: Hier stand ein Stummel, der 0 zurueckgab — fuer JEDEN nicht
+      // aufgezaehlten Builtin, ohne ein Wort darueber. `peek8(p)` lieferte
+      // damit 0 statt des Byteinhalts. Derselbe stille Default wie bei den
+      // Opcodes in #1339, eine Ebene tiefer.
+      //
+      // Xtensa hat in diesem Backend keine geprueften Kodierungen fuer
+      // schmale Speicherzugriffe (siehe #1281), also wird gemeldet statt
+      // geraten.
+      self._builtinUnsupportedXT(id);
     }
   }
+  // #2228: Bit-Rechenwerke (#2190, #2177) auf Xtensa.
+  //
+  // DARSTELLUNG: dieses Backend haelt jeden int64-Wert als EIN 32-Bit-Wort
+  // im Slot (xt_loadSlot/xt_storeSlot, L32I/S32I). Vergleiche (SUB+BLTZ),
+  // Division und PrintInt lesen das Wort vorzeichenbehaftet; der dargestellte
+  // int64-Wert ist also die Vorzeichenerweiterung des Wortes. Gerechnet wird
+  // genau unter dieser Annahme — fuer jeden Wert in [-2^31, 2^31) ist das
+  // Ergebnis dasselbe wie auf x86:
+  //
+  //   popcount(x) = popcount32(w) + (w < 0 ? 32 : 0)
+  //   clz(x)      = w < 0 ? 0 : 32 + clz32(w)          (clz(0) == 64)
+  //   ctz(x)      = w == 0 ? 64 : ctz32(w)
+  //   rotl32/rotr32: das Ergebniswort sind exakt die unteren 32 Bit des
+  //     x86-Ergebnisses. Ein Ergebnis >= 2^31 liest dieses Ziel — wie jede
+  //     solche Konstante — als negativ; mit Maske/Addition/XOR weiterrechnen
+  //     (Krypto) ist davon nicht betroffen.
+  //
+  // bswap64, rotl und rotr (64 Bit) haben KEIN darstellbares Ergebnis: die
+  // unteren 32 Bit des Ergebnisses kommen aus dem oberen Wort, das es hier
+  // nicht gibt. Sie werden laut abgewiesen statt still auf 32 Bit gerechnet.
+  //
+  // Nur Kernbefehle: NSAU (clz) gehoert zur NSA-Option, MULL zur Mul32-Option
+  // — beides hat der hier pruefbare qemu-Kern nicht sicher (vgl. #1790).
+  // clz32 entsteht deshalb als Binaersuche, popcount32 als SWAR ohne MUL,
+  // die Rotationen ueber den Trichterschieber SRC (Kern-ISA).
+  //
+  // Dieselbe Rechnung steht in arm_cm_backend.lyx (cm_emitBitBuiltin) — die
+  // beiden muessen uebereinstimmen.
+  fn xt_emitBitBuiltin(id: int64, sB: int64, dest: int64) {
+    if id == 258 || id == 259 || id == 260 {
+      EPrintStr("error: xtensa: "c);
+      if id == 258 { EPrintStr("bswap64"c); }
+      if id == 259 { EPrintStr("rotl"c); }
+      if id == 260 { EPrintStr("rotr"c); }
+      EPrintStrLn(" braucht 64 Bit -- dieses Ziel haelt int64 als ein 32-Bit-Wort (#2228)."c);
+      EPrintStrLn("  Die unteren 32 Bit des Ergebnisses kaemen aus dem oberen Wort, das es"c);
+      EPrintStrLn("  hier nicht gibt; ein Ergebnis auf 32 Bit waere still falsch."c);
+      EPrintStrLn("  Fuer 32-Bit-Woerter: rotl32/rotr32."c);
+      exit(1);
+    }
+    self.xt_loadSlot(sB);
+    self.xt_MOV(XT_A3, XT_T0);                  // a3 = w
+    if id == 261 || id == 262 {
+      self.xt_loadSlot(sB + 1);                 // T0 = Weite
+      // SSL: SAR = 32 - (n & 31), SSR: SAR = n & 31 — die Weite mod 32
+      // liefert der Befehl selbst, auch fuer negative n.
+      if id == 261 { self.xt_SSL(XT_T0); } else { self.xt_SSR(XT_T0); }
+      self.xt_SRC(XT_T0, XT_A3, XT_A3);
+      self.xt_storeSlot(dest);
+      return;
+    }
+    if id == 255 {
+      // SWAR: Paare, Vierer, Achter, dann Bytesummen aufaddieren.
+      self.xt_MOV(XT_A4, XT_A3);
+      self.xt_SRLI(XT_A5, XT_A4, 1);
+      self.xt_li(XT_A6, 0x55555555);
+      self.xt_AND(XT_A5, XT_A5, XT_A6);
+      self.xt_SUB(XT_A4, XT_A4, XT_A5);
+      self.xt_li(XT_A6, 0x33333333);
+      self.xt_SRLI(XT_A5, XT_A4, 2);
+      self.xt_AND(XT_A5, XT_A5, XT_A6);
+      self.xt_AND(XT_A4, XT_A4, XT_A6);
+      self.xt_ADD(XT_A4, XT_A4, XT_A5);
+      self.xt_SRLI(XT_A5, XT_A4, 4);
+      self.xt_ADD(XT_A4, XT_A4, XT_A5);
+      self.xt_li(XT_A6, 0x0F0F0F0F);
+      self.xt_AND(XT_A4, XT_A4, XT_A6);
+      self.xt_SRLI(XT_A5, XT_A4, 8);
+      self.xt_ADD(XT_A4, XT_A4, XT_A5);
+      self.xt_srl_k(XT_A5, XT_A4, 16);
+      self.xt_ADD(XT_A4, XT_A4, XT_A5);
+      self.xt_MOVI(XT_A6, 63);
+      self.xt_AND(XT_A4, XT_A4, XT_A6);
+      // oberes Wort = Vorzeichenerweiterung: bei w < 0 32 weitere Bits.
+      self.xt_SRAI(XT_A5, XT_A3, 31);
+      self.xt_MOVI(XT_A6, 32);
+      self.xt_AND(XT_A5, XT_A5, XT_A6);
+      self.xt_ADD(XT_T0, XT_A4, XT_A5);
+      self.xt_storeSlot(dest);
+      return;
+    }
+    if id == 256 {
+      self.xt_MOV(XT_A4, XT_A3);
+      self.xt_emitClz32();                      // a5 = clz32(a4)
+      var cNeg: int64 := self.codeLen;
+      self.xt_BLTZ(XT_A3, 0);                   // w < 0: oberes Wort voll Einsen → 0
+      self.xt_ADDI(XT_A5, XT_A5, 32);
+      self.xt_patchBRI12(cNeg, 9, self.codeLen);
+      self.xt_MOV(XT_T0, XT_A5);
+      self.xt_storeSlot(dest);
+      return;
+    }
+    // id == 257: ctz. Niedrigstes Bit isolieren (w & -w), dann 31 - clz32.
+    self.xt_NEG(XT_A4, XT_A3);
+    self.xt_AND(XT_A4, XT_A4, XT_A3);
+    self.xt_emitClz32();
+    self.xt_MOVI(XT_A4, 31);
+    self.xt_SUB(XT_A5, XT_A4, XT_A5);
+    var tNz: int64 := self.codeLen;
+    self.xt_BNEZ(XT_A3, 0);                     // w == 0 → ctz(0) == 64
+    self.xt_MOVI(XT_A5, 64);
+    self.xt_patchBRI12(tNz, 5, self.codeLen);
+    self.xt_MOV(XT_T0, XT_A5);
+    self.xt_storeSlot(dest);
+  }
+
+  // #2228: a5 = clz32(a4), a4 und a6 werden verbraucht. Binaersuche ueber
+  // 16/8/4/2/1 Bit; danach ist a4 genau dann 0, wenn es vorher 0 war — dann
+  // ist clz32 = 32, nicht 31. Spruenge werden nachgetragen, nicht gezaehlt.
+  fn xt_emitClz32() {
+    self.xt_MOVI(XT_A5, 0);
+    var k: int64 := 16;
+    while k >= 1 {
+      self.xt_srl_k(XT_A6, XT_A4, 32 - k);       // a6 = obere k Bit
+      var b: int64 := self.codeLen;
+      self.xt_BNEZ(XT_A6, 0);
+      self.xt_ADDI(XT_A5, XT_A5, k);
+      self.xt_SLLI(XT_A4, XT_A4, k);
+      self.xt_patchBRI12(b, 5, self.codeLen);
+      k := k / 2;
+    }
+    var bNull: int64 := self.codeLen;
+    self.xt_BNEZ(XT_A4, 0);
+    self.xt_ADDI(XT_A5, XT_A5, 1);
+    self.xt_patchBRI12(bNull, 5, self.codeLen);
+  }
+
+  fn _builtinUnsupportedXT(id: int64) {
+    EPrintStr("error: xtensa: Builtin-ID "c);
+    EPrintInt(id);
+    EPrintStrLn(" ist fuer dieses Backend nicht umgesetzt (#1388)"c);
+    EPrintStrLn("  Fuer Xtensa fehlen die geprueften Kodierungen (vgl. #1281)."c);
+    EPrintStrLn("  Vergabe und Belegung der IDs: src/backend/_builtin_ids.md."c);
+    exit(1);
+  }
+
 
   // --------------------------------------------------------------------------
   // Function emitter
@@ -658,12 +1528,45 @@ pub type EmitXtensa = class {
       poke64(self.funcAddrs + funcId * 8, self.codeLen);
       self.funcCount := self.funcCount + 1;
     }
+    // #1782: Anfang von main merken. Der Einstiegspunkt im ELF stand auf der
+    // ZUERST erzeugten Funktion (lyxc reichte getFuncAddr(0) durch). Stand main
+    // nicht vorn, startete das Programm in einer fremden Funktion — dieselbe
+    // Falle wie auf riscv (#1740) und Cortex-M (#1765).
+    if self.xtIsMain(funcId) != 0 { self.xtMainOff := self.codeLen; }
     self.stackSize  := 0;
-    self.patchCount := 0;
+    // #1782: patchCount wird NICHT zurueckgesetzt. Aufruf-Patches muessen die
+    // Funktion ueberleben, sonst bleibt ein Vorwaertsaufruf auf seinem
+    // Platzhalter stehen. Aufgeloeste Eintraege sind mit labelId = -2
+    // markiert; der Schlussdurchlauf in emit() holt den Rest.
     var li: int64 := 0;
     while li < 1024 { poke64(self.labelAddrs + li * 8, -1); li := li + 1; }
     self.calcStackFrame(funcId);
     self.emitPrologue();
+    // #1782: eingehende Argumentregister a2..a7 in die Param-Slots spillen.
+    // Ohne das las ein LOAD_LOCAL eines Parameters uninitialisierten Stapel.
+    // Die Parameter liegen hinter dem Kratzstreifen (IR_BARG_SLOTS), wie bei
+    // arm64 (#1388), riscv (#1740) und arm-cm (#1765).
+    var pSpill: int64 := peek64(peek64(self.ir + 80) + funcId * 80 + 40);
+    var pi: int64 := 0;
+    while pi < pSpill {
+      if pi < 6 {
+        self.xt_MOV(XT_T0, XT_RV + pi);
+        self.xt_storeSlot(IR_BARG_SLOTS + pi);
+      } else {
+        // #2140: Parameter ab dem siebten liegen beim Aufrufer auf dem
+        // Stapel, 4-Byte-Plaetze ab dessen sp — hier [sp + Rahmen]. Bis
+        // 1.2.16A blieben diese Slots unbeschrieben (#1782: der Aufrufer
+        // meldete laut, der Callee verwarf still). Gegenstueck: IRO_CALL.
+        var pw: int64 := self.stackSize / 4 + (pi - 6);
+        if pw > 255 || IR_BARG_SLOTS + pi + 1 > 255 {
+          EPrintStrLn("error: xtensa: Parameter jenseits von 255 Worten -- L32I/S32I erreichen ihn nicht (#2140)."c);
+          exit(1);
+        }
+        self.xt_L32I(XT_T0, XT_SP, pw);
+        self.xt_storeSlot(IR_BARG_SLOTS + pi);
+      }
+      pi := pi + 1;
+    }
     var instrStart: int64 := self.getFuncInstrStart(funcId);
     var instrCount: int64 := self.getFuncInstrCount(funcId);
     var i: int64 := 0;
@@ -677,6 +1580,22 @@ pub type EmitXtensa = class {
   // --------------------------------------------------------------------------
 
   pub fn init(irMod: int64) {
+    self.xtMainOff  := 0 - 1;
+    self.wort32Merker := 0;
+    self.poolOff    := 0;
+    self.poolCount  := 0;
+    self.poolCap    := 0;
+    self.poolFix    := alloc(65536 * 32);
+    self.poolFixN   := 0;
+    self.getpcOff   := 0;
+    self.xt_divOff  := 0;
+    self.xt_mulOff  := 0;
+    self.strDatCap  := 4096;
+    self.strDatBuf  := alloc(self.strDatCap);
+    self.strDatLen  := 0;
+    self.strIdxBuf  := alloc(1024 * 8);
+    self.strIdxN    := 0;
+    self.globDatOff := 0;
     self.ir              := irMod;
     self.codeBuf         := alloc(131072);
     self.codeCap         := 131072;
@@ -691,13 +1610,188 @@ pub type EmitXtensa = class {
     self.xt_printintOff  := 0;
   }
 
+  // ==================================================================
+  // #1786: Literal-Pool und PC-relative Adressen
+  //
+  // Der Pool steht ganz vorn im Abbild — L32R liest nur RUECKWAERTS
+  // (Ziel = ((PC+3) & ~3) + (imm16 − 65536) * 4, also bis 256 KB davor).
+  // Seine Groesse muss beim ersten Befehl schon feststehen, deshalb wird
+  // Platz reserviert und spaeter gefuellt. Ein Ueberlauf meldet sich, statt
+  // still auf einen fremden Eintrag zu zeigen.
+  // ==================================================================
+
+  // Traegt einen Eintrag ein und liefert seine Nummer.
+  fn xt_poolNeu(): int64 {
+    if self.poolCount >= self.poolCap {
+      EPrintStrLn("error: xtensa: Literal-Pool voll (#1786)."c);
+      EPrintStrLn("  Der Pool steht vor dem Code und ist deshalb in der Groesse"c);
+      EPrintStrLn("  festgelegt. Wer mehr braucht, erhoeht poolCap -- geraten wird hier"c);
+      EPrintStrLn("  nicht, ein falscher Eintrag zeigte sonst auf fremde Daten."c);
+      exit(1);
+    }
+    var idx: int64 := self.poolCount;
+    self.poolCount := self.poolCount + 1;
+    return idx;
+  }
+
+  // L32R at, pool[idx] — der Abstand steht beim Erzeugen fest.
+  fn xt_L32R_pool(at: int64, idx: int64) {
+    var ziel:  int64 := self.poolOff + idx * 4;
+    var bezug: int64 := (self.codeLen + 3) & -4;
+    var wort:  int64 := (ziel - bezug) >> 2;      // negativ
+    self.xt_e3((at << 4) | 1, wort & 0xFF, (wort >> 8) & 0xFF);
+  }
+
+  // Adresse einer Stelle im Abbild nach T0 holen — PC-relativ.
+  //
+  //   CALL0 marke     ; a0 = Adresse HINTER diesem Befehl
+  //   L32R  a9, pool  ; a9 = Ziel − diese Adresse
+  //   ADD   a8, a0, a9
+  //
+  // art: 0 = Zeichenkette (nummer = Literal-Index), 1 = globale Variable
+  // (nummer = Index). Wohin es zeigt, steht erst am Ende fest; deshalb wird
+  // der Pool-Eintrag vorgemerkt und spaeter gefuellt.
+  fn xt_adresseNachT0(art: int64, nummer: int64) {
+    var idx: int64 := self.xt_poolNeu();
+    // CALL0 auf die Marke: Ziel = ((PC & ~3) + 4) + off*4
+    var pc:   int64 := self.codeLen;
+    var off:  int64 := (self.getpcOff - ((pc & -4) + 4)) >> 2;
+    self.xt_CALL0(off);
+    var bezug: int64 := self.codeLen;   // a0 traegt genau diese Adresse
+    self.xt_L32R_pool(XT_T1, idx);
+    self.xt_ADD(XT_T0, XT_A0, XT_T1);
+    var rec: int64 := self.poolFix + self.poolFixN * 32;
+    poke64(rec + 0, idx);
+    poke64(rec + 8, bezug);
+    poke64(rec + 16, art);
+    poke64(rec + 24, nummer);
+    self.poolFixN := self.poolFixN + 1;
+  }
+
+  // Legt die Bytes eines Zeichenkettenliterals ab und liefert seine Nummer.
+  fn xt_strNeu(strOff: int64): int64 {
+    var strBufX: int64 := peek64(self.ir + 32);
+    var p:   int64 := strBufX + strOff;
+    var len: int64 := StrLen(p as pchar);
+    while (self.strDatLen + len + 1) > self.strDatCap {
+      var nc: int64 := self.strDatCap * 2;
+      var nb: int64 := alloc(nc);
+      var ci: int64 := 0;
+      while ci < self.strDatLen { poke8(nb + ci, peek8(self.strDatBuf + ci)); ci := ci + 1; }
+      self.strDatBuf := nb;
+      self.strDatCap := nc;
+    }
+    var nummer: int64 := self.strIdxN;
+    poke64(self.strIdxBuf + nummer * 8, self.strDatLen);
+    var i: int64 := 0;
+    while i < len { poke8(self.strDatBuf + self.strDatLen + i, peek8(p + i)); i := i + 1; }
+    poke8(self.strDatBuf + self.strDatLen + len, 0);
+    self.strDatLen := self.strDatLen + len + 1;
+    self.strIdxN := nummer + 1;
+    return nummer;
+  }
+
+  // #1782: heisst die Funktion "main"? Der Name steht als Offset im
+  // String-Pool des IR-Moduls.
+  fn xtIsMain(funcId: int64): int64 {
+    var funcBuf: int64 := peek64(self.ir + 80);
+    var rec:     int64 := funcBuf + funcId * 80;
+    if peek64(rec + 8) != 4 { return 0; }
+    var strBufX: int64 := peek64(self.ir + 32);
+    var p:       int64 := strBufX + peek64(rec + 0);
+    if peek8(p + 0) != 109 { return 0; }
+    if peek8(p + 1) != 97  { return 0; }
+    if peek8(p + 2) != 105 { return 0; }
+    if peek8(p + 3) != 110 { return 0; }
+    return 1;
+  }
+
+  // #1782: Code-Offset von main; -1, wenn das Modul keines hat.
+  pub fn getMainOff(): int64 { return self.xtMainOff; }
+
   pub fn emit(): int64 {
+    // #1786: Der Literal-Pool steht ganz vorn, denn L32R liest nur
+    // RUECKWAERTS. Seine Groesse muss also feststehen, bevor der erste Befehl
+    // entsteht — sie wird vorher aus dem IR gezaehlt, statt sie zu schaetzen.
+    // #2239: Merker zuerst — sie brauchen eigene Pool-Eintraege.
+    self.wort32Merker := _irWort32Merker(self.ir);
+    self.poolCap := self.xt_zaehleGlobalZugriffe();
+    self.poolOff := self.codeLen;
+    var pz: int64 := 0;
+    while pz < self.poolCap { self.xt_e32(0); pz := pz + 1; }
+
+    // Die Marke, die den Programmzaehler liefert: CALL0 hierher legt die
+    // Adresse des naechsten Befehls in a0, RET springt sofort zurueck. Sie
+    // muss wortausgerichtet sein — CALL0 rechnet ab (PC & ~3) + 4.
+    while (self.codeLen & 3) != 0 { self.xt_NOP(); }
+    self.getpcOff := self.codeLen;
+    self.xt_JX_A0();                    // RET
+    while (self.codeLen & 3) != 0 { self.xt_NOP(); }
+
     // WP-D3: prepend PrintStr + PrintInt helper subroutines before user code
     self.xt_emitHelpers();
     var n: int64 := self.getFuncCount();
     var i: int64 := 0;
     while i < n { self.emitFunc(i); i := i + 1; }
+    // #1782: jetzt steht jede Funktionsadresse fest — offene Vorwaertsaufrufe
+    // aufloesen.
+    self.applyPatches();
+
+    // #1786: der Datenbereich der globalen Variablen haengt hinter dem Code,
+    // vorbelegt mit den Anfangswerten. Auf dem ESP32 liegt er im IRAM und ist
+    // damit beschreibbar; das PT_LOAD-Segment traegt deshalb PF_W.
+    while (self.codeLen & 3) != 0 { self.xt_e1(0); }
+    self.globDatOff := self.codeLen;
+    var gCount: int64 := peek64(self.ir + 120);
+    var gBuf:   int64 := peek64(self.ir + 104);
+    var gi: int64 := 0;
+    while gi < gCount {
+      var gv: int64 := 0;
+      if gBuf != 0 { gv := peek64(gBuf + gi * 8); }
+      self.xt_e32(gv);
+      gi := gi + 1;
+    }
+
+    // Jetzt steht jede Zieladresse fest: die Pool-Eintraege tragen den ABSTAND
+    // vom jeweiligen Bezugspunkt (der Adresse hinter dem CALL0) zum Ziel.
+    var fi: int64 := 0;
+    while fi < self.poolFixN {
+      var rec:   int64 := self.poolFix + fi * 32;
+      var idx:   int64 := peek64(rec + 0);
+      var bezug: int64 := peek64(rec + 8);
+      var nummer: int64 := peek64(rec + 24);
+      self.xt_poke32at(self.poolOff + idx * 4, self.globDatOff + nummer * 4 - bezug);
+      fi := fi + 1;
+    }
     return self.codeLen;
+  }
+
+  // #1786: Wie viele Pool-Eintraege braucht dieses Modul? Je Zugriff auf eine
+  // globale Variable genau einer — der Abstand haengt an der Aufrufstelle.
+  fn xt_zaehleGlobalZugriffe(): int64 {
+    var summe: int64 := 0;
+    var fn2: int64 := 0;
+    var nf:  int64 := self.getFuncCount();
+    while fn2 < nf {
+      var st: int64 := self.getFuncInstrStart(fn2);
+      var ct: int64 := self.getFuncInstrCount(fn2);
+      var k:  int64 := 0;
+      while k < ct {
+        var o: int64 := self.getInstrOp(st + k);
+        if o == IRO_LOAD_GLOBAL || o == IRO_STORE_GLOBAL {
+          summe := summe + 1;
+          // #2239: ein Zugriff auf ein Global mit Merker braucht einen zweiten
+          // Eintrag — dieselbe Unterscheidung wie im Zweig IRO_LOAD_GLOBAL /
+          // IRO_STORE_GLOBAL, die beiden muessen uebereinstimmen.
+          var gIdxZ: int64 := self.getInstrSrc1(st + k);
+          if o == IRO_STORE_GLOBAL { gIdxZ := self.getInstrDest(st + k); }
+          if _irWort32MerkerFuer(self.wort32Merker, gIdxZ) >= 0 { summe := summe + 1; }
+        }
+        k := k + 1;
+      }
+      fn2 := fn2 + 1;
+    }
+    return summe;
   }
 
   pub fn getCodeBuf(): int64 { return self.codeBuf; }
@@ -811,24 +1905,22 @@ pub type XtensaBackend = class {
     poke16(elfBuf + 50, 0);            // e_shstrndx
 
     // PT_LOAD segment (32 bytes at offset 52)
+    // #1786: Das Segment trug p_offset = 0 und elfSize als Groesse — geladen
+    // wurde also die Datei MITSAMT ELF-Header, und der Code landete 4096 Byte
+    // hinter seiner eigenen Einstiegsadresse. Derselbe Fehler wie auf
+    // Cortex-M (#1744). Jetzt wird genau der Code geladen.
     poke32(elfBuf + 52, 1);               // p_type: PT_LOAD
-    poke32(elfBuf + 56, 0);              // p_offset: from file start
+    poke32(elfBuf + 56, codeFileOffset); // p_offset
     poke32(elfBuf + 60, 0x40080000);     // p_vaddr: IRAM base
     poke32(elfBuf + 64, 0x40080000);     // p_paddr
-    poke32(elfBuf + 68, elfSize);        // p_filesz
-    poke32(elfBuf + 72, elfSize);        // p_memsz
-    poke32(elfBuf + 76, 5);              // p_flags: PF_R | PF_X
+    poke32(elfBuf + 68, codeSize);       // p_filesz
+    poke32(elfBuf + 72, codeSize);       // p_memsz
+    // PF_W, weil der Datenbereich der globalen Variablen hinter dem Code liegt
+    // (#1786). Auf dem ESP32 ist IRAM beschreibbar.
+    poke32(elfBuf + 76, 7);              // p_flags: PF_R | PF_W | PF_X
     poke32(elfBuf + 80, 0x1000);         // p_align: 4096
 
-    var fd: int64 := open(path, 577, 493);
-    if fd < 0 {
-      EPrintStr("error: cannot write output: "c);
-      EPrintStrLn(path);
-      free(elfBuf, elfSize);
-      return;
-    }
-    write(fd, elfBuf as pchar, elfSize);
-    close(fd);
+    EmitWriteFile(path, elfBuf, elfSize);   // #1682
     free(elfBuf, elfSize);
   }
 };

@@ -1,6 +1,21 @@
-# Lyx v0.9.5B — Canonical EBNF Grammar
+# Lyx 1.2.36F — Canonical EBNF Grammar
 
-Status: Draft
+> Stand 2026-11-11, gegen lyxc 1.2.36F geprueft. Die Keyword-Liste in
+> Abschnitt 2.1 wurde Wort fuer Wort gegen den Compiler verifiziert; die
+> Typgrammatik in Abschnitt 7 ist um Funktions- und Methodenzeiger ergaenzt,
+> und die match-Produktion in Abschnitt 12 entspricht jetzt dem Parser.
+> Neu in dieser Fassung: Abschnitt 7 fuehrt die kurze Schreibweise der
+> vorzeichenbehafteten Ganzzahltypen (`i8`..`i64`) jetzt auch fuer den
+> var-Deklarator, und 20.1 haelt fest, wann Indexzugriffe geprueft werden und
+> wo schmale Ganzzahltypen gekuerzt werden.
+> Bekannte Abweichungen zwischen Grammatik und Compiler stehen in 20.1.
+
+Status: Normativ — verbindliche Fassung. Massgeblich ist ausschliesslich
+`ebnf.md` im Compiler-Repository (aurum); Dateien gleichen Namens in anderen
+Projekten sind Abschriften und veralten. Wer eine Abweichung zwischen
+Grammatik und Compiler meldet, nennt bitte die Versionszeile der Datei, gegen
+die er gemessen hat — fuenf Meldungen einer einzigen Runde (#1350, #1353,
+#1354, #1356, #1357) stammten aus einer Abschrift des Standes v0.9.3A.
 Target parser: Recursive Descent + Pratt Expression Parser
 Scope: Concrete syntax only.
 
@@ -15,7 +30,20 @@ HexDigit            = Digit | "A"…"F" | "a"…"f" ;
 BinaryDigit         = "0" | "1" ;
 OctalDigit          = "0"…"7" ;
 
-Ident               = Letter { Letter | Digit } ;
+Ident               = ( Letter | "_" ) { Letter | Digit | "_" } ;
+
+(* Der Unterstrich fehlte hier, obwohl er ueberall verwendet wird -- auch
+   fuehrend (`_thrCtl`, `cg_genCall`). Geprueft: `my_var`, `_x` und `x1` sind
+   gueltig, `1x` nicht.
+
+   Ein ALLEINSTEHENDER Unterstrich ist dagegen kein gewoehnlicher Ident: der
+   Lexer fuehrt ihn als eigenes Token. Er steht nur an zwei Stellen, und
+   beide Male als VERWURF -- im Wildcard-Muster eines `match` (Abschnitt 14)
+   und in der Zerlegung einer Mehrfachrueckgabe (`var a, _ := f()`, siehe
+   VarDecl). `var _: int64 := 5;` wird abgewiesen; dafuer gibt es keine
+   Bedeutung. Bis 1.1.3L war er auch in der Zerlegung abgewiesen -- vier
+   Testdateien im Bestand benutzten die Schreibweise und uebersetzten
+   deshalb nie (#1697). *)
 
 DecimalLiteral      = Digit { Digit | "_" } ;
 
@@ -43,7 +71,9 @@ StringLiteral       = '"'
 
 StringChar          = ? any Unicode scalar value except '"', '\', CR, LF ? ;
 
-EscapeSequence      = "\\" ( "n" | "r" | "t" | "\\" | '"' | "0" ) ;
+EscapeSequence      = "\\" ( "n" | "r" | "t" | "\\" | '"' | "'" | "0"
+                             | "x" HexDigit HexDigit ) ;
+HexDigit            = "0".."9" | "a".."f" | "A".."F" ;
 
 BoolLiteral         = "true" | "false" ;
 NullLiteral         = "null" ;
@@ -86,28 +116,59 @@ Examples:
 
 ## 2.1 Reserved Keywords
 
+Diese 70 Woerter sind reserviert und koennen nicht als Bezeichner
+verwendet werden. Die Liste ist gegen den Compiler geprueft: jedes Wort wurde
+als Variablenname eingesetzt und muss einen Fehler ausloesen.
+
 ```text
-fn var let co con
-if else while for do downto to repeat until
-switch case break continue default return
-true false null
-extern unit import pub as
-array struct flat packed class extends
-new dispose super static self Self
-private protected
-panic assert check
-enum match try catch throw limit
-virtual override abstract
-dim utype
+abstract and array as assert
+break case catch class co
+con continue default dim dispose
+do downto else enum extends
+extern false finally fn for
+if implements import in interface
+is let Map match
+new not null or override
+panic parallel pool private protected
+pub public repeat return RingBuffer
+self Set signal static struct
+super switch throw to true
+try type unit until utype
+var virtual where while
 ```
+
+Zwei Sonderfaelle:
+
+- `self` steht nicht in der Keyword-Tabelle des Lexers, sondern wird im Parser
+  gesondert behandelt (`src/parser.lyx`) — reserviert ist es dennoch.
+- `char` steht umgekehrt in der Keyword-Tabelle, laesst sich aber als Bezeichner
+  verwenden: es ist ein Typname, kein reserviertes Wort.
+
+Fruehere Fassungen dieses Dokuments fuehrten ausserdem `Self`, `flat`, `packed`,
+`check` und `limit` als reserviert. Das trifft nicht zu; alle fuenf sind als
+Bezeichner verwendbar.
 
 ## 2.2 Soft Keywords
 
 ```text
-range wraps defer
+range wraps defer limit layout widget
 ```
 
+`layout` und `widget` bedeuten nur innerhalb eines LFD-Formulars etwas und
+werden dort am Text erkannt, wie `form` es immer schon wurde. Bis 1.1.6C waren
+sie harte Schluesselwoerter und sperrten damit zwei Bezeichner, die in einer
+Oberflaechenbibliothek naheliegen (#1745).
+
 Soft keywords are tokenized as identifiers and interpreted contextually by the parser.
+
+`limit` wird nur unmittelbar hinter der Bedingung eines `while` und vor dem
+Block erkannt, gefolgt von "(" -- ueberall sonst bleibt es ein gewoehnlicher
+Bezeichner (#1103). Damit stimmen die WhileStmt-Produktion in Abschnitt 12 und
+die Feststellung oben, `limit` sei nicht reserviert, wieder ueberein.
+
+Hinweis zur Geschichte: `defer` lief in einem inneren Block lange am
+Funktionsende statt am Blockende (#1006, samt Argument-Zeitpunkt #1030), und
+`range(N)` erzeugte gar keinen Code (#1007). Beides ist behoben.
 
 ```text
 "defer" is recognized as DeferStmt only when an identifier token with text "defer"
@@ -132,6 +193,7 @@ TopDecl             = ImportDecl
                     | VarDecl
                     | FnDecl
                     | ExternFnDecl
+                    | ExternDataDecl
                     | TypeDecl
                     | EnumDecl
                     | DimDecl
@@ -141,6 +203,7 @@ TopDecl             = ImportDecl
 ImportDecl          = "import" ImportItem { "," ImportItem } ";" ;
 
 ImportItem          = DotPath
+                      [ "as" Ident ]
                       [ "grant"    "[" CapabilityList "]" ]
                       [ "restrict" "[" CapabilityList "]" ] ;
 ```
@@ -150,7 +213,12 @@ ImportItem          = DotPath
 # 4. Attributes and Directives
 
 ```ebnf
-Visibility          = "pub" ;
+Visibility          = ( "pub" | "public" ) ;
+
+(* #1245: `public` wurde vom Parser schon immer angenommen, war hier aber nicht
+   verzeichnet -- bei MemberVisibility stand es bereits. Wer nachschlug, hielt
+   `public fn` fuer ungueltig, obwohl es uebersetzt. Kanonisch bleibt `pub`;
+   `public` ist die gleichwertige Langform. *)
 
 Directive           = IoCheckDirective
                     | OverflowCheckDirective
@@ -176,14 +244,21 @@ FuncAttr            = EnergyAttr
 
 EnergyAttr          = "@energy" "(" IntLiteral ")" ;
 
+(* #2191: Mindest-CPU ab dieser Stelle fuer die folgenden Funktionen des
+   Bereichs. Wie @energy eine eigene Anweisung, kein Funktionsattribut: in
+   den Attributbits von FuncDecl ist kein Platz mehr. Hebt die Stufe aus
+   --target-cpu nur nach OBEN. *)
+CpuDirective        = "@cpu" "(" CpuLevel ")" [ ";" ] ;
+CpuLevel            = "baseline" | "sse4" | "avx2" | "avx512" ;
+
 DalAttr             = "@dal" "(" DalLevel ")" ;
 DalLevel            = "A" | "B" | "C" | "D" ;
 
 CriticalAttr        = "@critical" ;
 
-WcetAttr            = "@wcet" "(" IntLiteral ")" ;
+WcetAttr            = "@wcet" "(" IntLiteral ")" ;   (* Iterationen, 1..16777215 *)
 
-StackLimitAttr      = "@stack_limit" "(" IntLiteral ")" ;
+StackLimitAttr      = "@stack_limit" "(" IntLiteral ")" ;   (* Bytes, 1..16777215 *)
 
 FlightCritAttr      = "@flight_crit" ;
 
@@ -196,14 +271,36 @@ IntegrityMode       = "mode" ":"
                       | "scrubbed"
                       | "hardware_ecc" ) ;
 
-IntegrityInterval   = "interval" ":" IntLiteral ;
+IntegrityInterval   = "interval" ":" IntLiteral ;   (* ms, 1..3600000 *)
 
-VarAttr             = "@redundant"
-                    | "@volatile" ;
+(* #1878, seit 1.1.15A: `mode` ist PFLICHT -- `@integrity()` ohne Modus wird
+   abgewiesen. `software_lockstep` rechnet den Rueckgabeausdruck zweimal und
+   vergleicht vor dem `ret`; `interval` ist dort ein Widerspruch und wird
+   abgewiesen. `scrubbed` haengt einen periodischen CRC32-Sweep ueber den
+   geladenen Code ein (SIGALRM, Standardintervall 1000 ms).
+   `hardware_ecc` nennt die Grammatik, umgesetzt ist es NICHT: es braucht
+   ECC-Speicher und einen Weg an dessen Fehlerzaehler. Der Compiler weist den
+   Modus mit dieser Begruendung ab, statt ihn anzunehmen und nichts zu tun. *)
+
+VarAttr             = "@redundant"   (* TMR: drei Kopien + Mehrheitsentscheid, §20.1 *)
+                    | "@volatile"
+                    | "@align" "(" IntLiteral ")" ;
+(* "@align(N) var ..." — Allokations-Alignment (N Bytes) für array/heap-backed Locals.
+   LyxOS: über-alloziert + rundet Pointer auf N auf (emitAlloc). Skalare Stack-Locals: n/a. *)
 
 EndianAttr          = "@big_endian"
                     | "@little_endian" ;
+
+ModuleDocAttr       = ( "@description" | "@author" | "@copyright" | "@version" )
+                      "(" StringLiteral ")" ;
+(* Modulkopf-Angaben vor `unit`/`import`. Rein beschreibend; der Bestand
+   benutzt sie durchgaengig (#1099). *)
 ```
+
+Ein Attributname ausserhalb dieser Mengen ist ein Fehler, ebenso ein
+fehlendes, ueberzaehliges oder falsch getipptes Argument (#1099). Welche
+Attribute eine Wirkung haben und welche nur vermerkt werden, steht in
+Abschnitt 20.1.
 
 ---
 
@@ -230,6 +327,20 @@ VarDecl             = [ Visibility ]
 
 VarKind             = "var" | "let" | "co" ;
 
+TupleVarDecl        = VarKind ( Ident | "_" ) "," ( Ident | "_" )
+                      ":=" Expr ";" ;
+
+(* Zerlegung einer Mehrfachrueckgabe. Genau zwei Namen -- die
+   Aufrufkonvention traegt zwei Rueckgabewerte (rax, rdx), siehe Abschnitt 7.
+   An jeder der beiden Stellen darf `_` stehen und verwirft den Wert; beide
+   zugleich sind erlaubt, aber sinnlos. Ein Typ wird nicht angegeben, er
+   kommt aus dem Rueckgabetyp des Aufgerufenen. *)
+
+(* `let` und `co` binden einmal: eine Zuweisung nach der Initialisierung
+   wird abgewiesen. `var` bleibt beschreibbar. Bis 1.0.11D trug `let` den
+   Schutz nur im Namen und `co` wurde vom Parser gar nicht angenommen --
+   siehe #1083. *)
+
 IdentList           = Ident { "," Ident } ;
 ```
 
@@ -254,7 +365,8 @@ NestedFnDecl        = "fn"
                       [ ":" ReturnType ]
                       Block ;
 
-ExternFnDecl        = [ "@cap" "(" CapabilityPath ")" ]
+ExternFnDecl        = [ "@cap" "(" CapabilityPath ")"
+                      | CapabilitiesAttr ]
                       "extern"
                       "fn"
                       Ident
@@ -264,13 +376,57 @@ ExternFnDecl        = [ "@cap" "(" CapabilityPath ")" ]
                       StringLiteral
                       ";" ;
 
-TypeParamClause     = "[" TypeParamList "]" ;
+(* WSP-07: externes Daten-Symbol. Der Linkage-String steht DIREKT nach `extern`
+   (Unterscheidung von ExternFnDecl, wo `fn` folgt). Der Bezeichner liefert an
+   jeder Nutzung die ADRESSE des Symbols; sie wird zur Link-Zeit von `ld` aufgelöst
+   (z.B. Linker-Skript-Symbole __kernel_start/__kernel_end). Erfordert Ausgabe als
+   relocatable Objekt (`--emit=obj`); ohne Objektmodus ist es ein Compile-Fehler. *)
+ExternDataDecl      = "extern" StringLiteral Ident ":" Type ";" ;
+
+TypeParamClause     = "<" TypeParamList ">" ;
 
 TypeParamList       = Ident { "," Ident } ;
 
+(* Die eckige Form `[T]` stand hier frueher und war nie gueltig -- der Parser
+   erwartet spitze Klammern. `tests/generics_monomorph_test.lyx` folgte der
+   alten Angabe und scheiterte deshalb.
+
+   Generische FUNKTIONEN sind seit #1009 nutzbar: `fn Id<T>(x: T): T`, mehrere
+   Typparameter (`fn Pair<A, B>(a: A, b: B): A`), Aufrufe mit Struct-Typen
+   (`Id<P>(p)`) und -- seit #1117 -- die Weitergabe des eigenen Typparameters
+   an einen generischen Aufruf (`fn Twice<T>(x: T): T { return Id<T>(x); }`).
+   Ein Typparameter gilt nur INNERHALB seiner Funktion; ausserhalb ist er ein
+   unbekannter Typ und wird gemeldet.
+
+   Bis 1.2.15A wurden generische TYPEN (`type P<T> = struct {...}`) nicht
+   angenommen. Seit #2134 steht TypeParamClause auch an der Typdeklaration
+   (Abschnitt 7, TypeDecl).
+
+   Je Kombination von Typargumenten entsteht EIN Rumpf, mit T ersetzt -- auf
+   allen Zielen, x86 eingeschlossen (bis 1.2.15A war der x86-Rumpf
+   typgeloescht: ein Feld ueber T lieferte 0, f64 wurde abgewiesen). Die
+   Anzahl der Typargumente muss der der Typparameter entsprechen (sema,
+   #2134). Ein Aufruf OHNE Typargumente (`Max(8, 2)`) nimmt weiterhin den
+   typgeloeschten Rumpf; haengt darin ein Feldzugriff an T, bricht er an
+   dieser Stelle zur Laufzeit ab. Eine innere Funktion in einer generischen
+   Funktion wird auf x86 abgewiesen. *)
+
 ParamList           = Param { "," Param } ;
 
-Param               = [ "con" ] Ident ":" Type [ "=" Expr ] ;
+Param               = [ "con" ] [ "ref" ] Ident ":" Type [ "=" Expr ] ;
+
+(* #1528: `ref` uebergibt einen STRUCT-Parameter nach Referenz. Ohne `ref` ist
+   ein Struct-Parameter ein WERT: die Funktion bekommt beim Eintritt eine
+   Kopie, und Aenderungen daran bleiben in der Funktion. Das entspricht der
+   Zuweisung (`var b: T := a` kopiert seit #1351).
+
+   `ref` ist ein WEICHES Schluesselwort: es gilt nur unmittelbar vor einem
+   Parameternamen, der von einem Doppelpunkt gefolgt wird. `ref: int64` bleibt
+   ein Parameter, der schlicht so heisst, und `var ref := 5` eine gewoehnliche
+   Variable.
+
+   An einem eingebauten Skalartyp ist `ref` wirkungslos und wird gemeldet;
+   Klassen sind ohnehin Referenzen und werden nie kopiert. *)
 
 ReturnType          = Type | TupleType ;
 ```
@@ -280,14 +436,40 @@ ReturnType          = Type | TupleType ;
 # 7. Type Grammar
 
 ```ebnf
-TypeDecl            = [ Visibility ] "type" Ident "=" TypeDef ";" ;
+TypeDecl            = [ Visibility ] "type" Ident [ TypeParamClause ] "=" TypeDef ";" ;
+
+(* #2134: generische Typen. Mit TypeParamClause ist TypeDef nur StructDef,
+   FlatStructDef, PackedStructDef oder ClassDef -- kein Interface, kein
+   Alias, keine Einschraenkung `T: I` (laut abgewiesen).
+
+     type Box<T> = class { v: T; fn Get(): T { return self.v; } };
+     var b: Box<int64> := new Box<int64>();
+
+   Jede Nennung `Box<A>` (GenericTypeRef) steht fuer eine eigene Klasse
+   "Box<A>": Feld-Layout, Methoden und VMT entstehen je Typargument. Zwei
+   Nennungen derselben Kombination sind derselbe Typ; geschachtelt
+   (`Box<Box<int64>>`) und selbstbezueglich (`next: Node<T>`) geht.
+
+   Seit #2143 auch: ein generischer Typ einer ANDEREN Unit (`import gt;
+   Box<int64>` -- die Instanz entsteht in der Unit der Deklaration, deren
+   private Helfer gelten; ein Typ der rufenden Unit als Typargument wird
+   abgewiesen, dort waere er unbekannt) und ein Typparameter einer
+   generischen Funktion als Typargument (`Box<T>` in `fn f<T>`, je
+   Spezialisierung "Box<int64>"; der typgeloeschte Rumpf -- Aufruf ohne
+   Typargumente -- bricht dann zur Laufzeit ab). Ein Local vom Typparameter
+   (`var q: T`) ist so gueltig wie ein Parameter.
+
+   Laut abgewiesen (nicht umgesetzt): Ableitung von einer Instanz
+   (`extends Box<int64>`), ein Typargument, das kein schlichter Typname ist
+   (`Box<int64[]>`), eine generische Typdeklaration in einem `@if`-Zweig. *)
 
 TypeDef             = Type
                     | RangeTypeDef
                     | StructDef
                     | FlatStructDef
                     | PackedStructDef
-                    | ClassDef ;
+                    | ClassDef
+                    | InterfaceDef ;
 
 RangeTypeDef        = BaseIntType RangeClause ;
 
@@ -298,13 +480,16 @@ RangeBound          = [ "-" ] IntLiteral ;
 Type                = PrimaryType [ "?" ] ;
 
 PrimaryType         = BuiltinType
+                    | GenericTypeRef
                     | Ident
-                    | QualifiedIdent
                     | ArrayType
                     | ParallelArrayType
                     | TupleType
                     | MapType
-                    | SetType ;
+                    | FnPtrType
+                    | MethodPtrType ;
+
+GenericTypeRef      = Ident "<" TypeArgList ">" ;   (* #2134, siehe TypeDecl *)
 
 BuiltinType         = "bool"
                     | BaseIntType
@@ -313,29 +498,144 @@ BuiltinType         = "bool"
                     | "pchar"
                     | "void" ;
 
-BaseIntType         = "int8"
-                    | "int16"
-                    | "int32"
-                    | "int64"
-                    | "uint8"
-                    | "uint16"
-                    | "uint32"
-                    | "uint64"
-                    | "isize"
-                    | "usize" ;
+BaseIntType         = "int8"  | "i8"
+                    | "int16" | "i16"
+                    | "int32" | "i32"
+                    | "int64" | "i64"
+                    | "uint8"  | "u8"
+                    | "uint16" | "u16"
+                    | "uint32" | "u32"
+                    | "uint64" | "u64" ;
 
-QualifiedIdent      = Ident "::" Ident ;
+(* Beide Schreibweisen sind gueltig und bezeichnen denselben Typ; die kurze
+   (`u8`) ist im Bestand die haeufigere. Bis 1.0.11B kannte der Compiler die
+   kurze Form im var-Deklarator und die lange nur als Feldtyp -- `var x: uint8`
+   wurde abgewiesen, `feld: uint8` stillschweigend angenommen (#1010).
+
+   `isize` und `usize` standen hier frueher ebenfalls; der Compiler kennt sie
+   nicht (`unknown type in var decl`).
+
+   Die kurze Schreibweise der VORZEICHENBEHAFTETEN Typen (`i8`, `i16`, `i32`,
+   `i64`) wurde im var-Deklarator bis 1.0.11D abgewiesen -- als Feldtyp und im
+   `as`-Cast ging sie durch. Das ist dieselbe Asymmetrie, die #1010 fuer die
+   vorzeichenlose Haelfte geschlossen hat; sie ist seit #1151 beseitigt. *)
+
+(* Qualifizierter Zugriff gibt es seit 1.0.18F -- aber nur ueber einen
+   Import-Alias, nicht ueber den Modulnamen. `import std.math as m;` legt die
+   Unit in einen eigenen Namensraum; ihre Symbole heissen dann `m.Clamp64(...)`
+   und sind UNQUALIFIZIERT NICHT mehr sichtbar. Ohne Alias bleibt es beim
+   flachen Namensraum.
+
+   `Modul::Name` ist weiterhin ungueltig, und auch `std.math.Clamp64(...)` ist
+   es -- ein Punktpfad bezeichnet eine Datei, keinen Namensraum. Bis 1.0.18E
+   gab es gar keinen qualifizierten Zugriff; 31 Unit-Paare der eigenen
+   Standardbibliothek liessen sich deshalb nicht gemeinsam importieren
+   (#1262). Frueher stand hier `QualifiedIdent = Ident "::" Ident`; `::`
+   erzeugt einen Parse-Fehler. *)
 
 ArrayType           = "array" "[" Type "]"
-                    | "Array" "<" Type ">" ;
+                    | "Array" "<" Type ">"
+                    | FixedArrayType ;
+
+FixedArrayType      = "[" ConstExpr "]" Type
+                    | Type "[" ConstExpr "]" ;
+
+(* Beide Schreibweisen ergeben denselben Typ; die Groesse ist eine Konstante,
+   ein Bereich (`int64[0..100]`) wird abgewiesen. GENAU EINE Verschachtelung
+   ist umgesetzt: `[N][M]T` liegt FLACH -- N*M Slots hinter einem
+   `{cap,len}`-Kopf --, `m[i]` liefert die ADRESSE der Zeile i und `m[i][j]`
+   liest von dort mit Schrittweite 8. Beide Indizes werden unter
+   `--runtime-checks` geprueft. Eine ganze Zeile zuzuweisen (`m[i] := x`) hat
+   keine Bedeutung und wird gemeldet, ebenso eine dritte Dimension: der
+   Lesepfad kennt genau eine Zeilenlaenge. Bis 1.0.16G wurde `[N][M]T`
+   abgewiesen, davor belegte es nur N Slots und stuerzte bei JEDEM Zugriff ab
+   (#1230). *)
 
 ParallelArrayType   = "ParallelArray" "<" Type ">" ;
 
-TupleType           = "(" Type "," Type { "," Type } ")" ;
+(* Elementart: f32, f64, int8, int16, int32 oder int64. Alles andere wird
+   abgewiesen -- die Ablage braucht eine Schrittweite je Elementbreite und
+   die Vektorschleife eine Operation je Elementart (#2199, #2224, #2247).
+
+   Welche RECHNUNGEN es gibt, haengt an der Elementart, weil die CPUs nicht
+   mehr hergeben:
+
+     Gleitkomma        + - * /
+     int8, int64       + -
+     int16, int32      + - *
+
+   Fuer die Multiplikation auf 8 und 64 Bit und fuer Division und Rest auf
+   JEDER Ganzzahlbreite gibt es weder auf x86 (PMULLQ fehlt, Ganzzahl-
+   Division gar nicht) noch auf ARM64 (kein 64-Bit-MUL als Vektor) einen
+   Befehl. Das wird GEMELDET und nicht emuliert: eine Emulation waere eigener
+   Code mit eigener Laufzeit, und solange sie nicht da ist, ist die Meldung
+   die ehrliche Antwort.
+
+   `*` auf int32 braucht PMULLD und damit `--target-cpu=sse4`; ohne die
+   Zusage wird abgebrochen statt still etwas Langsameres zu erzeugen (#2191).
+   Auf ARM64 ist die Vektormultiplikation Grundbestand.
+
+   Ein Element wird VORZEICHENERWEITERT gelesen -- dieselbe Bedeutung, die
+   peek8/peek16/peek32 tragen (#2300). *)
+
+TupleType           = "(" Type "," Type ")" ;
+
+(* Die eckige Schreibweise `[T, T]` ist gleichbedeutend und bleibt gueltig;
+   der Bestand benutzt sie. GENAU ZWEI Elemente: die Aufrufkonvention traegt
+   zwei Rueckgabewerte (rax, rdx). Die Produktion liess bis 1.0.13P beliebig
+   viele zu, der Compiler wies ab drei ab -- jetzt sagen beide dasselbe.
+   (#1088, #1122) *)
+
+(* Funktions- und Methodenzeiger (seit 1.0.4A). In der Praxis ueber einen
+   Typalias verwendet:
+
+       type Cb = fn(int64): int64;
+       var f: Cb := dbl;          (* Funktionsname als Wert *)
+       f(21)
+
+   Ein Methodenzeiger fuehrt den Empfaenger als ersten Parameter und bindet
+   beim Zuweisen die Instanz; intern ist er ein 16-Byte-Paar {Code, Daten}:
+
+       type TM = method(TC): int64;
+       btn.on_click := form.Handle;   (* bindet form als self *)
+       btn.on_click(rcv)
+
+   Der Typ darf inline geschrieben werden (`var f: fn(int64): int64 := g;`) --
+   als lokale Variable, als Parameter und als Feld. Bis 1.0.11B stuerzte der
+   AUFRUF eines inline geschriebenen fn-Zeigers ab, weil der Aufrufpfad ihn nur
+   am Namen eines Typalias erkannte (#1003); der Typalias war deshalb die
+   einzige verlaessliche Form. *)
+
+FnPtrType           = "fn" "(" [ FnPtrParams ] ")" [ ":" Type ] ;
+
+MethodPtrType       = "method" "(" [ FnPtrParams ] ")" [ ":" Type ] ;
+
+FnPtrParams         = FnPtrParam { "," FnPtrParam } ;
+
+FnPtrParam          = [ Ident ":" ] Type ;   (* Parametername optional *)
 
 MapType             = "Map" "<" Type "," Type ">" ;
 
-SetType             = "Set" "<" Type ">" ;
+(* Seit #1152/#1205 ein benutzbarer Typ, nicht nur ein Wort: das Literal
+   `{k: v, ...}` legt an, `m[k]` liest, `m[k] := v` schreibt (legt an oder
+   aktualisiert), `k in m` prueft, `len(m)` zaehlt. Eine Deklaration OHNE
+   Initialisierung ist ebenfalls benutzbar — sie legt eine leere Map an.
+   Ein fehlender Schluessel liefert 0.
+
+   SCHLUESSELTYP: nur ganzzahlig (und `bool`). Die Laufzeit vergleicht den
+   Schluessel als Zahl; bei `pchar` waere das die ADRESSE, und gleich
+   geschriebene Literale haben verschiedene Adressen. `Map<pchar, V>` wird
+   deshalb bei der Deklaration abgewiesen — siehe #1291.
+
+   Bis 1.0.15A war nichts davon nutzbar: Lesen lieferte still eine Adresse,
+   Schreiben stuerzte ab, `in` war immer falsch. Die falschen WERTE kamen aus
+   dem Parser — `{5: 100}` verlor den Doppelpunkt an die Format-Schreibweise
+   `expr:breite` (§13) und wurde zur MENGE, deren Zweig jeden Wert auf 1 setzt.
+   NICHT umgesetzt sind `delete m[k]` und `for k, v in m` (#1152). *)
+
+(* `Set` ist als Wort reserviert, `Set<T>` wird von der Semantikpruefung aber
+   nicht aufgeloest ("unknown type in var decl"). Die Form ist fuer spaeter
+   vorgesehen und hier bewusst nicht als gueltige Produktion gefuehrt. *)
 ```
 
 ---
@@ -366,6 +666,13 @@ StructField         = Ident ":" Type ";" ;
 PackedField         = Ident ":" Type [ "at" "(" IntLiteral ")" ] ";" ;
 ```
 
+`flat` und `packed` sind WEICHE Schluesselwoerter und werden nur unmittelbar
+vor `struct` als solche gelesen (§2.1 haelt fest, dass sie nicht reserviert
+sind); ueberall sonst bleiben sie gewoehnliche Bezeichner. Beide Formen legen
+die Felder ohne Auffuellung hintereinander, jedes so breit wie sein Typ --
+dasselbe, was die Annotation `@packed` bewirkt. `at(N)` ist ein **Byte**-Offset
+vom Anfang des Structs, kein Bit-Offset. (#1084)
+
 ---
 
 # 9. Classes
@@ -374,9 +681,26 @@ PackedField         = Ident ":" Type [ "at" "(" IntLiteral ")" ] ";" ;
 ClassDef            = [ "abstract" ]
                       "class"
                       [ "extends" Type ]
+                      [ "implements" Ident { "," Ident } ]
                       "{"
                       { ClassMember }
                       "}" ;
+
+InterfaceDef        = "interface"
+                      "{"
+                      { MethodSignature }
+                      "}" ;
+
+MethodSignature     = "fn" Ident "(" [ ParamList ] ")" [ ":" ReturnType ] ";" ;
+
+(* Ein Interface deklariert nur Signaturen -- die Methoden sind ohne Rumpf und
+   implizit oeffentlich. `implements` sagt zu, dass die Klasse jede genannte
+   Methode traegt; die Semantikpruefung weist einen unbekannten Interface-Namen
+   ("unknown interface") und eine fehlende Methode ("class missing interface
+   method") ab. Der Aufruf ueber den Interface-Typ laeuft ueber die VMT, die
+   Methode braucht dafuer KEIN `virtual` -- die Zusage steckt im `implements`.
+   Bis 1.0.14C fehlte beides in dieser Grammatik, und der Aufruf lieferte
+   still 0 (#1133). *)
 
 ClassMember         = FieldDecl
                     | MethodDecl ;
@@ -405,7 +729,10 @@ MethodModifier      = "static"
 
 MemberVisibility    = "private"
                     | "protected"
-                    | "pub" ;
+                    | ( "pub" | "public" ) ;
+
+(* `public` ist eine gleichwertige Schreibweise zu `pub` -- an Funktionen wie
+   an Klassenmitgliedern (#1104). *)
 ```
 
 ---
@@ -472,6 +799,7 @@ Statement           = Block
                     | NestedFnDecl
                     | AssignStmt
                     | IncDecStmt
+                    | CompoundAssignStmt
                     | IfStmt
                     | WhileStmt
                     | ForStmt
@@ -484,6 +812,7 @@ Statement           = Block
                     | BreakStmt
                     | ContinueStmt
                     | DeferStmt
+                    | AsmStmt
                     | ExprStmt ;
 
 TupleUnpackStmt     = "var"
@@ -499,6 +828,9 @@ AssignStmt          = LValue ":=" Expr ";" ;
 
 IncDecStmt          = LValue ( "++" | "--" ) ";" ;
 
+(* Compound assignment: `x += y` desugars to `x := x + y` (likewise -= *= /= %=). *)
+CompoundAssignStmt  = LValue ( "+=" | "-=" | "*=" | "/=" | "%=" ) Expr ";" ;
+
 IfStmt              = "if"
                       "(" Expr ")"
                       Block
@@ -511,17 +843,30 @@ WhileStmt           = "while"
                       [ "limit" "(" ConstExpr ")" ]
                       Block ;
 
+(* limit(N) begrenzt die Zahl der DURCHLAEUFE des Rumpfes, einschliesslich:
+   N sind erlaubt, N+1 bricht mit panic ab. Die Schranke wird durchgesetzt,
+   nicht nur vermerkt -- sie ist das Mittel, die Endlichkeit einer Schleife
+   zuzusichern, und ein ungeprueftes Versprechen sagt darueber nichts aus.
+   N muss zur Uebersetzungszeit feststehen (Literal oder `con`); der Zaehler
+   beginnt bei jedem EINTRITT in die Schleife neu. `limit` ist ein weiches
+   Schluesselwort, siehe Abschnitt 2.2. RepeatStmt fuehrt es nicht. (#1103) *)
+
 ForStmt             = ForRangeStmt
                     | ForCStyleStmt ;
 
 ForRangeStmt        = "for"
                       Ident
-                      ":="
-                      Expr
-                      ( "to" | "downto" )
-                      Expr
+                      ( ":=" Expr ( "to" | "downto" ) Expr
+                      | "in" Expr ".." Expr
+                      | "in" "range" "(" Expr [ "," Expr ] ")" )
                       [ "do" ]
                       Block ;
+
+(* Drei Schreibweisen, zwei Bedeutungen der oberen Grenze:
+   `:= a to b` und `in a..b` laufen EINSCHLIESSLICH bis b, `in range(a, b)`
+   AUSSCHLIESSLICH bis b (`range(n)` beginnt bei 0). `in a..b` gab es bis
+   1.0.13S nicht -- der Parser wies es ab, obwohl `in` und `..` als Ausdruck
+   beide existieren (#1129). Rueckwaerts laeuft nur `downto`. *)
 
 ForCStyleStmt       = "for"
                       Ident
@@ -549,32 +894,83 @@ SwitchStmt          = "switch"
                       [ SwitchDefault ]
                       "}" ;
 
-SwitchCase          = "case" ConstExpr ":" { Statement } ;
+SwitchCase          = "case" ConstExpr ":" Block ;
 
-SwitchDefault       = "default" ":" { Statement } ;
+SwitchDefault       = "default" ":" Block ;
+
+(* #1232: Hier stand `{ Statement }`, also eine Anweisungsfolge ohne Klammern.
+   Der Parser verlangt einen Block; `case 1: PrintLn("a"); break;` scheitert mit
+   "expected {, got IDENT". Der Bestand hatte sich bereits nach dem Compiler
+   gerichtet und schrieb ueberall Bloecke -- die Grammatik sagte etwas anderes
+   zu, als der Compiler traegt. *)
+
+(* Jeder Zweig muss mit `break` oder `return` enden; ein durchfallender Zweig
+   wird gemeldet ("switch case may fall through"). Das kehrt das Verhalten von
+   C bewusst um: dort faellt ein Zweig ohne `break` in den naechsten, und die
+   haeufigste Fehlerquelle des Konstrukts ist genau das vergessene `break`.
+   Die Regel ist eine semantische Pruefung; die Grammatik allein erzwingt sie
+   nicht (#1104). *)
 
 MatchStmt           = "match"
-                      Expr
+                      [ "(" ] Expr [ ")" ]
                       "{"
                       { MatchCase }
-                      [ MatchDefault ]
                       "}" ;
 
 MatchCase           = "case"
                       Pattern
                       { "|" Pattern }
+                      [ "if" Expr ]          (* Guard *)
                       "=>"
-                      Block ;
+                      ( Expr | Block )
+                      [ ";" ] ;
 
-MatchDefault        = "default" "=>" Block ;
+(* Dieselbe Form ist auch als Ausdruck verwendbar (Abschnitt 15,
+   PrimaryExpr -> MatchExpr) und liefert dann den Wert des getroffenen
+   Fallrumpfes; trifft kein Fall, ist das Ergebnis 0.
+
+   Ein BLOCK als Fallrumpf traegt eine Anweisungsfolge -- das ist der Weg zu
+   mehreren Schritten je Zweig, denn eine Zuweisung ist in Lyx kein Ausdruck.
+   Als Ausdruck benutzt liefert ein Block den Wert seiner LETZTEN Anweisung,
+   sofern das ein Ausdruck ist; sonst 0. *)
+
+MatchExpr           = MatchStmt ;
+
+(* Korrekturen gegenueber frueheren Fassungen dieses Dokuments:
+   - Der Guard (`case p if cond => ...`) fehlte hier ganz, existiert aber.
+   - Ein `MatchDefault` mit dem Wort `default` gibt es NICHT -- der Parser
+     erwartet `case`. Der Auffangfall wird als `case _ =>` geschrieben.
+   - Der Fallrumpf durfte bis 1.0.11C nur ein AUSDRUCK sein; seit #1024 ist
+     auch ein Block zugelassen. *)
 
 TryStmt             = "try"
                       Block
-                      "catch"
-                      "(" Ident ":" Type ")"
-                      Block ;
+                      [ "catch" [ "(" Ident [ ":" Type ] ")" ] Block ]
+                      [ "finally" Block ] ;
+(* - Die Bindung ist seit #1147 lesbar: `catch (e: int64)` legt `e` im
+     catch-Block an und traegt den geworfenen Wert. Sie verdeckt eine
+     gleichnamige aeussere Variable NUR im Rumpf. Bis 1.0.15A wies der Parser
+     die Typangabe ab und band den Bezeichner nicht.
+   - Die Typangabe darf fehlen; der geworfene Wert ist dann `int64` (das rohe
+     Maschinenwort).
+   - Sie WAEHLT NICHT AUS: der Wert traegt keine Typkennung. Mehr als eine
+     catch-Klausel wird deshalb gemeldet statt still nacheinander ausgefuehrt.
+   - OHNE catch faengt der try-Block nichts: `finally` raeumt auf, danach geht
+     die Ausnahme WEITER zum naechsten Handler, und findet sie keinen, endet
+     das Programm mit 1. Bis 1.0.16G war sie verschluckt -- das finally lief,
+     der Code dahinter ebenfalls, und das Programm meldete rc=0, wo der nackte
+     `throw` mit rc=1 abbricht (#1242).
+   - Nur der x86-64-Pfad senkt try/catch ab. Fuer lyxos, arm64, riscv, arm-cm4
+     und xtensa wird es GEMELDET; eine Uebersetzung waere still falsch, weil
+     dort kein Handler installiert wird (#1281). *)
 
 ThrowStmt           = "throw" Expr ";" ;
+
+(* Findet der Wurf keinen Handler, endet das Programm mit 1. Fuer die
+   IR-Backends (lyxos, arm64, riscv, arm-cm4) ist das der einzige Fall, denn
+   try/catch wird dort gemeldet; bis 1.0.16G erzeugte `throw` fuer diese Ziele
+   gar keinen Code und war ein No-op (#1281). Auf xtensa wird `throw` gemeldet:
+   dort fehlt eine gepruefte Trap-Kodierung. *)
 
 ReturnStmt          = "return" [ Expr ] ";" ;
 
@@ -584,7 +980,74 @@ ContinueStmt        = "continue" ";" ;
 
 DeferStmt           = "defer" Statement ;
 
+(* Die angemeldete Anweisung laeuft beim Verlassen des Rahmens in LIFO-Reihen-
+   folge -- auf dem `return`-Weg, bei `break`/`continue` aus einer Schleife und
+   seit 1.0.16G auch dann, wenn die Funktion per `throw` verlassen wird. Bis
+   dahin uebersprang genau der Ausnahmeweg die Kette: ein `defer CloseFile(fd)`
+   leckte still im Fehlerfall, also in dem einzigen Fall, fuer den man es
+   schreibt (#1241). NICHT erfasst ist der DURCHLAUFENE Rahmen: wirft eine
+   gerufene Funktion, springt die Ausnahme ueber die Zwischenrahmen hinweg zum
+   Handler, und deren defers laufen nicht -- die Kette ist zur Uebersetzungszeit
+   bekannt, die erreichte Tiefe eines fremden Rahmens dagegen nicht. *)
+
+AsmStmt             = "asm" "{" { StringLiteral }
+                      [ ":" [ AsmOperandList ] [ ":" [ AsmOperandList ] ] ] "}" ;
+AsmOperandList      = AsmOperand { "," AsmOperand } ;
+AsmOperand          = ( "out" | "in" ) "(" StringLiteral "," Expr ")" ;
+
 ExprStmt            = Expr ";" ;
+```
+
+## 12.2 Inline-Assembly Rule (WSP-05)
+
+```text
+### Operandenbindung (#1324)
+
+Nach den Mnemonics koennen zwei durch `:` getrennte Abschnitte folgen: zuerst
+die AUSGABEN, dann die EINGABEN — dieselbe Reihenfolge wie bei GCC. Beide
+Abschnitte duerfen leer sein (`asm { "..." : : in("dx", p) }`).
+
+Jeder Operand nennt sein Register AUSGESCHRIEBEN, nicht als
+Constraint-Buchstaben: es gibt keinen Registerzuteiler, und ein Buchstabe
+wuerde eine Wahl versprechen, die niemand trifft.
+
+    asm { "in eax, dx" : out("eax", wert) : in("dx", port) }
+
+* `in("<reg>", <Ausdruck>)` — der Ausdruck wird VOR dem Block ausgewertet und
+  in das Register gelegt. Mehrere Eingaben werden erst vollstaendig berechnet
+  und danach verteilt; die Auswertung der zweiten kann die erste also nicht
+  zerstoeren.
+* `out("<reg>", <Variable>)` — NACH dem Block wird das Register in die
+  Variable geschrieben. Ziel ist eine lokale oder globale Variable.
+
+Erkannt werden rax/rcx/rdx/rbx/rsi/rdi samt ihren 32-, 16- und 8-Bit-Namen
+(eax, ax, al, ...). Geladen wird immer 64 Bit; welcher Teil benutzt wird,
+entscheidet die Instruktion im Block. Ein unbekannter Registername wird
+gemeldet.
+
+Die Bindung gilt derzeit fuer den x86-64-Weg (ELF, macOS, Windows). Auf den
+IR-Zielen weist ein Block mit Portbefehl laut ab, statt etwas Halbes zu
+erzeugen.
+
+"asm" is a soft keyword: it is recognized as AsmStmt only when an identifier
+token with text "asm" appears in statement position and is immediately followed
+by "{". Otherwise "asm" remains a normal identifier.
+
+Each StringLiteral in the block is one instruction mnemonic. The accepted
+mnemonic set is ARCHITECTURE-SPECIFIC (chosen by the compilation --target):
+
+    x86-64 / lyxos : cli sti hlt nop pause cpuid iretq wbinvd invd sfence
+                     lfence mfence rdtsc ud2 int3 leave ret
+                     in eax, dx / in al, dx / out dx, eax / out dx, al  (#1324)
+                     "lgdt [rdi]" "lidt [rdi]" "invlpg [rdi]"
+    arm64          : nop wfi wfe sev sevl yield isb dsb dmb svc brk hlt ret eret
+    arm-cm4 (Thumb): nop wfi wfe sev yield isb dsb dmb svc bkpt "cpsid i" "cpsie i"
+    riscv (linux)  : nop wfi fence fence.i ecall ebreak mret sret
+    xtensa (esp32) : nop
+
+A mnemonic not in the target's set is a hard compile error (no silent NOP).
+Mnemonics from a different architecture are therefore rejected. The block is
+never removed by optimization (each instruction has a side effect).
 ```
 
 ## 12.1 If/Else Binding Rule
@@ -624,20 +1087,87 @@ LValueSuffix        = "." Ident
 
 ```ebnf
 Pattern             = LiteralPattern
+                    | RangePattern
                     | IdentPattern
                     | EnumPattern
                     | WildcardPattern
-                    | TuplePattern ;
+                    | TuplePattern
+                    | StructPattern ;
 
 LiteralPattern      = Literal ;
 
+RangePattern        = RangeBound ".." [ RangeBound ] ;
+
+RangeBound          = [ "-" ] IntLiteral ;
+
+(* #1113: Grenzen sind EINSCHLIESSLICH, wie beim Bereichstyp in Abschnitt 7.
+   Die obere Grenze darf fehlen (`case 13001.. =>`), die untere nicht. Bei
+   Ueberschneidung gewinnt der ERSTE passende Zweig, wie bei den uebrigen
+   Mustern auch; eine Luecke zwischen zwei Baendern faellt an den Wildcard und
+   nicht an das naechstliegende Band. Ein Bereich ist auch als Alternative
+   eines Or-Musters (`case 0..9 | 20..29`) und mit Guard verwendbar.
+
+   Erzeugt werden zwei Vergleiche je Bereich, keine Sprungtabelle. *)
+
 IdentPattern        = Ident ;
 
-EnumPattern         = QualifiedIdent ;
+EnumPattern         = Ident "." Ident ;   (* z. B. Color.Green *)
+
+(* Erreichbar sind: LiteralPattern, WildcardPattern, IdentPattern (aufgeloest
+   ueber Konstanten und Enum-Mitglieder), EnumPattern in qualifizierter Form
+   (`Color.Green`), Guards und Or-Muster -- letztere auch mit Bezeichnern auf
+   beiden Seiten.
+
+   NICHT umgesetzt: BINDENDE Bezeichner-Muster. Ein blanker Bezeichner ist ein
+   VERWEIS auf eine Konstante, ein Enum-Mitglied oder eine lokale Variable --
+   nicht ein Name, an den der Wert gebunden wird. Beide Lesarten zugleich gehen
+   nicht, und die Verweis-Lesart ist die, auf der Enum-Muster beruhen. Benennt
+   der Bezeichner nichts, wird das gemeldet. Wer jeden Wert annehmen will,
+   schreibt `case _`.
+
+   Ein qualifiziertes Enum-Muster wird ueber den MITGLIEDSnamen aufgeloest --
+   Enum-Mitglieder liegen in einer flachen Konstantentabelle. Der Typname davor
+   dient der Lesbarkeit; zwei Enums mit gleichnamigen Mitgliedern kollidieren
+   deshalb weiterhin.
+
+   `match` ist Anweisung UND Ausdruck. Als Ausdruck liefert es den Wert des
+   getroffenen Fallrumpfes; trifft kein Fall und gibt es keinen Default, ist
+   das Ergebnis 0. *)
 
 WildcardPattern     = "_" ;
 
 TuplePattern        = "(" Pattern "," Pattern { "," Pattern } ")" ;
+
+(* Umgesetzt seit 1.0.16I (#1250). Geprueft wird zuerst die LAENGE -- ein
+   Muster mit zwei Teilen passt nicht auf ein dreielementiges Tupel --, dann
+   Element fuer Element. Teilmuster sind ein Ganzzahlliteral (auch negativ),
+   ein `con`- oder Enum-Name oder `_`; ein blanker Name ist auch hier ein
+   VERWEIS und keine Bindung, wie im uebrigen Abschnitt. Beliebig viele
+   Teilmuster sind zulaessig, weil der Tupel-Ausdruck die Ablage eines
+   Array-Literals hat; die Zweierschranke aus TupleType gilt nur fuer
+   RUECKGABEwerte. Bis 1.0.16I fehlte das Muster ganz und die Meldung lautete
+   `expected =>, got (`. *)
+
+StructPattern       = Ident "{" [ FieldPattern { "," FieldPattern } ] "}" ;
+
+FieldPattern        = Ident ":" ( IntLiteral | Ident | "_" ) ;
+
+(* Struktur-Muster: `case P { t: 1, f: _ }`. Das Muster passt, wenn ALLE
+   genannten Felder passen; nicht genannte Felder werden nicht geprueft.
+   Der Feldwert ist ein Vergleich (Ganzzahlliteral oder `con`), `_` (Feld
+   ungeprueft) oder eine BINDUNG: ein Bezeichner, der nichts benennt, bindet
+   den Feldwert an diesen Namen und ist im Fallrumpf sichtbar. Die Lesart
+   "Bezeichner = Verweis, wenn er einen kennt" ist dieselbe wie beim
+   Enum-Muster.
+
+   Ein unbekannter Typname oder Feldname wird gemeldet. Bis #1104 passte das
+   Muster IMMER: der Sprung bei einem nicht passenden Feld ging auf die
+   naechste Anweisung statt zum naechsten Fall, und der Vergleich lief
+   ohnehin nie an. Ein `match` mit mehreren Struktur-Fallen nahm damit stets
+   den ersten -- ohne Meldung.
+
+   Die geschweifte Form ist ein MUSTER, kein Wert: `var p: P := P { t: 1 };`
+   gibt es nicht (siehe Abschnitt 20.1). *)
 ```
 
 ---
@@ -653,7 +1183,6 @@ PipeExpr            = NullCoalesceExpr
                       { "|>" PipeTarget } ;
 
 PipeTarget          = Ident [ "(" [ PipeArgList ] ")" ]
-                    | QualifiedIdent [ "(" [ PipeArgList ] ")" ]
                     | FieldPipelineTarget ;
 
 FieldPipelineTarget = Ident "." Ident [ "(" [ PipeArgList ] ")" ] ;
@@ -661,17 +1190,47 @@ FieldPipelineTarget = Ident "." Ident [ "(" [ PipeArgList ] ")" ] ;
 PipeArgList         = "?" { "," Expr }
                     | Expr { "," Expr } ;
 
+(* Der gepipte Wert wird VORANGESTELLT: `50 |> Clamp(0, 30)` heisst
+   `Clamp(50, 0, 30)`. Steht ein `?` in der Liste, tritt der Wert an DESSEN
+   Stelle und wird nicht zusaetzlich vorangestellt. Bis 1.0.16I fiel er ohne
+   Platzhalter ersatzlos weg, und der Aufruf scheiterte an der Argumentzahl --
+   benutzbar war `|>` damit nur ohne weitere Argumente oder mit `?` (#1253). *)
+
 NullCoalesceExpr    = LogicalOrExpr
                       { "??" LogicalOrExpr } ;
 
+(* `&&` und `||` werten KURZ: ist das Ergebnis nach der linken Seite bereits
+   entschieden, wird die rechte gar nicht ausgewertet. Damit traegt das
+   uebliche Null-Guard-Idiom `p != 0 && deref(p)`.
+
+   Bis lyxc 1.0.11A war das nicht so -- beide Seiten wurden ausgewertet und
+   danach verknuepft, wodurch genau dieses Idiom segfaultete. Siehe Issue
+   #1023. Das Ergebnis ist in beiden Faellen 0 oder 1. *)
+
 LogicalOrExpr       = LogicalAndExpr
-                      { "||" LogicalAndExpr } ;
+                      { ( "||" | "or" ) LogicalAndExpr } ;
 
 LogicalAndExpr      = BitwiseOrExpr
-                      { "&&" BitwiseOrExpr } ;
+                      { ( "&&" | "and" ) BitwiseOrExpr } ;
+
+(* `and`, `or` und `not` sind gleichwertige Schreibweisen zu `&&`, `||` und
+   `!` -- gleiche Praezedenz, gleiche KURZSCHLUSSauswertung: die rechte Seite
+   wird nur ausgewertet, wenn die linke sie nicht schon entscheidet (#1104). *)
 
 BitwiseOrExpr       = BitwiseXorExpr
                       { ( "|" | "|~" ) BitwiseXorExpr } ;
+
+(* `|~` ist BITWEISES NOR: `a |~ b` entspricht `~(a | b)`. Auf Ganzzahlen ist
+   das nachrechenbar -- `12 |~ 10` = `~14` = `-15`.
+
+   Auf WAHRHEITSWERTEN ist es KEIN logisches NOR, und das ist die Falle:
+   `true |~ false` rechnet `~1` = `-2`, und alles ungleich 0 ist wahr. Wer
+   logisches NOR meint, schreibt `not (a or b)`. Ein Test in
+   `regression/operators/` hat sich genau daran verrechnet und war jahrelang
+   gruen, weil sein Fall `false |~ false` = `-1` zufaellig ebenfalls wahr ist
+   (#1819). Bis 1.0.x emittierte der Codegen fuer `|~` ausserdem gar nichts und
+   lieferte still 0 -- der Operator stand in Lexer und Parser, aber in keinem
+   Emit-Zweig. *)
 
 BitwiseXorExpr      = BitwiseAndExpr
                       { "^" BitwiseAndExpr } ;
@@ -694,22 +1253,35 @@ AdditiveExpr        = MultiplicativeExpr
 MultiplicativeExpr  = UnaryExpr
                       { ( "*" | "/" | "%" ) UnaryExpr } ;
 
-UnaryExpr           = ( "+" | "-" | "!" | "~" ) UnaryExpr
+UnaryExpr           = ( "+" | "-" | "!" | "not" | "~" | "@" ) UnaryExpr
                     | CastExpr ;
+(* "@" Ident  = Adresse-von (address-of) eines Locals/Params → Slot-Adresse.
+   Codegen: ELF lea rax,[rbp+off]; LyxOS IRO_LOAD_LOCAL_ADDR (PR #872). *)
 
-CastExpr            = PostfixExpr [ "as" Type ] ;
+CastExpr            = PostfixExpr [ ( "as" | "as" "?" | "is" ) Type ] ;
+
+(* "is" prueft die Typzugehoerigkeit und liefert bool (#1094).
+   Zielt der Test auf eine Klasse MIT Methoden, so wird zur Laufzeit ueber den
+   Typzeiger geprueft, und zwar gegen die Zielklasse SAMT ihrer Nachfahren:
+   `b is A` ist wahr, wenn B von A abstammt. `null` ist nie ein T.
+   In allen uebrigen Faellen steht die Antwort zur Uebersetzungszeit fest;
+   der Empfaenger wird dennoch ausgewertet. Siehe Abschnitt 20.1. *)
 
 PostfixExpr         = PrimaryExpr { PostfixSuffix } ;
 
-PostfixSuffix       = CallSuffix
-                    | GenericCallSuffix
-                    | IndexSuffix
+PostfixSuffix       = IndexSuffix
                     | FieldSuffix
                     | SafeFieldSuffix ;
 
-CallSuffix          = "(" [ ArgList ] ")" ;
+(* Ein Aufruf haengt am NAMEN, nicht an einem beliebigen Ausdruck: `f(a, b)`
+   und `f<T>(a, b)` sind Primaerausdruecke. Ein Aufruf ueber einen indizierten
+   Ausdruck -- `handlers[0](a, b)` -- ist NICHT vorgesehen und wird abgewiesen;
+   ein Funktionszeiger wird zuerst einer Variablen zugewiesen und ueber diese
+   aufgerufen. Der Methodenaufruf `obj.m(a, b)` steht bei FieldSuffix. *)
 
-GenericCallSuffix   = "[" TypeArgList "]" "(" [ ArgList ] ")" ;
+CallExpr            = Ident "(" [ ArgList ] ")" ;
+
+GenericCallExpr     = Ident "<" TypeArgList ">" "(" [ ArgList ] ")" ;
 
 IndexSuffix         = "[" Expr "]" ;
 
@@ -720,13 +1292,35 @@ SafeFieldSuffix     = "?." Ident ;
 PrimaryExpr         = Literal
                     | SelfExpr
                     | SuperExpr
+                    | CallExpr
+                    | GenericCallExpr
                     | Ident
-                    | QualifiedIdent
+                    | MatchExpr
                     | BuiltinCall
                     | NewExpr
                     | DisposeExpr
+                    | LambdaExpr
                     | TupleExpr
                     | "(" Expr ")" ;
+
+LambdaExpr          = "fn" "(" [ ParamList ] ")" [ ":" Type ] Block ;
+
+(* Bis 1.0.16I fehlte diese Produktion, obwohl der Parser die Form seit jeher
+   annimmt und die Doku sie an 35 Stellen nennt.
+
+   EINFANGEN: was der Rumpf aus der umgebenden Funktion liest, wird BEIM
+   ANLEGEN kopiert (by value). Eine spaetere Zuweisung an die aeussere Variable
+   wirkt nicht mehr -- `var f := fn(x: int64): int64 { return x + n; };` mit
+   anschliessendem `n := 1` rechnet weiter mit dem alten `n`.
+
+   DARSTELLUNG: ein Lambda OHNE Einfangen ist eine gewoehnliche Funktion -- der
+   Wert ist ihre Adresse, und es passt damit in einen `fn(...)`-Typ, als
+   Variable wie als Parameter. Faengt es etwas ein, ist der Wert ein Satz aus
+   Adresse und Umgebung; ein `fn(...)`-Typ traegt davon nur die Adresse, und
+   der Uebergang wird deshalb GEMELDET. Bis 1.0.16I entschied die Aufrufstelle
+   ihre Aufrufkonvention allein nach dem deklarierten Typ, waehrend der Wert
+   stets ein Satz war: `var f: fn(int64): int64 := fn(x: int64): int64 {…}`
+   sprang mitten in diesen Satz -- SIGSEGV ohne jede Meldung (#1249). *)
 
 SelfExpr            = "self" | "Self" ;
 
@@ -734,12 +1328,29 @@ SuperExpr           = "super" ;
 
 TupleExpr           = "(" Expr "," Expr { "," Expr } ")" ;
 
+(* Ein Tupel-AUSDRUCK ist dieselbe Ablage wie ein Array-Literal: `{cap,len}`-Kopf,
+   dann die Elemente. `var u := (1, 2);` ist damit indizierbar (`u[0]`, `u[1]`)
+   und traegt `len(u)` = 2; der Tupel-TYP einer Variablen wird nicht getrennt
+   gefuehrt. Davon unabhaengig ist die Rueckgabe ZWEIER Werte in rax und rdx,
+   entnommen mit `var a, b := f();` -- dort gilt die Zweierschranke aus
+   TupleType. *)
+
 ArgList             = Arg { "," Arg } ;
 
 Arg                 = NamedArg
                     | Expr ;
 
 NamedArg            = Ident ":" Expr ;
+
+(* Benannte Argumente duerfen in beliebiger Reihenfolge stehen; ein
+   POSITIONELLES Argument nach einem benannten wird gemeldet. Ein Parameter
+   gilt als versorgt, wenn er positionell oder benannt belegt ist ODER einen
+   Vorgabewert hat -- damit laesst sich ein hinterer Parameter einzeln setzen
+   und ein mittlerer auf seinem Vorgabewert lassen (`G(1, c: 9)`). Bis 1.0.16I
+   schaltete jedes benannte Argument die Vorgabewerte ab: sobald eines im
+   Aufruf stand, verlangte die Pruefung jeden Parameter (#1252). Ebenfalls bis
+   1.0.16I setzte der Pfad fuer SIEBEN und mehr Argumente Vorgabewerte gar
+   nicht ein -- die Werte lagen dann verschoben. *)
 
 TypeArgList         = Type { "," Type } ;
 ```
@@ -776,23 +1387,123 @@ LValue follows the same rule via the { LValueSuffix } repetition.
 
 ---
 
+## 15.3 Operator Overloading
+
+```text
+Operator overloading adds NO syntax — the productions AdditiveExpr,
+MultiplicativeExpr, EqualityExpr, RelationalExpr and the index PostfixSuffix
+are used unchanged. It is a semantic (overload-resolution) rule, which by the
+disclaimer in Section 19 is otherwise outside this EBNF; documented here for
+discoverability.
+
+When the left operand of an operator has a static type that is a `class`
+defining the corresponding method, the operator desugars to a method call on
+that operand:
+
+    +  -> .Add(rhs)      -  -> .Sub(rhs)      *  -> .Mul(rhs)
+    /  -> .Div(rhs)      %  -> .Mod(rhs)
+    == -> .Eq(rhs)       != -> .Ne(rhs)   (falls back to !(.Eq(rhs)))
+    <  -> .Lt(rhs)       <= -> .Le(rhs)   >  -> .Gt(rhs)   >= -> .Ge(rhs)
+    a[i] -> a.Get(i)
+
+Resolution rules:
+  - The left operand must resolve to a class type: an identifier of class type,
+    another arithmetic operator overload (its result class is the left
+    operand's class), or a call to a free function with a class return type.
+  - The class must define the operator's method (a defined ClassName_Method
+    label) or inherit it from a base class; otherwise the operator keeps its
+    normal built-in meaning. So int/f64/pchar operators and normal array/pchar
+    indexing are unaffected. (Inherited operator methods: since 1.2.11G.)
+  - `!=` additionally falls back to negating `.Eq` when no `.Ne` is defined.
+
+A method call is also a valid left operand and a valid receiver: its class is
+resolved through the receiver's class plus the declared return type, so
+`a.M() + b`, `a.M() == b`, `a.M()[i]` and chains like `t.Trim().ByteLength()`
+work. Chains resolve recursively, so the receiver may itself be a method call
+or a free function returning a class.
+
+An operand whose class cannot be determined statically keeps the operator's
+built-in meaning; there is no runtime fallback. The call is bound statically,
+to the method of the operand's static class.
+
+The rule holds on every target. Until 1.2.11F it was implemented only on the
+x86-64 fast path; on the IR targets (arm64, riscv, lyxos) every operator kept
+its built-in meaning even on class operands.
+```
+
+---
+
+## 15.4 Builtin Names and User Definitions (#2082)
+
+```text
+A call by a bare name resolves in this order:
+  1. a nested function in scope (#2044),
+  2. a function WITH BODY declared at the top level of the CURRENT unit,
+  3. a builtin of that name.
+A function of the current unit therefore shadows a builtin of the same
+name completely -- on every target, regardless of the argument count.
+An `extern fn` declaration has no body and does not shadow a builtin.
+```
+
+Bis 1.2.13D galt das je Ziel verschieden: x86 nahm immer den Builtin,
+arm64/riscv nahmen fuer einen Teil der Namen die eigene Definition
+(`fn StrLen` ergab 3 bzw. 99), fuer `sqrt`, `Print*`, `Inspect` und
+`profile_*` dagegen den Builtin.
+
+**Funktionen IMPORTIERTER Units** mit Builtin-Namen (§20.1) verdecken den
+Builtin nicht: der Aufruf geht an den Builtin -- seit 1.2.15A auf x86, arm64
+und riscv gleich (#2103). Ausnahme #1311: StrSplit, StrFind, StrTrim,
+FloatToStr, FileSize, ArgvGetStr mit einer anderen Argumentzahl als die
+Builtin-Form meinen die Unit-Funktion. Ausnahme lyxos: dort ersetzen die
+std-Fassungen Builtins, die das Backend nicht kennt (#1388) -- die
+importierte Funktion gewinnt. Bis 1.2.14C nahm der IR-Weg fuer einen Teil
+der Namen (peek8, StrLen, ...) die Unit-Funktion.
+
 # 16. Built-in and Special Expressions
 
 ```ebnf
-BuiltinCall         = CheckExpr
-                    | PanicExpr
-                    | AssertExpr
-                    | VerifyIntegrityCall ;
+BuiltinCall         = PanicExpr
+                    | AssertExpr ;
 
-CheckExpr           = "check" "(" Expr ")" ;
+(* #1234: Hier standen zusaetzlich CheckExpr (`check(...)`) und
+   VerifyIntegrityCall (`VerifyIntegrity()`). Beide gibt es nicht -- der
+   Compiler meldet "undefined function 'check'" bzw.
+   "undefined function 'VerifyIntegrity'". `panic` und `assert` sind dagegen
+   vorhanden und verhalten sich wie unten beschrieben. *)
 
 PanicExpr           = "panic" "(" [ Expr ] ")" ;
+(* panic ist KEIN Ausnahmemechanismus: die Meldung geht nach stderr, dann
+   endet der Prozess mit 1. Ein umschliessendes `try` faengt ihn NICHT, und
+   `finally` laeuft nicht mehr an — der Abbruch ist die Zusicherung des
+   Konstrukts. Bis 1.0.15A sprang er in einen installierten Handler und war
+   damit fangbar; das Programm lief mit gebrochener Invariante weiter (#1149).
+   Dasselbe gilt fuer `assert`, die Bereichs- und die Grenzpruefung. Fangbar
+   ist allein `throw`. *)
 
 AssertExpr          = "assert" "(" Expr ")" ;
 
-VerifyIntegrityCall = "VerifyIntegrity" "(" ")" ;
+NewExpr             = "new" Type "(" [ ArgList ] ")"
+                    | "new" Type "[" Expr "]" ;
 
-NewExpr             = "new" Type "(" [ ArgList ] ")" ;
+(* Die zweite Form belegt ein Array, dessen Laenge erst zur LAUFZEIT feststeht:
+   `16 + n*8` Byte, also `{cap,len}`-Kopf und n Slots, wie ein `[N]T`. `len(a)`
+   liest denselben Kopf, und die dynamische Bereichspruefung haelt den Index
+   dagegen. Eine Laenge <= 0 bricht mit `panic` ab. Bis 1.0.16G gab es die Form
+   nicht -- eine gerechnete Groesse zwang zu alloc/poke64 (#1255).
+
+   Der belegte Speicher ist GENULLT, beide Formen. Ein Feld, das der
+   Konstruktor nicht setzt, liest sich also als 0, und `new T[n]` beginnt mit
+   n Nullen. Bis 1.1.12H galt das nur zufaellig: alle Ziele ausser lyxos
+   bekommen frische Seiten vom Betriebssystem, und die sind genullt (Linux
+   anonymes mmap, Windows VirtualAlloc). LyxOS nullt nicht, dieselbe Quelle
+   verhielt sich dort also anders -- still, denn unter Linux besteht jedes
+   vergessene Feld die Pruefung auf 0. #1848 macht die Zusicherung
+   verbindlich; der lyxos-Zweig nullt seither selbst.
+
+   Auf freistehenden Zielen (arm-cm*, esp32*) gibt es `new` NICHT: kein
+   Betriebssystem, kein Allokator, keine Quelle fuer Speicher, der den Aufruf
+   ueberlebt. Der Uebersetzer meldet das (#1783 fuer arm-cm, #1848 fuer
+   xtensa); bis dahin lieferte er dort still einen Nullzeiger. *)
 
 DisposeExpr         = "dispose" Expr ;
 ```
@@ -804,16 +1515,15 @@ DisposeExpr         = "dispose" Expr ;
 Constant expressions use the same precedence model as runtime expressions, but with a restricted primary set.
 
 ```ebnf
-ConstExpr                 = ConstPipeExpr ;
+ConstExpr                 = ConstNullCoalesceExpr ;
 
-ConstPipeExpr             = ConstNullCoalesceExpr
-                            { "|>" ConstPipeTarget } ;
-
-ConstPipeTarget           = Ident [ "(" [ ConstPipeArgList ] ")" ]
-                          | QualifiedIdent [ "(" [ ConstPipeArgList ] ")" ] ;
-
-ConstPipeArgList          = "?" { "," ConstExpr }
-                          | ConstExpr { "," ConstExpr } ;
+(* #1232: Hier standen ConstPipeExpr, ConstPipeTarget und ConstPipeArgList.
+   Der Pipe-Operator ist im Konstantenausdruck nicht umgesetzt und wird
+   ausdruecklich abgewiesen ("pipe-forward not allowed in const expression").
+   Das ist auch stimmig: `|>` reicht einen Wert an eine FUNKTION weiter, und
+   ein Funktionsaufruf steht zur Uebersetzungszeit nicht zur Verfuegung --
+   dieselbe Grenze, an der auch WP-1.2 Aufrufe im Konstantenausdruck sperrt.
+   Zur Laufzeit gibt es den Operator unveraendert. *)
 
 ConstNullCoalesceExpr     = ConstLogicalOrExpr
                             { "??" ConstLogicalOrExpr } ;
@@ -870,7 +1580,6 @@ ConstSafeFieldSuffix      = "?." Ident ;
 
 ConstPrimaryExpr          = Literal
                           | Ident
-                          | QualifiedIdent
                           | ConstTupleExpr
                           | "(" ConstExpr ")" ;
 
@@ -905,8 +1614,8 @@ Whether a construct is compile-time evaluable is a semantic decision.
 | ----: | ---------------------------------------------------------- | ------------- |
 |     1 | `\|>`                                                      | Left          |
 |     2 | `??`                                                       | Left          |
-|     3 | `\|\|`                                                     | Left          |
-|     4 | `&&`                                                       | Left          |
+|     3 | `\|\|`, `or`                                               | Left          |
+|     4 | `&&`, `and`                                                | Left          |
 |     5 | `\|`, `\|~`                                                | Left          |
 |     6 | `^`                                                        | Left          |
 |     7 | `&`                                                        | Left          |
@@ -915,8 +1624,8 @@ Whether a construct is compile-time evaluable is a semantic decision.
 |    10 | `<<`, `>>`                                                 | Left          |
 |    11 | `+`, `-`                                                   | Left          |
 |    12 | `*`, `/`, `%`                                              | Left          |
-|    13 | unary `+`, unary `-`, `!`, `~`                             | Right         |
-|    14 | `as`                                                       | Left          |
+|    13 | unary `+`, unary `-`, `!`, `not`, `~`                      | Right         |
+|    14 | `as`, `is`                                                 | Left          |
 |    15 | call, generic call, index, field access, safe field access | Left          |
 
 ---
@@ -965,6 +1674,79 @@ visibility and module export rules
 default parameter value evaluation order and scoping
 named argument resolution when callee is an imported or builtin function
 ```
+
+## 20.1 Bekannte Abweichungen zwischen Grammatik und Compiler
+
+Stellen, an denen der Parser mehr annimmt, als der Rest der Werkzeugkette
+tragen kann. Sie sind hier festgehalten, damit die Grammatik nicht mehr
+verspricht, als eingeloest wird.
+
+Der Stand ist aus der Testinventur zu Issue #1004 hervorgegangen; die
+Einzelbefunde sind dort verlinkt.
+
+| Konstrukt | Abschnitt | Verhalten |
+|---|---|---|
+| Bindendes Muster | 14 | `case x =>` (jeden Wert annehmen und an den Namen binden) ist **nicht umgesetzt und auch nicht vorgesehen**. Ein blanker Bezeichner ist ein VERWEIS auf eine Konstante, ein Enum-Mitglied oder eine lokale Variable; beide Lesarten zugleich gehen nicht, und auf der Verweis-Lesart beruhen die Enum-Muster. Wer jeden Wert annehmen will, schreibt `case _`. (#1024) |
+| `Set<T>` | 7 | Als Wort reserviert, von der Semantikpruefung nicht aufgeloest (`unknown type in var decl`). |
+| `Map<K,V>` | 14 | Benutzbar seit 1.0.15A (#1152/#1205): Literal, `m[k]` lesen und schreiben, `k in m`, `len(m)`, Deklaration ohne Initialisierung. Schluessel nur ganzzahlig — ein `pchar`-Schluessel wuerde ueber die Adresse verglichen und wird abgewiesen (#1291). Ein fehlender Schluessel liefert 0. `delete m[k]` und `for k, v in m` gibt es nicht. |
+| `new T[n]` (Heap-Array) | 15 | **Erledigt** -- die Produktion ist nachgezogen: `NewExpr` fuehrt seit 1.0.16G beide Formen. Die Zeile stand hier, solange der Parser mehr konnte als die Grammatik nannte (nachgemessen mit 1.1.6E: `new uint8[n]` und `new int64[4]` belegen Speicher, auch mit zur Laufzeit bestimmter Groesse). Sie bleibt als Standvermerk stehen; eine Abweichung ist es nicht mehr. |
+| `&x` (Adress-Operator) | 15 | Gibt es nicht. Ein Ausgabeparameter wird als Zelle uebergeben (`alloc(8)`, danach `peek64`). (#1061) |
+| Builtin-Name in einer IMPORTIERTEN Unit | 15.4 | **Erledigt** seit 1.2.15A: auf x86, arm64 und riscv gewinnt der Builtin (Ausnahmen #1311 und lyxos, siehe 15.4). Bis 1.2.14C nahm der IR-Weg fuer einen Teil der Namen die Unit-Funktion. (#2082, #2103) |
+| Aufruf ueber indizierten Ausdruck | 15 | `handlers[0](a)` ist kein Aufruf -- ein Aufruf haengt am NAMEN. Wird abgewiesen; ein Funktionszeiger wird zuerst einer Variablen zugewiesen. (#1053) |
+| Nullable-Suffix, Pruefung | 7 | `T?` wird geparst und am Typknoten vermerkt, loest aber KEINE zusaetzliche Pruefung aus: ein nicht-nullbarer Typ nimmt weiterhin `null` an, und ein nullbarer wird ohne `?.` ungeprueft dereferenziert. Das Suffix dokumentiert die Absicht, es erzwingt sie nicht. `?.` dagegen prueft zur Laufzeit. (#1092) |
+| Struktur-Literal als Wert | 15 | `P { t: 1, f: 0 }` gibt es nur als MUSTER (§14, StructPattern), nicht als Ausdruck: `var p: P := P { t: 1 };` wird mit "expected expression" abgewiesen. Ein struct-Local wird ohne Initialisierer angelegt und feldweise gefuellt. Die Asymmetrie ist festgehalten, nicht behoben. (#1104) |
+| Attribute ohne Nachweis | 4 | `@dal` und `@critical` werden geparst, in ihrer Argumentform geprueft und am Knoten vermerkt -- der Compiler weist die Zusicherung aber **nicht** nach. Keine TMR-Verifikation. `@stack_limit` (seit 1.0.14K, #1138), `@wcet` (seit 1.0.14L, #1139), `@flight_crit` (seit 1.0.14M, #1140) und `@integrity` (seit 1.1.15A, #1878) sind NICHT mehr darunter. Sie sind seit #1099 nicht mehr stumm: jedes Vorkommen meldet den fehlenden Nachweis. Wer die Annotation setzt, bekommt sie also als Vermerk, nicht als Beweis. Unbekannte Attributnamen und falsche Argumentformen werden abgewiesen. |
+| Typtest `is`, Reichweite | 15 | Zur LAUFZEIT geprueft wird nur gegen eine Klasse MIT Methoden -- nur die traegt einen Typzeiger. Eine Klasse OHNE Methode bekommt struct-Layout und damit keine VMT; dort ist die Antwort der statisch bekannte Vererbungsweg (plus `null`-Probe), und ein zur Laufzeit eingelagerter anderer Typ waere nicht zu sehen. Wo der statische Typ des Empfaengers nicht bestimmbar ist oder der genannte Typ weder Klasse noch eingebauter Typ ist (Alias, Generik), MELDET der Compiler das, statt `false` zu liefern. (#1094) |
+| Doppelte Mitglieder | 9 | Seit 1.1.3G (#1668): zwei gleichnamige Mitglieder in DERSELBEN Klasse werden abgewiesen — zwei Methoden, zwei Felder, oder ein Feld und eine Methode. Lyx kennt keine Ueberladung, es koennte also nur eines gelten. Die Meldung nennt beide Zeilen. In verschiedenen Klassen ist derselbe Name erlaubt, ebenso `override` in einer Ableitung. Fuer freie Funktionen auf Modulebene gilt dasselbe seit #1135. |
+| `ClassName()` | 15 | Seit 1.1.3D (#1670): `obj.ClassName()` liefert den Klassennamen als `pchar`. Bei einer Klasse MIT Methoden dynamisch ueber den Typzeiger — eine als Basisklasse deklarierte Variable meldet die tatsaechliche Klasse. Eine Klasse OHNE Methoden traegt keinen Typzeiger; dort ist es der statische Name. Ein Empfaenger ohne bestimmbaren Klassentyp wird gemeldet. Weitergehende Typinformation zur Laufzeit (Feld- und Methodennamen) gibt es NICHT. |
+| `static` an Feldern | 9 | `static fn` gibt es (Aufruf ueber den Typnamen, `self` darin abgewiesen). `static` an einem FELD wird abgewiesen: der Zugriff hiesse `A.v`, und diese Schreibweise bezeichnet in Lyx bereits den Byte-OFFSET des Feldes -- std/string.lyx nutzt sie so (`StringBuilder.capacity`). Welche Bedeutung gelten soll, ist eine Sprachentscheidung. Eine Klassenkonstante wird als `con` auf Modulebene geschrieben. (#1090) |
+| Default-Werte, Auswertung | 15.1 | Ein weggelassenes Argument wird durch den Default ersetzt, solange die uebersprungenen Parameter am ENDE stehen. Steht hinter einem Default noch ein Parameter OHNE, laesst sich der Default nicht ueberspringen. Der Ausdruck muss zur Uebersetzungszeit feststehen -- er wird an jeder Aufrufstelle eingesetzt, ein nicht-konstanter liefe sonst je Aufruf erneut. Die Kombination aus benannten Argumenten und uebersprungenen Defaults gibt es nicht. (#1089) |
+| Tupel-Entpacken, geklammerte Form | 12 | `var (q, r) := f();` gibt es nicht -- §12 (TupleUnpackStmt) schreibt die Form OHNE Klammern vor: `var q, r := f();`. Die DokuWiki fuehrt faelschlich die geklammerte. (#1088) |
+| Tupel, Stelligkeit und Elementtypen | 7 | Ein Tupel hat GENAU ZWEI Elemente -- die Aufrufkonvention traegt zwei Rueckgabewerte (`rax`, `rdx`). Mehr wird beim Parsen abgewiesen; die Grammatik in §7 nannte bis 1.0.13P faelschlich `{ "," Type }`. Als Element sind auch Struct- und Klassentypen zugelassen: der Slot haelt den ZEIGER, wie bei jeder Struct-Variablen sonst. Bis 1.0.13P trug der entpackte Name keinen Typ -- der Zeiger kam an, aber `a.v` fand kein Feld und lieferte still `0` (#1122). Der Typ wird jetzt aus dem deklarierten Rueckgabetyp des Aufgerufenen uebernommen, bei freien Funktionen wie bei Methoden (auch geerbten). Ist der Aufgerufene dem Codegen unbekannt (importiert, Builtin), bleibt der Name typlos wie bisher. |
+| Rechtsshift, Vorzeichen | 15 | `>>` zieht auf einem vorzeichenBEHAFTETEN Typ das Vorzeichenbit nach (arithmetisch, `SAR`) und fuellt auf einem vorzeichenLOSEN mit Nullen auf (`SHR`) -- massgeblich ist der LINKE Operand. Erkannt wird der Typ, wo er ohne Aufwand feststeht: eine Variable mit deklariertem Typ (lokal oder global) und der `as`-Cast; alles andere gilt als vorzeichenbehaftet. `(x as uint64) >> n` ist damit der ausdrueckliche Weg zum logischen Shift, den Rotationen und Konstante-Zeit-Idiome brauchen. Bis 1.0.13R fuellte `>>` IMMER mit Nullen auf: `-8 >> 1` ergab 9223372036854775804 statt -4, und weil das Ergebnis riesig positiv ist, folgte meist ein Speicher- oder Indexfehler statt einer Meldung (#1125). Der Shift-BETRAG wird wie in der Hardware auf 6 Bit maskiert -- `1 << 64` ergibt `1`, nicht `0`. |
+| `in` als Operator | 15 | `x in a..b` prueft die Zugehoerigkeit zu einem Bereich, Grenzen EINSCHLIESSLICH wie beim Bereichsmuster in `match` und beim Bereichstyp; ein offenes Ende (`a..`) ist nach oben unbeschraenkt. Steht rechts kein Bereich, gilt weiterhin die Woerterbuch-Zugehoerigkeit (`schluessel in map`). Bis 1.0.13S lief JEDES `in` in den Woerterbuch-Zweig: `_lyx_map_has` bekam als "Map" das, was der Bereichsknoten hinterliess -- kein Zeiger, sondern die obere Grenze, waehrend die untere unbalanciert auf dem Stack blieb. Der Ausdruck uebersetzte und stuerzte zur Laufzeit ab (#1129). |
+| for-Laufvariable, Sichtbarkeit | 9 | Die Laufvariable einer for-Schleife ist BLOCKWEISE, in allen vier Formen (`for i in a..b`, `for i := a to b` / `downto`, die C-artige `for i := a; bed; schritt` und `for i in range(n)`). Sie gilt nur im Rumpf; nach der Schleife ist der Name wieder das, was er davor war -- eine gleichnamige AEUSSERE Variable behaelt ihren Wert (`var i := 40; for i in 0..3 { }` laesst `i` auf 40). Gibt es keine aeussere Variable, ist der Name nach der Schleife unbekannt und sema weist ihn ab. Bis 1.2.21D traf das nur die IR-Ziele: der x86-Codegen liess den Eintrag der Laufvariable in der Lokalenliste stehen, sodass sie die aeussere Variable fuer den REST der Funktion verdeckte -- derselbe Quelltext gab je nach Ziel 4 oder 40 aus (#2277). Die Bereichsgrenzen unterscheiden sich dabei: `a..b` ist einschliesslich, `range(n)` laeuft bis `n-1`. |
+| Enum-Werte | 10 | Ein Mitglied ohne eigenen Wert zaehlt vom vorigen weiter, beginnend bei 0; ein ausdruecklicher Wert setzt den Zaehler neu (`A = 5, B, C` ergibt 5, 6, 7 — wie in C). Der Wert muss zur UEBERSETZUNGSZEIT feststehen (Literal, `con`, konstanter Ausdruck) und im Bereich 0..4294967295 liegen: Wert und Nutzlastgroesse teilen sich intern eine int64 (Wert unten, Groesse oben), ein negativer oder groesserer Wert liefe in die obere Haelfte. Beides wird gemeldet. Bis 1.0.14A wurde der angegebene Wert VERWORFEN: der Wertausdruck haengt am Mitglied als Kind und wurde als Nutzlast gezaehlt, womit `E.A` bei `A = 10` den Wert 2^32 + 0 lieferte -- auch dann, wenn der angegebene Wert der impliziten Zaehlung entsprach (#1131, #1157). Eine Nutzlast gibt es in der Deklaration nicht; die Musterform `Ok(wert)` wird beim `match` aufgeloest. |
+| Speicherklassen, Schreibschutz | 11 | Eine Zuweisung an `let`, `co`, einen `con`-PARAMETER und seit 1.0.14C auch an eine `con`-Deklaration wird abgewiesen -- in jeder Form (`:=`, `+=`, `++`, `--`) und in beiden Geltungsbereichen. Bis 1.0.14B fiel die con-Deklaration durch, und das Ergebnis hing vom Ort ab: eine LOKALE `con` liess sich tatsaechlich aendern, bei einer GLOBALEN verpuffte die Zuweisung, weil der Wert als Immediate im Code steht. Derselbe Quelltext tat also je nach Geltungsbereich etwas anderes, gemeldet wurde nichts (#1132). |
+| Interfaces, Dispatch | 9 | Ein Aufruf ueber eine Variable vom Interface-Typ laeuft ueber die VMT und trifft die Methode der WIRKLICHEN Klasse; die implementierende Methode braucht kein `virtual`. Umgesetzt ueber Selektoren: die Namen aller in Interfaces deklarierten Methoden bekommen je einen festen Slot, den JEDE Klasse an derselben Stelle fuehrt -- nur so trifft der Aufruf, der bloss das Interface kennt, dieselbe Stelle. Mehrere Interfaces an einer Klasse, Vererbung und die Mischung mit `virtual`/`override` sind damit abgedeckt. Bis 1.0.14C wurde das Interface als gewoehnliche Klasse registriert und fuer jede seiner Methoden ein LEERER Rumpf erzeugt, der 0 zurueckgab -- genau den rief der Aufruf ueber die Schnittstelle (#1133). Was ein Interface NICHT hat: Felder, Standardimplementierungen und einen Typtest `is` gegen den Interface-Namen. |
+| Statische Pruefungen, Reichweite | 20 | Geprueft werden Namen, Stelligkeit und -- seit 1.0.14F/G -- Typen bei Initialisierung, Zuweisung, `return` und Argumenten, dazu die fehlende Rueckgabe, der doppelt vergebene Name im selben Block und die doppelt deklarierte Funktion im selben Modul. Die Typableitung kennt Literale, Variablen mit deklariertem Typ, den `as`-Cast und den Rueckgabetyp einer im selben Lauf deklarierten Funktion; alles andere (Builtins, Importiertes, Feld- und Indexzugriffe, Methodenaufrufe) gilt als unbestimmt und wird NICHT gemeldet. Zwei Muster bleiben ausdruecklich zugelassen: der `as`-Cast (er IST die Umwandlung) und die Null in einem `pchar`-Ziel (Nullzeiger). Eine Zeichenkette in einem GANZZAHL-Ziel war bis 1.0.14H ebenfalls zugelassen, weil `int64` in der stdlib durchgehend als Zeigertyp diente; das ist mit #1221 aufgeraeumt (470 Stellen in 16 Dateien tragen jetzt `pchar`), und seit 1.0.14I wird auch diese Richtung gemeldet. Arithmetik auf `pchar` bleibt ebenfalls zulaessig: `pchar` IST ein Zeiger, `peek8(src + i)` ist die uebliche zeichenweise Iteration. Die return-Pruefung ist KEINE Flussanalyse -- sie meldet nur, wenn im Rumpf gar kein Ausgang (`return`, `throw`, `panic`, `exit`) vorkommt. (#1135) |
+| `@stack_limit`, Nachweis | 4 | Die Schranke wird in BYTES angegeben und in zwei Teilen geprueft: der Codegen haelt die RAHMENGROESSE der Funktion dagegen (er kennt sie, wenn er `sub rsp, imm32` patcht), und eine Funktion mit dem Attribut darf nicht rekursiv sein -- ohne nachweisbare Aufruftiefe ist der Gesamtverbrauch unbeschraenkt. Der Aufrufgraph erkennt auch INDIREKTE Zyklen. Beides sind harte Fehler. Nicht erfasst: der Verbrauch der AUFGERUFENEN Funktionen (Summe entlang der Aufrufkette) und dynamisch angeforderter Speicher. Zu beachten: ein `int64[N]` liegt NICHT im Rahmen -- Arrays bekommen einen Heap-Block, der Slot haelt den Zeiger, der Rahmen waechst also nur um 8 Byte je Variable. Bis 1.0.14J war das Attribut ein blosser Vermerk (#1099, #1138). |
+| `@wcet`, Nachweis | 4 | Die Schranke zaehlt ITERATIONEN, nicht Zyklen: eine Zyklenzahl braeuchte ein Mikroarchitekturmodell, jede Zahl in einer Kostentabelle waere erfunden und damit ein Beweisanschein. Gezaehlt wird kumulativ -- eine Schleife mit Schranke B, in deren Rumpf I Iterationen stecken, traegt B * (1 + I) bei; zwei geschachtelte Zehnerschleifen ergeben 110. Abzaehlbar sind `for ... to`/`downto` und `for i in a..b` mit literalen Grenzen, `for i in range(A, B)`, `while (c) limit(N)` (§12) und `while (i < C)` mit literalem Startwert des Zaehlers, konstanter Grenze und GENAU EINER Fortschaltung `i := i + K`, K > 0. Alles andere ist in einer `@wcet`-Funktion ein harter FEHLER, kein stiller Durchlass: berechnete Schleifengrenzen, `repeat/until`, das C-artige `for`, Rekursion (auch indirekt, ueber den Aufrufgraphen) und der Aufruf einer Funktion ohne eigene Schranke. Traegt der Gerufene selbst ein `@wcet`, geht dessen N in die Summe ein. Kostenfrei sind allein die Speicher-Builtins `peek8/16/32/64`, `poke8/16/32/64` und `exit` -- sie erzeugen geradlinigen Code; die Liste steht in `src/frontend/wcet.lyx`. Importierte Funktionen liegen nicht vor und sind damit nicht nachweisbar, `PrintLn` eingeschlossen. Gilt auch fuer METHODEN. Bis 1.0.14K war das Attribut ein blosser Vermerk (#1099, #1139). |
+| `@flight_crit`, Wirkung | 4 | Schaltet die SSE-Ausnahmen fuer *invalid* (MXCSR-Bit 7) und *divide-by-zero* (Bit 9) frei: der Prolog der annotierten Funktion sichert MXCSR und loescht die beiden Masken, der Epilog schreibt den alten Wert zurueck. Eine entstehende NaN oder Inf loest damit SIGFPE aus statt still weiterzulaufen; der Compiler gibt den passenden Handler mit (`__lyx_fc_handler`, eingehaengt in `main`), der `panic: FPU-Ausnahme (NaN/Inf oder Division durch 0) unter @flight_crit in \`NAME\`` meldet und mit 134 endet. **Reichweite: dynamisch.** MXCSR ist THREAD-Zustand -- ab dem Eintritt gilt der Trap auch fuer alles, was die Funktion RUFT, bis sie zurueckkehrt; ein Maskieren vor jedem Aufruf wuerde die Zusage an der ersten Funktionsgrenze enden lassen. Gilt auch fuer METHODEN. Nicht erfasst: Ueberlauf (Bit 10), Unterlauf (Bit 11) und Ungenauigkeit (Bit 12) bleiben maskiert -- zugesagt sind NaN und Inf, nicht jede IEEE-Ausnahme. Ganzzahlige Division durch 0 (#DE) loest denselben SIGFPE aus und wird vom Handler mitgemeldet; deshalb nennt der Text beide Anlaesse. Bis 1.0.14L war das Attribut ein blosser Vermerk (#1099, #1140). |
+| `@redundant`, Reichweite und Pruefung | 4 | Die Variable wird DREIFACH abgelegt (TMR): drei Zellen hintereinander, Lesen ueber die Mehrheitsentscheidung, Schreiben in alle drei. Der Voter HEILT dabei die Minderheit -- eine verfaelschte Kopie wird ueberstimmt und korrigiert. Gilt seit 1.0.15A auch fuer GLOBALE Variablen (drei Datenzellen, Anfangswert in allen dreien); bis dahin wirkte das Attribut auf Modulebene gar nicht: acht Byte, kein Voter, kein Hinweis (#1141). Die Adresse-von-Form `@x` liefert die Adresse EINER Kopie und umgeht damit den Voter; ein Schreibzugriff darueber geht beim naechsten Mehrheitsentscheid verloren. Das wird gemeldet -- unter `--verify-tmr` als Fehler, sonst als Warnung. `--verify-tmr` druckt ausserdem die Bilanz (Variablen, gevotete Lesezugriffe, dreifache Schreibzugriffe, Umgehungen) und schlaegt mit Exit 1 fehl, sobald ein Zugriff am Voter vorbeigeht; eine Bilanz ohne Fehlschlag waere nur ein Bericht. |
+| Binaere Operatoren, Typen | 15 | Die Operanden von `+ - * / %` und `^ & \| << >>` werden auf ihre Typen geprueft: `bool` ist dort keine Ganzzahl (`true + 1` ergab 2) und `pchar` kein Rechenwert (`"abc" * 2`). Die Meldung nennt den Operator und beide Typen. ZUGELASSEN bleibt, was die Sprache umgesetzt hat: die VERKETTUNG `pchar + pchar` (der Codegen emittiert dafuer StrConcat), die ZEIGERARITHMETIK `pchar + int64` und `pchar - int64` (auch `int64 + pchar`; `peek8(src + i)` steht im Bestand an 807 Stellen) und die BOOLESCHE ALGEBRA `^`, `&`, `\|` auf zwei Wahrheitswerten. Geurteilt wird nur, wenn BEIDE Typen bestimmt sind. Vergleiche bleiben unberuehrt. (#1143) |
+| `Print`/`PrintLn`, Typbestimmung | 15 | Der Drucker waehlt die Ausgaberoutine zur UEBERSETZUNGSZEIT (`cg_inferPrintType`): Zeichenkette, Gleitkomma, Wahrheitswert, sonst Ganzzahl. Eine VERKETTUNG als Argument fiel bis 1.0.15A durch und wurde als Zahl ausgegeben -- `PrintLn("Wert: " + IntToStr(7))` druckte die Adresse. Die Verkettung selbst war dabei immer richtig; nur ihre Einstufung fehlte (#1143). Ein Aufruf wird seit #1058 ueber den deklarierten Rueckgabetyp beziehungsweise die Liste der Zeichenketten-Builtins eingestuft. |
+| Benannte Argumente, Auswertungsreihenfolge | 15.1 | `F(b: 2, a: 1)` ordnet richtig zu, wertet die Argumente aber in PARAMETERREIHENFOLGE aus, nicht in der geschriebenen. Bei Seiteneffekten in den Argumenten ist das sichtbar. Wo die Deklaration nicht herangezogen werden kann (importiert, extern, variadisch, generisch, Builtin), werden benannte Argumente ABGEWIESEN statt stillschweigend positionell genommen. (#1087) |
+| Einheitentypen, Semantik | 11 | `utype N: Dim = Faktor` wirkt: bei Zuweisung zwischen Einheiten DERSELBEN Dimension rechnet der Compiler mit dem Faktorverhaeltnis um — erst multiplizieren, dann ganzzahlig teilen, `Km` nach `M` also exakt, `M` nach `Km` abschneidend wie die Ganzzahldivision sonst. Die DIMENSION wird geprueft: Zuweisung ueber Dimensionsgrenzen, Addition zweier Dimensionen und das Verrechnen mit einer dimensionslosen Zahl werden abgewiesen. Erlaubt bleiben ein Literal als Wert (`var a: Km := 2`), die Skalierung mit einer Zahl (`a * 3` behaelt die Einheit) und der `as`-Cast als bewusster Fluchtweg. `range LO..HI` bricht ausserhalb mit `panic` ab, `wraps LO..HI` rechnet in den Bereich zurueck; Grenzen einschliesslich, konstante Werte meldet der Compiler sofort. Bis 1.0.13D war `utype` ein Typalias mit dekorativem Faktor, und `range`/`wraps` parsten gar nicht (#1110). NICHT gerechnet werden abgeleitete Dimensionen: `dim Speed = Meter / Second` wird angenommen, aber `laenge / zeit` ergibt keine `Speed` — das Ergebnis gilt als dimensionslos, und `utype`-Werte sind ganzzahlig. |
+| Array als Funktionsparameter | 6 | `fn F(a: int64[4])` uebergibt den ZEIGER auf die Ablage: der Callee liest und schreibt denselben Speicher, eine Zuweisung darin ist beim Aufrufer sichtbar. Die deklarierte Groesse wird mitgenommen, `len(a)` liefert sie, und die Bereichspruefung unter `--runtime-checks` (#1156) greift auch hier. Gilt fuer alle Uebergabewege: Register, Stack (ab dem siebten Argument) und Methodenparameter. Bis 1.0.13F fehlte im Callee die Merkung "das ist ein Array" — der Indexzugriff fiel in den Zweig fuer einen rohen Zeiger, lieferte lesend eine Adresse und schrieb ins Leere (#1115). Die Schreibweise `array[T]` ist als Parametertyp weiterhin nicht zugelassen. |
+| Array mit Struct-/Klassen-Elementtyp | 7 | `T[N]` haelt ZEIGER-Slots: `arr[i] := s` teilt das Objekt mit `s`, wie die Struct-Zuweisung sonst auch, und `arr[i].feld := x` wirkt auf beide. Die Slots werden bei der Deklaration mit frischen Objekten belegt — ein `arr[0].v := 42` braucht also kein vorheriges `new`, genau wie ein `var s: S;` seit WP-10d angelegt wird. Belegt werden `16 + N*8` Byte: die 16 sind der `{cap,len}`-Kopf, den der Indexzugriff ueberspringt. Bis 1.0.13C wurde der Elementtyp am Local nicht vermerkt, `arr[0].v` bekam Feldoffset -1 und lieferte still `0`; ausserdem wurden nur `N*8` Byte angefordert, die Zugriffe lagen also um einen Kopf verschoben dahinter (#1109). Ein `array[T]`, `Array<T>` oder `T[]` OHNE Initialisierung wird seit 1.0.13H ebenfalls belegt: leer, mit `{cap,len}`-Kopf (`len` = 0). `len(a)` liefert damit 0 statt auf eine Null zu treffen, und ein Schreibzugriff kommt an; `push` findet den Zeiger gesetzt vor und legt nicht erneut an. Bis 1.0.13G war die Variable null, und nur `push` legte an — beim ERSTEN Aufruf (#1177). |
+| Aggregate auf Modulebene | 10 | Ein globales `[N]T` oder ein globales Struct passt nicht in den 8-Byte-Slot der Variablen. Es bekommt seit 1.0.16G einen eigenen Block im Datenbereich -- `{cap,len}`-Kopf plus `N*8` Byte beim Array, die Feldgroesse beim Struct --, der Slot traegt einen ZEIGER darauf; das ist dieselbe Form, die ein Local zur Laufzeit per mmap anlegt, nur schon zur Uebersetzungszeit. Damit wirken `q[0] := 3`, `s.x := 3`, `len(q)` und ein Array-Literal als Startwert auch auf Modulebene, und der Typ darf UNTER der Variablen deklariert stehen (das Layout wird vorgezogen). Bis 1.0.16G blieb der Slot 0: `q[0] := 3` schrieb nach Adresse 16 und stuerzte ab, `s.x := 3` verpuffte still, und ein Array-Literal als Startwert fiel ersatzlos weg -- der zugehoerige Test druckte 0/0/0 und galt trotzdem als gruen (#1256, #1299). Nicht umgesetzt und deshalb GEMELDET: Struct-Elemente in einem globalen Array (jedes Element braeuchte ein eigenes Objekt, das es zur Uebersetzungszeit nicht gibt), `@redundant` auf einem Aggregat und eine Elementzahl, die keine Konstante zwischen 1 und 33554431 ist. |
+| Capability-Argumente, Wirkung | 22 | Der Capability-NAME wird geprueft, der ARGUMENTNAME seit 1.0.13C ebenfalls: ein unbekannter Schluessel (`fs.read(pfad: …)`) und ein Argument an einer Capability, die keine nimmt, werden abgewiesen. Gueltige Schluessel: `path` (fs.*, process.exec), `host`/`port` (network.*), `pin` (hardware.gpio), `bus` (i2c/spi), `cs` (spi), `vendor`/`product` (usb). Der WERT wird jedoch **nicht durchgesetzt** — die Sandbox wirkt als Ja/Nein (seccomp-Syscallfilter plus EINE Landlock-Regel fuer `/`), nicht als Beschraenkung auf den genannten Pfad, Rechner oder Port. Der Compiler meldet das an jedem Argument, statt eine Sicherheitszusage vorzutaeuschen, die es nicht gibt (#1108); die Durchsetzung ist als #1173 geführt. Die PortSpec-Bereichsform (`"host":8000-9000`) parst seit 1.0.13C und wird auf Start <= Ende geprueft. |
+| Schmale Ganzzahltypen, Breite | 7 | `intN`/`uintN` mit N < 64 belegen einen vollen 64-Bit-Slot; gekuerzt wird beim SPEICHERN, vorzeichenbehaftet bei `intN`, vorzeichenlos bei `uintN`. Erfasst sind Initialisierung, Zuweisung, Parameter, Rueckgabe, globale Variablen und der `as`-Cast; Strukturfelder liegen ohnehin in ihrer eigenen Breite. Bis 1.0.11D fand die Kuerzung an KEINER dieser Stellen statt (`var a: int8 := 130` ergab 130 statt -126), und `as int8`/`as int16` kuerzten nur in der kurzen Schreibweise (`as i8`) -- #1151. Ein konstanter Wert, der nicht in die Breite passt, wird gekuerzt und nicht gemeldet. Eine globale Variable mit BERECHNETER Initialisierung bleibt weiterhin still 0 (#1164). |
+| Indexzugriff, Bereichspruefung | 15 | Ein konstanter Index auf eine Variable mit fester Groesse (`int64[N]` oder ein Array-Literal als Initialisierung) wird zur UEBERSETZUNGSZEIT geprueft und ausserhalb der Grenzen abgewiesen -- ohne Schalter. Berechnete Indizes prueft der erzeugte Code nur unter `--runtime-checks`; dann bricht ein Zugriff ausserhalb mit `panic` ab ("index out of bounds"). Der Vergleich ist vorzeichenLOS, ein negativer Index faellt also in denselben Zweig. `@bounds_check(true)` fordert sie umgekehrt AN und wirkt damit auch OHNE `--runtime-checks`; `@bounds_check(false)` schaltet sie im Geltungsbereich ab, auch WENN die Option gesetzt ist -- die Direktive steht naeher am Code. Bis 1.0.13Q war die Direktive nur in der Richtung `false` wirksam: der Vorgabewert stand auf "an", "angefordert" und "nicht gesetzt" waren nicht zu unterscheiden, und `@bounds_check(true)` erzeugte dieselbe Binary wie gar keine Angabe (#1124). NICHT geprueft wird, wo es keine Laenge gibt: roher Zeiger, `pchar`, Array-Parameter und inline liegende Struct-Felder. Bis 1.0.11D emittierte `--runtime-checks` fuer Indizes gar nichts -- der Zugriff las still den Speicher dahinter (#1156). Nur das x86-64-Backend traegt diese Pruefung; die uebrigen Backends kennen `--runtime-checks` insgesamt nicht. |
+| Indexzugriff, Elementtyp | 15 | `s[i]` auf einem `pchar` liest bzw. schreibt das BYTE i (Schrittweite 1, Wert 0..255) -- auf allen Zielen und fuer jede Herkunft des pchar: Variable, Parameter, Modulvariable, Konstante, Feld, Literal, `x as pchar`, Aufruf mit pchar-Rueckgabe. Ein Index auf einen SKALAR (`int64`, `bool`, `char`, `f64` ...) hat keine Bedeutung und wird abgewiesen; ein Byte ist `peek8(p + i)` oder `(p as pchar)[i]`, ein Maschinenwort `peek64(p + i * 8)`. Bis 1.2.15A lief der IR-Weg (arm64, riscv, lyxos) fuer pchar mit 8-Byte-Schrittweite, x86 kannte pchar nur als Bezeichner, und `p[i]` mit `p: int64` lieferte auf x86 den Zeiger selbst, im IR-Weg 8 Byte ab p+8i (#2131). |
+| Bereichstyp, Pruefzeitpunkt | 7 | `type X = int64 range LO..HI;` wird geprueft, wo ein Wert den Typ ANNIMMT: Initialisierung, Zuweisung (lokal wie global), Parameter, Rueckgabe und Strukturfeld -- bei Funktionen wie bei Methoden. Steht der Wert zur UEBERSETZUNGSZEIT fest (Literal, `con`, konstanter Ausdruck), meldet der Compiler ihn dort (#1082); sonst prueft der erzeugte Code zur Laufzeit und bricht mit `panic` ab (#1097). Die Laufzeitpruefung haengt NICHT an `--runtime-checks`: der Bereich ist der einzige Inhalt dieses Typs. Grenzen sind einschliesslich, der Vergleich vorzeichenbehaftet. Nicht erfasst: ein Wert, der ueber einen `as`-Cast oder einen Zeiger am Typ vorbei geschrieben wird. |
+
+Behoben seit der letzten Fassung dieses Abschnitts und daher hier entfallen:
+Fallrumpf als Block und qualifizierte Enum-Muster (#1024), `fn f<T>(...)`
+(#1009), `range(N)` (#1007), `defer` im inneren Block (#1006) samt
+Argument-Zeitpunkt (#1030).
+
+Nicht mehr betroffen: die Bindung von Methodenzeigern (`feld := obj.Method`)
+war bis PR #1005 abgewiesen, weil die Existenzpruefung fuer Feldnamen nur die
+Felder einer Klasse durchsuchte und nicht ihre Methoden. Sie funktioniert
+wieder und ist durch `tests/method_ptr_test.sh` abgedeckt.
+
+Ebenfalls nicht mehr betroffen: der Ziffern-Trenner im Float-Literal
+(`3.14_159`, `1_000.5`). Bis 1.0.11B kuerzten die Literal-Umwandlungen den Wert
+stillschweigend am ersten `_`; seither ueberspringen sie ihn in allen
+Ziffernschleifen. Abgedeckt durch `tests/lexer_float_dot_test.lyx`. (#1011)
+
+Ebenfalls nicht mehr betroffen: der inline geschriebene Funktionszeigertyp
+(`var f: fn(int64): int64 := g;`) als lokale Variable und als Parameter. Der
+Aufrufpfad erkannte einen fn-Zeiger bis 1.0.11B nur am Namen eines Typalias;
+inline geschrieben lief der Aufruf ueber den Closure-Pfad und stuerzte ab.
+Abgedeckt durch `tests/inline_fnptr_test.sh`. (#1003)
 
 ---
 
@@ -1026,7 +1808,44 @@ CapabilityDecl    = CapabilityPath
                     [ "(" CapabilityArgList ")" ]
                     [ "@fastpath" ] ;
 
-CapabilityPath    = Ident { "." Ident } ;
+CapabilityPath    = CapSegment { "." CapSegment } ;
+
+(* Ein Segment ist ein NAME, keine Ausdrucksform: auch reservierte Woerter
+   sind zulaessig. `process.signal` ist der gaengige Fall — `signal` ist ein
+   Schluesselwort und war bis 1.0.17F nicht schreibbar, obwohl die Capability
+   in der Registry steht (#1198, #1347). Der Parser prueft die Schreibweise
+   des Tokens, nicht seine Art. *)
+CapSegment        = Ident | Keyword ;
+
+(* #1653: `Keyword` wurde hier seit jeher benutzt, aber nirgends definiert —
+   damit liess sich nicht nachschlagen, welche Namen als Bezeichner
+   ausscheiden; man erfuhr es erst beim Uebersetzen. Die folgende Liste ist
+   aus der Tabelle des Lexers (`_lexLookupKw`) gewonnen und Wort fuer Wort
+   nachgemessen: jedes davon wurde als Parametername abgewiesen. *)
+Keyword           = "abstract" | "and" | "array" | "as" | "assert" | "break"
+                  | "case" | "catch" | "class" | "co" | "con" | "continue"
+                  | "default" | "dim" | "dispose" | "do" | "downto" | "else"
+                  | "enum" | "extends" | "extern" | "false" | "finally" | "fn"
+                  | "for" | "if" | "implements" | "import" | "in" | "interface"
+                  | "is" | "let" | "match" | "new" | "not"
+                  | "null" | "or" | "override" | "panic" | "parallel" | "pool"
+                  | "private" | "protected" | "pub" | "public" | "repeat" | "return"
+                  | "signal" | "static" | "struct" | "super" | "switch" | "throw"
+                  | "to" | "true" | "try" | "type" | "unit" | "until"
+                  | "utype" | "var" | "virtual" | "where" | "while" ;
+
+(* WEICHE Schluesselwoerter: der Lexer kennt sie, sie sind aber als Bezeichner
+   zulaessig — sie wirken nur an ihrer Stelle im Satzbau. Nachgemessen:
+   `fn f(defer: int64, range: int64, limit: int64, char: int64)` uebersetzt,
+   und ein `defer { … }` im selben Programm laeuft weiterhin.
+
+     asm char defer end exit form from key layout limit loop next of range
+     start step then value widget wraps
+
+   `asm` ist in 12.2 bereits so beschrieben. Fuer die uebrigen galt bisher
+   nichts Schriftliches; sie sind hier festgehalten, damit die Unterscheidung
+   zwischen hartem Schluesselwort, weichem und gewoehnlichem Bezeichner
+   nachlesbar ist. *)
 
 CapabilityArgList = CapabilityArg { "," CapabilityArg } ;
 
@@ -1045,6 +1864,22 @@ PortSpec          = "*"
                   | IntLiteral
                   | IntLiteral "-" IntLiteral ;
 ```
+
+(* Gueltige Argumentnamen je Capability: `path` fuer `fs.*` und
+   `process.exec`; `host` und `port` fuer `network.*`; `pin` fuer
+   `hardware.gpio`; `bus` fuer `hardware.i2c` und `hardware.spi`; `cs` fuer
+   `hardware.spi`; `vendor` und `product` fuer `hardware.usb`. Alle uebrigen
+   Capabilities nehmen keine Argumente. Ein anderer Name wird abgewiesen.
+
+   Der WERT wird nicht durchgesetzt — siehe 20.1.
+
+   `hardware.block` (#1755) nimmt keine Argumente und meint den Rohzugriff auf
+   Blockgeraete; im LBF-Ziel setzt es 0x40. `hardware.i2c`, `hardware.usb`,
+   `hardware.gpio` und `hardware.spi` teilen sich 0x100 fuer den direkten
+   Geraetezugriff (#1759) — ein gemeinsames Bit, weil der Kernel dafuer genau
+   eine Klasse kennt. Welche Capability welches Bit setzt und welche im
+   LBF-Ziel wirkungslos bleibt, steht in capabilities.md; der Compiler warnt
+   beim Uebersetzen auf die wirkungslosen. *)
 
 ## 22.1 ImportItem with grant/restrict (amended from Section 3)
 

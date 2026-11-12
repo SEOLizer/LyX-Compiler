@@ -1,0 +1,373 @@
+// std/nn_store.lyx
+// Netze in einer SQLite-Datenbank ablegen und zurueckholen.
+
+@description("Persistence of std.nn networks in SQLite: versioned BLOB column with metadata, save/load/list/delete by name")
+@author("Andreas Roene")
+@copyright("2026 Andreas Roene")
+unit std.nn_store;
+
+import std.nn;
+import std.nn_io;
+import std.db.sqlite;
+import std.alloc;
+import std.string;
+
+// ── Worum es geht ────────────────────────────────────────────────────────────
+//
+// Dieselbe Bytefolge wie std.nn_io, nur liegt sie in einer Spalte statt in
+// einer Datei. Der Gewinn ist nicht der Speicherort, sondern die Nebenspalten:
+// Architektur, Parameterzahl, Pruefsumme und Zeitpunkt stehen als eigene
+// Spalten daneben. Damit laesst sich ein Bestand DURCHSUCHEN, ohne jedes Netz
+// zu laden -- "welche Modelle haben drei Ausgaenge" ist eine Abfrage, keine
+// Schleife ueber Dateien.
+//
+// Die Bytefolge bleibt die Wahrheit: die Nebenspalten sind abgeleitet und
+// werden beim Schreiben aus dem Netz gefuellt. Beim Laden entscheidet die
+// Pruefsumme IN der Bytefolge (NnIoVerify), nicht die Spalte -- wer die
+// Spalte von Hand aendert, aendert damit nichts an der Pruefung.
+//
+// ── Ein Name, ein Netz ───────────────────────────────────────────────────────
+//
+// name ist eindeutig. Erneutes Sichern unter demselben Namen ERSETZT den
+// Eintrag, in einer Transaktion (loeschen, einfuegen): ein abgebrochener
+// Schreibvorgang laesst entweder das alte Netz stehen oder das neue, nie ein
+// halbes.
+
+// ── Fehlerschluessel ─────────────────────────────────────────────────────────
+
+pub con NNSTORE_OK: int64         := 0;
+pub con NNSTORE_E_ARGS: int64     := 1;   // Handle 0, Name 0 oder leer
+pub con NNSTORE_E_SQL: int64      := 2;   // SQLite hat abgelehnt
+pub con NNSTORE_E_NOTFOUND: int64 := 3;   // kein Eintrag dieses Namens
+pub con NNSTORE_E_SERIALIZE: int64 := 4;  // Netz liess sich nicht schreiben
+pub con NNSTORE_E_CORRUPT: int64  := 5;   // Bytefolge in der Spalte unbrauchbar
+pub con NNSTORE_E_BUILD: int64    := 6;   // Netz liess sich nicht aufbauen
+
+var _nnst_err: int64 := 0;
+
+// Letzter Fehler. Ohne ihn waere jeder Fehlschlag ununterscheidbar; bei
+// NNSTORE_E_CORRUPT sagt zusaetzlich NnIoLoadError(), was an der Bytefolge
+// nicht stimmte.
+pub fn NnStoreError(): int64 {
+  return _nnst_err;
+}
+
+fn _failI(code: int64): int64 {
+  _nnst_err := code;
+  return 0;
+}
+
+fn _failB(code: int64): bool {
+  _nnst_err := code;
+  return false;
+}
+
+fn _nameOk(name: pchar): bool {
+  if (name == 0 as pchar) { return false; }
+  if (StrLen(name) < 1) { return false; }
+  return true;
+}
+
+// ── Tabelle ──────────────────────────────────────────────────────────────────
+
+pub fn NnStoreTableName(): pchar {
+  return "nn_models"c;
+}
+
+// Legt die Tabelle an, falls sie fehlt. Mehrfaches Aufrufen ist harmlos.
+pub fn NnStoreInit(db: int64): bool {
+  _nnst_err := NNSTORE_OK;
+  if (db == 0) { return _failB(NNSTORE_E_ARGS); }
+  var sql: pchar := "CREATE TABLE IF NOT EXISTS nn_models (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, format INTEGER NOT NULL, input_dim INTEGER NOT NULL, output_dim INTEGER NOT NULL, layers INTEGER NOT NULL, params INTEGER NOT NULL, has_opt_state INTEGER NOT NULL, nbytes INTEGER NOT NULL, checksum INTEGER NOT NULL, created INTEGER NOT NULL, updated INTEGER NOT NULL, state BLOB NOT NULL)"c;
+  if (SQLiteExec(db, sql) == false) { return _failB(NNSTORE_E_SQL); }
+  var idx: pchar := "CREATE INDEX IF NOT EXISTS nn_models_shape ON nn_models (input_dim, output_dim)"c;
+  if (SQLiteExec(db, idx) == false) { return _failB(NNSTORE_E_SQL); }
+  return true;
+}
+
+// ── Sichern ──────────────────────────────────────────────────────────────────
+
+// Netz unter name ablegen; ein vorhandener Eintrag desselben Namens wird
+// ersetzt. withOpt entscheidet, ob der Optimiererzustand mitgeht -- fuer ein
+// fortzusetzendes Training ja, fuer ein ausgeliefertes Modell nicht.
+pub fn NnStoreSave(db: int64, name: pchar, net: int64, withOpt: bool): bool {
+  _nnst_err := NNSTORE_OK;
+  if (db == 0) { return _failB(NNSTORE_E_ARGS); }
+  if (_nameOk(name) == false) { return _failB(NNSTORE_E_ARGS); }
+  var need: int64 := NnIoBufferSize(net, withOpt);
+  if (need == 0) { return _failB(NNSTORE_E_SERIALIZE); }
+  var buf: int64 := alloc(need);
+  if (buf == 0) { return _failB(NNSTORE_E_ARGS); }
+  var n: int64 := NnIoSaveBuffer(net, buf, need, withOpt);
+  if (n == 0) {
+    free(buf, need);
+    return _failB(NNSTORE_E_SERIALIZE);
+  }
+  var sum: int64 := NnIoChecksum(buf, n - 8);   // ohne die Pruefsumme selbst
+  var optFlag: int64 := 0;
+  if (withOpt) { optFlag := 1; }
+
+  if (SQLiteBegin(db) == false) {
+    free(buf, need);
+    return _failB(NNSTORE_E_SQL);
+  }
+
+  var del: int64 := SQLiteStmtPrepare(db, "DELETE FROM nn_models WHERE name = ?"c);
+  if (del == 0) {
+    SQLiteRollback(db);
+    free(buf, need);
+    return _failB(NNSTORE_E_SQL);
+  }
+  var okb: bool := SQLiteBindStr(del, 1, name);
+  var rc: int64 := SQLiteStmtStep(del);
+  SQLiteStmtFinalize(del);
+  if (rc != SQLITE_DONE) {
+    SQLiteRollback(db);
+    free(buf, need);
+    return _failB(NNSTORE_E_SQL);
+  }
+
+  var insSql: pchar := "INSERT INTO nn_models (name, format, input_dim, output_dim, layers, params, has_opt_state, nbytes, checksum, created, updated, state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s','now'), strftime('%s','now'), ?)"c;
+  var ins: int64 := SQLiteStmtPrepare(db, insSql);
+  if (ins == 0) {
+    SQLiteRollback(db);
+    free(buf, need);
+    return _failB(NNSTORE_E_SQL);
+  }
+  okb := SQLiteBindStr(ins, 1, name);
+  okb := SQLiteBindInt(ins, 2, NNIO_FORMAT);
+  okb := SQLiteBindInt(ins, 3, NnInputDim(net));
+  okb := SQLiteBindInt(ins, 4, NnOutputDim(net));
+  okb := SQLiteBindInt(ins, 5, NnLayerCount(net));
+  okb := SQLiteBindInt(ins, 6, NnParamCount(net));
+  okb := SQLiteBindInt(ins, 7, optFlag);
+  okb := SQLiteBindInt(ins, 8, n);
+  okb := SQLiteBindInt(ins, 9, sum);
+  okb := SQLiteBindBlob(ins, 10, buf, n);
+  rc := SQLiteStmtStep(ins);
+  SQLiteStmtFinalize(ins);
+  free(buf, need);
+  if (rc != SQLITE_DONE) {
+    SQLiteRollback(db);
+    return _failB(NNSTORE_E_SQL);
+  }
+  if (SQLiteCommit(db) == false) { return _failB(NNSTORE_E_SQL); }
+  return true;
+}
+
+// ── Laden ────────────────────────────────────────────────────────────────────
+
+// Netz unter name aufbauen. Rueckgabe ist ein Handle wie von NnNew oder 0;
+// NnStoreError() nennt den Grund. Der Aufrufer gibt es mit NnFree zurueck.
+pub fn NnStoreLoad(db: int64, name: pchar): int64 {
+  _nnst_err := NNSTORE_OK;
+  if (db == 0) { return _failI(NNSTORE_E_ARGS); }
+  if (_nameOk(name) == false) { return _failI(NNSTORE_E_ARGS); }
+  var st: int64 := SQLiteStmtPrepare(db,
+    "SELECT state, nbytes FROM nn_models WHERE name = ?"c);
+  if (st == 0) { return _failI(NNSTORE_E_SQL); }
+  var okb: bool := SQLiteBindStr(st, 1, name);
+  var rc: int64 := SQLiteStmtStep(st);
+  if (rc != SQLITE_ROW) {
+    SQLiteStmtFinalize(st);
+    if (rc == SQLITE_DONE) { return _failI(NNSTORE_E_NOTFOUND); }
+    return _failI(NNSTORE_E_SQL);
+  }
+  var ptr: int64 := SQLiteColumnBlob(st, 0);
+  var len: int64 := SQLiteColumnBytes(st, 0);
+  if (ptr == 0) {
+    SQLiteStmtFinalize(st);
+    return _failI(NNSTORE_E_CORRUPT);
+  }
+  if (len < 1) {
+    SQLiteStmtFinalize(st);
+    return _failI(NNSTORE_E_CORRUPT);
+  }
+  // Der Zeiger von sqlite3_column_blob gilt nur bis zum naechsten step/reset.
+  // Darum umkopieren, BEVOR das Statement abgeraeumt wird -- sonst liest der
+  // Aufbau aus freigegebenem Speicher.
+  var buf: int64 := alloc(len);
+  if (buf == 0) {
+    SQLiteStmtFinalize(st);
+    return _failI(NNSTORE_E_ARGS);
+  }
+  var i: int64 := 0;
+  while (i < len) {
+    poke8(buf + i, peek8(ptr + i));
+    i := i + 1;
+  }
+  SQLiteStmtFinalize(st);
+
+  var rcv: int64 := NnIoVerify(buf, len);
+  if (rcv != NNIO_OK) {
+    free(buf, len);
+    return _failI(NNSTORE_E_CORRUPT);
+  }
+  var net: int64 := NnIoLoadBuffer(buf, len);
+  free(buf, len);
+  if (net == 0) { return _failI(NNSTORE_E_BUILD); }
+  return net;
+}
+
+// ── Bestand ──────────────────────────────────────────────────────────────────
+
+pub fn NnStoreExists(db: int64, name: pchar): bool {
+  _nnst_err := NNSTORE_OK;
+  if (db == 0) { return _failB(NNSTORE_E_ARGS); }
+  if (_nameOk(name) == false) { return _failB(NNSTORE_E_ARGS); }
+  var st: int64 := SQLiteStmtPrepare(db,
+    "SELECT 1 FROM nn_models WHERE name = ?"c);
+  if (st == 0) { return _failB(NNSTORE_E_SQL); }
+  var okb: bool := SQLiteBindStr(st, 1, name);
+  var rc: int64 := SQLiteStmtStep(st);
+  SQLiteStmtFinalize(st);
+  if (rc == SQLITE_ROW) { return true; }
+  return false;
+}
+
+pub fn NnStoreCount(db: int64): int64 {
+  _nnst_err := NNSTORE_OK;
+  if (db == 0) { return _failI(NNSTORE_E_ARGS); }
+  var st: int64 := SQLiteStmtPrepare(db, "SELECT COUNT(*) FROM nn_models"c);
+  if (st == 0) { return _failI(NNSTORE_E_SQL); }
+  var rc: int64 := SQLiteStmtStep(st);
+  var n: int64 := 0;
+  if (rc == SQLITE_ROW) { n := SQLiteColumnInt(st, 0); }
+  SQLiteStmtFinalize(st);
+  return n;
+}
+
+// Eintrag loeschen. false heisst "nicht geloescht": entweder gab es ihn nicht
+// (NNSTORE_E_NOTFOUND) oder SQLite hat abgelehnt (NNSTORE_E_SQL) -- der
+// Unterschied steht in NnStoreError().
+pub fn NnStoreDelete(db: int64, name: pchar): bool {
+  _nnst_err := NNSTORE_OK;
+  if (db == 0) { return _failB(NNSTORE_E_ARGS); }
+  if (_nameOk(name) == false) { return _failB(NNSTORE_E_ARGS); }
+  var st: int64 := SQLiteStmtPrepare(db, "DELETE FROM nn_models WHERE name = ?"c);
+  if (st == 0) { return _failB(NNSTORE_E_SQL); }
+  var okb: bool := SQLiteBindStr(st, 1, name);
+  var rc: int64 := SQLiteStmtStep(st);
+  SQLiteStmtFinalize(st);
+  if (rc != SQLITE_DONE) { return _failB(NNSTORE_E_SQL); }
+  if (SQLiteChanges(db) < 1) { return _failB(NNSTORE_E_NOTFOUND); }
+  return true;
+}
+
+// Name an Stelle idx, alphabetisch sortiert. Rueckgabe 0 bei Fehler oder
+// wenn idx hinter dem Bestand liegt. Die Zeichenkette gehoert dem Aufrufer
+// und wird mit free(ptr, len+1) zurueckgegeben; die Laenge liefert StrLen.
+pub fn NnStoreNameAt(db: int64, idx: int64): pchar {
+  _nnst_err := NNSTORE_OK;
+  if (db == 0) {
+    _nnst_err := NNSTORE_E_ARGS;
+    return 0 as pchar;
+  }
+  if (idx < 0) {
+    _nnst_err := NNSTORE_E_ARGS;
+    return 0 as pchar;
+  }
+  var st: int64 := SQLiteStmtPrepare(db,
+    "SELECT name FROM nn_models ORDER BY name LIMIT 1 OFFSET ?"c);
+  if (st == 0) {
+    _nnst_err := NNSTORE_E_SQL;
+    return 0 as pchar;
+  }
+  var okb: bool := SQLiteBindInt(st, 1, idx);
+  var rc: int64 := SQLiteStmtStep(st);
+  if (rc != SQLITE_ROW) {
+    SQLiteStmtFinalize(st);
+    if (rc == SQLITE_DONE) { _nnst_err := NNSTORE_E_NOTFOUND; }
+    else { _nnst_err := NNSTORE_E_SQL; }
+    return 0 as pchar;
+  }
+  var txt: pchar := SQLiteColumnText(st, 0);
+  if (txt == 0 as pchar) {
+    SQLiteStmtFinalize(st);
+    _nnst_err := NNSTORE_E_CORRUPT;
+    return 0 as pchar;
+  }
+  // Auch hier gilt der Zeiger nur bis zum Abraeumen -- umkopieren
+  var len: int64 := StrLen(txt);
+  var out: int64 := alloc(len + 1);
+  if (out == 0) {
+    SQLiteStmtFinalize(st);
+    _nnst_err := NNSTORE_E_ARGS;
+    return 0 as pchar;
+  }
+  var i: int64 := 0;
+  while (i < len) {
+    poke8(out + i, peek8((txt as int64) + i));
+    i := i + 1;
+  }
+  poke8(out + len, 0);
+  SQLiteStmtFinalize(st);
+  return out as pchar;
+}
+
+// ── Angaben ohne Laden ───────────────────────────────────────────────────────
+//
+// Die Nebenspalten, fuer die diese Ablage ueberhaupt da ist: Architektur und
+// Umfang eines Eintrags, ohne die Bytefolge anzufassen. Rueckgabe -1 heisst
+// "kein solcher Eintrag" (0 waere eine Zahl, die es nicht gibt, aber wie eine
+// Aussage aussieht).
+
+fn _metaInt(db: int64, name: pchar, sql: pchar): int64 {
+  _nnst_err := NNSTORE_OK;
+  if (db == 0) {
+    _nnst_err := NNSTORE_E_ARGS;
+    return -1;
+  }
+  if (_nameOk(name) == false) {
+    _nnst_err := NNSTORE_E_ARGS;
+    return -1;
+  }
+  var st: int64 := SQLiteStmtPrepare(db, sql);
+  if (st == 0) {
+    _nnst_err := NNSTORE_E_SQL;
+    return -1;
+  }
+  var okb: bool := SQLiteBindStr(st, 1, name);
+  var rc: int64 := SQLiteStmtStep(st);
+  var v: int64 := -1;
+  if (rc == SQLITE_ROW) { v := SQLiteColumnInt(st, 0); }
+  else {
+    if (rc == SQLITE_DONE) { _nnst_err := NNSTORE_E_NOTFOUND; }
+    else { _nnst_err := NNSTORE_E_SQL; }
+  }
+  SQLiteStmtFinalize(st);
+  return v;
+}
+
+pub fn NnStoreInputDim(db: int64, name: pchar): int64 {
+  return _metaInt(db, name, "SELECT input_dim FROM nn_models WHERE name = ?"c);
+}
+
+pub fn NnStoreOutputDim(db: int64, name: pchar): int64 {
+  return _metaInt(db, name, "SELECT output_dim FROM nn_models WHERE name = ?"c);
+}
+
+pub fn NnStoreLayerCount(db: int64, name: pchar): int64 {
+  return _metaInt(db, name, "SELECT layers FROM nn_models WHERE name = ?"c);
+}
+
+pub fn NnStoreParamCount(db: int64, name: pchar): int64 {
+  return _metaInt(db, name, "SELECT params FROM nn_models WHERE name = ?"c);
+}
+
+pub fn NnStoreByteCount(db: int64, name: pchar): int64 {
+  return _metaInt(db, name, "SELECT nbytes FROM nn_models WHERE name = ?"c);
+}
+
+pub fn NnStoreChecksum(db: int64, name: pchar): int64 {
+  return _metaInt(db, name, "SELECT checksum FROM nn_models WHERE name = ?"c);
+}
+
+pub fn NnStoreUpdatedAt(db: int64, name: pchar): int64 {
+  return _metaInt(db, name, "SELECT updated FROM nn_models WHERE name = ?"c);
+}
+
+pub fn NnStoreHasOptState(db: int64, name: pchar): int64 {
+  return _metaInt(db, name,
+    "SELECT has_opt_state FROM nn_models WHERE name = ?"c);
+}

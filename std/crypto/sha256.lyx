@@ -8,14 +8,16 @@
 unit std.crypto.sha256;
 
 import std.alloc;
+import std.cpu.features;   // #2391: CpuHasSHANI
 
 // ============================================================================
 // Internal helpers
 // ============================================================================
 
-fn sha256Rotr32(x: int64, n: int64): int64 {
-    return (((x & 0xFFFFFFFF) >> n) | ((x << (32 - n)) & 0xFFFFFFFF)) & 0xFFFFFFFF;
-}
+// #2228: Die 32-Bit-Rotationen gehen ueber das Builtin rotr32 (#2177) — es
+// nimmt die unteren 32 Bit und liefert null-erweitert, die Masken nach jeder
+// Rotation entfallen damit. sha256Rotr32 stand hier ungenutzt (#1318 hatte
+// die Aufrufe schon von Hand ersetzt).
 
 // Fill 256-byte K table with the 64 SHA-256 round constants (big-endian cube roots)
 fn sha256InitK(K: int64): void {
@@ -53,11 +55,110 @@ fn sha256InitK(K: int64): void {
     poke32(K + 248, 0xbef9a3f7); poke32(K + 252, 0xc67178f2);
 }
 
+// #1318: Die 64 Rundenkonstanten sind durch FIPS 180-4 festgelegt und aendern
+// sich nie — sie wurden hier trotzdem VOR JEDEM BLOCK neu geschrieben, dazu kam
+// je Block eine Allokation fuer die Tabelle und eine fuer W. Gemessen: 55 µs je
+// 64-Byte-Hash, bei rund 244.000 Blockkompressionen je SLH-DSA-KeyGen.
+//
+// Tabelle und Kratzpuffer entstehen jetzt einmal je Programmlauf. W wird ohnehin
+// in den ersten sechzehn Schritten vollstaendig ueberschrieben und danach von
+// 16 bis 63 fortgeschrieben — sein Inhalt aus dem Vorlauf wird also nirgends
+// gelesen, das Wiederverwenden ist unbedenklich.
+//
+// Die Namen tragen bewusst ein Praefix: Globale teilen sich ueber Unit-Grenzen
+// hinweg den Namensraum.
+var _sha256K: int64 := 0;
+var _sha256W: int64 := 0;
+
+fn sha256Scratch(): int64 {
+    if (_sha256K != 0) { return _sha256K; }
+    var k: int64 := alloc(256);
+    if (k == 0) { return 0; }
+    sha256InitK(k);
+    var w: int64 := alloc(256);
+    if (w == 0) { return 0; }
+    _sha256K := k;
+    _sha256W := w;
+    return k;
+}
+
+// ============================================================================
+// #2391: SHA-NI
+// ============================================================================
+//
+// `sha256_compress(state, data, blocks)` rechnet die Kompressionsfunktion in
+// Hardware (SHA256RNDS2/MSG1/MSG2). Der Zustand hat dort DASSELBE Format wie
+// hier — 8 uint32 in ABCDEFGH —, die Umordnung auf das ABEF/CDGH-Paar, das
+// die Befehle brauchen, macht der erzeugte Code selbst.
+//
+// Ergebnis von CpuHasSHANI, einmal gemessen. Das Flag ist noetig, weil 0 ein
+// gueltiges Ergebnis ist (dieselbe Begruendung wie bei AES-NI in aes.lyx und
+// in std/cpu/features.lyx).
+var shaniCache: int64 := 0;
+var shaniProbed: int64 := 0;
+
+// Umschalter auf den Rechenweg, auch wenn die CPU SHA-NI hat.
+//
+// Wie `AESForceSoftware` (#2383) nicht fuer Anwender, sondern damit der
+// SOFTWAREweg messbar bleibt: auf einer CPU mit SHA-NI fuehrt sonst kein
+// Aufruf mehr durch die Rundenschleife unten, und eine Regression dort waere
+// auf genau den Maschinen unsichtbar, auf denen sie auffallen muesste.
+// tests/sha_ni_2391_test.sh prueft beide Wege gegeneinander.
+var shaniForceSoft: int64 := 0;
+
+// 1 = ab jetzt rechnen statt SHA256RNDS2. 0 = wieder die CPU fragen.
+pub fn SHA256ForceSoftware(on: int64): int64 {
+    shaniForceSoft := on;
+    return shaniForceSoft;
+}
+
+// Hat diese CPU SHA-NI (und ist der Rechenweg nicht erzwungen)? 1 oder 0.
+// Auf Nicht-x86 immer 0.
+pub fn SHA256NIAvailable(): int64 {
+    if (shaniForceSoft != 0) { return 0; }
+    if (shaniProbed != 0) { return shaniCache; }
+    var v: int64 := 0;
+    if (CpuHasSHANI() != 0) { v := 1; }
+    shaniCache := v;
+    shaniProbed := 1;
+    return v;
+}
+
+// #2391: Blockfolge. Der Schnellweg haelt den Zustand ueber ALLE Bloecke in
+// den Registern; nur Eintritt und Austritt lesen und schreiben `state`. Darum
+// bekommt `sha256_compress` die ganze Folge und nicht Block fuer Block einen
+// Aufruf. Der Softwareweg kann das nicht — er legt den Zustand nach jedem
+// Block ab — und laeuft deshalb hier in der Schleife.
+//
+// Die Abfrage steht VOR jeder Vorarbeit: `sha256BlockSoft` legt sich einen
+// Kratzbereich an und baut die K-Tabelle, und beides waere hier verloren.
+//
+// Ohne SHA-NI wird `sha256_compress` NICHT aufgerufen: der Befehl loest dort
+// SIGILL aus. Diese Weiche ist die einzige Stelle, die ihn verhindert.
+fn sha256Blocks(state: int64, data: int64, n: int64): void {
+    if (n <= 0) { return; }
+    if (SHA256NIAvailable() != 0) {
+        sha256_compress(state, data, n);
+        return;
+    }
+    var b: int64 := 0;
+    while (b < n) {
+        sha256BlockSoft(state, data + b * 64);
+        b += 1;
+    }
+}
+
 // Process one 64-byte (512-bit) block into the 8-word state buffer
 fn sha256Block(state: int64, block: int64): void {
-    var W: int64 := alloc(256);  // W[0..63]: 64 x 4 bytes
-    var K: int64 := alloc(256);  // K[0..63]: 64 x 4 bytes
-    sha256InitK(K);
+    sha256Blocks(state, block, 1);
+}
+
+// Softwarefassung eines einzelnen Blocks. Bleibt als Vergleichsmassstab im
+// Repo und ist der Weg auf jeder CPU ohne SHA-NI.
+fn sha256BlockSoft(state: int64, block: int64): void {
+    if (sha256Scratch() == 0) { panic("SHA-256: kein Speicher fuer die Rundentabelle (#1318)"); }
+    var W: int64 := _sha256W;
+    var K: int64 := _sha256K;
 
     // Load W[0..15] as big-endian 32-bit words from the input block
     var i: int64 := 0;
@@ -68,7 +169,7 @@ fn sha256Block(state: int64, block: int64): void {
                       | (peek8(block + off + 2) <<  8)
                       |  peek8(block + off + 3);
         poke32(W + i * 4, w & 0xFFFFFFFF);
-        i := i + 1;
+        i += 1;
     }
 
     // Expand W[16..63]: W[i] = sigma1(W[i-2]) + W[i-7] + sigma0(W[i-15]) + W[i-16]
@@ -76,12 +177,12 @@ fn sha256Block(state: int64, block: int64): void {
     while (i < 64) {
         var w15: int64 := peek32(W + (i - 15) * 4) & 0xFFFFFFFF;
         var w2:  int64 := peek32(W + (i -  2) * 4) & 0xFFFFFFFF;
-        var s0:  int64 := sha256Rotr32(w15, 7) ^ sha256Rotr32(w15, 18) ^ (w15 >> 3);
-        var s1:  int64 := sha256Rotr32(w2, 17) ^ sha256Rotr32(w2,  19) ^ (w2  >> 10);
+        var s0:  int64 := rotr32(w15, 7) ^ rotr32(w15, 18) ^ (w15 >> 3);
+        var s1:  int64 := rotr32(w2, 17) ^ rotr32(w2, 19) ^ (w2 >> 10);
         var wv:  int64 := (peek32(W + (i - 16) * 4) + s0
                          + peek32(W + (i -  7) * 4) + s1) & 0xFFFFFFFF;
         poke32(W + i * 4, wv);
-        i := i + 1;
+        i += 1;
     }
 
     // Working variables a..h from state
@@ -97,10 +198,14 @@ fn sha256Block(state: int64, block: int64): void {
     // 64 compression rounds
     i := 0;
     while (i < 64) {
-        var S1:   int64 := sha256Rotr32(e, 6) ^ sha256Rotr32(e, 11) ^ sha256Rotr32(e, 25);
+        // #1318: Rotationen ohne Funktionsaufruf — sha256Rotr32 wurde sechsmal
+        // je Runde gerufen, bei gemessenen 50 µs je Block der Hauptposten.
+        // #2228: statt Schieben/Verodern/Maskieren das Builtin rotr32, ein
+        // Befehl je Rotation; das Ergebnis ist bereits null-erweitert.
+        var S1:   int64 := rotr32(e, 6) ^ rotr32(e, 11) ^ rotr32(e, 25);
         var ch:   int64 := (e & f) ^ ((e ^ 0xFFFFFFFF) & g);
         var tmp1: int64 := (h + S1 + (ch & 0xFFFFFFFF) + peek32(K + i * 4) + peek32(W + i * 4)) & 0xFFFFFFFF;
-        var S0:   int64 := sha256Rotr32(a, 2) ^ sha256Rotr32(a, 13) ^ sha256Rotr32(a, 22);
+        var S0:   int64 := rotr32(a, 2) ^ rotr32(a, 13) ^ rotr32(a, 22);
         var maj:  int64 := (a & b) ^ (a & c) ^ (b & c);
         var tmp2: int64 := (S0 + (maj & 0xFFFFFFFF)) & 0xFFFFFFFF;
         h := g;
@@ -111,7 +216,7 @@ fn sha256Block(state: int64, block: int64): void {
         c := b;
         b := a;
         a := (tmp1 + tmp2) & 0xFFFFFFFF;
-        i := i + 1;
+        i += 1;
     }
 
     // Add compressed chunk to current hash state
@@ -124,8 +229,7 @@ fn sha256Block(state: int64, block: int64): void {
     poke32(state + 24, (peek32(state + 24) + g) & 0xFFFFFFFF);
     poke32(state + 28, (peek32(state + 28) + h) & 0xFFFFFFFF);
 
-    free(W, 256);
-    free(K, 256);
+    // #1318: kein free mehr — beide Puffer leben fuer die Dauer des Programms.
 }
 
 // ============================================================================
@@ -147,11 +251,11 @@ pub fn SHA256(data: int64, len: int64, out: int64): void {
     poke32(state + 28, 0x5be0cd19);
 
     // Process all complete 64-byte blocks
-    var processed: int64 := 0;
-    while (processed + 64 <= len) {
-        sha256Block(state, data + processed);
-        processed := processed + 64;
-    }
+    // #2391: alle vollen Bloecke in EINEM Aufruf — der Schnellweg haelt den
+    // Zustand dann ueber die ganze Folge in den Registern.
+    var blocks:    int64 := len / 64;
+    var processed: int64 := blocks * 64;
+    sha256Blocks(state, data, blocks);
 
     // Build final padded block(s): at most 2 blocks (128 bytes)
     var padBuf: int64 := alloc(128);
@@ -160,7 +264,7 @@ pub fn SHA256(data: int64, len: int64, out: int64): void {
     var i: int64 := 0;
     while (i < remaining) {
         poke8(padBuf + i, peek8(data + processed + i));
-        i := i + 1;
+        i += 1;
     }
     poke8(padBuf + remaining, 0x80);
     i := remaining + 1;
@@ -180,8 +284,9 @@ pub fn SHA256(data: int64, len: int64, out: int64): void {
     poke8(padBuf + lenOff + 6, (bitLen >>  8) & 0xFF);
     poke8(padBuf + lenOff + 7,  bitLen        & 0xFF);
 
-    sha256Block(state, padBuf);
-    if (remaining >= 56) { sha256Block(state, padBuf + 64); }
+    var padBlocks: int64 := 1;
+    if (remaining >= 56) { padBlocks := 2; }
+    sha256Blocks(state, padBuf, padBlocks);
 
     // Write 32-byte big-endian digest
     i := 0;
@@ -192,7 +297,7 @@ pub fn SHA256(data: int64, len: int64, out: int64): void {
         poke8(base + 1, (hw >> 16) & 0xFF);
         poke8(base + 2, (hw >>  8) & 0xFF);
         poke8(base + 3,  hw        & 0xFF);
-        i := i + 1;
+        i += 1;
     }
 
     free(state, 32);
@@ -209,7 +314,7 @@ pub fn SHA256Hex(data: int64, len: int64, out: int64): void {
         var b: int64 := peek8(digest + i) & 0xFF;
         poke8(out + i * 2,     peek8(hex as int64 + (b >> 4)));
         poke8(out + i * 2 + 1, peek8(hex as int64 + (b & 15)));
-        i := i + 1;
+        i += 1;
     }
     poke8(out + 64, 0);
     free(digest, 32);
@@ -223,4 +328,108 @@ pub fn SHA256Str(data: pchar, len: int64, out: int64): void {
 // WP-PQC-02: HashSHA256Bytes — canonical multi-block alias (same as SHA256)
 pub fn HashSHA256Bytes(data: int64, len: int64, out: int64): void {
     SHA256(data, len, out);
+}
+
+// ============================================================================
+// Schrittweises SHA-256 (#2096)
+//
+// TLS 1.3 braucht den Transkript-Hash ueber viele Teilstuecke, bevor die
+// Nachricht vollstaendig ist — das geht mit der Einzelaufruf-Form oben nicht.
+// Beide Formen rechnen dieselbe Kompression (sha256Block); wer eine aendert,
+// muss die andere nachziehen.
+//
+// Zustandslayout (112 Byte):
+//   +0   h0..h7           8 x int64 (je 32 Bit genutzt)
+//   +32  verarbeitete Byte (ohne Teilblock)
+//   +40  Fuellstand des Teilblocks
+//   +48  64-Byte-Blockpuffer
+// ============================================================================
+
+con S256_H_OFF:    int64 := 0;
+con S256_LEN_OFF:  int64 := 32;
+con S256_FILL_OFF: int64 := 40;
+con S256_BUF_OFF:  int64 := 48;
+con S256_CTX_SIZE: int64 := 112;
+
+// Groesse des Zustands in Byte. Als Funktion, weil ein `pub con` ueber
+// Unit-Grenzen still -1 liefern kann (#2102).
+pub fn Sha256CtxSize(): int64 {
+    return S256_CTX_SIZE;
+}
+
+pub fn Sha256Init(ctx: int64): void {
+    poke32(ctx + S256_H_OFF +  0, 0x6a09e667);
+    poke32(ctx + S256_H_OFF +  4, 0xbb67ae85);
+    poke32(ctx + S256_H_OFF +  8, 0x3c6ef372);
+    poke32(ctx + S256_H_OFF + 12, 0xa54ff53a);
+    poke32(ctx + S256_H_OFF + 16, 0x510e527f);
+    poke32(ctx + S256_H_OFF + 20, 0x9b05688c);
+    poke32(ctx + S256_H_OFF + 24, 0x1f83d9ab);
+    poke32(ctx + S256_H_OFF + 28, 0x5be0cd19);
+    poke64(ctx + S256_LEN_OFF, 0);
+    poke64(ctx + S256_FILL_OFF, 0);
+}
+
+pub fn Sha256Update(ctx: int64, data: int64, len: int64): void {
+    if (len <= 0) { return; }
+    var fill: int64 := peek64(ctx + S256_FILL_OFF);
+    var pos: int64 := 0;
+
+    if (fill > 0) {
+        while (fill < 64 && pos < len) {
+            poke8(ctx + S256_BUF_OFF + fill, peek8(data + pos));
+            fill += 1;
+            pos += 1;
+        }
+        if (fill == 64) {
+            sha256Block(ctx + S256_H_OFF, ctx + S256_BUF_OFF);
+            poke64(ctx + S256_LEN_OFF, peek64(ctx + S256_LEN_OFF) + 64);
+            fill := 0;
+        }
+    }
+
+    // #2391: dieselbe Folge in einem Aufruf wie in SHA256().
+    var full: int64 := (len - pos) / 64;
+    if (full > 0) {
+        sha256Blocks(ctx + S256_H_OFF, data + pos, full);
+        poke64(ctx + S256_LEN_OFF, peek64(ctx + S256_LEN_OFF) + full * 64);
+        pos += full * 64;
+    }
+
+    while (pos < len) {
+        poke8(ctx + S256_BUF_OFF + fill, peek8(data + pos));
+        fill += 1;
+        pos += 1;
+    }
+    poke64(ctx + S256_FILL_OFF, fill);
+}
+
+// 32 Byte Digest nach out. Der Zustand ist danach verbraucht.
+pub fn Sha256Final(ctx: int64, out: int64): void {
+    var fill: int64 := peek64(ctx + S256_FILL_OFF);
+    var bitLen: int64 := (peek64(ctx + S256_LEN_OFF) + fill) * 8;
+
+    poke8(ctx + S256_BUF_OFF + fill, 0x80);
+    fill += 1;
+    if (fill > 56) {
+        while (fill < 64) { poke8(ctx + S256_BUF_OFF + fill, 0); fill := fill + 1; }
+        sha256Block(ctx + S256_H_OFF, ctx + S256_BUF_OFF);
+        fill := 0;
+    }
+    while (fill < 56) { poke8(ctx + S256_BUF_OFF + fill, 0); fill := fill + 1; }
+
+    var j: int64 := 0;
+    while (j < 8) {
+        poke8(ctx + S256_BUF_OFF + 56 + (7 - j), ((bitLen as uint64) >> (j * 8)) & 0xFF);
+        j += 1;
+    }
+    sha256Block(ctx + S256_H_OFF, ctx + S256_BUF_OFF);
+
+    var i: int64 := 0;
+    while (i < 32) {
+        var word: int64 := peek32(ctx + S256_H_OFF + (i / 4) * 4) & 0xFFFFFFFF;
+        var shift: int64 := 24 - (i % 4) * 8;
+        poke8(out + i, ((word as uint64) >> shift) & 0xFF);
+        i += 1;
+    }
 }

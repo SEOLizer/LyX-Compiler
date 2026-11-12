@@ -1,243 +1,189 @@
-# LFD EBNF Grammatik v0.1.0
+# LFD EBNF Grammatik v1.0.0
 
-> Diese Grammatik definiert das LFD (LyX Form Description) Format.
-> Version: 0.1.0 | Status: Draft
+> Diese Grammatik beschreibt das LFD-Format (LyX Form Description) so, wie
+> `std/lfd_parser.lyx` es **tatsächlich** liest.
+>
+> Version: 1.0.0 | Status: gültig | Maßgeblich: der Parser
+
+**Zur Fassung 0.1.0 (#1397):** Die vorherige Grammatik beschrieb eine andere
+Sprache als der Parser — großgeschriebene Schlüsselwörter (`Form`, `Layout`,
+`Button`), einen Bezeichner je Element (`Button btnOk { … }`), eine
+`Format:`-Kopfzeile und Widget-Typen, die es nie gab (`WebView`). Wer sich
+daran hielt, bekam `expected 'form'`. Entschieden wurde: **der Parser ist
+maßgeblich**, die Grammatik zieht nach. Alles unten Beschriebene ist gegen
+`tests/lfd_grammatik_test.sh` gemessen.
 
 ## 1. Grundstruktur
 
 ```
-LFD-File          ::= Header? Form-Block
-Header           ::= "Format:" String NEWLINE
-Form-Block       ::= "Form" Identifier String "{" Layout-Block "}"
-Identifier       ::= [a-zA-Z_][a-zA-Z0-9_]*
-String            ::= '"' [^"\\\n]* '"'
+LFD-Datei    ::= Form-Block
+Form-Block   ::= "form" Titel? Block
+Titel        ::= String
+Block        ::= "{" Element* "}"
 ```
 
-## 2. Layout-Blöcke
+Es gibt **keine Kopfzeile**. Ein `Format: "…"` am Dateianfang ist kein
+gültiges LFD — die Datei beginnt mit `form`.
+
+Der Titel ist **optional** und steht als Zeichenkette direkt hinter dem
+Schlüsselwort. Einen Bezeichner je Element gibt es nicht: der Knoten führt
+Typ und Text, kein Namensfeld.
+
+## 2. Elemente
 
 ```
-Layout-Block      ::= (Layout-Directive | Widget-Definition)*
-Layout-Directive  ::= "Layout" Layout-Type "{" Layout-Block "}"
-Layout-Type       ::= "Vertical" | "Horizontal" | "Grid" | "Stack"
+Element      ::= Container | Widget | Property
+Container    ::= Container-Typ Titel? Block
+Widget       ::= Widget-Typ Titel? Block?
+Property     ::= Property-Name ":" Wert
 ```
 
-**Beispiel:**
+Container und Widgets unterscheiden sich nur darin, dass ein Container
+üblicherweise Kinder trägt; syntaktisch sind sie gleich. Der Block ist bei
+beiden optional — `button "OK"` allein ist gültig.
+
+## 3. Schlüsselwörter
+
+**Alle Schlüsselwörter werden kleingeschrieben verglichen.** `Button` ist
+kein Widget-Typ, sondern ein gewöhnlicher Bezeichner (und damit ein
+Property-Name, sobald ein `:` folgt).
+
 ```
-Layout Vertical {
-  ...
-}
+Container-Typ ::= "layout" | "vertical" | "horizontal" | "grid" | "stack"
+                | "groupbox" | "tabwidget" | "splitter"
+
+Widget-Typ    ::= "button" | "label" | "input" | "checkbox" | "radiobutton"
+                | "combobox" | "spinbox" | "slider" | "listbox" | "textedit"
+                | "progressbar" | "image" | "custom"
 ```
 
-## 3. Widget-Definitionen
+`groupbox`, `tabwidget` und `splitter` zählen im Parser zu den Containern,
+nicht zu den Widgets — sie tragen Kinder.
 
-```
-Widget-Definition ::= Widget-Type Identifier "{" Property-List "}"
-Widget-Type      ::= "Button" | "Label" | "Input" | "Checkbox" 
-                    | "RadioButton" | "ComboBox" | "SpinBox"
-                    | "Slider" | "ListBox" | "TextEdit"
-                    | "ProgressBar" | "GroupBox" | "TabWidget"
-                    | "Splitter" | "Image" | "WebView"
-                    | "Custom"
-```
-
-**Widget-Typ Aliasse:**
-```
-Button         = QPushButton
-Label         = QLabel
-Input         = QLineEdit
-Checkbox      = QCheckBox
-RadioButton   = QRadioButton
-ComboBox      = QComboBox
-SpinBox       = QSpinBox
-Slider        = QSlider
-ListBox       = QListWidget
-TextEdit      = QPlainTextEdit
-ProgressBar   = QProgressBar
-GroupBox      = QGroupBox
-TabWidget     = QTabWidget
-Splitter      = QSplitter
-Image         = QLabel (mit Pixmap)
-WebView       = QWebEngineView (falls verfügbar)
-Custom        = Benutzerdefiniertes Widget
-```
+Ein `webview` gibt es nicht. Die Fassung 0.1.0 führte ihn in der Liste; der
+Parser kannte ihn nie und liest ihn als Bezeichner.
 
 ## 4. Properties
 
 ```
-Property-List    ::= Property*
-Property         ::= Property-Name ":" PropertyValue
-Property-Name    ::= Identifier
-PropertyValue    ::= String | Number | Boolean | Expression | Block
+Property-Name ::= Property-Schlüsselwort | Identifier
+Property-Schlüsselwort
+              ::= "text" | "tooltip" | "enabled" | "visible"
+                | "width" | "height" | "onclick" | "onchange"
+Identifier    ::= [a-zA-Z_][a-zA-Z0-9_]*
 
-Boolean          ::= "true" | "false"
-Number          ::= [0-9]+ ("." [0-9]+)?
-Expression       ::= "$" Identifier | "$" "{" Expression "}" | ...
+Wert          ::= String | Number | Boolean | Identifier
+Boolean       ::= "true" | "false"
+Number        ::= [0-9]+
+String        ::= '"' [^"]* '"'
 ```
 
-### Standard Properties (alle Widgets):
+Ein Property-Name darf jeder Bezeichner sein — die acht Schlüsselwörter sind
+nur die, für die es einen eigenen Token-Typ gibt. `align: "center"` ist
+gültig und landet als Property mit dem Namen `align` im Baum.
 
-| Property | Typ | Default | Beschreibung |
-|---------|-----|---------|-------------|
-| Text | String | "" | Angezeigter Text |
-| ToolTip | String | "" | Tooltip bei Hover |
-| Enabled | Boolean | true | Widget aktiviert |
-| Visible | Boolean | true | Widget sichtbar |
-| Width | Number | -1 | feste Breite (-1 = auto) |
-| Height | Number | -1 | fixe Höhe (-1 = auto) |
-| MinWidth | Number | 0 | minimale Breite |
-| MinHeight | Number | 0 | minimale Höhe |
-| MaxWidth | Number | 0xFFFFFF | maximale Breite |
-| MaxHeight | Number | 0xFFFFFF | maximale Höhe |
-| Align | String | "left" | Text-Ausrichtung |
-| Style | String | "" | CSS-Style (QSS) |
-| OnClick | LFun | - | Click-Event Handler |
-| OnChange | LFun | - | Change-Event Handler |
+**Zahlen sind vorzeichenlos.** Ein `-` vor der Zahl ist kein Teil der Zahl;
+zur Behandlung siehe #1394.
 
-### Widget-spezifische Properties:
+**Zeichenketten-Werte** werden vom Parser derzeit gelesen, aber nicht am
+Knoten abgelegt (#1393). Die Grammatik beschreibt hier die Sprache, nicht den
+Stand der Umsetzung; die offenen Punkte sind unten aufgeführt.
 
-**Button:**
-| Property | Typ | Default |
-|---------|-----|---------|
-| Default | Boolean | false |
-| Flat | Boolean | false |
-| Icon | String | - |
+## 5. Vollständiges Beispiel
 
-**Input:**
-| Property | Typ | Default |
-|---------|-----|---------|
-| Placeholder | String | "" |
-| MaxLength | Number | 0 (unlimited) |
-| EchoMode | String | "Normal" (Normal/NoEcho/Password) |
-
-**Slider/SpinBox:**
-| Property | Typ | Default |
-|---------|-----|---------|
-| Min | Number | 0 |
-| Max | Number | 100 |
-| Value | Number | 0 |
-| Step | Number | 1 |
-
-**ComboBox:**
-| Property | Typ | Default |
-|---------|-----|---------|
-| Items | String[] | [] |
-| Editable | Boolean | false |
-
-## 5. Events & Interaktion
+Dieses Beispiel ist gegen den Parser gemessen und wird fehlerfrei gelesen:
 
 ```
-Event-Handler    ::= "On" Event-Name ":" LFun-Reference
-Event-Name       ::= "Click" | "Change" | "Select" | "DoubleClick"
-                    | "FocusIn" | "FocusOut" | "KeyPress" | "Hover"
-LFun-Reference   ::= Identifier | String
-```
-
-**Beispiel:**
-```
-Button btnOk {
-  Text: "OK"
-  OnClick: "command-insert"
-}
-```
-
-## 6. Erweiterungen
-
-### Verschachtelte Widgets
-
-```
-GroupBox mainGroup {
-  Text: "Optionen"
-  Layout Vertical {
-    Checkbox opt1 { Text: "Option A" }
-    Checkbox opt2 { Text: "Option B" }
-  }
-}
-```
-
-### Bedingte Properties
-
-```
-Input field {
-  Text: "$value"
-  Enabled: "$isEditable"
-}
-```
-
-### Wiederholungen (Future)
-
-```
-For i in 0..3 {
-  Button "btn$i" { Text: "Button $i" }
-}
-```
-
----
-
-## Vollständiges Beispiel
-
-```
-Format: "LFD v1.0"
-
-Form ConfigDialog "Konfiguration" {
-  Layout Vertical {
-    Label lblTitle {
-      Text: "Einstellungen"
-      Align: "center"
+form "Konfiguration" {
+  vertical {
+    label "Einstellungen" {
+      align: "center"
     }
-    
-    GroupBox grpOptions {
-      Text: "Optionen"
-      Layout Vertical {
-        Checkbox optAutoSave {
-          Text: "Automatisch speichern"
-          OnChange: "set-auto-save"
+
+    groupbox "Optionen" {
+      vertical {
+        checkbox "Automatisch speichern" {
+          onchange: "set-auto-save"
         }
-        Checkbox optNotifications {
-          Text: "Benachrichtigungen anzeigen"
-          OnChange: "set-notifications"
+        checkbox "Benachrichtigungen anzeigen" {
+          onchange: "set-notifications"
         }
       }
     }
-    
-    Layout Horizontal {
-      Button btnOk {
-        Text: "OK"
-        OnClick: "save-config"
+
+    horizontal {
+      button "OK" {
+        width: 100
+        onclick: "save-config"
       }
-      Button btnCancel {
-        Text: "Abbrechen"
-        OnClick: "cancel"
+      button "Abbrechen" {
+        onclick: "cancel"
       }
     }
   }
 }
 ```
 
----
+## 6. Knotenarten
 
-## Zusammenfassung: Reserved Words
+Der Baum führt für jeden Knoten eine Art. Widget- und Container-Knoten tragen
+den `LFD_TK_*`-Wert ihres Schlüsselworts, Properties eine eigene Konstante:
+
+| Knoten | Konstante | Wert |
+|---|---|---|
+| Form | `LFD_TK_FORM` | 0 |
+| Layout | `LFD_TK_LAYOUT` | 1 |
+| Property | `LFD_NODE_PROPERTY` | 101 |
+| Event | `LFD_NODE_EVENT` | 102 |
+| Wurzel | `LFD_NODE_ROOT` | 100 |
+
+Die Widget-Konstanten `LFD_NODE_*` aus früheren Fassungen überschneiden sich
+mit den Token-Werten (`LFD_NODE_WIDGET` = 3 = `LFD_TK_HORIZONTAL`); das ist
+als #1396 geführt.
+
+## 7. Reservierte Wörter
 
 ```
-Form
-Layout
-Vertical
-Horizontal
-Grid
-Stack
-OnClick
-OnChange
-OnSelect
-OnDoubleClick
-OnFocusIn
-OnFocusOut
-OnHover
-true
-false
-Format
+form  layout  vertical  horizontal  grid  stack
+button  label  input  checkbox  radiobutton  combobox  spinbox
+slider  listbox  textedit  progressbar  groupbox  tabwidget
+splitter  image  custom
+text  tooltip  enabled  visible  width  height  onclick  onchange
+true  false
 ```
+
+Alles andere ist ein Bezeichner.
+
+## 8. Was diese Grammatik NICHT beschreibt
+
+Die Fassung 0.1.0 führte mehrere Formen, die nie umgesetzt waren. Sie stehen
+hier bewusst nicht mehr, damit niemand danach schreibt:
+
+* Bezeichner je Element (`Button btnOk { … }`)
+* `Format:`-Kopfzeile
+* Ausdrücke und Variablen (`Text: "$value"`)
+* Wiederholungen (`For i in 0..3 { … }`)
+* Der Widget-Typ `webview`
+* Die Ereignisse `onselect`, `ondoubleclick`, `onfocusin`, `onfocusout`,
+  `onhover` — der Lexer kennt nur `onclick` und `onchange`; alles andere
+  wird als gewöhnlicher Property-Name gelesen.
+
+## 9. Offene Punkte am Parser
+
+Die folgenden Abweichungen sind gemeldet und noch nicht behoben. Sie ändern
+nichts an der hier beschriebenen Sprache:
+
+| Nummer | Punkt |
+|---|---|
+| #1393 | Zeichenketten-Werte (`text`, `tooltip`, `onclick`) werden verworfen |
+| #1394 | `width: -5` ergibt still 5 — das Minuszeichen fällt weg |
+| #1395 | kein Getter für die Textlänge |
+| #1396 | `LFD_NODE_WIDGET` kollidiert mit `LFD_TK_HORIZONTAL` |
+| #1391 | `std.lfd_factory` ist funktionslos |
+| #1392 | `std.lfd_factory` vergleicht `pchar` mit `==` statt `StrEquals` |
 
 ---
 
-*EBNF Version: 0.1.0*
+*EBNF-Version: 1.0.0*
 *Erstellt: 2026-04-20*
-*Letzte Änderung: 2026-04-20*
+*Letzte Änderung: 2026-08-15 (#1397 — an den Parser angeglichen)*
