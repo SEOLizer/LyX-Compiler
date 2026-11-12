@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.37A
+VERSION   := 1.2.37B
 VERSION_DATE := 2026-11-12
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -769,6 +769,8 @@ test: lyxc
 	@bash tests/utype_test.sh
 	@bash tests/units_test.sh
 	@bash tests/std_unit_deklaration_test.sh
+	@echo "--- std.list: ListStr* (Zeichenkettenliste, 12 Pruefungen) (#2485) ---"
+	@bash tests/liststr_2485_test.sh
 	@bash tests/embed_test.sh
 	@bash tests/lyu_import_test.sh
 	@bash tests/lyu_arch_test.sh

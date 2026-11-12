@@ -521,4 +521,381 @@ pub fn QueueInt64Peek(q: int64): int64 {
 pub fn QueueInt64IsEmpty(q: int64): bool { return q == 0 || peek64(q + Q_CNT) == 0; }
 pub fn QueueInt64IsFull(q: int64): bool  { return q != 0 && peek64(q + Q_CNT) >= peek64(q + Q_CAP); }
 
+// ============================================================================
+// ListStr - dynamische Liste von Zeichenketten (#2485)
+// ============================================================================
+//
+// WARUM HIER. Eine Liste von Zeichenketten gab es in der stdlib nicht; sie
+// lag nur als TStringList im lyx-vcl-Paket. Eine so grundlegende
+// Datenstruktur gehoert in den Compiler -- versioniert, getestet und
+// ausgeliefert wie der Rest.
+//
+// EIGENTUM AN DEN ZEICHENKETTEN -- die wichtigste Zusage dieser Unit:
+// Die Liste BESITZT ihre Eintraege. ListStrAdd, ListStrSet und ListStrInsertAt
+// legen eine EIGENE KOPIE an; ListStrRemoveAt, ListStrClear und ListStrFree
+// geben sie wieder frei.
+//
+// Alles andere waere hier falsch. Ein String-Literal ist kein Schreibpuffer,
+// und `free` darauf ist ein Fehler -- wuerde die Liste bloss fremde Zeiger
+// ablegen, wuesste beim Freigeben niemand, wem der Text gehoert. Genau diese
+// Entscheidung trifft TStringList in lyx-vcl ebenso, und aus demselben Grund.
+//
+// Was der Aufrufer daraus zu beachten hat:
+//   * ListStrGet gibt einen GELIEHENEN Zeiger. Er gilt, bis derselbe Eintrag
+//     ueberschrieben oder entfernt wird oder die Liste freigegeben wird.
+//     Wer ihn laenger braucht, kopiert ihn selbst.
+//   * Der uebergebene Text wird nur gelesen. Ein Literal ist also erlaubt.
+//
+// Ein Eintrag ist EIN Block: 8 Byte Laenge, dann die Bytes, dann ein
+// Nullbyte. Ein Block statt zweier Allokationen, damit Freigeben nicht zwei
+// Buchfuehrungen braucht; das Nullbyte, damit ListStrGet ein gueltiges pchar
+// liefert, ohne zu kopieren.
+//
+// Allokator: `std.alloc` wie der Rest dieser Unit (mmap je Allokation, `free`
+// gibt wirklich zurueck). Die Groesse wird deshalb beim Freigeben mitgefuehrt.
+
+pub type ListStr = int64;
+
+con LSTR_HDR_SIZE: int64 := 24;     // Kopf wie bei ListInt64: cap, len, ptr
+
+// Laenge einer nullterminierten Zeichenkette. Lokal gehalten, damit diese
+// Unit nicht von std.string abhaengt -- sie laege damit in jedem Programm,
+// das bloss eine Liste braucht.
+fn _lsLen(s: pchar): int64 {
+  if ((s as int64) == 0) { return 0; }
+  var n: int64 := 0;
+  while (peek8((s as int64) + n) != 0) { n += 1; }
+  return n;
+}
+
+// Eigene Kopie anlegen: [laenge][bytes][0]
+fn _lsNeu(s: pchar): int64 {
+  var n: int64 := _lsLen(s);
+  var blk: int64 := alloc(8 + n + 1);
+  if (blk == 0) { return 0; }
+  poke64(blk, n);
+  var i: int64 := 0;
+  while (i < n) {
+    poke8(blk + 8 + i, peek8((s as int64) + i));
+    i += 1;
+  }
+  poke8(blk + 8 + n, 0);
+  return blk;
+}
+
+fn _lsBlkLen(blk: int64): int64 { if (blk == 0) { return 0; } return peek64(blk); }
+fn _lsBlkTxt(blk: int64): pchar { return (blk + 8) as pchar; }
+
+fn _lsBlkFrei(blk: int64): void {
+  if (blk == 0) { return; }
+  free(blk, 8 + peek64(blk) + 1);
+}
+
+// Vergleich zweier Zeichenketten: <0, 0, >0. Byteweise und vorzeichenLOS --
+// peek8 liefert 0..255, ein Vergleich ueber 0x7F soll nicht kippen.
+fn _lsCmp(a: pchar, b: pchar): int64 {
+  var i: int64 := 0;
+  while (1 == 1) {
+    var ca: int64 := peek8((a as int64) + i);
+    var cb: int64 := peek8((b as int64) + i);
+    if (ca != cb) { return ca - cb; }
+    if (ca == 0) { return 0; }
+    i += 1;
+  }
+  return 0;
+}
+
+pub fn ListStrNew(): int64 {
+  var h: int64 := alloc(LSTR_HDR_SIZE);
+  if (h == 0) { return 0; }
+  _listSetCap(h, LIST_INITIAL_CAP);
+  _listSetLen(h, 0);
+  _listSetPtr(h, alloc(LIST_INITIAL_CAP * 8));
+  return h;
+}
+
+pub fn ListStrWithCapacity(capacity: int64): int64 {
+  var cap: int64 := capacity;
+  if (cap < 1) { cap := 1; }
+  var h: int64 := alloc(LSTR_HDR_SIZE);
+  if (h == 0) { return 0; }
+  _listSetCap(h, cap);
+  _listSetLen(h, 0);
+  _listSetPtr(h, alloc(cap * 8));
+  return h;
+}
+
+pub fn ListStrLen(list: int64): int64 {
+  if (list == 0) { return 0; }
+  return _listLen(list);
+}
+
+pub fn ListStrIsEmpty(list: int64): bool {
+  return list == 0 || _listLen(list) == 0;
+}
+
+// Haengt eine KOPIE an. Rueckgabe: der Index, oder -1 wenn kein Speicher da
+// war. Ein Fehlschlag ist hier ein echter Wert und nicht stilles Nichts --
+// sonst zaehlt die Liste weiter, ohne den Eintrag zu haben.
+pub fn ListStrAdd(list: int64, s: pchar): int64 {
+  if (list == 0) { return 0 - 1; }
+  var blk: int64 := _lsNeu(s);
+  if (blk == 0) { return 0 - 1; }
+  if (_listLen(list) == _listCap(list)) { _listGrow(list); }
+  var len: int64 := _listLen(list);
+  poke64(_listPtr(list) + len * 8, blk);
+  _listSetLen(list, len + 1);
+  return len;
+}
+
+// Geliehener Zeiger, siehe Kopf. 0 bei ungueltigem Index.
+pub fn ListStrGet(list: int64, index: int64): pchar {
+  if (list == 0 || index < 0 || index >= _listLen(list)) { return 0 as pchar; }
+  return _lsBlkTxt(peek64(_listPtr(list) + index * 8));
+}
+
+pub fn ListStrLengthOf(list: int64, index: int64): int64 {
+  if (list == 0 || index < 0 || index >= _listLen(list)) { return 0 - 1; }
+  return _lsBlkLen(peek64(_listPtr(list) + index * 8));
+}
+
+// Ersetzt den Eintrag durch eine KOPIE und gibt den alten frei.
+pub fn ListStrSet(list: int64, index: int64, s: pchar): bool {
+  if (list == 0 || index < 0 || index >= _listLen(list)) { return false; }
+  var blk: int64 := _lsNeu(s);
+  if (blk == 0) { return false; }
+  var slot: int64 := _listPtr(list) + index * 8;
+  _lsBlkFrei(peek64(slot));
+  poke64(slot, blk);
+  return true;
+}
+
+pub fn ListStrIndexOf(list: int64, s: pchar): int64 {
+  if (list == 0) { return 0 - 1; }
+  var n: int64 := _listLen(list);
+  var i: int64 := 0;
+  while (i < n) {
+    if (_lsCmp(_lsBlkTxt(peek64(_listPtr(list) + i * 8)), s) == 0) { return i; }
+    i += 1;
+  }
+  return 0 - 1;
+}
+
+pub fn ListStrContains(list: int64, s: pchar): bool {
+  return ListStrIndexOf(list, s) >= 0;
+}
+
+pub fn ListStrInsertAt(list: int64, index: int64, s: pchar): bool {
+  if (list == 0 || index < 0 || index > _listLen(list)) { return false; }
+  var blk: int64 := _lsNeu(s);
+  if (blk == 0) { return false; }
+  if (_listLen(list) == _listCap(list)) { _listGrow(list); }
+  var len: int64 := _listLen(list);
+  var p: int64 := _listPtr(list);
+  var i: int64 := len;
+  while (i > index) {
+    poke64(p + i * 8, peek64(p + (i - 1) * 8));
+    i -= 1;
+  }
+  poke64(p + index * 8, blk);
+  _listSetLen(list, len + 1);
+  return true;
+}
+
+pub fn ListStrRemoveAt(list: int64, index: int64): bool {
+  if (list == 0 || index < 0 || index >= _listLen(list)) { return false; }
+  var p: int64 := _listPtr(list);
+  _lsBlkFrei(peek64(p + index * 8));
+  var len: int64 := _listLen(list);
+  var i: int64 := index;
+  while (i < len - 1) {
+    poke64(p + i * 8, peek64(p + (i + 1) * 8));
+    i += 1;
+  }
+  _listSetLen(list, len - 1);
+  return true;
+}
+
+pub fn ListStrRemove(list: int64, s: pchar): bool {
+  var i: int64 := ListStrIndexOf(list, s);
+  if (i < 0) { return false; }
+  return ListStrRemoveAt(list, i);
+}
+
+// Gibt ALLE Eintraege frei, behaelt aber die Zeigertabelle.
+pub fn ListStrClear(list: int64): void {
+  if (list == 0) { return; }
+  var n: int64 := _listLen(list);
+  var p: int64 := _listPtr(list);
+  var i: int64 := 0;
+  while (i < n) {
+    _lsBlkFrei(peek64(p + i * 8));
+    i += 1;
+  }
+  _listSetLen(list, 0);
+}
+
+// Gibt die Liste UND alle Eintraege frei. Der Handle ist danach ungueltig.
+pub fn ListStrFree(list: int64): void {
+  if (list == 0) { return; }
+  ListStrClear(list);
+  free(_listPtr(list), _listCap(list) * 8);
+  free(list, LSTR_HDR_SIZE);
+}
+
+pub fn ListStrExchange(list: int64, a: int64, b: int64): bool {
+  if (list == 0) { return false; }
+  var n: int64 := _listLen(list);
+  if (a < 0 || b < 0 || a >= n || b >= n) { return false; }
+  if (a == b) { return true; }
+  var p: int64 := _listPtr(list);
+  var t: int64 := peek64(p + a * 8);
+  poke64(p + a * 8, peek64(p + b * 8));
+  poke64(p + b * 8, t);
+  return true;
+}
+
+// Einfuegesortierung ueber die ZEIGER -- die Bloecke bleiben liegen, nur die
+// Tabelle wird umgestellt. Damit bleibt jeder geliehene Zeiger aus
+// ListStrGet gueltig; kopiert wird nichts.
+pub fn ListStrSort(list: int64): void {
+  if (list == 0) { return; }
+  var n: int64 := _listLen(list);
+  var p: int64 := _listPtr(list);
+  var i: int64 := 1;
+  while (i < n) {
+    var cur: int64 := peek64(p + i * 8);
+    var j: int64 := i;
+    while (j > 0 && _lsCmp(_lsBlkTxt(peek64(p + (j - 1) * 8)), _lsBlkTxt(cur)) > 0) {
+      poke64(p + j * 8, peek64(p + (j - 1) * 8));
+      j -= 1;
+    }
+    poke64(p + j * 8, cur);
+    i += 1;
+  }
+}
+
+pub fn ListStrSortDesc(list: int64): void {
+  if (list == 0) { return; }
+  ListStrSort(list);
+  var n: int64 := _listLen(list);
+  var i: int64 := 0;
+  while (i < n / 2) {
+    ListStrExchange(list, i, n - 1 - i);
+    i += 1;
+  }
+}
+
+// Der Platz, an den `s` in einer SORTIERTEN Liste gehoert. Binaer gesucht.
+// Auf einer unsortierten Liste ist das Ergebnis bedeutungslos -- dieselbe
+// Zusage wie bei jeder binaeren Suche.
+pub fn ListStrSortedPos(list: int64, s: pchar): int64 {
+  if (list == 0) { return 0; }
+  var lo: int64 := 0;
+  var hi: int64 := _listLen(list);
+  var p: int64 := _listPtr(list);
+  while (lo < hi) {
+    var mid: int64 := lo + (hi - lo) / 2;
+    if (_lsCmp(_lsBlkTxt(peek64(p + mid * 8)), s) < 0) { lo := mid + 1; }
+    else { hi := mid; }
+  }
+  return lo;
+}
+
+// Eine neue Liste mit eigenen Kopien aller Eintraege. Beide Listen sind
+// danach unabhaengig und muessen beide freigegeben werden.
+pub fn ListStrClone(list: int64): int64 {
+  if (list == 0) { return 0; }
+  var n: int64 := _listLen(list);
+  var cap: int64 := n;
+  if (cap < 1) { cap := 1; }
+  var neu: int64 := ListStrWithCapacity(cap);
+  if (neu == 0) { return 0; }
+  var i: int64 := 0;
+  while (i < n) {
+    if (ListStrAdd(neu, ListStrGet(list, i)) < 0) { ListStrFree(neu); return 0; }
+    i += 1;
+  }
+  return neu;
+}
+
+// Alle Eintraege mit `trenner` dazwischen in EINEN neuen Block.
+//
+// FREIGABE: der Rueckgabewert gehoert dem AUFRUFER. Er gibt ihn mit
+// ListStrJoinFree zurueck -- `free` braucht die Groesse, und die kennt nur
+// diese Unit. Ohne das Gegenstueck waere der Rueckgabewert ein Leck mit
+// Ankuendigung.
+pub fn ListStrJoin(list: int64, trenner: pchar): pchar {
+  var tl: int64 := _lsLen(trenner);
+  var n: int64 := 0;
+  if (list != 0) { n := _listLen(list); }
+  var gesamt: int64 := 0;
+  var i: int64 := 0;
+  while (i < n) {
+    gesamt += _lsBlkLen(peek64(_listPtr(list) + i * 8));
+    if (i + 1 < n) { gesamt += tl; }
+    i += 1;
+  }
+  var blk: int64 := alloc(8 + gesamt + 1);
+  if (blk == 0) { return 0 as pchar; }
+  poke64(blk, gesamt);
+  var w: int64 := 0;
+  i := 0;
+  while (i < n) {
+    var src: int64 := peek64(_listPtr(list) + i * 8);
+    var sl: int64 := _lsBlkLen(src);
+    var k: int64 := 0;
+    while (k < sl) { poke8(blk + 8 + w + k, peek8(src + 8 + k)); k += 1; }
+    w += sl;
+    if (i + 1 < n) {
+      k := 0;
+      while (k < tl) { poke8(blk + 8 + w + k, peek8((trenner as int64) + k)); k += 1; }
+      w += tl;
+    }
+    i += 1;
+  }
+  poke8(blk + 8 + gesamt, 0);
+  return _lsBlkTxt(blk);
+}
+
+// Gegenstueck zu ListStrJoin. Nimmt genau den Zeiger, den ListStrJoin
+// geliefert hat; alles andere ist ein Fehler.
+pub fn ListStrJoinFree(s: pchar): void {
+  if ((s as int64) == 0) { return; }
+  _lsBlkFrei((s as int64) - 8);
+}
+
+// Zerlegt `s` an jedem Vorkommen von `trenner` (EIN Byte) in eine neue
+// Liste. Zwei Trenner hintereinander ergeben einen leeren Eintrag -- die
+// Zahl der Felder ist damit vorhersagbar, was beim Lesen von Tabellen der
+// Punkt ist. Die Liste gehoert dem Aufrufer (ListStrFree).
+pub fn ListStrSplit(s: pchar, trenner: int64): int64 {
+  var liste: int64 := ListStrNew();
+  if (liste == 0) { return 0; }
+  if ((s as int64) == 0) { return liste; }
+  var n: int64 := _lsLen(s);
+  var start: int64 := 0;
+  var i: int64 := 0;
+  while (i <= n) {
+    var am_ende: int64 := 0;
+    if (i == n) { am_ende := 1; }
+    if (am_ende == 1 || peek8((s as int64) + i) == trenner) {
+      var tl: int64 := i - start;
+      var blk: int64 := alloc(8 + tl + 1);
+      if (blk == 0) { ListStrFree(liste); return 0; }
+      poke64(blk, tl);
+      var k: int64 := 0;
+      while (k < tl) { poke8(blk + 8 + k, peek8((s as int64) + start + k)); k += 1; }
+      poke8(blk + 8 + tl, 0);
+      if (_listLen(liste) == _listCap(liste)) { _listGrow(liste); }
+      var len: int64 := _listLen(liste);
+      poke64(_listPtr(liste) + len * 8, blk);
+      _listSetLen(liste, len + 1);
+      start := i + 1;
+    }
+    i += 1;
+  }
+  return liste;
+}
+
 // End of std/list.lyx
