@@ -8634,6 +8634,82 @@ pub type Sema = class {
     self._meldeKlasseOhneNew(ni, typeNi);
   }
 
+  // #2429: `b.Zahl()` auf einem FELD uebersetzte still und sprang zur Laufzeit
+  // auf den FELDWERT als Codeadresse — SIGSEGV an einer Stelle, die im
+  // Quelltext harmlos aussieht. #1976 hat denselben Fall fuer eine FEHLENDE
+  // Methode geschlossen; hier fehlt sie nicht, sondern es gibt ein Feld
+  // gleichen Namens, und dann griff keine Pruefung.
+  //
+  // Der zulaessige Fall ist ein Feld, das einen Funktionszeiger haelt
+  // (`OnClick: TNotifyEvent`) — unterscheidbar am deklarierten Typ.
+  // Rueckgabe 1 heisst "aufrufbar ODER nicht entscheidbar": nur ein Typ, der
+  // sicher kein Code sein kann, wird abgewiesen. Ein benannter Typ bleibt
+  // ungeprueft, weil ein Typalias auf einen Funktionszeiger zeigen kann und
+  // das ueber eine Unit-Grenze hinweg nicht zu sehen ist (fail-open).
+  fn _feldTypAufrufbar(typeNi: int64): int64 {
+    if (typeNi < 0) { return 1; }
+    var k: int64 := self.sn_kind(typeNi);
+    if (k == SNK_FN_PTR || k == SNK_METHOD_PTR) { return 1; }
+    if (k != SNK_TYPE_NAME) { return 1; }
+    if (self.sn_c1(typeNi) >= 0) { return 1; }
+    var pt: int64 := self.ResolveType(typeNi);
+    if (pt == TY_INT64 || pt == TY_INT32 || pt == TY_INT16 || pt == TY_INT8) { return 0; }
+    if (pt == TY_UINT64 || pt == TY_UINT32 || pt == TY_UINT16 || pt == TY_UINT8) { return 0; }
+    if (pt == TY_BOOL || pt == TY_FLOAT64 || pt == TY_CHAR || pt == TY_PCHAR) { return 0; }
+    return 1;
+  }
+
+  // Laeuft die Vererbungskette hoch (c2 = Elterntyp) und meldet NUR dann,
+  // wenn es nirgends eine Methode dieses Namens gibt UND ein Feld mit einem
+  // sicher nicht aufrufbaren Typ. Die Reihenfolge ist wesentlich: eine
+  // GEERBTE Methode steht nicht in der Methodenliste dieser Klasse, und ohne
+  // den Durchlauf waere jeder geerbte Aufruf ein Fehlalarm.
+  fn _pruefFeldStattMethode(callNi: int64, startNi: int64, nm: pchar, nl: int64): void {
+    var cur:     int64 := startNi;
+    var depth:   int64 := 0;
+    var feldTyp: int64 := 0 - 2;        // -2: kein Feld dieses Namens gesehen
+    var besitzer: int64 := -1;
+    while (cur >= 0 && depth <= 16) {
+      var m: int64 := self.sn_c1(cur);
+      while (m >= 0) {
+        if (self._strNEq(self.sn_sVal(m), self.sn_sLen(m), nm, nl) != 0) { return; }
+        m := self.sn_next(m);
+      }
+      if (feldTyp == 0 - 2) {
+        var fl: int64 := self.sn_c0(cur);
+        while (fl >= 0) {
+          if (self.sn_kind(fl) == 7) {
+            if (self._strNEq(self.sn_sVal(fl), self.sn_sLen(fl), nm, nl) != 0) {
+              feldTyp  := self.sn_c0(fl);
+              besitzer := cur;
+            }
+          }
+          fl := self.sn_next(fl);
+        }
+      }
+      var p: int64 := self.sn_c2(cur);
+      if (p < 0) { cur := -1; }
+      else {
+        var ps: int64 := self.Lookup(self.sn_sVal(p), self.sn_sLen(p));
+        if (ps < 0) { cur := -1; } else { cur := self.SymNodeIdx(ps); }
+      }
+      depth := depth + 1;
+    }
+    if (feldTyp == 0 - 2) { return; }
+    if (self._feldTypAufrufbar(feldTyp) != 0) { return; }
+    EPrintStr("sema error: '"c);
+    sys_write(2, nm as int64, nl);
+    EPrintStr("' ist ein Feld"c);
+    if (besitzer >= 0 && self.sn_sLen(besitzer) > 0) {
+      EPrintStr(" von "c);
+      sys_write(2, self.sn_sVal(besitzer) as int64, self.sn_sLen(besitzer));
+    }
+    EPrintStrLn(" und keine Methode -- die Klammern entfernen."c);
+    EPrintStrLn("  Mit Klammern springt der Lauf auf den FELDWERT als Codeadresse (#2429)."c);
+    self.hadError   := 1;
+    self.errorCount += 1;
+  }
+
   fn _checkInstanceMethodArity(callNi: int64, recvSi: int64): void {
     var vDecl: int64 := self.SymNodeIdx(recvSi);
     if (vDecl < 0) { return; }
@@ -8677,6 +8753,15 @@ pub type Sema = class {
           }
           mth := self.sn_next(mth);
         }
+      }
+    }
+
+    // #2429: kein Methodeneintrag gefunden — steht statt dessen ein FELD
+    // dieses Namens da? Dann ist der Aufruf ein Sprung auf den Feldwert.
+    if (tsi >= 0) {
+      var cFeld: int64 := self.SymNodeIdx(tsi);
+      if (cFeld >= 0 && self.sn_kind(cFeld) == SNK_TYPE_DECL) {
+        self._pruefFeldStattMethode(callNi, cFeld, mname, mlen);
       }
     }
 
