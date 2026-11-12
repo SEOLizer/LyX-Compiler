@@ -187,6 +187,37 @@ pruef "Split behaelt leere Felder" '
 bc
 0'
 
+echo "-- ListInt64Exchange (Nachtrag zu #2485) --"
+# Gegenstueck zu ListStrExchange. Gebraucht, damit TObjectList aus lyx-vcl
+# ganz auf diese Unit abgebildet werden kann. Geprueft wird der TAUSCH und
+# die Grenze -- und dass ein abgewiesener Tausch NICHTS veraendert: ein
+# halber Tausch verdoppelt den einen Wert und verliert den anderen still.
+pruef "ListInt64Exchange tauscht" '
+  var l: int64 := ListInt64New();
+  ListInt64Add(l, 10); ListInt64Add(l, 20); ListInt64Add(l, 30);
+  if (ListInt64Exchange(l, 0, 2)) {
+    PrintLn(IntToStr(ListInt64Get(l, 0)));
+    PrintLn(IntToStr(ListInt64Get(l, 1)));
+    PrintLn(IntToStr(ListInt64Get(l, 2)));
+  }
+  ListInt64Free(l);' '30
+20
+10'
+
+pruef "ListInt64Exchange: Grenze haelt und laesst die Liste unberuehrt" '
+  var l: int64 := ListInt64New();
+  ListInt64Add(l, 1); ListInt64Add(l, 2);
+  if (!ListInt64Exchange(l, 0, 5)) { PrintLn("abgewiesen"c); }
+  PrintLn(IntToStr(ListInt64Get(l, 0)));
+  PrintLn(IntToStr(ListInt64Get(l, 1)));
+  if (ListInt64Exchange(l, 1, 1)) { PrintLn("a==b ist erlaubt"c); }
+  PrintLn(IntToStr(ListInt64Get(l, 1)));
+  ListInt64Free(l);' 'abgewiesen
+1
+2
+a==b ist erlaubt
+2'
+
 echo
 echo "Ergebnis: $PASS PASS, $FAIL FAIL"
 [ "$FAIL" = "0" ] || exit 1
