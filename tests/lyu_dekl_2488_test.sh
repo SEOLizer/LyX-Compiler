@@ -119,8 +119,74 @@ fn main(): int64 {
   fi
 fi
 
+echo "-- pub var auf Modulebene (#2488 Schritt 2) --"
+# Eine Modulvariable ist SPEICHER, nicht nur ein Name. Dass der Eintrag
+# gefahrlos ist, haengt daran, dass cg_addGlobal bei einem NAMENStreffer
+# denselben Datenoffset zurueckgibt -- eine zweite Deklaration legt keinen
+# zweiten Speicher an. Geprueft wird deshalb nicht nur das Lesen, sondern
+# auch das SCHREIBEN: wer auf eine eigene Zelle schriebe, bekaeme beim
+# Zurueklesen den alten Wert.
+if vorkompilieren pv 'unit probe.pv;
+pub var PvZaehler: int64 := 5;
+pub var PvLeer: int64;
+'; then
+  printf '%s' 'unit main;
+import std.io;
+import probe.pv;
+fn main(): int64 {
+  PrintLn(IntToStr(PvZaehler));
+  PrintLn(IntToStr(PvLeer));
+  PvZaehler := PvZaehler + 1;
+  PrintLn(IntToStr(PvZaehler));
+  return 0;
+}' > "$TMP/pv.lyx"
+  if "$LYXC" -I"$TMP/u" --std-path="$ROOT" "$TMP/pv.lyx" -o "$TMP/pv" >"$TMP/pv.log" 2>&1; then
+    got="$( ulimit -v 2000000 -c 0; timeout 30 "$TMP/pv" 2>&1 | tr '\n' '|' )"
+    if [ "$got" = "5|0|6|" ]; then
+      echo "PASS pub var: Startwert 5 erhalten, ohne Startwert 0, Schreiben wirkt (6)"
+      PASS=$((PASS+1))
+    else
+      echo "FAIL pub var: Ausgabe '$got' statt '5|0|6|'"
+      FAIL=$((FAIL+1))
+    fi
+  else
+    echo "FAIL pub var uebersetzt NICHT gegen die reine .lyu:"
+    grep -iE "error|Nicht beschrieben" "$TMP/pv.log" | head -3 | sed 's/^/    /'
+    FAIL=$((FAIL+1))
+  fi
+fi
+
+echo "-- Gegenseite: nicht ausrechenbarer Startwert scheitert LAUT --"
+# Den Wert weglassen und den Eintrag trotzdem schreiben waere der stille
+# Fall: der Leser saehe 0, wo 7 steht. Der Schreiber muss den Eintrag
+# deshalb GANZ weglassen, und der Codegen die Quelle verlangen.
+if vorkompilieren pvx 'unit probe.pvx;
+fn _hol(): int64 { return 7; }
+pub var PvBerechnet: int64 := _hol();
+'; then
+  printf '%s' 'unit main;
+import std.io;
+import probe.pvx;
+fn main(): int64 {
+  PrintLn(IntToStr(PvBerechnet));
+  return 0;
+}' > "$TMP/pvx.lyx"
+  out="$("$LYXC" -I"$TMP/u" --std-path="$ROOT" "$TMP/pvx.lyx" -o "$TMP/pvx" 2>&1)"
+  if [ "$?" = "0" ]; then
+    echo "FAIL berechneter Startwert uebersetzte klaglos — der Leser bekommt still eine 0"
+    FAIL=$((FAIL+1))
+  elif printf '%s' "$out" | grep -q "Nicht beschrieben: PvBerechnet"; then
+    echo "PASS berechneter Startwert scheitert laut und nennt PvBerechnet"
+    PASS=$((PASS+1))
+  else
+    echo "FAIL scheitert, aber nicht mit der erwarteten Ursache:"
+    printf '%s\n' "$out" | grep -iE "error" | head -2 | sed 's/^/    /'
+    FAIL=$((FAIL+1))
+  fi
+fi
+
 echo
 echo "Ergebnis: $PASS PASS, $FAIL FAIL"
 [ "$FAIL" = "0" ] || exit 1
-echo "OK: Typalias und f64-Konstante stehen in der .lyu (#2488)"
+echo "OK: Typalias, f64-Konstante und pub var stehen in der .lyu (#2488)"
 exit 0
