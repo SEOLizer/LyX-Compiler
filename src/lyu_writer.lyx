@@ -187,6 +187,27 @@ con LYU_DK_PUBVAR: int64 := 8;   // pub var X: <Typ> [:= <Wert>]
 // LyrObjAbbild prueft deshalb gegen den Kopf.
 con LYU_DK_OBJ: int64 := 9;      // relozierbares Objektabbild
 
+// #2502: `extern fn NAME(...) link "lib"` -- eine FFI-Bindung.
+//
+// Bis 1.2.38H uebersprungen ("braucht Bibliothek und Aufrufkonvention --
+// nicht beschrieben"), und das kostete die ganze Unit: die Namen stehen in
+// der Symboltabelle, der Codegen zaehlte sie als verloren und verlangte die
+// .lyx. 11 von 40 Beispielen scheiterten daran, alle ueber std.x11,
+// std.qt5_app und std.qt5_egl.
+//
+// Beschrieben werden Name, Signatur und die link-Bibliothek. KEINE
+// Aufrufkonvention: die gibt es in der Sprache nicht als Angabe an der
+// Deklaration -- `extern fn` ist immer die C-Konvention des Ziels.
+//
+// Nicht beschrieben, und darum uebersprungen (die Unit bleibt dann wie bisher
+// quellpflichtig, also laut statt still falsch):
+//   - eine Deklaration MIT @capabilities-Angabe. Sie entscheidet ueber
+//     Rechte; ginge sie verloren, waere die wiederhergestellte Deklaration
+//     eine ANDERE als die geschriebene.
+//   - eine ohne link-Klausel (`extern fn getenv(...)` kommt im Bestand vor):
+//     ohne Bibliothek kann der einbindende Compiler kein DT_NEEDED setzen.
+con LYU_DK_EXTERNFN: int64 := 10;
+
 // Magic 'LYU\0'
 con LYU_W_M0: int64 := 76;
 con LYU_W_M1: int64 := 89;
@@ -857,13 +878,25 @@ pub type LyuWriter = class {
       if (k == NK_IMPORT) {
         self._dkAdd(LYU_DK_IMPORT, cur);
       } else if (k == NK_FUNC_DECL && self._npub(cur) != 0) {
-        // extern: eine FFI-Bindung braucht Bibliothek und Aufrufkonvention —
-        // nicht beschrieben. Generisch (c3 = Typparameter): nicht beschrieben.
+        // Generisch (c3 = Typparameter): nicht beschrieben.
         var ext: int64 := self._niv(cur) & 1;
         var gen: int64 := 0;
         var tp: int64 := self._nc(cur, 3);
         if (tp >= 0) { if (self._nk(tp) == NK_TYPE_PARAM) { gen := 1; } }
         if (ext == 0 && gen == 0) { self._dkAdd(LYU_DK_FN, cur); }
+      } else if (k == NK_FUNC_DECL && (self._niv(cur) & 1) != 0) {
+        // #2502: `extern fn` -- im Bestand NIE `pub` (0 von 528 in std/),
+        // aber in der Symboltabelle. Deshalb hier ohne pub-Bedingung: ohne
+        // Beschreibung zaehlt der Codegen den Namen als verloren und
+        // verlangt die Quelle der ganzen Unit.
+        //
+        // KEINE Generik-Pruefung ueber c3: bei `extern fn` ist c3 nicht der
+        // Typparameter-Knoten, sondern die GEPACKTE Bibliotheksspanne
+        // ((Laenge << 32) | Offset). Als Knotenindex gelesen zeigt sie weit
+        // aus der Knotentabelle hinaus -- der Compiler stuerzte damit beim
+        // Schreiben von std/x11.lyu ab. Generische extern-Deklarationen gibt
+        // es nicht; der Platz ist hier anders belegt.
+        self._dkAdd(LYU_DK_EXTERNFN, cur);
       } else if (k == NK_TYPE_DECL && self._npub(cur) != 0) {
         var iv: int64 := self._niv(cur);
         var tauglich: int64 := 1;
@@ -1115,6 +1148,32 @@ pub type LyuWriter = class {
       self._eStr(self._nsp(li), self._nsl(li));
     } else if (art == LYU_DK_FN) {
       if (self._eSignatur(n) == 0) { return 0; }
+    } else if (art == LYU_DK_EXTERNFN) {
+      // #2502: Signatur und link-Bibliothek. Die Bibliothek steht im Knoten
+      // als gepackte Spanne in den Quelltext ((Laenge << 32) | Offset) --
+      // dieselbe Rechnung wie in cg_genFile.
+      var lp: int64 := self._nc(n, 3);
+      if (lp == -1) { return 0; }                    // ohne link-Klausel
+      var lOff: int64 := lp & 0xFFFFFFFF;
+      var lLen: int64 := (lp >> 32) & 0xFFFFFFFF;
+      if (lLen == 0) { return 0; }
+      // Eine @capabilities-Angabe legt der Parser in c2 ab (dort, wo sonst
+      // der Rumpf steht). Sie entscheidet ueber Rechte und wird NICHT
+      // beschrieben -- lieber die Unit quellpflichtig lassen als eine
+      // Deklaration wiederherstellen, die anders lautet als die geschriebene.
+      var ec2: int64 := self._nc(n, 2);
+      if (ec2 >= 0) { if (self._nk(ec2) == NK_CAPABILITY_ATTR) { return 0; } }
+      // KEINE Signatur. Der Parser legt bei `extern fn` keine Parameterknoten
+      // an: er scannt die Signatur in Bitklassen in iVal (#1486/#2140) und
+      // laesst c0/c1 auf -1, damit sema keine unbekannten Typen meldet. Ein
+      // _eSignatur() lief darum auf Typ -1 und stuerzte ab.
+      //
+      // Gebraucht wird sie hier auch nicht: eine `extern fn` ist unit-privat
+      // (0 von 528 in std/ sind pub), der einbindende Compiler ruft sie also
+      // nie selbst. Die AUFRUFE liegen im Objektabbild, mit der Signatur, die
+      // der Erzeuger gesehen hat. Beschrieben wird deshalb nur, was der
+      // Einbindende braucht: Name und Bibliothek fuer DT_NEEDED und GOT.
+      self._eStr((self.dkSrc + lOff) as pchar, lLen);
     } else if (art == LYU_DK_STRUCT) {
       if (self._layoutTyp(self._nsp(n), self._nsl(n)) == 0) { return 0; }
       if (peek64(self.dkBox + 8) != 0) { return 0; }   // Struct mit Typwort: nicht diese Art
