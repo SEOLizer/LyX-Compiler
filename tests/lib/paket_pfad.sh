@@ -15,3 +15,9 @@ PKG_UNITS="$ROOT/lyx-compiler/usr/include/lyx/units/$PKG_ARCH"
 if [ ! -d "$PKG_UNITS" ] && [ -d "$ROOT/lyx-compiler/usr/include/lyx/units/std" ]; then
   PKG_UNITS="$ROOT/lyx-compiler/usr/include/lyx/units"
 fi
+
+# #2499: Mit welchen Schaltern das Makefile die Vorkompilate baut. Wer eine
+# .lyu zum Vergleich neu uebersetzt, muss DIESELBEN nehmen -- sonst vergleicht
+# er zwei verschiedene Dinge und nennt das einen Unterschied.
+PKG_OBJCODE="$(grep -oE '^LYU_OBJCODE[[:space:]]*\?=.*' "$ROOT/Makefile" 2>/dev/null \
+               | head -1 | sed 's/^[^=]*=[[:space:]]*//')"

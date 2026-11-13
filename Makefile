@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.38G
+VERSION   := 1.2.38H
 VERSION_DATE := 2026-11-13
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -38,6 +38,19 @@ PKG_DIR   := lyx-compiler
 # x86_64 bleibt --target leer (Standardziel).
 LYU_ARCH   ?= x86_64
 LYU_TARGET ?=
+# #2499: Die Vorkompilate des Pakets tragen das Objektabbild (#2146). Erst
+# damit traegt sich das Paket selbst: ohne Abbild scheitert ein Programm, das
+# NUR gegen den Paketbaum uebersetzt, an "stammt aus einer .lyu ohne
+# Objektcode" und braucht die Quellen aus dem LPM-Paket std.
+#
+# Gemessen bei 500 von 500 Units ohne Fehlschlag: Baum 2,4 MB -> 26 MB,
+# fertiges Paket 1,5 MB -> rund 2,0 MB. Der Baum wird elfmal groesser, das
+# Paket nur um ein Drittel -- die Abbilder komprimieren gut. Vor dem Schnitt
+# aus #2146 Stufe C2b waeren es 101 MB im Baum gewesen; DANN war die
+# Voreinstellung "aus" richtig, jetzt nicht mehr.
+#
+# Ueberschreibbar: `make package LYU_OBJCODE=` baut ohne Abbilder.
+LYU_OBJCODE ?= --with-objcode
 UNITS_DST := $(PKG_DIR)/usr/include/lyx/units/$(LYU_ARCH)/std
 DATA_DST  := $(PKG_DIR)/usr/include/lyx/units/$(LYU_ARCH)/data
 BIN_DST   := $(PKG_DIR)/usr/local/bin
@@ -802,6 +815,8 @@ test: lyxc
 	@bash tests/lyu_binder_2146_test.sh
 	@echo "--- Vorkompilate liegen je Architektur, der Kopf entscheidet (#2499) ---"
 	@bash tests/arch_ablage_2499_test.sh
+	@echo "--- das Paket traegt sich selbst: Vorkompilate mit Objektabbild (#2499) ---"
+	@bash tests/paket_tragfaehig_2499_test.sh
 	@bash tests/embed_test.sh
 	@bash tests/lyu_import_test.sh
 	@bash tests/lyu_arch_test.sh
@@ -1392,12 +1407,12 @@ install-bin: lyxc
 $(UNITS_DST)/%.lyu: std/%.lyx lyxc
 	@mkdir -p $(dir $@)
 	@echo "  precompile $<"
-	./lyxc --std-path=. $(LYU_TARGET) --compile-unit $< -o $@
+	./lyxc --std-path=. $(LYU_TARGET) $(LYU_OBJCODE) --compile-unit $< -o $@
 
 $(DATA_DST)/%.lyu: data/%.lyx lyxc
 	@mkdir -p $(dir $@)
 	@echo "  precompile $<"
-	./lyxc --std-path=. $(LYU_TARGET) --compile-unit $< -o $@
+	./lyxc --std-path=. $(LYU_TARGET) $(LYU_OBJCODE) --compile-unit $< -o $@
 
 # ── Keygen (nicht für Endkunden — nur intern verwenden) ──────────────────────
 

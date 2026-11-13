@@ -39,6 +39,10 @@ PKG_DIR="lyx-compiler"
 LYU_ARCH="$(grep -oE '^LYU_ARCH[[:space:]]*\?=[[:space:]]*[A-Za-z0-9_]+' Makefile 2>/dev/null \
             | head -1 | awk '{print $NF}')"
 : "${LYU_ARCH:=x86_64}"
+# #2499: Mit welchen Schaltern das Makefile die Vorkompilate baut -- die
+# Stichprobe unten uebersetzt zum Vergleich neu und muss dieselben nehmen.
+LYU_OBJCODE="$(grep -oE '^LYU_OBJCODE[[:space:]]*\?=.*' Makefile 2>/dev/null \
+               | head -1 | sed 's/^[^=]*=[[:space:]]*//')"
 UNITS_DST="$PKG_DIR/usr/include/lyx/units/$LYU_ARCH"
 if [ ! -d "$UNITS_DST" ] && [ -d "$PKG_DIR/usr/include/lyx/units/std" ]; then
   UNITS_DST="$PKG_DIR/usr/include/lyx/units"
@@ -237,7 +241,7 @@ tmpv="$(mktemp -d)"
 abweichung=""
 for f in $stich; do
   [ -f "$f" ] || continue
-  if ! ./lyxc "$f" --compile-unit -o "$tmpv/p.lyu" --std-path=. >"$tmpv/log" 2>&1; then
+  if ! ./lyxc "$f" $LYU_OBJCODE --compile-unit -o "$tmpv/p.lyu" --std-path=. >"$tmpv/log" 2>&1; then
     rm -rf "$tmpv"; fehler "$f lässt sich nicht vorkompilieren: $(grep -m1 -i error "$tmpv/log")"
   fi
   cmp -s "$tmpv/p.lyu" "$UNITS_DST/${f%.lyx}.lyu" || abweichung="$abweichung $f"
