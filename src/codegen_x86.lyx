@@ -1804,6 +1804,12 @@ pub type Codegen = class {
   // WP-34: overflow flags — set when code/data buffer exceeds 512 MB limit
   codeOverflow: int64;
   dataOverflow: int64;
+  // #2146 Stufe C2c (Messung): Herkunft der DATEN als Abschnittsliste. Der
+  // Datenbereich waechst an genau einer Stelle (cg_edata), die Herkunft
+  // wechselt nur mit der Unit -- je Wechsel ein Paar (Startoffset, fremd).
+  dOrig:      int64;
+  dOrigCount: int64;
+  dOrigCap:   int64;
 
   // ------------------------------------------------------------------
   // Raw byte emitters (code buffer)
@@ -1885,9 +1891,63 @@ pub type Codegen = class {
     self.data := nb; self.dataCap := nc;
   }
 
+  // #2146 Stufe C2c: Herkunftswechsel im Datenbereich vermerken.
+  fn cg_dOrigVermerk() {
+    var fremd: int64 := 0;
+    if (self.cgUnitTag != 0) { fremd := 1; }
+    if (self.dOrigCount > 0) {
+      if (peek64(self.dOrig + (self.dOrigCount - 1) * 16 + 8) == fremd) { return; }
+    }
+    if (self.dOrigCount >= self.dOrigCap) {
+      var nc: int64 := self.dOrigCap * 2;
+      if (nc < 16) { nc := 16; }
+      var nb: int64 := alloc(nc * 16);
+      memcpy(nb, self.dOrig, self.dOrigCount * 16);
+      self.dOrig := nb; self.dOrigCap := nc;
+    }
+    var e: int64 := self.dOrig + self.dOrigCount * 16;
+    poke64(e, self.dataLen);
+    poke64(e + 8, fremd);
+    self.dOrigCount += 1;
+  }
+
+  // #2146 Stufe C2c: Stammt dieses Datenbyte aus einer importierten Unit?
+  // Gefragt wird die Abschnittsliste. Gemessen: die eigenen Daten sind NICHT
+  // zusammenhaengend -- std/string.lyx hat sie in [152,319) und [459,607),
+  // fremde dazwischen. Ein Datenschnitt braeuchte deshalb eine Umrechnung
+  // aller Datenoffsets; C2c geht stattdessen ueber NAMEN.
+  fn cg_dOrigFremd(off: int64): int64 {
+    var i: int64 := self.dOrigCount - 1;
+    while (i >= 0) {
+      if (off >= peek64(self.dOrig + i * 16)) { return peek64(self.dOrig + i * 16 + 8); }
+      i -= 1;
+    }
+    return 0;
+  }
+
+  // #2146 Stufe C2c: Globale Variable zu einem DATENOFFSET. Jede Globale
+  // reserviert in cg_addGlobal genau 8 Byte, die Zuordnung ist damit exakt --
+  // kein Raten ueber Abstaende zur naechsten Globalen, zwischen denen auch
+  // Literale liegen. Rueckgabe: Index oder -1; der Versatz INNERHALB der
+  // Variablen steht danach in innerBox.
+  fn cg_globalIdxAnDatenOffset(doff: int64, innerBox: int64): int64 {
+    var i: int64 := 0;
+    while (i < self.globalVarCount) {
+      var gd: int64 := peek64(self.globalVars + i * 24 + CG_GLOBAL_OFF_DOFF);
+      if (doff >= gd && doff < gd + 8) {
+        poke64(innerBox, doff - gd);
+        return i;
+      }
+      i += 1;
+    }
+    poke64(innerBox, 0);
+    return 0 - 1;
+  }
+
   fn cg_edata(b: int64) {
     // WP-34: stop writing if data buffer overflow was detected
     if (self.dataOverflow != 0) { return; }
+    self.cg_dOrigVermerk();   // #2146 Stufe C2c
     if (self.dataLen >= self.dataCap) { self.cg_growData(); }
     poke8(self.data + self.dataLen, b & 255);
     self.dataLen += 1;
@@ -4115,7 +4175,8 @@ pub type Codegen = class {
   // Index liefern. EINE Stelle fuer beide Wege -- Aufrufe aus dem Code und
   // Datenslots, die auf fremden Code zeigen.
   fn cg_uSymIdx(uNames: int64, uLens: int64, cntBox: int64, strBox: int64,
-                nm: int64, nl: int64): int64 {
+                uDef: int64, uVal: int64, nm: int64, nl: int64,
+                def: int64, wert: int64): int64 {
     var cnt: int64 := peek64(cntBox);
     var i: int64 := 0;
     while (i < cnt) {
@@ -4127,6 +4188,8 @@ pub type Codegen = class {
     }
     poke64(uNames + cnt * 8, nm);
     poke64(uLens  + cnt * 8, nl);
+    poke8(uDef + cnt, def);
+    poke64(uVal + cnt * 8, wert);
     poke64(strBox, peek64(strBox) + nl + 1);
     poke64(cntBox, cnt + 1);
     return cnt;
@@ -33433,6 +33496,9 @@ pub type Codegen = class {
     self.resTabOff   := 0 - 1;
     self.cgLesePfad  := 0;   // #1971
     self.dataLen     := 152; // WP-18: 88 Byte reserviert, +8 CG_FC_NAME (#1140), +8 CG_ENVBLOCK (#1677), +16 Bump-Allokator (#1836), +8 CG_RESTAB (#1961), +16 Vektorarena (#2206), +8 Vektorarena-Summe (#2253)
+    self.dOrig := alloc(16 * 16);   // #2146 Stufe C2c
+    self.dOrigCount := 0;
+    self.dOrigCap := 16;
     self.dataOverflow := 0;  // WP-34  // WP-18: pre-reserve 88 bytes (EXN_VAL@0, EXN_PTR@8, IO_RESULT@16, RAND_STATE@24, ARGC@32, ARGV@40, FLOAT_BUF@48, CANARY@80)
 
     self.localCap  := 64;
@@ -35086,13 +35152,18 @@ pub type Codegen = class {
     // Zahl und Inhalt der Relokationen kommen aus derselben Aufzaehlung.
     // uNames/uLens: die UNDEF-Symbole (entdoppelt), uRel: je Stelle das Paar
     // (Codeoffset, Symbolindex in uNames).
-    var uNames: int64 := alloc((self.patchCount + self.baseRelocCount + 2) * 8);
-    var uLens:  int64 := alloc((self.patchCount + self.baseRelocCount + 2) * 8);
+    var uAnz: int64 := self.patchCount + self.baseRelocCount + 2;
+    var uNames: int64 := alloc(uAnz * 8);
+    var uLens:  int64 := alloc(uAnz * 8);
+    // #2146 Stufe C2c: 1 = das Abbild DEFINIERT das Symbol (eigene globale
+    // Variable), 0 = UNDEF. uVal traegt bei definierten den st_value.
+    var uDef:   int64 := alloc(uAnz);
+    var uVal:   int64 := alloc(uAnz * 8);
     var uCntB:  int64 := alloc(8);
     var uStrB:  int64 := alloc(8);
     poke64(uCntB, 0);
     poke64(uStrB, 0);
-    var uRel:   int64 := alloc((self.patchCount + 1) * 16);
+    var uRel:   int64 := alloc((self.patchCount + 1) * 24);   // (Codeoffset, Symbolindex, Versatz)
     var uRelCount: int64 := 0;
     // Datenslots, die auf Code vor dem Schnitt zeigen: absolute 8-Byte-Werte,
     // also R_X86_64_64 gegen das Namenssymbol statt gegen .ltext.
@@ -35107,6 +35178,9 @@ pub type Codegen = class {
         var ukd: int64 := peek64(ub + CG_PATCH_OFF_KIND);
         var unp: int64 := 0;
         var unl: int64 := 0;
+        var uInner: int64 := 0;      // #2146 Stufe C2c: Versatz in der Variablen
+        var uDefJetzt: int64 := 0;
+        var uValJetzt: int64 := 0;
         if (uco >= anf) {
           if (ukd == CG_PATCH_HELFER) {
             var hlb: int64 := alloc(8);
@@ -35119,12 +35193,40 @@ pub type Codegen = class {
             // Nur was VOR den Schnitt zeigt: ein Aufruf innerhalb der Unit
             // bleibt als Abstand gueltig und braucht keine Relokation.
             if (tof >= 0 && tof < anf) { unp := tnp; unl := tnl; }
+          } else if (ukd == CG_PATCH_STR) {
+            // #2146 Stufe C2c: Zeigt dieser Datenbezug auf eine GLOBALE
+            // VARIABLE, wird er zum Namenssymbol. Zeichenketten und Tabellen
+            // bleiben als Abstand gebacken -- die sind unveraenderlich, eine
+            // zweite Kopie ist Platz und kein zweiter Zustand. Eine Globale
+            // dagegen braucht genau einen Slot, sonst haetten Wirt und Abbild
+            // je einen eigenen Zaehler.
+            var inb: int64 := alloc(8);
+            var gi: int64 := self.cg_globalIdxAnDatenOffset(peek64(ub + CG_PATCH_OFF_NAMEPTR), inb);
+            if (gi >= 0) {
+              var gnl: int64 := alloc(8);
+              var gdo: int64 := peek64(self.globalVars + gi * 24 + CG_GLOBAL_OFF_DOFF);
+              unp := self.cg_mangleInto("_lyxg"c, 5,
+                                        peek64(self.globalVars + gi * 24) as pchar,
+                                        peek64(self.globalVars + gi * 24 + CG_GLOBAL_OFF_NAMELEN),
+                                        gnl);
+              unl := peek64(gnl);
+              uInner := peek64(inb);
+              // Eigene Globale: das Abbild definiert sie und traegt ihre
+              // Bytes. Fremde: UNDEF -- sie gehoert dem Abbild der anderen
+              // Unit oder dem Wirt.
+              if (self.cg_dOrigFremd(gdo) == 0) {
+                uDefJetzt := 1;
+                uValJetzt := codeSz + gdo;
+              }
+            }
           }
         }
         if (unp != 0) {
-          var gef: int64 := self.cg_uSymIdx(uNames, uLens, uCntB, uStrB, unp, unl);
-          poke64(uRel + uRelCount * 16, uco);
-          poke64(uRel + uRelCount * 16 + 8, gef);
+          var gef: int64 := self.cg_uSymIdx(uNames, uLens, uCntB, uStrB, uDef, uVal,
+                                            unp, unl, uDefJetzt, uValJetzt);
+          poke64(uRel + uRelCount * 24, uco);
+          poke64(uRel + uRelCount * 24 + 8, gef);
+          poke64(uRel + uRelCount * 24 + 16, uInner);
           uRelCount += 1;
         }
         up += 1;
@@ -35157,7 +35259,8 @@ pub type Codegen = class {
               EPrintStrLn("), dort beginnt keine Funktion -- #2146 Stufe C2b"c);
               exit(1);
             }
-            var dgef: int64 := self.cg_uSymIdx(uNames, uLens, uCntB, uStrB, dnm, peek64(dlb));
+            var dgef: int64 := self.cg_uSymIdx(uNames, uLens, uCntB, uStrB, uDef, uVal,
+                                               dnm, peek64(dlb), 0, 0);
             poke64(uDRel + uDRelCount * 16, bloc);
             poke64(uDRel + uDRelCount * 16 + 8, dgef);
             uDRelCount += 1;
@@ -35319,8 +35422,17 @@ pub type Codegen = class {
     while (uq < uCount) {
       var su: int64 := buf + symtabOff + (3 + self.externDataCount + fnSyms + uq) * 24;
       poke32(su, peek64(uNameOff + uq * 8));
-      poke8(su + 4, (1 << 4) | 0);     // STB_GLOBAL<<4 | STT_NOTYPE
-      poke16(su + 6, 0);               // SHN_UNDEF
+      if (peek8(uDef + uq) != 0) {
+        // #2146 Stufe C2c: eigene globale Variable -- das Abbild definiert sie
+        // und traegt ihre acht Bytes im Datenteil von .ltext.
+        poke8(su + 4, (1 << 4) | 1);   // STB_GLOBAL<<4 | STT_OBJECT
+        poke16(su + 6, 1);             // .ltext
+        poke64(su + 8, peek64(uVal + uq * 8));
+        poke64(su + 16, 8);            // st_size: acht Byte, wie cg_addGlobal reserviert
+      } else {
+        poke8(su + 4, (1 << 4) | 0);   // STB_GLOBAL<<4 | STT_NOTYPE
+        poke16(su + 6, 0);             // SHN_UNDEF
+      }
       uq += 1;
     }
 
@@ -35400,12 +35512,15 @@ pub type Codegen = class {
 
     var ur: int64 := 0;
     while (ur < uRelCount) {
-      var urc: int64 := peek64(uRel + ur * 16) - anf;
-      var uri: int64 := peek64(uRel + ur * 16 + 8);
+      var urc: int64 := peek64(uRel + ur * 24) - anf;
+      var uri: int64 := peek64(uRel + ur * 24 + 8);
+      var urv: int64 := peek64(uRel + ur * 24 + 16);
       poke32(buf + ltextOff + urc, 0);
       poke64(buf + ro, urc);                                              // r_offset
       poke64(buf + ro + 8, ((3 + self.externDataCount + fnSyms + uri) << 32) | 2);  // R_X86_64_PC32
-      poke64(buf + ro + 16, 0 - 4);                                       // r_addend
+      // #2146 Stufe C2c: Summand = -4 (PC-relativ ab dem Befehlsende) plus der
+      // Versatz IN der Variablen, falls die Stelle nicht ihren Anfang meint.
+      poke64(buf + ro + 16, urv - 4);                                     // r_addend
       ro += 24;
       ur += 1;
     }
