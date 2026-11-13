@@ -863,6 +863,14 @@ pub type Codegen = class {
   labels:     int64;
   labelCount: int64;
   labelCap:   int64;
+  // #2146 Stufe A: 1 je Marke, die ANFANG EINER FUNKTION ODER METHODE ist.
+  // Gesetzt an der Quelle (cg_addLabelFunc), nicht aus dem Namen geraten:
+  // die Markentabelle fuehrt auch interne Sprungziele (__lyx_*), anonyme
+  // Marken und Aliase, und ein Namensmuster waere eine Vermutung.
+  // Gelesen von cg_writeELFObj, um je Funktion ein GLOBAL/STT_FUNC-Symbol
+  // auszugeben -- ohne das exportiert ein Objekt nur `_start`, und keine
+  // andere Einheit kann etwas daraus aufrufen.
+  labelIsFn:  int64;
 
   // Backpatch table
   patches:    int64;
@@ -4052,15 +4060,25 @@ pub type Codegen = class {
       var nb: int64 := alloc(nc * CG_LABEL_SZ);
       var i: int64 := 0;
       memcpy(nb, self.labels, self.labelCount * CG_LABEL_SZ);
-      self.labels := nb; self.labelCap := nc;
+      var nfn: int64 := alloc(nc);                                    // #2146
+      memcpy(nfn, self.labelIsFn, self.labelCount);
+      self.labels := nb; self.labelCap := nc; self.labelIsFn := nfn;
     }
     var base: int64 := self.labels + self.labelCount * CG_LABEL_SZ;
     poke64(base,      name as int64);
     poke64(base + CG_LABEL_OFF_NAMELEN,  nlen);
     poke64(base + CG_LABEL_OFF_CODEOFF, self.codeLen);
     poke64(base + CG_LABEL_OFF_LINENUM, lineNum);
+    poke8(self.labelIsFn + self.labelCount, 0);   // #2146: Vorgabe "kein Funktionsanfang"
     self.lbHx := self.cg_hxEin(self.lbHx, self.labels, CG_LABEL_SZ, CG_LABEL_OFF_NAMELEN, self.labelCount);   // #2175
     self.labelCount += 1;
+  }
+
+  // #2146 Stufe A: wie cg_addLabel, markiert die Marke aber als Anfang einer
+  // Funktion oder Methode. Nur solche Marken werden im Objekt exportiert.
+  fn cg_addLabelFunc(name: pchar, nlen: int64, lineNum: int64) {
+    self.cg_addLabel(name, nlen, lineNum);
+    poke8(self.labelIsFn + (self.labelCount - 1), 1);
   }
 
   fn cg_findLabel(name: pchar, nlen: int64): int64 {
@@ -14548,7 +14566,7 @@ pub type Codegen = class {
     var jj: int64 := 0;
     while (jj < mlen) { poke8(mangBuf + classNameLen + 1 + jj, StrCharAt(mname, jj)); jj := jj + 1; }
     poke8(mangBuf + mangLen, 0);
-    self.cg_addLabel(mangBuf as pchar, mangLen, self.cg_lineOf(ni));
+    self.cg_addLabelFunc(mangBuf as pchar, mangLen, self.cg_lineOf(ni));   // #2146
     self.cg_trackTempBuf(mangBuf, mangLen + 1);
 
     // Meldung: "lyxc: abstrakte Methode Klasse.Methode ohne Implementierung
@@ -14742,7 +14760,7 @@ pub type Codegen = class {
     while (jj < mlen) { poke8(mangBuf + classNameLen + 1 + jj, StrCharAt(mname, jj)); jj := jj + 1; }
     poke8(mangBuf + mangLen, 0);
     // Register label with mangled name
-    self.cg_addLabel(mangBuf as pchar, mangLen, self.cg_lineOf(ni));
+    self.cg_addLabelFunc(mangBuf as pchar, mangLen, self.cg_lineOf(ni));   // #2146
     self.cg_cfi(CFI_FN, 0);   // #2135: wie cg_genFuncDecl
     self.cfiInFn := 1;
     // Track mangled name buffer for cleanup after patching (BUG-02)
@@ -29078,7 +29096,7 @@ pub type Codegen = class {
       fnlen := peek64(tlc);
       free(tlc, 8);
     }
-    self.cg_addLabel(fname, fnlen, self.cg_lineOf(ni));
+    self.cg_addLabelFunc(fname, fnlen, self.cg_lineOf(ni));   // #2146: exportierbar
     self.cg_cfi(CFI_FN, 0);   // #2135: Abwickelbereich beginnt an der Marke
     self.cfiInFn := 1;
 
@@ -33301,6 +33319,7 @@ pub type Codegen = class {
 
     self.labelCap  := 128;
     self.labels    := alloc(self.labelCap * CG_LABEL_SZ);
+    self.labelIsFn := alloc(self.labelCap);          // #2146 Stufe A
     self.labelCount := 0;
 
     self.patchCap  := 512;
@@ -34811,7 +34830,28 @@ pub type Codegen = class {
   // code||data (interne Refs sind RIP-relativ → reloc-invariant bei einem Block). baseRelocs
   // (VMT/Klassen-Zeiger) → R_X86_64_64 gegen .ltext-Section-Symbol; extern-"asm"-Nutzungen →
   // R_X86_64_PC32 gegen UNDEF-Symbol. Auflösung via `ld -T script.ld obj.o stub.o`.
-  fn cg_writeELFObj(path: pchar) {
+  // #2146 Stufe A: heisst die Marke "_start"? Dann KEIN zweites Symbol dafuer
+  // ausgeben -- `_start` steht schon als eigener Eintrag, und zwei
+  // gleichnamige GLOBAL-Symbole weist der Binder als Dublette ab.
+  fn cg_objNameIstStart(nm: pchar, nl: int64): int64 {
+    if (nl != 6) { return 0; }
+    if (StrCharAt(nm, 0) != 95)  { return 0; }   // _
+    if (StrCharAt(nm, 1) != 115) { return 0; }   // s
+    if (StrCharAt(nm, 2) != 116) { return 0; }   // t
+    if (StrCharAt(nm, 3) != 97)  { return 0; }   // a
+    if (StrCharAt(nm, 4) != 114) { return 0; }   // r
+    if (StrCharAt(nm, 5) != 116) { return 0; }   // t
+    return 1;
+  }
+
+  // #2146 Stufe B: das Objektabbild in einen PUFFER bauen statt in eine Datei.
+  // Rueckgabe: Puffer, Laenge in lenBox. cg_writeELFObj schreibt denselben
+  // Puffer -- eine zweite Fassung derselben Rechnung gibt es damit nicht.
+  //
+  // Gebraucht von --compile-unit: dort laeuft der Codegen seit #1587 ohnehin
+  // vollstaendig (die Diagnose wird gebraucht, das Erzeugnis wurde bisher
+  // verworfen). Das Abbild liegt also schon im Speicher.
+  pub fn cg_buildELFObj(lenBox: int64): int64 {
     var codeSz: int64 := self.codeLen;
     var dataSz: int64 := self.dataLen;
     var ltextSize: int64 := codeSz + dataSz;
@@ -34826,11 +34866,38 @@ pub type Codegen = class {
       pc += 1;
     }
 
-    var symCount:  int64 := 3 + self.externDataCount;   // null, .ltext-Section, _start, externs
+    // #2146 Stufe A: je Funktion und Methode ein Symbol. Ohne sie exportiert
+    // ein Objekt nur `_start`, und keine andere Einheit kann etwas daraus
+    // aufrufen -- genau das braucht der Objektcode in der .lyu.
+    //
+    // Gezaehlt wird ueber labelIsFn, nicht ueber ein Namensmuster: die
+    // Markentabelle fuehrt auch interne Sprungziele (__lyx_*), anonyme Marken
+    // und Aliase.
+    //
+    // `_start` bleibt als eigenes Symbol stehen. Traegt die Unit eine Funktion
+    // mit diesem Namen, entstuende ein zweites gleichnamiges GLOBAL-Symbol und
+    // der Binder wuerde es als Dublette abweisen -- deshalb wird sie hier
+    // uebersprungen und `_start` bleibt die eine Definition.
+    var fnSyms: int64 := 0;
+    var fnStr:  int64 := 0;
+    var lf: int64 := 0;
+    while (lf < self.labelCount) {
+      if (peek8(self.labelIsFn + lf) != 0) {
+        var lnp: pchar := peek64(self.labels + lf * CG_LABEL_SZ) as pchar;
+        var lnl: int64 := peek64(self.labels + lf * CG_LABEL_SZ + CG_LABEL_OFF_NAMELEN);
+        if (self.cg_objNameIstStart(lnp, lnl) == 0) {
+          fnSyms := fnSyms + 1;
+          fnStr  := fnStr + lnl + 1;
+        }
+      }
+      lf += 1;
+    }
+
+    var symCount:  int64 := 3 + self.externDataCount + fnSyms;   // null, .ltext, _start, externs, Funktionen
     var relaCount: int64 := self.baseRelocCount + edPatch;
 
-    // .strtab-Größe: null + "_start\0" + je extern-Name+null
-    var strtabSize: int64 := 1 + 7;
+    // .strtab-Größe: null + "_start\0" + je extern-Name+null + je Funktionsname+null
+    var strtabSize: int64 := 1 + 7 + fnStr;
     var es: int64 := 0;
     while (es < self.externDataCount) {
       strtabSize := strtabSize + peek64(self.externData + es * 16 + 8) + 1;
@@ -34887,6 +34954,25 @@ pub type Codegen = class {
       em += 1;
     }
 
+    // #2146: Funktionsnamen in die .strtab, Offsets merken
+    var fnNameOff: int64 := alloc((fnSyms + 1) * 8);
+    var fnLabIdx:  int64 := alloc((fnSyms + 1) * 8);
+    var fw: int64 := 0;
+    lf := 0;
+    while (lf < self.labelCount) {
+      if (peek8(self.labelIsFn + lf) != 0) {
+        var fnp: pchar := peek64(self.labels + lf * CG_LABEL_SZ) as pchar;
+        var fnl: int64 := peek64(self.labels + lf * CG_LABEL_SZ + CG_LABEL_OFF_NAMELEN);
+        if (self.cg_objNameIstStart(fnp, fnl) == 0) {
+          poke64(fnNameOff + fw * 8, wo - strtabOff);
+          poke64(fnLabIdx  + fw * 8, lf);
+          wo := self.cg_objPutName(buf, wo, fnp as int64, fnl);
+          fw := fw + 1;
+        }
+      }
+      lf += 1;
+    }
+
     // .symtab
     // sym 0 = null (schon 0). sym 1 = .ltext-Section-Symbol (LOCAL, STT_SECTION)
     var s1: int64 := buf + symtabOff + 24;
@@ -34905,6 +34991,21 @@ pub type Codegen = class {
       poke8(sk + 4, (1 << 4) | 0);     // STB_GLOBAL<<4 | STT_NOTYPE
       poke16(sk + 6, 0);               // SHN_UNDEF
       ek += 1;
+    }
+
+    // #2146 Stufe A: je Funktion/Methode ein GLOBAL/STT_FUNC-Symbol, st_value
+    // ist der Codeoffset. Code liegt am Anfang von .ltext, der Offset gilt
+    // also unveraendert. st_size bleibt 0: die Laenge einer Funktion fuehrt
+    // der Codegen nicht, und eine geratene Groesse waere schlechter als keine.
+    var fq: int64 := 0;
+    while (fq < fnSyms) {
+      var sf: int64 := buf + symtabOff + (3 + self.externDataCount + fq) * 24;
+      var fli: int64 := peek64(fnLabIdx + fq * 8);
+      poke32(sf, peek64(fnNameOff + fq * 8));
+      poke8(sf + 4, (1 << 4) | 2);     // STB_GLOBAL<<4 | STT_FUNC
+      poke16(sf + 6, 1);               // .ltext
+      poke64(sf + 8, peek64(self.labels + fli * CG_LABEL_SZ + CG_LABEL_OFF_CODEOFF));
+      fq += 1;
     }
 
     // .rela.text
@@ -34971,7 +35072,16 @@ pub type Codegen = class {
     poke64(sh5 + 24, shstrOff); poke64(sh5 + 32, shstrtabSize);
     poke64(sh5 + 48, 1);
 
-    EmitWriteFile(path, buf, fileSize);   // #1682: schreibt oder scheitert laut
+    poke64(lenBox, fileSize);
+    return buf;
+  }
+
+  fn cg_writeELFObj(path: pchar) {
+    var wlb: int64 := alloc(8);
+    var wbuf: int64 := self.cg_buildELFObj(wlb);
+    var wsz: int64 := peek64(wlb);
+    free(wlb, 8);
+    EmitWriteFile(path, wbuf, wsz);   // #1682: schreibt oder scheitert laut
   }
 
   // ==================================================================
