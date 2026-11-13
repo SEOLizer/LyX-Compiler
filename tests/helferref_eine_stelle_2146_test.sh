@@ -22,6 +22,35 @@ ROH=$(grep -n 'poke32(self\.code + [A-Za-z0-9_]*, CG_H_[A-Z0-9_]* -' "$SRC"; \
 if [ -z "$ROH" ]; then pr ok "keine rohe Helfer-rel32-Rechnung in $SRC"
 else pr no "rohe Helfer-rel32-Rechnung in $SRC: $ROH"; fi
 
+# 1b) Auch NICHT roh, wenn der Offset in einer VARIABLEN steckt. Genau daran
+#     ist die erste Fassung vorbeigegangen: sechs Stellen hielten den
+#     Helferoffset in `hStr`/`hInt` (je nach stdout/stderr), rechneten den
+#     rel32 selbst und wurden darum nicht vermerkt. Im Abbild fehlte die
+#     Relokation, der gebackene rel32 des Erzeugers blieb stehen, und ein
+#     gebundenes std.io sprang mitten in fremden Code -- SIGILL nach
+#     korrekter Ausgabe. Gefunden hat das erst ein Lauf gegen die echte
+#     stdlib, kein Test.
+#
+#     Geprueft wird: jede Variable, die einen CG_H_*-Wert zugewiesen bekommt,
+#     darf in keiner rel32-Rechnung auftauchen.
+HVARS="$(grep -oE 'var [A-Za-z0-9_]+: int64 := CG_H_[A-Z0-9_]+' "$SRC" \
+         | awk '{print $2}' | sed 's/:$//' | sort -u)"
+HVARS="$HVARS $(grep -oE '^[[:space:]]*[A-Za-z0-9_]+ := CG_H_[A-Z0-9_]+' "$SRC" \
+                | awk '{print $1}' | sort -u)"
+ROHVAR=""
+for v in $HVARS; do
+  [ -n "$v" ] || continue
+  if grep -qE "poke32\(self\.code \+ [A-Za-z0-9_]+, $v - [A-Za-z0-9_]+ - 4\)" "$SRC" \
+     || grep -qE "cg_e32\($v - [A-Za-z0-9_]+ - 4\)" "$SRC"; then
+    ROHVAR="$ROHVAR $v"
+  fi
+done
+if [ -z "$ROHVAR" ]; then
+  pr ok "keine Variable mit Helferoffset rechnet selbst ($(printf '%s' "$HVARS" | wc -w) geprueft)"
+else
+  pr no "Helferoffset in Variable, rel32 selbst gerechnet:$ROHVAR"
+fi
+
 # 2) Die Funktion gibt es, und sie vermerkt.
 if grep -q 'fn cg_helferRel32(pp: int64, hOff: int64)' "$SRC" \
    && grep -A3 'fn cg_helferRel32(pp: int64, hOff: int64)' "$SRC" | grep -q 'CG_PATCH_HELFER'; then

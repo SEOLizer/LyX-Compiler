@@ -74,7 +74,10 @@ for f in $STICH; do
   [ -f "$f" ] || { no "Stichprobe" "$f fehlt"; continue; }
   lyu="$PKG/${f%.lyx}.lyu"
   if [ ! -f "$lyu" ]; then no "Stichprobe" "$lyu fehlt (make precompile-units)"; continue; fi
-  if ! (ulimit -v 4000000; "$LYXC" "$f" --compile-unit -o "$TMP/p.lyu" --std-path=.) >"$TMP/l" 2>&1; then
+  # #2499: dieselben Schalter wie das Makefile (PKG_OBJCODE) -- sonst
+  # vergleicht die Stichprobe eine .lyu MIT Abbild gegen eine OHNE und nennt
+  # das einen Unterschied.
+  if ! (ulimit -v 4000000; "$LYXC" "$f" $PKG_OBJCODE --compile-unit -o "$TMP/p.lyu" --std-path=.) >"$TMP/l" 2>&1; then
     no "Stichprobe" "$f laesst sich nicht vorkompilieren: $(grep -m1 -i error "$TMP/l" | cut -c1-90)"
     continue
   fi
