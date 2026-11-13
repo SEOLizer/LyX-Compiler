@@ -4329,6 +4329,26 @@ pub type Codegen = class {
         } else if (snl == 11 && self.cg_seq(snm as pchar, 11, "_lyxs_arena"c, 11)) {
           // Bump-Bereich des Wirts, bei Bedarf angelegt.
           self.cg_addPatch(rOff, self.cg_arenaOffset() + rAdd + 4, 0, CG_PATCH_STR);
+        } else if (self.cg_findExternDeclIdx(snm as pchar, snl) >= 0) {
+          // #2502: eine FFI-Bindung dieser Uebersetzung. Die Aufrufstelle wird
+          // wieder ein CG_PATCH_EXTERN -- damit traegt das Erzeugnis
+          // DT_NEEDED, einen GOT-Platz und die Auflösung in
+          // cg_writeELFDynamic, genau wie ein Aufruf aus der Quelle.
+          //
+          // ZWEI TABELLEN, nicht eine: externDecls fuehrt die DEKLARATIONEN
+          // (was deklariert wurde, mit Bibliothek), externSyms die BENUTZTEN
+          // (je einer ein GOT-Platz, und `externCount > 0` entscheidet
+          // ueberhaupt erst, ob ein dynamisches ELF entsteht). Der Patch
+          // braucht den Index der ZWEITEN. Mit dem Deklarationsindex blieb
+          // das Erzeugnis statisch, ohne DT_NEEDED, und der erste Aufruf
+          // sprang ins Leere.
+          var edi2: int64 := self.cg_findExternDeclIdx(snm as pchar, snl);
+          var edb: int64 := self.externDecls + edi2 * CG_EXTERN_SZ;
+          var exU: int64 := self.cg_addExtern(peek64(edb) as pchar,
+                                              peek64(edb + CG_EXTERN_OFF_NAMELEN),
+                                              peek64(edb + CG_EXTERN_OFF_LIBPTR),
+                                              peek64(edb + CG_EXTERN_OFF_LIBLEN));
+          self.cg_addPatch(rOff, exU, 0, CG_PATCH_EXTERN);
         } else if (peek64(gDoff + rSym * 8) >= 0) {
           // Zugriff auf eine globale Variable: Datenadresse steht erst in
           // cg_patchAll fest, also derselbe Weg wie jeder Zeichenkettenbezug.
@@ -5354,6 +5374,22 @@ pub type Codegen = class {
   }
 
   // Record a declared extern (lookup only — no GOT slot until it is called).
+  // #2502: Index einer FFI-Bindung zu ihrem Namen, -1 wenn keine. Gebraucht
+  // beim Einbinden eines Abbilds: dort steht die Aufrufstelle als Relokation
+  // gegen den NAMEN, der Patch braucht aber den INDEX dieser Uebersetzung.
+  fn cg_findExternDeclIdx(nm: pchar, nl: int64): int64 {
+    var i: int64 := 0;
+    while (i < self.externDeclCount) {
+      var b: int64 := self.externDecls + i * CG_EXTERN_SZ;
+      if (peek64(b + CG_EXTERN_OFF_NAMELEN) == nl
+          && self.cg_seq(peek64(b) as pchar, nl, nm, nl)) {
+        return i;
+      }
+      i += 1;
+    }
+    return 0 - 1;
+  }
+
   fn cg_addExternDecl(namePtr: pchar, nlen: int64, libPtr: int64, liblen: int64, declNi: int64) {
     if (self.externDeclCount >= self.externDeclCap) {
       var nc: int64 := self.externDeclCap * 2;
@@ -33356,7 +33392,21 @@ pub type Codegen = class {
         var exHasBody: int64 := 1;
         if (exBody == -1) { exHasBody := 0; }
         else if (self.cg_nkind(exBody) == CGN_CAPABILITY_ATTR) { exHasBody := 0; }
-        if (self.cgNurDekl != 0) {
+        if (self.cgNurDekl != 0 && exHasBody == 0 && libPacked != -1) {
+          // #2502: eine FFI-Bindung aus der .lyu (Deklarationsart 10). Sie
+          // wird REGISTRIERT wie aus der Quelle, nicht bloss gemerkt: der
+          // eingebundene Code der Unit ruft sie, und dafuer braucht das
+          // Erzeugnis ein DT_NEEDED und einen GOT-Platz. Bis 1.2.38H stand
+          // hier nur cg_lyuNameMerke, und die Unit blieb quellpflichtig.
+          var lOff2: int64 := libPacked & 0xFFFFFFFF;
+          var lLen2: int64 := (libPacked >> 32) & 0xFFFFFFFF;
+          if (lLen2 > 0) {
+            self.cg_addExternDecl(self.cg_nsval(cur), self.cg_nslen(cur),
+                                  (self.pSrc as int64) + lOff2, lLen2, cur);
+          } else {
+            self.cg_lyuNameMerke(self.cg_nsval(cur) as int64, self.cg_nslen(cur));
+          }
+        } else if (self.cgNurDekl != 0) {
           // #2014: aus einer .lyu — kein Rumpf, keine Marke. Nur merken, damit
           // ein Aufruf mit dem richtigen Grund abgewiesen wird.
           self.cg_lyuNameMerke(self.cg_nsval(cur) as int64, self.cg_nslen(cur));
@@ -35528,6 +35578,21 @@ pub type Codegen = class {
             // Nur was VOR den Schnitt zeigt: ein Aufruf innerhalb der Unit
             // bleibt als Abstand gueltig und braucht keine Relokation.
             if (tof >= 0 && tof < anf) { unp := tnp; unl := tnl; }
+          } else if (ukd == CG_PATCH_EXTERN) {
+            // #2502: FFI-Aufruf. Das Feld traegt den INDEX der Bindung in
+            // DIESER Uebersetzung -- im Abbild muss daraus der NAME werden,
+            // denn der einbindende Compiler fuehrt eine eigene Tabelle.
+            //
+            // Ohne diesen Zweig blieb die Stelle unvermerkt: der disp32 eines
+            // `call *got(%rip)` wird erst in cg_writeELFDynamic gesetzt, im
+            // Abbild steht also 0. Ein gebundenes std.x11 bekam damit kein
+            // DT_NEEDED und sprang beim ersten Aufruf ins Leere (SIGSEGV).
+            var exI: int64 := peek64(ub + CG_PATCH_OFF_NAMEPTR);
+            if (exI >= 0 && exI < self.externDeclCount) {
+              var eb: int64 := self.externDecls + exI * CG_EXTERN_SZ;
+              unp := peek64(eb);
+              unl := peek64(eb + CG_EXTERN_OFF_NAMELEN);
+            }
           } else if (ukd == CG_PATCH_STR) {
             // #2146 Stufe C2c: Zeigt dieser Datenbezug auf eine GLOBALE
             // VARIABLE, wird er zum Namenssymbol. Zeichenketten und Tabellen

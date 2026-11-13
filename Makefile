@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.38H
+VERSION   := 1.2.38I
 VERSION_DATE := 2026-11-13
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -817,6 +817,8 @@ test: lyxc
 	@bash tests/arch_ablage_2499_test.sh
 	@echo "--- das Paket traegt sich selbst: Vorkompilate mit Objektabbild (#2499) ---"
 	@bash tests/paket_tragfaehig_2499_test.sh
+	@echo "--- extern fn steht in der .lyu, FFI-Aufrufe binden (#2502) ---"
+	@bash tests/lyu_externfn_2502_test.sh
 	@bash tests/embed_test.sh
 	@bash tests/lyu_import_test.sh
 	@bash tests/lyu_arch_test.sh
