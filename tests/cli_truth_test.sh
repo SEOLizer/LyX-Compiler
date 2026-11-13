@@ -47,7 +47,9 @@ EOF
 # stellt genau das her. Er greift auf den Paketbaum des Repos zu, indem er ihn
 # als /usr/include/lyx/units erwartet — liegt dort nichts, ist die Pruefung
 # nicht aussagekraeftig und wird uebersprungen statt falsch gruen gemeldet.
-if [ -d /usr/include/lyx/units/std ]; then
+# #2499: units/<arch>/std ODER der alte flache Pfad.
+if [ -d /usr/include/lyx/units/std ] \
+   || [ -n "$(find /usr/include/lyx/units -maxdepth 2 -type d -name std 2>/dev/null | head -1)" ]; then
   ( cd "$TMP" && env -u LYX_PATH -u LYX_STD_PATH "$LYXC" hallo.lyx -o hallo >/dev/null 2>&1 )
   if [ -x "$TMP/hallo" ] && [ "$("$TMP/hallo" 2>/dev/null)" = "hi" ]; then
     ok "import std.io ohne --std-path und ohne LYX_STD_PATH"

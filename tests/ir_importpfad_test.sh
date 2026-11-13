@@ -35,7 +35,10 @@ P=0; F=0
 ok()  { echo "PASS: $1"; P=$((P+1)); }
 bad() { echo "FAIL: $1${2:+ -- $2}"; F=$((F+1)); }
 
-if [ ! -d /usr/include/lyx/units/std ]; then
+# #2499: Seit der architekturgebundenen Ablage liegt der Baum unter
+# units/<arch>/std; der flache Pfad bleibt gueltig (aeltere Installation).
+# Beides pruefen, sonst UEBERSPRINGT der Test nach dem naechsten Paket still.
+if [ ! -d /usr/include/lyx/units/std ] && [ -z "$(find /usr/include/lyx/units -maxdepth 2 -type d -name std 2>/dev/null | head -1)" ]; then
   echo "SKIP: kein installiertes lyxc unter /usr/include/lyx/units -- die vierte Stufe ist hier nicht pruefbar"
   echo "Ergebnis: 0 PASS, 0 FAIL"
   exit 0
