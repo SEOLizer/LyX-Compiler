@@ -31,7 +31,18 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 PKG_DIR="lyx-compiler"
-UNITS_DST="$PKG_DIR/usr/include/lyx/units"
+# #2499: Die Vorkompilate liegen je Architektur (`units/<arch>/std/...`). Den
+# Verzeichnisnamen gibt das Makefile vor (LYU_ARCH) und holt ihn aus
+# LyuArchName (src/lyu_reader.lyx) -- EINE Quelle, denn er ist Teil des Pfads,
+# den der Aufloeser absucht. Der Rueckfall deckt einen alten Baum ohne die
+# Ebene; ohne ihn haette dieses Skript jede Unit als fehlend gemeldet.
+LYU_ARCH="$(grep -oE '^LYU_ARCH[[:space:]]*\?=[[:space:]]*[A-Za-z0-9_]+' Makefile 2>/dev/null \
+            | head -1 | awk '{print $NF}')"
+: "${LYU_ARCH:=x86_64}"
+UNITS_DST="$PKG_DIR/usr/include/lyx/units/$LYU_ARCH"
+if [ ! -d "$UNITS_DST" ] && [ -d "$PKG_DIR/usr/include/lyx/units/std" ]; then
+  UNITS_DST="$PKG_DIR/usr/include/lyx/units"
+fi
 BIN_DST="$PKG_DIR/usr/local/bin"
 CONTROL="$PKG_DIR/DEBIAN/control"
 MAN_DST="$PKG_DIR/usr/share/man/man1"
