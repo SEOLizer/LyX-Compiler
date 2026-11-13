@@ -60,17 +60,30 @@ if ./lyxc --std-path=. "$T/h.lyx" -o "$T/h" > "$T/build.log" 2>&1; then
 else pr no "Testprogramm uebersetzt nicht: $(tail -3 "$T/build.log")"; fi
 
 # 6) ZWEISEITIG: jeder Helfer, der cg_helferRel32 erreicht, muss in
-#    cg_helferName einen Namen haben. Sonst steht im geschnittenen Abbild
+#    cg_helferTab einen Namen haben. Sonst steht im geschnittenen Abbild
 #    (#2146 Stufe C2b) eine Relokation gegen ein Symbol, das der Binder nicht
 #    kennt -- oder der Lauf bricht erst beim Uebersetzen einer fremden Unit ab.
+#    Gelesen wird die TABELLE (cg_helferTab), aus der beide Richtungen
+#    bedient werden: Offset->Name beim Erzeugen, Name->Offset beim Binden.
 OHNE=""
 for h in $(grep -o 'cg_helferRel32([A-Za-z0-9_]*, CG_H_[A-Z0-9_]*)' "$SRC" | sed 's/.*, //; s/)//' | sort -u); do
-  grep -q "hOff == $h)" "$SRC" || OHNE="$OHNE $h"
+  grep -q "poke64(offBox, $h)" "$SRC" || OHNE="$OHNE $h"
 done
 if [ -z "$OHNE" ]; then
-  pr ok "jeder benutzte Helfer hat in cg_helferName einen Namen"
+  pr ok "jeder benutzte Helfer steht in cg_helferTab"
 else
-  pr no "Helfer ohne Namen in cg_helferName:$OHNE"
+  pr no "Helfer ohne Eintrag in cg_helferTab:$OHNE"
+fi
+
+# 7) Und die Tabelle hat genau EINE Stelle: zwei Aufzaehlungen derselben
+#    Helfer waeren die Fehlerklasse, die diesen Waechter ueberhaupt
+#    gerechtfertigt hat.
+if [ "$(grep -c 'fn cg_helferTab(' "$SRC")" = "1" ] \
+   && [ "$(grep -c 'fn cg_helferName(' "$SRC")" = "1" ] \
+   && [ "$(grep -c 'fn cg_helferOffset(' "$SRC")" = "1" ]; then
+  pr ok "eine Tabelle, zwei Leser (cg_helferName, cg_helferOffset)"
+else
+  pr no "cg_helferTab/Name/Offset nicht je genau einmal vorhanden"
 fi
 
 echo "--- $PASS PASS, $FAIL FAIL"

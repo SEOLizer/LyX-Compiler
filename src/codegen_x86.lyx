@@ -319,6 +319,19 @@ con CG_PATCH_DATA_FN:     int64 := 6;
 // und verschieben kann er nur, was aufgeschrieben ist.
 // namePtr = Offset des Helfers im Codepuffer, nameLen = 0.
 con CG_PATCH_HELFER:      int64 := 7;
+// #2146 Stufe C3: absolute 8-Byte-Funktionsadresse in einem Slot IM CODE.
+// CG_PATCH_DATA_FN meint denselben Gegenstand, aber einen Slot im
+// DATENbereich; ein eingebundenes Abbild bringt seine Tabellen (VMT) im
+// Codebereich mit, weil .ltext dort als Ganzes angehaengt wird.
+// codeOff = Slot im Codepuffer, namePtr/nameLen = Funktionsname.
+con CG_PATCH_CODE_FN64:   int64 := 8;
+
+// #2146 Stufe C3: lokale Kopie von LYU_ARCH_X86_64 aus src/lyu_writer.lyx --
+// dieselbe Rechnung wie dort, die beiden muessen uebereinstimmen. Lokal, weil
+// eine importierte Konstante in einer Klassenmethode still 0 wird (siehe die
+// NODE_OFF_*-Kopien am Dateianfang); hier waere 0 sogar der richtige Wert,
+// und genau deshalb faellt der Fehler nicht auf.
+con CG_LYU_ARCH_X86_64: int64 := 0;
 
 // FFI imports (extern fn ... link "lib.so")
 pub con CG_EXTERN_SZ:          int64 := 40;   // #1486: +8 fuer den Deklarationsknoten
@@ -613,6 +626,14 @@ con CG_VEC_END: int64 := 136;  // data[136..143]: _lyx_vec_end
 // mit; das Zuruecksetzen stellt sie zurueck und weiss damit, wie viel EIN
 // Durchlauf braucht (siehe cg_vecMarkeZurueck).
 con CG_VEC_SUM: int64 := 144;  // data[144..151]: _lyx_vec_sum
+// #2146 Stufe C3: Ende des reservierten Vorspanns im Datenbereich
+// (CG_VEC_SUM + 8). Diese Zellen -- Ausnahmezustand, I/O-Ergebnis,
+// PRNG-Zustand, argc/argv, Kanarienvogel, Vektorzaehler -- sind SCHREIBBAR
+// und muessen vom Wirt und jedem eingebundenen Abbild GETEILT werden: mit
+// eigener Kopie laese ein Abbild argc als 0 und wuerfe Ausnahmen an einem
+// Zustand, den niemand faengt. Ein neuer Platz hier erhoeht die Zahl.
+// tests/lyu_binder_2146_test.sh haelt sie gegen CG_VEC_SUM.
+con CG_RES_DATEN_ENDE: int64 := 152;
 
 // #1971: Groesse eines Eintrags in `ress` (siehe Feld).
 pub con CG_RES_SZ: int64 := 56;
@@ -4160,6 +4181,189 @@ pub type Codegen = class {
 
   // #2146 Stufe A: wie cg_addLabel, markiert die Marke aber als Anfang einer
   // Funktion oder Methode. Nur solche Marken werden im Objekt exportiert.
+  // #2146 Stufe C3: Funktionsmarke an einem BEKANNTEN Codeoffset. cg_addLabel
+  // nimmt immer self.codeLen -- beim Einbinden eines Abbilds steht der Offset
+  // aber schon fest (Anhaengestelle + st_value).
+  // ==================================================================
+  // #2146 Stufe C3: der eingebaute Binder
+  // ==================================================================
+  //
+  // Bindet das relozierbare Abbild einer importierten Unit (Deklarationsart 9)
+  // in die laufende Uebersetzung ein, statt den Aufruf mit "stammt aus einer
+  // .lyu ohne Objektcode" abzuweisen.
+  //
+  // Vorgehen: `.ltext` wird als GANZES an den Codepuffer angehaengt. Das
+  // Abbild traegt Code und Daten in einer Sektion, und alle Abstaende
+  // INNERHALB bleiben damit gueltig -- genau die Eigenschaft, auf der der
+  // Schnitt in Stufe C2b steht. Die angehaengten Daten liegen dadurch im
+  // Codebereich des Wirts, der nur gelesen wird: Zeichenketten und Tabellen
+  // sind unveraenderlich. SCHREIBBARE Groessen sind ausschliesslich die
+  // globalen Variablen, und die binden seit C2c ueber ein Symbol in den
+  // Datenbereich des Wirts -- sie liegen also NICHT in diesem Block.
+  //
+  // Alles, was das Abbild offen laesst, kommt aus seinen Relokationen:
+  //   PC32 gegen _lyxh_*   -> Helferblock DIESER Uebersetzung
+  //   PC32 gegen _lyxg_*   -> globale Variable des Wirts (cg_addGlobal teilt
+  //                           nach Namen), als CG_PATCH_STR, weil die Adresse
+  //                           der Daten erst in cg_patchAll feststeht
+  //   PC32 gegen Funktion  -> CG_PATCH_CALL; sie kann aus einem Abbild
+  //                           stammen, das erst spaeter gebunden wird
+  //   64 gegen .ltext      -> absolute Adresse im angehaengten Block
+  //   64 gegen Funktion    -> CG_PATCH_CODE_FN64 (VMT-Eintrag)
+  fn cg_bindeAbbild(ptr: int64, len: int64): int64 {
+    if (len < 64) { return 0; }
+    if (peek8(ptr) != 0x7F || peek8(ptr + 1) != 69
+        || peek8(ptr + 2) != 76 || peek8(ptr + 3) != 70) {
+      EPrintStrLn("error: codegen: Objektabbild der .lyu ist kein ELF (#2146 Stufe C3)"c);
+      exit(1);
+    }
+    if (peek16(ptr + 16) != 1 || peek16(ptr + 18) != 62) {
+      EPrintStrLn("error: codegen: Objektabbild ist nicht ET_REL/x86-64 (#2146 Stufe C3)"c);
+      exit(1);
+    }
+    var shoff: int64 := peek64(ptr + ELF64_EHDR_OFF_SHOFF);
+    var shnum: int64 := peek16(ptr + 60);
+    var ltOff: int64 := 0 - 1;
+    var ltSize: int64 := 0;
+    var symOff: int64 := 0 - 1;
+    var symSize: int64 := 0;
+    var strOff: int64 := 0 - 1;
+    var relOff: int64 := 0 - 1;
+    var relSize: int64 := 0;
+    var si: int64 := 0;
+    while (si < shnum) {
+      var sh: int64 := ptr + shoff + si * 64;
+      var typ: int64 := peek32(sh + 4);
+      if (typ == 1 && ltOff < 0) {
+        ltOff := peek64(sh + 24); ltSize := peek64(sh + 32);
+      } else if (typ == 2) {
+        symOff := peek64(sh + 24); symSize := peek64(sh + 32);
+        // Die zugehoerige Zeichenkettentabelle steht im sh_link, nicht
+        // "die erste STRTAB": .shstrtab ist auch eine.
+        var lk: int64 := peek32(sh + 40);
+        strOff := peek64(ptr + shoff + lk * 64 + 24);
+      } else if (typ == 4) {
+        relOff := peek64(sh + 24); relSize := peek64(sh + 32);
+      }
+      si += 1;
+    }
+    if (ltOff < 0 || symOff < 0 || strOff < 0) {
+      EPrintStrLn("error: codegen: Objektabbild ohne .ltext/.symtab/.strtab (#2146 Stufe C3)"c);
+      exit(1);
+    }
+
+    // Anhaengen, auf 16 ausgerichtet wie jeder Funktionsanfang.
+    while ((self.codeLen & 15) != 0) { self.cg_e8(0x90); }
+    var basis: int64 := self.codeLen;
+    var bi: int64 := 0;
+    while (bi < ltSize) { self.cg_e8(peek8(ptr + ltOff + bi)); bi += 1; }
+
+    // Symbole: definierte Funktionen werden Marken, definierte globale
+    // Variablen bekommen den Slot des Wirts.
+    var symAnz: int64 := symSize / 24;
+    var gDoff: int64 := alloc((symAnz + 1) * 8);
+    var sy: int64 := 0;
+    while (sy < symAnz) {
+      var sb: int64 := ptr + symOff + sy * 24;
+      var nmO: int64 := peek32(sb);
+      var inf: int64 := peek8(sb + 4);
+      var shx: int64 := peek16(sb + 6);
+      var val: int64 := peek64(sb + 8);
+      var nm:  int64 := ptr + strOff + nmO;
+      var nl:  int64 := StrLen(nm as pchar);
+      poke64(gDoff + sy * 8, 0 - 1);
+      if (nl > 0) {
+        var typ2: int64 := inf & 15;
+        if (shx != 0 && typ2 == 2) {
+          // STT_FUNC, definiert: Marke an der Anhaengestelle.
+          self.cg_addLabelFuncAt(nm as pchar, nl, basis + val);
+        } else if (typ2 == 1 || self.cg_istLyxgName(nm as pchar, nl) != 0) {
+          // Globale Variable, definiert ODER UNDEF: in BEIDEN Faellen der
+          // Slot des Wirts. cg_addGlobal teilt nach Namen -- dadurch hat eine
+          // Variable genau einen Slot, egal ueber wie viele Abbilder sie
+          // erreicht wird. Die acht Byte, die das Abbild selbst mitbringt,
+          // bleiben im angehaengten Block ungenutzt.
+          poke64(gDoff + sy * 8, self.cg_addGlobal((nm + 6) as pchar, nl - 6));
+        }
+      }
+      sy += 1;
+    }
+
+    // Relokationen
+    var ri: int64 := 0;
+    var relAnz: int64 := 0;
+    if (relOff >= 0) { relAnz := relSize / 24; }
+    while (ri < relAnz) {
+      var rb: int64 := ptr + relOff + ri * 24;
+      var rOff: int64 := peek64(rb) + basis;
+      var rInfo: int64 := peek64(rb + 8);
+      var rAdd: int64 := peek64(rb + 16);
+      var rSym: int64 := (rInfo >> 32) & 0xFFFFFFFF;
+      var rTyp: int64 := rInfo & 0xFFFFFFFF;
+      var sb2: int64 := ptr + symOff + rSym * 24;
+      var snm: int64 := ptr + strOff + peek32(sb2);
+      var snl: int64 := StrLen(snm as pchar);
+      var sshx: int64 := peek16(sb2 + 6);
+      if (rTyp == 2) {
+        // R_X86_64_PC32
+        var hv: int64 := self.cg_helferOffset(snm as pchar, snl);
+        if (hv >= 0) {
+          self.cg_helferRel32(rOff, hv);
+        } else if (snl == 14 && self.cg_seq(snm as pchar, 14, "_lyxs_vorspann"c, 14)) {
+          // #2146 Stufe C3: reservierter Vorspann des WIRTS. Dieselbe Stelle
+          // im Datenbereich -- der Vorspann hat in jeder Uebersetzung
+          // dasselbe Layout (CG_EXN_VAL .. CG_VEC_SUM).
+          self.cg_addPatch(rOff, rAdd + 4, 0, CG_PATCH_STR);
+        } else if (snl == 11 && self.cg_seq(snm as pchar, 11, "_lyxs_arena"c, 11)) {
+          // Bump-Bereich des Wirts, bei Bedarf angelegt.
+          self.cg_addPatch(rOff, self.cg_arenaOffset() + rAdd + 4, 0, CG_PATCH_STR);
+        } else if (peek64(gDoff + rSym * 8) >= 0) {
+          // Zugriff auf eine globale Variable: Datenadresse steht erst in
+          // cg_patchAll fest, also derselbe Weg wie jeder Zeichenkettenbezug.
+          self.cg_addPatch(rOff, peek64(gDoff + rSym * 8) + rAdd + 4, 0, CG_PATCH_STR);
+        } else {
+          self.cg_addPatch(rOff, snm, snl, CG_PATCH_CALL);
+        }
+      } else if (rTyp == 1) {
+        // R_X86_64_64
+        if (sshx != 0 && snl == 0) {
+          // gegen das .ltext-Sektionssymbol: Ziel liegt im angehaengten Block
+          poke64(self.code + rOff, CG_ELF_BASE + CG_CODE_OFF + basis + rAdd);
+          self.cg_addBaseReloc(CG_CODE_OFF + rOff);
+        } else if (snl > 0) {
+          self.cg_addPatch(rOff, snm, snl, CG_PATCH_CODE_FN64);
+        } else {
+          EPrintStrLn("error: codegen: 64-Bit-Relokation ohne Symbol im Abbild (#2146 Stufe C3)"c);
+          exit(1);
+        }
+      } else {
+        EPrintStr("error: codegen: unbekannte Relokationsart "c);
+        EPrintInt(rTyp);
+        EPrintStrLn(" im Objektabbild (#2146 Stufe C3)"c);
+        exit(1);
+      }
+      ri += 1;
+    }
+    return 1;
+  }
+
+  // #2146 Stufe C3: beginnt der Name mit "_lyxg_"?
+  fn cg_istLyxgName(nm: pchar, nl: int64): int64 {
+    if (nl <= 6) { return 0; }
+    if (StrCharAt(nm, 0) != 95)  { return 0; }   // _
+    if (StrCharAt(nm, 1) != 108) { return 0; }   // l
+    if (StrCharAt(nm, 2) != 121) { return 0; }   // y
+    if (StrCharAt(nm, 3) != 120) { return 0; }   // x
+    if (StrCharAt(nm, 4) != 103) { return 0; }   // g
+    if (StrCharAt(nm, 5) != 95)  { return 0; }   // _
+    return 1;
+  }
+
+  fn cg_addLabelFuncAt(name: pchar, nlen: int64, off: int64) {
+    self.cg_addLabelFunc(name, nlen, 0);
+    poke64(self.labels + (self.labelCount - 1) * CG_LABEL_SZ + CG_LABEL_OFF_CODEOFF, off);
+  }
+
   fn cg_addLabelFunc(name: pchar, nlen: int64, lineNum: int64) {
     self.cg_addLabel(name, nlen, lineNum);
     poke8(self.labelIsFn + (self.labelCount - 1), 1);
@@ -4850,42 +5054,75 @@ pub type Codegen = class {
   // still in den Helferblock des ERZEUGERS zeigt. Darum schreiben und
   // vermerken hier zusammen; `tests/helferref_eine_stelle_2146_test.sh` hält
   // die Bündelung fest.
-  // #2146 Stufe C2b: Name des Helfers zu seinem Offset. Gebraucht, weil eine
-  // Helferreferenz im geschnittenen Abbild als UNDEF-Symbol herauskommt und
-  // erst beim Einbinden die Adresse im Helferblock des WIRTS bekommt.
+  // #2146 Stufe C2b/C3: die EINE Aufzaehlung der Helfer, mit zwei Lesern.
   //
-  // Die Liste ist eine AUFZAEHLUNG und damit die Stelle, an der ein neuer
-  // Helfer vergessen wird. Darum unten eine laute Meldung statt eines
-  // Platzhalternamens, und in tests/helferref_eine_stelle_2146_test.sh die
-  // Gegenprobe, dass jeder Helfer, der cg_helferRel32 erreicht, hier vorkommt.
-  fn cg_helferName(hOff: int64, lenBox: int64): int64 {
-    if (hOff == CG_H_STRLEN_SIMD)    { poke64(lenBox, 17); return "_lyxh_strlen_simd"c as int64; }
-    if (hOff == CG_H_STRLEN)         { poke64(lenBox, 12); return "_lyxh_strlen"c as int64; }
-    if (hOff == CG_H_PRINTSTR)       { poke64(lenBox, 14); return "_lyxh_printstr"c as int64; }
-    if (hOff == CG_H_PRINTINT)       { poke64(lenBox, 14); return "_lyxh_printint"c as int64; }
-    if (hOff == CG_H_EPRINTSTR)      { poke64(lenBox, 15); return "_lyxh_eprintstr"c as int64; }
-    if (hOff == CG_H_EPRINTINT)      { poke64(lenBox, 15); return "_lyxh_eprintint"c as int64; }
-    if (hOff == CG_H_STRSUB)         { poke64(lenBox, 12); return "_lyxh_strsub"c as int64; }
-    if (hOff == CG_H_STRSPLIT)       { poke64(lenBox, 14); return "_lyxh_strsplit"c as int64; }
-    if (hOff == CG_H_STREQ)          { poke64(lenBox, 11); return "_lyxh_streq"c as int64; }
-    if (hOff == CG_H_STARTSW)        { poke64(lenBox, 13); return "_lyxh_startsw"c as int64; }
-    if (hOff == CG_H_MEMCPY)         { poke64(lenBox, 12); return "_lyxh_memcpy"c as int64; }
-    if (hOff == CG_H_BUMP)           { poke64(lenBox, 10); return "_lyxh_bump"c as int64; }
-    if (hOff == CG_H_F64STR)         { poke64(lenBox, 12); return "_lyxh_f64str"c as int64; }
-    if (hOff == CG_H_F64STR_CHK)     { poke64(lenBox, 16); return "_lyxh_f64str_chk"c as int64; }
-    if (hOff == CG_H_MAP_NEW)        { poke64(lenBox, 13); return "_lyxh_map_new"c as int64; }
-    if (hOff == CG_H_MAP_SET)        { poke64(lenBox, 13); return "_lyxh_map_set"c as int64; }
-    if (hOff == CG_H_MAP_GET)        { poke64(lenBox, 13); return "_lyxh_map_get"c as int64; }
-    if (hOff == CG_H_MAP_HAS)        { poke64(lenBox, 13); return "_lyxh_map_has"c as int64; }
-    if (hOff == CG_H_MAP_STR)        { poke64(lenBox, 13); return "_lyxh_map_str"c as int64; }
-    if (hOff == CG_H_WIN_PRINTSTRN)  { poke64(lenBox, 19); return "_lyxh_win_printstrn"c as int64; }
-    // Kein Platzhalter: ein Name, den der Binder nicht kennt, waere eine
-    // stille Fehlbindung auf den falschen Helfer.
-    EPrintStr("error: codegen: Helfer ohne Namen, Offset "c);
-    EPrintInt(hOff);
-    EPrintStrLn(" -- cg_helferName ergaenzen (#2146 Stufe C2b)"c);
-    exit(1);
+  // Gebraucht in beide Richtungen: beim Erzeugen eines Abbilds wird aus dem
+  // Offset ein Symbolname (cg_helferName), beim Einbinden eines fremden
+  // Abbilds aus dem Namen wieder ein Offset (cg_helferOffset). Zwei getrennte
+  // Tabellen waeren zwei Aufzaehlungen derselben Sache -- genau die Klasse,
+  // aus der in diesem Projekt mehrfach ein stiller Fehler entstand. Deshalb
+  // steht die Liste hier einmal und wird von beiden Richtungen gelesen.
+  //
+  // i von 0 aufwaerts; 0 bedeutet "keine weitere".
+  fn cg_helferTab(i: int64, offBox: int64, lenBox: int64): int64 {
+    if (i == 0) { poke64(offBox, CG_H_STRLEN_SIMD); poke64(lenBox, 17); return "_lyxh_strlen_simd"c as int64; }
+    if (i == 1) { poke64(offBox, CG_H_STRLEN); poke64(lenBox, 12); return "_lyxh_strlen"c as int64; }
+    if (i == 2) { poke64(offBox, CG_H_PRINTSTR); poke64(lenBox, 14); return "_lyxh_printstr"c as int64; }
+    if (i == 3) { poke64(offBox, CG_H_PRINTINT); poke64(lenBox, 14); return "_lyxh_printint"c as int64; }
+    if (i == 4) { poke64(offBox, CG_H_EPRINTSTR); poke64(lenBox, 15); return "_lyxh_eprintstr"c as int64; }
+    if (i == 5) { poke64(offBox, CG_H_EPRINTINT); poke64(lenBox, 15); return "_lyxh_eprintint"c as int64; }
+    if (i == 6) { poke64(offBox, CG_H_STRSUB); poke64(lenBox, 12); return "_lyxh_strsub"c as int64; }
+    if (i == 7) { poke64(offBox, CG_H_STRSPLIT); poke64(lenBox, 14); return "_lyxh_strsplit"c as int64; }
+    if (i == 8) { poke64(offBox, CG_H_STREQ); poke64(lenBox, 11); return "_lyxh_streq"c as int64; }
+    if (i == 9) { poke64(offBox, CG_H_STARTSW); poke64(lenBox, 13); return "_lyxh_startsw"c as int64; }
+    if (i == 10) { poke64(offBox, CG_H_MEMCPY); poke64(lenBox, 12); return "_lyxh_memcpy"c as int64; }
+    if (i == 11) { poke64(offBox, CG_H_BUMP); poke64(lenBox, 10); return "_lyxh_bump"c as int64; }
+    if (i == 12) { poke64(offBox, CG_H_F64STR); poke64(lenBox, 12); return "_lyxh_f64str"c as int64; }
+    if (i == 13) { poke64(offBox, CG_H_F64STR_CHK); poke64(lenBox, 16); return "_lyxh_f64str_chk"c as int64; }
+    if (i == 14) { poke64(offBox, CG_H_MAP_NEW); poke64(lenBox, 13); return "_lyxh_map_new"c as int64; }
+    if (i == 15) { poke64(offBox, CG_H_MAP_SET); poke64(lenBox, 13); return "_lyxh_map_set"c as int64; }
+    if (i == 16) { poke64(offBox, CG_H_MAP_GET); poke64(lenBox, 13); return "_lyxh_map_get"c as int64; }
+    if (i == 17) { poke64(offBox, CG_H_MAP_HAS); poke64(lenBox, 13); return "_lyxh_map_has"c as int64; }
+    if (i == 18) { poke64(offBox, CG_H_MAP_STR); poke64(lenBox, 13); return "_lyxh_map_str"c as int64; }
+    if (i == 19) { poke64(offBox, CG_H_WIN_PRINTSTRN); poke64(lenBox, 19); return "_lyxh_win_printstrn"c as int64; }
+    poke64(offBox, 0);
+    poke64(lenBox, 0);
     return 0;
+  }
+
+  // Name des Helfers zu seinem Offset.
+  fn cg_helferName(hOff: int64, lenBox: int64): int64 {
+    var ob: int64 := alloc(8);
+    var i: int64 := 0;
+    while (1 == 1) {
+      var nm: int64 := self.cg_helferTab(i, ob, lenBox);
+      if (nm == 0) {
+        // Kein Platzhalter: ein Name, den der Binder nicht kennt, waere eine
+        // stille Fehlbindung auf den falschen Helfer.
+        EPrintStr("error: codegen: Helfer ohne Namen, Offset "c);
+        EPrintInt(hOff);
+        EPrintStrLn(" -- cg_helferTab ergaenzen (#2146 Stufe C2b)"c);
+        exit(1);
+      }
+      if (peek64(ob) == hOff) { return nm; }
+      i += 1;
+    }
+    return 0;
+  }
+
+  // #2146 Stufe C3: Offset des Helfers zu seinem Symbolnamen, -1 wenn der
+  // Name keiner ist. Die Gegenrichtung zu cg_helferName, gleiche Tabelle.
+  fn cg_helferOffset(nm: pchar, nl: int64): int64 {
+    var ob: int64 := alloc(8);
+    var lb: int64 := alloc(8);
+    var i: int64 := 0;
+    while (1 == 1) {
+      var tn: int64 := self.cg_helferTab(i, ob, lb);
+      if (tn == 0) { return 0 - 1; }
+      if (peek64(lb) == nl && self.cg_seq(tn as pchar, nl, nm, nl)) { return peek64(ob); }
+      i += 1;
+    }
+    return 0 - 1;
   }
 
   fn cg_helferRel32(pp: int64, hOff: int64) {
@@ -5333,6 +5570,20 @@ pub type Codegen = class {
         // Eintrag waere der Zeiger ueberall dort falsch, wo nicht auf
         // 0x400000 geladen wird.
         self.cg_addBaseReloc(CG_CODE_OFF + self.codeLen + slotOff);
+      } else if (kind == CG_PATCH_CODE_FN64) {
+        // #2146 Stufe C3: absolute Funktionsadresse in einen Slot IM CODE
+        // (VMT eines eingebundenen Abbilds). Dieselbe Rechnung wie
+        // CG_PATCH_DATA_FN -- die beiden muessen uebereinstimmen, nur dass der
+        // Slot hier im Codepuffer liegt.
+        var cfOff: int64 := self.cg_findLabel(namePtr as pchar, nlen);
+        if (cfOff < 0) {
+          EPrintStr("error: eingebundenes Abbild verweist auf unbekannte Funktion '"c);
+          sys_write(2, namePtr, nlen);
+          EPrintStrLn("' (#2146 Stufe C3)"c);
+          exit(1);
+        }
+        poke64(self.code + codeOff, CG_ELF_BASE + CG_CODE_OFF + cfOff);
+        self.cg_addBaseReloc(CG_CODE_OFF + codeOff);
       } else if (kind == CG_PATCH_HELFER) {
         // #2146 Stufe C: schon beim Emittieren geschrieben (cg_helferRel32).
         // Der Eintrag ist der Vermerk für den Binder, keine offene Auflösung.
@@ -11850,17 +12101,26 @@ pub type Codegen = class {
   //
   // rdi/rsi/rcx bleiben unberuehrt: der Aufrufer benutzt sie unmittelbar
   // danach fuer `rep movsq`.
-  fn cg_emitStructArenaAlloc(groesse: int64) {
+  // #2146 Stufe C3: Datenoffset des Bump-Bereichs, bei Bedarf angelegt. EINE
+  // Stelle, weil auch der Binder ihn braucht: ein eingebundenes Abbild
+  // verweist auf die Arena des WIRTS, nicht auf die eigene Kopie (die liegt im
+  // angehaengten Block und damit im nur lesbaren Codebereich).
+  //
+  // Die beiden Zeiger werden mit `lock cmpxchg` fortgeschrieben. Ein
+  // unausgerichteter atomarer Zugriff sperrt nicht die Cache-Zeile, sondern
+  // den BUS -- gemessen rund 1,9 Mikrosekunden je Belegung statt weniger als
+  // 20 Nanosekunden. Der Datenbereich haette sie sonst an eine ungerade
+  // Adresse gelegt (0x...17f).
+  fn cg_arenaOffset(): int64 {
     if (self.structArenaOff < 0) {
-      // Die beiden Zeiger werden mit `lock cmpxchg` fortgeschrieben. Ein
-      // unausgerichteter atomarer Zugriff sperrt nicht die Cache-Zeile,
-      // sondern den BUS — gemessen rund 1,9 Mikrosekunden je Belegung statt
-      // weniger als 20 Nanosekunden. Der Datenbereich haette sie sonst an
-      // eine ungerade Adresse gelegt (0x…17f).
       while ((self.dataLen & 7) != 0) { self.cg_edata(0); }
       self.structArenaOff := self.cg_reserveData(16);
     }
-    var aOff: int64 := self.structArenaOff;
+    return self.structArenaOff;
+  }
+
+  fn cg_emitStructArenaAlloc(groesse: int64) {
+    var aOff: int64 := self.cg_arenaOffset();
     self.cg_e8(0x52);                                          // push rdx
     var retry: int64 := self.codeLen;
     // rax = [arena]
@@ -32164,7 +32424,18 @@ pub type Codegen = class {
     // laege auf dem naechsten fremden Code, und der Aufruf traefe ihn.
     if (cgAusLyu == 0) { self.cg_collectImportLabels(head); }
     self.cg_collectImportDefaults(head);   // #1342: konstante Vorgabewerte abschreiben
-    if (cgAusLyu != 0) { self.cg_lyuPruefeLayout(lyuRdr); }   // #2014
+    if (cgAusLyu != 0) {
+      self.cg_lyuPruefeLayout(lyuRdr);   // #2014
+      // #2146 Stufe C3: traegt die .lyu ein Objektabbild fuer DIESE
+      // Architektur, wird es eingebunden. Ohne das bleiben die Funktionen der
+      // Unit ohne Code, und cg_patchAll weist jeden Aufruf mit "stammt aus
+      // einer .lyu ohne Objektcode" ab.
+      var abLB: int64 := alloc(8);
+      var abPtr: int64 := lyuRdr.LyrObjAbbild(CG_LYU_ARCH_X86_64, abLB);
+      if (abPtr != 0 && peek64(abLB) > 0) {
+        self.cg_bindeAbbild(abPtr, peek64(abLB));
+      }
+    }
     self.cgNurDekl := nurDeklSaved;
     self.nestMapCnt := nestSaved;          // #2044
 
@@ -35201,8 +35472,27 @@ pub type Codegen = class {
             // dagegen braucht genau einen Slot, sonst haetten Wirt und Abbild
             // je einen eigenen Zaehler.
             var inb: int64 := alloc(8);
-            var gi: int64 := self.cg_globalIdxAnDatenOffset(peek64(ub + CG_PATCH_OFF_NAMEPTR), inb);
-            if (gi >= 0) {
+            var dOffS: int64 := peek64(ub + CG_PATCH_OFF_NAMEPTR);
+            var gi: int64 := self.cg_globalIdxAnDatenOffset(dOffS, inb);
+            if (dOffS < CG_RES_DATEN_ENDE) {
+              // #2146 Stufe C3: reservierter Vorspann -- SCHREIBBARE Zellen,
+              // die der Wirt fuehrt (Ausnahmezustand, argc/argv, PRNG,
+              // Kanarienvogel). Das Abbild darf sie nicht aus seiner eigenen
+              // Kopie lesen: die liegt im angehaengten Block und damit im nur
+              // lesbaren Codebereich -- ein Schreibzugriff faultet. Der
+              // Summand traegt den Offset, die Zellen liegen beim Wirt an
+              // derselben Stelle.
+              unp := "_lyxs_vorspann"c as int64;
+              unl := 14;
+              uInner := dOffS;
+            } else if (self.structArenaOff >= 0 && dOffS >= self.structArenaOff
+                       && dOffS < self.structArenaOff + 16) {
+              // Bump-Bereich: ebenfalls schreibbar, und zwei Arenen waeren
+              // zwei Halden. Der Binder legt ihn auf die Arena des Wirts.
+              unp := "_lyxs_arena"c as int64;
+              unl := 11;
+              uInner := dOffS - self.structArenaOff;
+            } else if (gi >= 0) {
               var gnl: int64 := alloc(8);
               var gdo: int64 := peek64(self.globalVars + gi * 24 + CG_GLOBAL_OFF_DOFF);
               unp := self.cg_mangleInto("_lyxg"c, 5,
