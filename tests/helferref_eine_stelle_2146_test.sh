@@ -59,6 +59,20 @@ if ./lyxc --std-path=. "$T/h.lyx" -o "$T/h" > "$T/build.log" 2>&1; then
   else pr no "falsche Werte: $(echo "$AUS" | tr '\n' '|') erwartet $(echo "$ERW" | tr '\n' '|')"; fi
 else pr no "Testprogramm uebersetzt nicht: $(tail -3 "$T/build.log")"; fi
 
+# 6) ZWEISEITIG: jeder Helfer, der cg_helferRel32 erreicht, muss in
+#    cg_helferName einen Namen haben. Sonst steht im geschnittenen Abbild
+#    (#2146 Stufe C2b) eine Relokation gegen ein Symbol, das der Binder nicht
+#    kennt -- oder der Lauf bricht erst beim Uebersetzen einer fremden Unit ab.
+OHNE=""
+for h in $(grep -o 'cg_helferRel32([A-Za-z0-9_]*, CG_H_[A-Z0-9_]*)' "$SRC" | sed 's/.*, //; s/)//' | sort -u); do
+  grep -q "hOff == $h)" "$SRC" || OHNE="$OHNE $h"
+done
+if [ -z "$OHNE" ]; then
+  pr ok "jeder benutzte Helfer hat in cg_helferName einen Namen"
+else
+  pr no "Helfer ohne Namen in cg_helferName:$OHNE"
+fi
+
 echo "--- $PASS PASS, $FAIL FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
 echo "OK: Helferreferenzen gehen durch eine Stelle (#2146 Stufe C, Vorarbeit)"
