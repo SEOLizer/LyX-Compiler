@@ -70,14 +70,17 @@ else
   pr no "importierte Funktionen im Abbild:$FREMD"
 fi
 
-# 3) der Code der importierten Unit ist weiter DA (nur nicht exportiert) --
-#    sonst waere das Abbild nicht etwa sauber, sondern unvollstaendig, und der
-#    Aufruf von GrossDrei spraenge ins Leere. Der Schnitt kommt erst mit C2b.
+# 3) Das Abbild traegt den eigenen Code -- keine leere Huelle. Die Frage, was
+#    GESCHNITTEN wird, gehoert seit 1.2.38D nach
+#    tests/lyu_abbild_schnitt_2146_test.sh; bis dahin stand hier die
+#    Erwartung, dass der mituebersetzte Code noch drin ist. Eine solche
+#    Erwartung wird rot, sobald die Luecke zugeht -- deshalb prueft sie jetzt
+#    nur noch, dass ueberhaupt Code da ist.
 GROESSE=$(stat -c %s "$T/g.o")
-if [ "$GROESSE" -gt 3000 ]; then
-  pr ok "Abbild traegt weiter den mituebersetzten Code ($GROESSE Byte)"
+if [ "$GROESSE" -gt 500 ]; then
+  pr ok "Abbild traegt Code ($GROESSE Byte)"
 else
-  pr no "Abbild ist auf $GROESSE Byte geschrumpft -- Code verloren, nicht nur Symbole"
+  pr no "Abbild ist mit $GROESSE Byte eine leere Huelle"
 fi
 
 # 4) --emit=obj bleibt vollstaendig: ein eigenstaendiges Objekt soll alles

@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.38C
+VERSION   := 1.2.38D
 VERSION_DATE := 2026-11-13
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -781,6 +781,8 @@ test: lyxc
 	@bash tests/helferref_eine_stelle_2146_test.sh
 	@echo "--- das Abbild exportiert nur die eigenen Funktionen (#2146 Stufe C) ---"
 	@bash tests/lyu_abbild_nur_eigene_2146_test.sh
+	@echo "--- das Abbild ist auf den eigenen Code geschnitten und bindet (#2146 Stufe C2b) ---"
+	@bash tests/lyu_abbild_schnitt_2146_test.sh
 	@bash tests/embed_test.sh
 	@bash tests/lyu_import_test.sh
 	@bash tests/lyu_arch_test.sh
