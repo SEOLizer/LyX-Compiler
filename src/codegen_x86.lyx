@@ -880,6 +880,14 @@ pub type Codegen = class {
   // auszugeben -- ohne das exportiert ein Objekt nur `_start`, und keine
   // andere Einheit kann etwas daraus aufrufen.
   labelIsFn:  int64;
+  // #2146 Stufe C: 1 je Marke, die beim Erzeugen einer IMPORTIERTEN Unit
+  // entstanden ist. Gelesen wird `cgUnitTag` — der Merker, den
+  // cg_processImport fuer die Dauer der fremden Unit setzt (0 = eigene Unit,
+  // so fragt es auch cg_genFuncDecl fuer `main`). Die Herkunft wird also
+  // mitgeschrieben, nicht aus der Reihenfolge der Codeoffsets geraten: dass
+  // importierter Code VOR dem eigenen liegt, ist heute gemessen, aber keine
+  // zugesicherte Eigenschaft.
+  labelFremd: int64;
 
   // Backpatch table
   patches:    int64;
@@ -4071,7 +4079,10 @@ pub type Codegen = class {
       memcpy(nb, self.labels, self.labelCount * CG_LABEL_SZ);
       var nfn: int64 := alloc(nc);                                    // #2146
       memcpy(nfn, self.labelIsFn, self.labelCount);
+      var nfr: int64 := alloc(nc);                                    // #2146 Stufe C
+      memcpy(nfr, self.labelFremd, self.labelCount);
       self.labels := nb; self.labelCap := nc; self.labelIsFn := nfn;
+      self.labelFremd := nfr;
     }
     var base: int64 := self.labels + self.labelCount * CG_LABEL_SZ;
     poke64(base,      name as int64);
@@ -4079,6 +4090,10 @@ pub type Codegen = class {
     poke64(base + CG_LABEL_OFF_CODEOFF, self.codeLen);
     poke64(base + CG_LABEL_OFF_LINENUM, lineNum);
     poke8(self.labelIsFn + self.labelCount, 0);   // #2146: Vorgabe "kein Funktionsanfang"
+    // #2146 Stufe C: Herkunft. 1, solange eine importierte Unit erzeugt wird.
+    var fremd: int64 := 0;
+    if (self.cgUnitTag != 0) { fremd := 1; }
+    poke8(self.labelFremd + self.labelCount, fremd);
     self.lbHx := self.cg_hxEin(self.lbHx, self.labels, CG_LABEL_SZ, CG_LABEL_OFF_NAMELEN, self.labelCount);   // #2175
     self.labelCount += 1;
   }
@@ -33352,6 +33367,7 @@ pub type Codegen = class {
     self.labelCap  := 128;
     self.labels    := alloc(self.labelCap * CG_LABEL_SZ);
     self.labelIsFn := alloc(self.labelCap);          // #2146 Stufe A
+    self.labelFremd := alloc(self.labelCap);         // #2146 Stufe C
     self.labelCount := 0;
 
     self.patchCap  := 512;
@@ -34876,6 +34892,26 @@ pub type Codegen = class {
     return 1;
   }
 
+  // #2146 Stufe C: Darf diese Marke als Symbol aus dem Abbild heraus?
+  // EIN Praedikat fuer beide Schleifen (zaehlen und schreiben) -- stehen die
+  // Bedingungen zweimal da, laufen Zahl und Inhalt der Symboltabelle
+  // auseinander, sobald eine der beiden Stellen nachgezogen wird.
+  //
+  // `nurEigene`: fuer das Abbild in der .lyu. Die Uebersetzung einer Unit
+  // erzeugt auch den Code ihrer Importe (cg_processImport); deren Funktionen
+  // hier mitzuexportieren gaebe beim Einbinden mehrerer Abbilder dieselbe
+  // Funktion mehrfach als GLOBAL-Symbol. Gemessen an einer Unit mit einem
+  // std-Import: 71 Funktionssymbole, davon 1 eigenes.
+  fn cg_objSymExport(lf: int64, nurEigene: int64): int64 {
+    if (peek8(self.labelIsFn + lf) == 0) { return 0; }
+    var nm: pchar := peek64(self.labels + lf * CG_LABEL_SZ) as pchar;
+    var nl: int64 := peek64(self.labels + lf * CG_LABEL_SZ + CG_LABEL_OFF_NAMELEN);
+    // `_start` bleibt die eine Definition aus sym 2.
+    if (self.cg_objNameIstStart(nm, nl) != 0) { return 0; }
+    if (nurEigene != 0 && peek8(self.labelFremd + lf) != 0) { return 0; }
+    return 1;
+  }
+
   // #2146 Stufe B: das Objektabbild in einen PUFFER bauen statt in eine Datei.
   // Rueckgabe: Puffer, Laenge in lenBox. cg_writeELFObj schreibt denselben
   // Puffer -- eine zweite Fassung derselben Rechnung gibt es damit nicht.
@@ -34883,7 +34919,7 @@ pub type Codegen = class {
   // Gebraucht von --compile-unit: dort laeuft der Codegen seit #1587 ohnehin
   // vollstaendig (die Diagnose wird gebraucht, das Erzeugnis wurde bisher
   // verworfen). Das Abbild liegt also schon im Speicher.
-  pub fn cg_buildELFObj(lenBox: int64): int64 {
+  pub fn cg_buildELFObj(lenBox: int64, nurEigene: int64): int64 {
     var codeSz: int64 := self.codeLen;
     var dataSz: int64 := self.dataLen;
     var ltextSize: int64 := codeSz + dataSz;
@@ -34914,13 +34950,10 @@ pub type Codegen = class {
     var fnStr:  int64 := 0;
     var lf: int64 := 0;
     while (lf < self.labelCount) {
-      if (peek8(self.labelIsFn + lf) != 0) {
-        var lnp: pchar := peek64(self.labels + lf * CG_LABEL_SZ) as pchar;
+      if (self.cg_objSymExport(lf, nurEigene) != 0) {
         var lnl: int64 := peek64(self.labels + lf * CG_LABEL_SZ + CG_LABEL_OFF_NAMELEN);
-        if (self.cg_objNameIstStart(lnp, lnl) == 0) {
-          fnSyms := fnSyms + 1;
-          fnStr  := fnStr + lnl + 1;
-        }
+        fnSyms := fnSyms + 1;
+        fnStr  := fnStr + lnl + 1;
       }
       lf += 1;
     }
@@ -34992,15 +35025,13 @@ pub type Codegen = class {
     var fw: int64 := 0;
     lf := 0;
     while (lf < self.labelCount) {
-      if (peek8(self.labelIsFn + lf) != 0) {
+      if (self.cg_objSymExport(lf, nurEigene) != 0) {
         var fnp: pchar := peek64(self.labels + lf * CG_LABEL_SZ) as pchar;
         var fnl: int64 := peek64(self.labels + lf * CG_LABEL_SZ + CG_LABEL_OFF_NAMELEN);
-        if (self.cg_objNameIstStart(fnp, fnl) == 0) {
-          poke64(fnNameOff + fw * 8, wo - strtabOff);
-          poke64(fnLabIdx  + fw * 8, lf);
-          wo := self.cg_objPutName(buf, wo, fnp as int64, fnl);
-          fw := fw + 1;
-        }
+        poke64(fnNameOff + fw * 8, wo - strtabOff);
+        poke64(fnLabIdx  + fw * 8, lf);
+        wo := self.cg_objPutName(buf, wo, fnp as int64, fnl);
+        fw := fw + 1;
       }
       lf += 1;
     }
@@ -35110,7 +35141,9 @@ pub type Codegen = class {
 
   fn cg_writeELFObj(path: pchar) {
     var wlb: int64 := alloc(8);
-    var wbuf: int64 := self.cg_buildELFObj(wlb);
+    // --emit=obj bleibt wie in Stufe A: ein eigenstaendiges Objekt soll alles
+    // anbieten, was in ihm steht, auch den Code der mituebersetzten Importe.
+    var wbuf: int64 := self.cg_buildELFObj(wlb, 0);
     var wsz: int64 := peek64(wlb);
     free(wlb, 8);
     EmitWriteFile(path, wbuf, wsz);   // #1682: schreibt oder scheitert laut
