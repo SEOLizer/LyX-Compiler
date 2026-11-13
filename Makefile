@@ -21,12 +21,25 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.38F
+VERSION   := 1.2.38G
 VERSION_DATE := 2026-11-13
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
-UNITS_DST := $(PKG_DIR)/usr/include/lyx/units/std
-DATA_DST  := $(PKG_DIR)/usr/include/lyx/units/data
+# #2499: Die Vorkompilate liegen je Architektur. Sobald eine .lyu Maschinencode
+# traegt (#2146), gilt sie fuer genau ein Ziel -- ein gemeinsames Verzeichnis
+# liesse den zweiten Bau den ersten ueberschreiben, und zwar lautlos.
+#
+# Die Namen kommen aus LyuArchName (src/lyu_reader.lyx) und stehen dort EINMAL:
+# sie sind nicht nur Text in Meldungen, sondern Teil des Pfads, den der
+# Aufloeser absucht. tests/arch_ablage_2499_test.sh haelt Makefile und
+# LyuArchName gegeneinander.
+#
+# LYU_ARCH ist der Verzeichnisname, LYU_TARGET das passende --target. Fuer
+# x86_64 bleibt --target leer (Standardziel).
+LYU_ARCH   ?= x86_64
+LYU_TARGET ?=
+UNITS_DST := $(PKG_DIR)/usr/include/lyx/units/$(LYU_ARCH)/std
+DATA_DST  := $(PKG_DIR)/usr/include/lyx/units/$(LYU_ARCH)/data
 BIN_DST   := $(PKG_DIR)/usr/local/bin
 SHARE_DST := $(PKG_DIR)/usr/share/lyx
 
@@ -787,6 +800,8 @@ test: lyxc
 	@bash tests/lyu_abbild_globale_2146_test.sh
 	@echo "--- der eingebaute Binder bindet Abbilder aus der .lyu (#2146 Stufe C3) ---"
 	@bash tests/lyu_binder_2146_test.sh
+	@echo "--- Vorkompilate liegen je Architektur, der Kopf entscheidet (#2499) ---"
+	@bash tests/arch_ablage_2499_test.sh
 	@bash tests/embed_test.sh
 	@bash tests/lyu_import_test.sh
 	@bash tests/lyu_arch_test.sh
@@ -1377,12 +1392,12 @@ install-bin: lyxc
 $(UNITS_DST)/%.lyu: std/%.lyx lyxc
 	@mkdir -p $(dir $@)
 	@echo "  precompile $<"
-	./lyxc --std-path=. --compile-unit $< -o $@
+	./lyxc --std-path=. $(LYU_TARGET) --compile-unit $< -o $@
 
 $(DATA_DST)/%.lyu: data/%.lyx lyxc
 	@mkdir -p $(dir $@)
 	@echo "  precompile $<"
-	./lyxc --std-path=. --compile-unit $< -o $@
+	./lyxc --std-path=. $(LYU_TARGET) --compile-unit $< -o $@
 
 # ── Keygen (nicht für Endkunden — nur intern verwenden) ──────────────────────
 

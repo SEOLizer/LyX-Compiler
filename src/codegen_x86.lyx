@@ -1539,6 +1539,18 @@ pub type Codegen = class {
   // nichts unter ihrem Namen: ein Aufruf bleibt unaufgeloest und wird in
   // cg_patchAll mit Begruendung gemeldet (cgLyuNamen).
   cgNurDekl: int64;
+  // #2499: Verzeichnisname der Zielarchitektur ("x86_64", "arm64", ...),
+  // gesetzt von lyxc aus LyuArchName -- derselben Quelle wie sema.lyuArch.
+  // Die Namen stehen im PFAD (`units/<arch>/std/io.lyu`); wer sie an zwei
+  // Stellen pflegt, legt eine Datei ab, die der Aufloeser nicht findet.
+  cgLyuArchDir: int64;
+  // #2499: Eine importierte .lyu trug ein Objektabbild, aber fuer eine ANDERE
+  // Architektur. Gemerkt, damit die Ablehnung eines Aufrufs den wahren Grund
+  // nennt: "ohne Objektcode" schickt sonst zur falschen Abhilfe (Quelle
+  // beilegen), obwohl das Abbild vorhanden und nur fuer ein anderes Ziel ist.
+  cgFremdArch:    int64;   // Architekturnummer, -1 = kein solcher Fall
+  cgFremdArchUnit: int64;  // Name der Unit
+  cgFremdArchUnitLen: int64;
   cgLyuNamen: int64;   // {ptr, len} je Name ohne Code (Funktion oder Klasse_Methode)
   cgLyuNamenN: int64;
   cgLyuNamenCap: int64;
@@ -5501,6 +5513,19 @@ pub type Codegen = class {
           // x86 bis Stufe 5 (Objektcode in der .lyu + eingebauter Binder).
           EPrintStr("error: '"c);
           sys_write(2, namePtr, nlen);
+          if (self.cgFremdArch >= 0) {
+            // #2499: Das Abbild ist da, nur fuer ein anderes Ziel.
+            EPrintStrLn("' liegt nur in einer .lyu mit Objektcode FUER EIN ANDERES ZIEL"c);
+            EPrintStr("  Die .lyu der Unit "c);
+            sys_write(2, self.cgFremdArchUnit, self.cgFremdArchUnitLen);
+            EPrintStr(" traegt ein Abbild fuer "c);
+            EPrintStr(LyuArchName(self.cgFremdArch));
+            EPrintStr(", gebraucht wird "c);
+            EPrintStrLn(LyuArchName(CG_LYU_ARCH_X86_64));
+            EPrintStrLn("  Abhilfe: die Unit fuer dieses Ziel vorkompilieren --"c);
+            EPrintStrLn("  die Vorkompilate liegen je Architektur unter units/<arch>/ (#2499)."c);
+            exit(1);
+          }
           EPrintStrLn("' stammt aus einer .lyu ohne Objektcode und ist auf x86 noch nicht aufrufbar"c);
           EPrintStrLn("  Die .lyu beschreibt Konstanten, Signaturen und Layouts (#2014 Stufen 1-4), traegt"c);
           EPrintStrLn("  aber keinen x86-Code (Stufe 5). Abhilfe: die .lyx der Unit beilegen, oder ein"c);
@@ -31888,10 +31913,33 @@ pub type Codegen = class {
       }
     }
     if (self.stdPath != 0)     { poke64(basen + n * 8, self.stdPath);     n := n + 1; }
+    // #2499: je Basis ZUERST die architekturspezifische Ablage, dann die alte.
+    // Dieselbe Reihenfolge wie in sema (_sema_readFile mit vorangestelltem
+    // Architekturnamen) -- und aus demselben Grund: ein Abbild gilt fuer genau
+    // ein Ziel, eine beschreibende .lyu fuer jedes. Der Rueckfall haelt
+    // bestehende Baeume und selbst gebaute .lyu lesbar.
+    var aDir: int64 := 0;
+    var aLen: int64 := 0;
+    if (self.cgLyuArchDir != 0) {
+      aDir := self.cgLyuArchDir;
+      aLen := StrLen(aDir as pchar);
+    }
     var i: int64 := 0;
     while (i < n) {
       var b: pchar := peek64(basen + i * 8) as pchar;
       var bl: int64 := StrLen(b);
+      if (aLen > 0) {
+        var vollA: int64 := alloc(bl + 1 + aLen + 1 + rl + 1);
+        memcpy(vollA, b as int64, bl);
+        poke8(vollA + bl, 47);
+        memcpy(vollA + bl + 1, aDir, aLen);
+        poke8(vollA + bl + 1 + aLen, 47);
+        memcpy(vollA + bl + 1 + aLen + 1, rel, rl);
+        poke8(vollA + bl + 1 + aLen + 1 + rl, 0);
+        var fdA: int64 := open(vollA as pchar, 0, 0);
+        if (fdA >= 0) { close(fdA); free(basen, 66 * 8); return vollA; }
+        free(vollA, bl + 1 + aLen + 1 + rl + 1);
+      }
       var voll: int64 := alloc(bl + 1 + rl + 1);
       memcpy(voll, b as int64, bl);
       poke8(voll + bl, 47);
@@ -32434,6 +32482,18 @@ pub type Codegen = class {
       var abPtr: int64 := lyuRdr.LyrObjAbbild(CG_LYU_ARCH_X86_64, abLB);
       if (abPtr != 0 && peek64(abLB) > 0) {
         self.cg_bindeAbbild(abPtr, peek64(abLB));
+      } else {
+        // #2499: Kein Abbild FUER DIESES ZIEL. Traegt die Datei eines fuer ein
+        // anderes, ist das ein anderer Befund als "traegt keines" -- und nur
+        // der zweite wird durch Beilegen der Quelle besser. Der Pfad ordnet,
+        // der KOPF entscheidet: gefragt wird das rohe Abbild samt Kopf-Arch,
+        // nicht das Verzeichnis, in dem die Datei lag.
+        var rohLB: int64 := alloc(8);
+        if (lyuRdr.LyrObjAbbildRoh(rohLB) != 0 && peek64(rohLB) > 0) {
+          self.cgFremdArch := lyuRdr.arch;
+          self.cgFremdArchUnit := modName as int64;
+          self.cgFremdArchUnitLen := nameLen;
+        }
       }
     }
     self.cgNurDekl := nurDeklSaved;
@@ -33988,6 +34048,10 @@ pub type Codegen = class {
     // WP-AS-04/05: directive flags
     self.boundsCheckEnabled := 1;  // on by default
     self.boundsCheckForced  := 0;  // #1124: nicht angefordert
+    self.cgFremdArch        := 0 - 1;   // #2499: kein Abbild fremder Architektur gesehen
+    self.cgFremdArchUnit    := 0;
+    self.cgFremdArchUnitLen := 0;
+    self.cgLyuArchDir       := 0;       // #2499: setzt lyxc
     self.structArenaOff     := 0 - 1;   // #1580/#1595
     self.msAbi              := 0;  // #1674: SysV, sofern nicht win64
     self.debugInfoEnabled   := 0;

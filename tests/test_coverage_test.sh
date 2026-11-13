@@ -130,6 +130,13 @@ is_exempt() {
     lib/qemu.sh)             return 0 ;;  # #2048: Bibliothek, kein Test — sucht
                                           # den Emulator unter beiden Paketnamen;
                                           # geprueft von qemu_name_test.sh
+    lib/paket_pfad.sh)       return 0 ;;  # #2499: Bibliothek, kein Test — gibt
+                                          # den Pfad der Vorkompilate je
+                                          # Architektur; geprueft wird sie
+                                          # mittelbar durch jeden Test, der
+                                          # sie einbindet (arch_ablage_2499,
+                                          # paket_ohne_quellen,
+                                          # paket_lyu_vollstaendig).
     lib/lyxc_guard.sh)       return 0 ;;  # #1294: Bibliothek, kein Test — wird
                                           # von den Scripts eingebunden und vom
                                           # Waechter lyxc_guard_coverage_test.sh
