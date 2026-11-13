@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.38A
+VERSION   := 1.2.38B
 VERSION_DATE := 2026-11-13
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -777,6 +777,8 @@ test: lyxc
 	@bash tests/obj_funktionssymbole_2146_test.sh
 	@echo "--- die .lyu traegt das Objektabbild, architekturgebunden (#2146 Stufe B) ---"
 	@bash tests/lyu_objabbild_2146_test.sh
+	@echo "--- jede Helferreferenz geht durch eine Stelle (#2146 Stufe C, Vorarbeit) ---"
+	@bash tests/helferref_eine_stelle_2146_test.sh
 	@bash tests/embed_test.sh
 	@bash tests/lyu_import_test.sh
 	@bash tests/lyu_arch_test.sh
