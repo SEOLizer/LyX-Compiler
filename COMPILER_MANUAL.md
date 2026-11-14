@@ -380,6 +380,48 @@ the mapping is by package name — a plain include path would not find it. If
 | `esp32` | Xtensa | ELF32 | Simplified SysV | ⚠️ Experimental |
 | `riscv` | RV64GC | ELF64 | LP64D | ✅ Stable |
 
+#### 3.4.1 win64: Bibliotheksnamen und Sockets (#2480)
+
+`extern fn ... link "libc.so.6"` ist ein LINUX-Name. Beim Ziel `win64` schreibt
+das Backend ihn auf den DLL-Namen um, den der Windows-Lader kennt — sonst
+scheitert der Start der .exe, bevor eine Zeile eigener Code laeuft
+("Die Ausfuehrung des Codes kann nicht fortgesetzt werden, da libc.so.6 nicht
+gefunden wurde").
+
+| `link` | DLL unter win64 |
+|---|---|
+| `libc.so.*` | `msvcrt.dll` — bei Winsock-Funktionen (`socket`, `connect`, `send`, `recv`, `select`, …) `ws2_32.dll` |
+| `libm.so.*` | `msvcrt.dll` |
+| `libdl.so.*`, `libpthread.so.*` | `kernel32.dll` |
+| `libcrypto.so.*` | `libcrypto-3-x64.dll` |
+| `libssl.so.*` | `libssl-3-x64.dll` |
+| sonstiges `libX.so.N` | `libX.dll` |
+| Name ohne `.so` (`"user32.dll"`) | unveraendert |
+
+Die OpenSSL-DLLs muessen neben der .exe liegen; sie gehoeren nicht zu Windows.
+
+Fuer TCP gibt es `std.net.tcp`, zweimal mit gleichen Signaturen — Linux ueber
+`std.net.socket`, win64 ueber `std.net.socket_win` (Winsock, WSAStartup,
+`closesocket`, Zeitgrenzen in Millisekunden). Ausgewaehlt wird ueber den
+Include-Pfad, der Plattformpfad kommt als LETZTES `-I`:
+
+```bash
+# Linux
+lyxc prog.lyx --std-path=<aurum> -I <aurum>/platform/linux -o prog
+# Windows
+lyxc prog.lyx --std-path=<aurum> -I <aurum>/platform/win64 \
+  --target=win64 --format=pe -o prog.exe
+```
+
+`std.net.tcp` loest auch Namen auf: `TcpResolve(host)` und
+`TcpConnectHost(host, port)`. Unter Linux spricht `std.net.dns` selbst DNS,
+unter Windows fragt `getaddrinfo` den Loeser des Systems — dort gibt es weder
+die UDP-Syscalls noch `/etc/resolv.conf`.
+
+`std.net.socket`, `std.net.dns` und `std.net.https` bleiben Linux-only: sie
+arbeiten ueber rohe Syscalls. UDP, Raw-Sockets und ICMP sind nicht nach
+Windows portiert.
+
 ---
 
 ## 4. Built-in Functions

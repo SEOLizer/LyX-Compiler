@@ -21,8 +21,8 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.38K
-VERSION_DATE := 2026-11-13
+VERSION   := 1.2.39A
+VERSION_DATE := 2026-11-14
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
 # #2499: Die Vorkompilate liegen je Architektur. Sobald eine .lyu Maschinencode
@@ -281,6 +281,7 @@ test: lyxc
 	@bash tests/stille_varianten_runde16_test.sh
 	@bash tests/classname_test.sh
 	@bash tests/win64_pe_test.sh
+	@bash tests/win64_dll_namen_test.sh
 	@bash tests/doppelte_mitglieder_test.sh
 	@bash tests/schluesselwoerter_test.sh
 	@bash tests/struct_rueckgabe_test.sh
