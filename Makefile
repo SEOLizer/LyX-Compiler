@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.39D
+VERSION   := 1.2.39E
 VERSION_DATE := 2026-11-14
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -832,6 +832,8 @@ test: lyxc
 	@bash tests/stdlib_fehlerwortschatz_2509_test.sh
 	@echo "--- portables Warten, x86-Teil getrennt (#2511, #2512) ---"
 	@bash tests/net_wait_portabel_2511_test.sh
+	@echo "--- lyxos-Gestaltpruefung ist nicht mehr fail-open (#2482) ---"
+	@bash tests/lyxos_argc_2482_test.sh
 	@bash tests/embed_test.sh
 	@bash tests/lyu_import_test.sh
 	@bash tests/lyu_arch_test.sh
