@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.39A
+VERSION   := 1.2.39B
 VERSION_DATE := 2026-11-14
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -820,6 +820,8 @@ test: lyxc
 	@bash tests/paket_tragfaehig_2499_test.sh
 	@echo "--- extern fn steht in der .lyu, FFI-Aufrufe binden (#2502) ---"
 	@bash tests/lyu_externfn_2502_test.sh
+	@echo "--- Capability-Angabe, pchar-Cast-Konstante und fn-Typ in der .lyu (#2449) ---"
+	@bash tests/lyu_dekl_2449_test.sh
 	@echo "--- FFI-Aufrufstellen im Abbild nennen das richtige Symbol (#2505) ---"
 	@bash tests/lyu_ffi_index_2505_test.sh
 	@echo "--- der Paketbau laeuft und das Paket traegt sich selbst ---"

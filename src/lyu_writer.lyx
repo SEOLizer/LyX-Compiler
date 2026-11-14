@@ -741,38 +741,20 @@ pub type LyuWriter = class {
             self.LywAddKonstante(src + peek64(off + NODE_OFF_SVAL),
                                  peek64(off + NODE_OFF_SLEN),
                                  0, kv, 0);
+          } else if (iK == NK_CAST && self._kastStrInt64(nodes, src, initN) != 0) {
+            // #2449: `pub con X: int64 := "text"c as int64`. Weder Zahl noch
+            // reines Literal -- der WERT ist eine Adresse, die erst der
+            // lesende Compiler kennt. Beschrieben wird der TEXT; der Reader
+            // stellt Schreibweise samt Cast wieder her (Art 2). 15 der zwanzig
+            // verbliebenen Faelle aus #2449, allein 13 ueber
+            // std/cloud/cf/transport.lyx.
+            self._konAusLiteral(nodes, peek64(iOff + NODE_OFF_C0), src,
+                                src + peek64(off + NODE_OFF_SVAL),
+                                peek64(off + NODE_OFF_SLEN), 2);
           } else if (iK == NK_LIT_STR) {
-            // In die Bibliothek gehoert der WERT, nicht die Schreibweise:
-            // Anfuehrungszeichen weg, `c`-Suffix weg, Escapes aufgeloest.
-            // Sonst muesste jeder Leser die Quelltextregeln noch einmal
-            // kennen — und die beiden liefen auseinander.
-            var roh: int64 := (src as int64) + peek64(iOff + NODE_OFF_SVAL);
-            var rlen: int64 := peek64(iOff + NODE_OFF_SLEN);
-            var tEnd: int64 := rlen - 1;                 // schliessendes "
-            if (rlen >= 2) {
-              if (peek8(roh + rlen - 1) == 99) { tEnd := rlen - 2; }   // c-Suffix
-            }
-            var tBuf: int64 := alloc(rlen + 2);
-            var tOut: int64 := 0;
-            var ti:   int64 := 1;                        // oeffnendes " ueberspringen
-            while (ti < tEnd) {
-              var tc: int64 := peek8(roh + ti);
-              if (tc == 92 && ti + 1 < tEnd) {
-                var tn: int64 := peek8(roh + ti + 1);
-                if (tn == 110)      { tc := 10; ti := ti + 1; }
-                else if (tn == 116) { tc := 9;  ti := ti + 1; }
-                else if (tn == 114) { tc := 13; ti := ti + 1; }
-                else if (tn == 92)  { tc := 92; ti := ti + 1; }
-                else if (tn == 34)  { tc := 34; ti := ti + 1; }
-                else if (tn == 48)  { tc := 0;  ti := ti + 1; }
-              }
-              poke8(tBuf + tOut, tc);
-              tOut := tOut + 1;
-              ti := ti + 1;
-            }
-            self.LywAddKonstante(src + peek64(off + NODE_OFF_SVAL),
-                                 peek64(off + NODE_OFF_SLEN),
-                                 1, tBuf, tOut);
+            self._konAusLiteral(nodes, initN, src,
+                                src + peek64(off + NODE_OFF_SVAL),
+                                peek64(off + NODE_OFF_SLEN), 1);
           }
         }
       }
@@ -782,6 +764,70 @@ pub type LyuWriter = class {
 
   // Records: 32 Byte {namePtr, nameLen, art, wert} + Textlaenge im vierten
   // Feld, wenn art == 1.
+  // #2449: Ist das ein Cast `"text"c as int64`? Nur dann, und nur mit einem
+  // Zeichenkettenliteral darunter -- jede andere Cast-Form bleibt
+  // unbeschrieben und die Unit damit quellpflichtig (laut statt still).
+  fn _kastStrInt64(nodes: int64, src: pchar, castN: int64): int64 {
+    // Knoten und Quelle kommen als PARAMETER: LywSammleKonstanten laeuft vor
+    // LywSammleDeklarationen, dkNodes/dkSrc sind dort noch nicht gesetzt.
+    // Ueber self._nc/_nk gelesen zeigte das auf einen fremden oder leeren
+    // Puffer.
+    var cOff: int64 := nodes + castN * PARSER_NODE_SIZE;
+    var inner: int64 := peek64(cOff + NODE_OFF_C0);
+    var zielT: int64 := peek64(cOff + NODE_OFF_C1);
+    if (inner < 0 || zielT < 0) { return 0; }
+    if (peek64(nodes + inner * PARSER_NODE_SIZE) != NK_LIT_STR) { return 0; }
+    var zOff: int64 := nodes + zielT * PARSER_NODE_SIZE;
+    if (peek64(zOff) != NK_TYPE_NAME) { return 0; }
+    if (peek64(zOff + NODE_OFF_SLEN) != 5) { return 0; }
+    var zp: int64 := (src as int64) + peek64(zOff + NODE_OFF_SVAL);
+    var soll: pchar := "int64";
+    var zi: int64 := 0;
+    while (zi < 5) {
+      if (peek8(zp + zi) != StrCharAt(soll, zi)) { return 0; }
+      zi := zi + 1;
+    }
+    return 1;
+  }
+
+  // #2449: EINE Stelle, die ein Zeichenkettenliteral in den Konstantenwert
+  // aufloest. Vorher stand diese Rechnung inline im Sammler; mit dem
+  // Cast-Fall braeuchte es sie zweimal -- und zwei Fassungen derselben
+  // Escape-Regeln laufen auseinander.
+  //
+  // In die Bibliothek gehoert der WERT, nicht die Schreibweise:
+  // Anfuehrungszeichen weg, `c`-Suffix weg, Escapes aufgeloest. Sonst muesste
+  // jeder Leser die Quelltextregeln noch einmal kennen.
+  fn _konAusLiteral(nodes: int64, litN: int64, src: pchar,
+                    nm: pchar, nmLen: int64, art: int64) {
+    var iOff: int64 := nodes + litN * PARSER_NODE_SIZE;
+    var roh: int64 := (src as int64) + peek64(iOff + NODE_OFF_SVAL);
+    var rlen: int64 := peek64(iOff + NODE_OFF_SLEN);
+    var tEnd: int64 := rlen - 1;                 // schliessendes "
+    if (rlen >= 2) {
+      if (peek8(roh + rlen - 1) == 99) { tEnd := rlen - 2; }   // c-Suffix
+    }
+    var tBuf: int64 := alloc(rlen + 2);
+    var tOut: int64 := 0;
+    var ti:   int64 := 1;                        // oeffnendes " ueberspringen
+    while (ti < tEnd) {
+      var tc: int64 := peek8(roh + ti);
+      if (tc == 92 && ti + 1 < tEnd) {
+        var tn: int64 := peek8(roh + ti + 1);
+        if (tn == 110)      { tc := 10; ti := ti + 1; }
+        else if (tn == 116) { tc := 9;  ti := ti + 1; }
+        else if (tn == 114) { tc := 13; ti := ti + 1; }
+        else if (tn == 92)  { tc := 92; ti := ti + 1; }
+        else if (tn == 34)  { tc := 34; ti := ti + 1; }
+        else if (tn == 48)  { tc := 0;  ti := ti + 1; }
+      }
+      poke8(tBuf + tOut, tc);
+      tOut := tOut + 1;
+      ti := ti + 1;
+    }
+    self.LywAddKonstante(nm, nmLen, art, tBuf, tOut);
+  }
+
   pub fn LywAddKonstante(nm: pchar, nmLen: int64, art: int64, wert: int64, txtLen: int64) {
     if (self.konCount >= self.konCap) {
       var nc: int64 := self.konCap * 2;
@@ -1006,6 +1052,33 @@ pub type LyuWriter = class {
       if ((self._niv(tn) & 1) != 0) { self._tbPut(63); }   // nullable `?`
       return 1;
     }
+    if (k == NK_FN_PTR) {
+      // #2449: Funktionszeigertyp `fn(T1, T2): R`. Ohne diesen Zweig blieb
+      // jede Unit quellpflichtig, die so einen Typ OEFFENTLICH nennt -- als
+      // Alias (std/semarti/registry.lyx) oder als Parameter (std/numeric.lyx:
+      // `pub fn NumDeriv(f: fn(f64): f64, ...)`). Vier der zwanzig
+      // verbliebenen Faelle aus #2449.
+      //
+      // Geschrieben wird die SCHREIBWEISE der Sprache, keine eigene
+      // Kodierung: der lesende Compiler parst sie mit seinem eigenen Parser.
+      self._tbStr("fn("c, 3);
+      var fp: int64 := self._nc(tn, 0);
+      var erst: int64 := 1;
+      while (fp >= 0) {
+        if (erst == 0) { self._tbStr(", "c, 2); }
+        if (self._typText(fp) == 0) { return 0; }
+        erst := 0;
+        fp := self._nnx(fp);
+      }
+      self._tbPut(41);
+      var fr: int64 := self._nc(tn, 1);
+      if (fr >= 0) {
+        self._tbStr(": "c, 2);
+        if (self._typText(fr) == 0) { return 0; }
+      }
+      if ((self._niv(tn) & 1) != 0) { self._tbPut(63); }
+      return 1;
+    }
     if (k == NK_TYPE_ARRAY) {
       var el: int64 := self._nc(tn, 0);
       if (el < 0) { self._tbStr("array"c, 5); return 1; }
@@ -1161,8 +1234,33 @@ pub type LyuWriter = class {
       // der Rumpf steht). Sie entscheidet ueber Rechte und wird NICHT
       // beschrieben -- lieber die Unit quellpflichtig lassen als eine
       // Deklaration wiederherstellen, die anders lautet als die geschriebene.
+      var ecN: int64 := 0;
       var ec2: int64 := self._nc(n, 2);
-      if (ec2 >= 0) { if (self._nk(ec2) == NK_CAPABILITY_ATTR) { return 0; } }
+      if (ec2 >= 0) {
+        if (self._nk(ec2) == NK_CAPABILITY_ATTR) {
+          // #2449: Die Angabe wird MITBESCHRIEBEN -- vorher blieb die ganze
+          // Unit quellpflichtig, und das kostete allein ueber std/net/dns.lyx
+          // (`@cap(system.time)` an `time`) 50 der 72 Faelle.
+          //
+          // Beschrieben wird die LISTE DER PFADE. Im Bestand ist das
+          // vollstaendig: alle 18 Angaben an einer `extern fn` sind die
+          // Kurzform `@cap(pfad)` mit einem Pfad und ohne Argumente.
+          //
+          // Was NICHT beschrieben wird, bleibt quellpflichtig (laut statt
+          // still): die dynamische Form, Argumente (Netzziele,
+          // Schluessel/Wert) und @fastpath.
+          if (self._niv(ec2) != 0) { return 0; }
+          var cd: int64 := self._nc(ec2, 0);
+          while (cd >= 0) {
+            if (self._nk(cd) != NK_CAPABILITY_DECL) { return 0; }
+            if (self._nc(cd, 0) >= 0)     { return 0; }
+            if ((self._niv(cd) & 1) != 0) { return 0; }
+            ecN := ecN + 1;
+            cd := self._nnx(cd);
+          }
+          if (ecN == 0 || ecN > 255) { return 0; }
+        }
+      }
       // KEINE Signatur. Der Parser legt bei `extern fn` keine Parameterknoten
       // an: er scannt die Signatur in Bitklassen in iVal (#1486/#2140) und
       // laesst c0/c1 auf -1, damit sema keine unbekannten Typen meldet. Ein
@@ -1174,6 +1272,15 @@ pub type LyuWriter = class {
       // der Erzeuger gesehen hat. Beschrieben wird deshalb nur, was der
       // Einbindende braucht: Name und Bibliothek fuer DT_NEEDED und GOT.
       self._eStr((self.dkSrc + lOff) as pchar, lLen);
+      // Zahl der Capability-Pfade, dann die Pfade. 0 = keine Angabe.
+      // Der Reader liest dieses Byte immer -- es muss auch bei 0 dastehen.
+      self._e8(ecN);
+      var cw: int64 := 0 - 1;
+      if (ecN > 0) { cw := self._nc(ec2, 0); }
+      while (cw >= 0) {
+        self._eStr(self._nsp(cw), self._nsl(cw));
+        cw := self._nnx(cw);
+      }
     } else if (art == LYU_DK_STRUCT) {
       if (self._layoutTyp(self._nsp(n), self._nsl(n)) == 0) { return 0; }
       if (peek64(self.dkBox + 8) != 0) { return 0; }   // Struct mit Typwort: nicht diese Art
