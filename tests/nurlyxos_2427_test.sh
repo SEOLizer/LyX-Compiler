@@ -68,17 +68,43 @@ lyxos_args() { # $1 = Name; Ausgabe: Argumentliste, oder Rueckgabe 1
 # Diese Haelfte ist vom Gate UNBERUEHRT (dort feuert es nicht) und damit die
 # eigentliche Zusicherung: der Name gehoert wirklich zu lyxos. Stimmte sie
 # nicht, waere der Eintrag eine Behauptung.
-fehlt=""
+# #2482: Namen, deren Aufrufgestalt nicht zur Kernel-ABI passt, scheitern
+# seit der verschaerften Pruefung in JEDER Argumentform. Das ist ein eigener
+# Defekt (siehe die Liste), kein Listenfehler — und er wird hier mitgefuehrt,
+# nicht uebergangen: Pruefung 1b verlangt, dass jeder Eintrag noch scheitert.
+KAPUTT="$ROOT/tests/nurlyxos-bekannt-kaputt.txt"
+declare -A BEKANNT
+if [ -f "$KAPUTT" ]; then
+  while IFS= read -r z; do
+    case "$z" in ''|'#'*) continue ;; esac
+    BEKANNT["$(printf '%s' "$z" | cut -f1)"]="$(printf '%s' "$z" | cut -f2-)"
+  done < "$KAPUTT"
+fi
+
+fehlt=""; bekanntGescheitert=""; bekanntGeht=""
 declare -A ARGS
 for n in "${NAMEN[@]}"; do
-  if a="$(lyxos_args "$n")"; then ARGS["$n"]="$a"; else fehlt="$fehlt $n"; fi
+  if a="$(lyxos_args "$n")"; then
+    ARGS["$n"]="$a"
+    [ -n "${BEKANNT[$n]+x}" ] && bekanntGeht="$bekanntGeht $n"
+  else
+    if [ -n "${BEKANNT[$n]+x}" ]; then bekanntGescheitert="$bekanntGescheitert $n"
+    else fehlt="$fehlt $n"; fi
+  fi
 done
 if [ -z "$fehlt" ]; then
-  ok "alle ${#NAMEN[@]} gelisteten Namen uebersetzen mit --target=lyxos"
+  ok "alle gelisteten Namen uebersetzen mit --target=lyxos (${#BEKANNT[@]} bekannt kaputt ausgenommen)"
 else
   no "Liste enthaelt Namen, die lyxos nicht kennt" "$(echo $fehlt | cut -c1-200)"
   echo "    Entweder gehoert der Name nicht in die Liste, oder er ist auf lyxos"
-  echo "    kaputt — dann ist das ein eigener Defekt und kein Listenfehler."
+  echo "    kaputt — dann gehoert er mit Issue in tests/nurlyxos-bekannt-kaputt.txt."
+fi
+# 1b) Ein Eintrag, der wieder uebersetzt, muss verschwinden — sonst
+#     verdeckt die Liste einen behobenen Defekt.
+if [ -z "$bekanntGeht" ]; then
+  ok "jeder Eintrag der Kaputt-Liste scheitert wirklich noch"
+else
+  no "Kaputt-Liste veraltet" "uebersetzt wieder:$bekanntGeht — Eintrag entfernen"
 fi
 
 # ── 2. Jeder gelistete Name wird auf x86 MIT GENANNTER URSACHE abgewiesen ──

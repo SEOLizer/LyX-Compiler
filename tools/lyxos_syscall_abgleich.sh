@@ -30,6 +30,8 @@ cd "$(dirname "$0")/.." || exit 1
 
 LYXOS_REPO="${LYXOS_REPO:-$HOME/PhpstormProjects/lyx-os}"
 STAND="work/lyxos/syscall-ist.txt"
+ARGC_STAND="work/lyxos/syscall-argc.txt"   # #2482
+ARGC_AUSNAHMEN="work/lyxos/syscall-argc-ausnahmen.txt"   # #2482
 SCHREIBEN=0
 [ "${1:-}" = "--schreiben" ] && SCHREIBEN=1
 
@@ -88,6 +90,76 @@ awk '
 
 sort -n -u "$TMP/a.txt" "$TMP/b.txt" > "$TMP/alle.txt"
 
+# --- Quelle A, zweite Auskunft: ARGUMENTZAHL je Nummer ---------------------
+# #2482: `lyxosGestaltPasst` war fail-open -- sie kannte genau einen Fall
+# (0x020C) und gab fuer jede andere Nummer 1 zurueck, ohne zu pruefen. Eine
+# belegte Nummer mit falscher Argumentzahl ging damit durch, und der Kernel
+# liest dann Register, die niemand gefuellt hat.
+#
+# Die Zahl steht in derselben Tabelle, in der Spalte "Bedeutung": sie beginnt
+# mit der Signatur, etwa `sys_sendto(sock, buf_uva, len, dst_uva)`. Gezaehlt
+# werden die Argumente dieser Klammer -- dieselbe Quelle wie die Nummern
+# darueber, keine zweite Auslesung.
+#
+# Zeilen ohne lesbare Signatur werden UEBERGANGEN, nicht geraten: fuer die
+# gibt LyxosArgcFuerNr spaeter -1 ("nicht erfasst") zurueck, und die Pruefung
+# laesst sie durch. Wie viele das sind, misst tests/lyxos_argc_2482_test.sh.
+awk -F'|' '
+  { if (NF < 5) next
+    nr = $2; gsub(/[ \t]/, "", nr)
+    if (nr !~ /^[0-9]+$/) next
+    name = $4; gsub(/[ \t`]/, "", name)
+    bed = $5
+    # Signatur, VERANKERT. Die Bedeutungsspalte enthaelt auch Prosa, in der
+    # eine Klammer vorkommt -- bei 136/257 steht dort
+    #   "sys_getpid(136) und sys_gettid(257) liefern HIER dasselbe"
+    # und ein unverankerter Griff liest daraus eine Signatur mit EINEM
+    # Argument. Gemessen: genau diese zwei Zeilen machten die verschaerfte
+    # Pruefung rot, und zwar zu Recht -- die Tabelle war falsch, nicht der
+    # Compiler. Zwei Bedingungen schliessen das aus:
+    #
+    #   1. Die Signatur muss am ANFANG der Spalte stehen und mit dem Namen
+    #      aus der Namensspalte beginnen. Prosa tut das nicht.
+    #   2. Kein Argument darf eine reine Zahl sein. Eine Signatur nennt
+    #      Parameternamen; "(136)" ist ein Verweis, kein Parameter.
+    if (name == "") next
+    if (substr(bed, 1, 1) == " ") sub(/^[ \t]+/, "", bed)
+    if (index(bed, name "(") != 1) next
+    sig = substr(bed, length(name) + 2)
+    if (index(sig, ")") == 0) next
+    inner = substr(sig, 1, index(sig, ")") - 1)
+    gsub(/^[ \t]+|[ \t]+$/, "", inner)
+    # OPTIONALE Argumente in eckigen Klammern: "sys_stat(path, buf [, flags])"
+    # nimmt ZWEI ODER DREI. Eine einzelne erwartete Zahl kann das nicht
+    # ausdruecken -- wer 3 eintraegt, weist den gueltigen Aufruf mit 2 ab.
+    # Gemessen: genau 517 machte die verschaerfte Pruefung rot, zu Recht.
+    # Solche Zeilen werden uebersprungen; fuer sie gilt "nicht erfasst".
+    if (index(inner, "[") > 0 || index(inner, "]") > 0) next
+    if (inner == "" || inner == "void") { argc = 0 }
+    else {
+      argc = 1
+      n_feld = split(inner, feld, ",")
+      for (i = 1; i <= n_feld; i++) {
+        f = feld[i]; gsub(/^[ \t]+|[ \t]+$/, "", f)
+        if (f ~ /^[0-9]+$/) { argc = -1; break }
+      }
+      if (argc != -1) argc = n_feld
+    }
+    if (argc < 0) next
+    print nr "\t" name "\t" argc
+  }
+' "$TABELLE" | sort -n -u -k1,1 > "$TMP/argc_roh.txt"
+
+# #2482: Nummern ausnehmen, deren Signaturkommentar nicht die gebaute ABI
+# beschreibt. Der Kommentar ist nicht die ABI -- der Rumpf des Handlers ist
+# es. Belegt bei 196 (sys_mount): Kommentar vier Argumente, Rumpf liest drei.
+if [ -f "$ARGC_AUSNAHMEN" ]; then
+    grep -v '^#' "$ARGC_AUSNAHMEN" | awk -F'\t' 'NF>=1 && $1 != "" {print $1}' | sort -u > "$TMP/aus.txt"
+    awk -F'\t' 'NR==FNR {aus[$1]=1; next} !($1 in aus)' "$TMP/aus.txt" "$TMP/argc_roh.txt" > "$TMP/argc.txt"
+else
+    cp "$TMP/argc_roh.txt" "$TMP/argc.txt"
+fi
+
 # --- Laeufe bilden ---------------------------------------------------------
 {
   echo "# Belegter LyxOS-Syscall-Raum — erzeugt von tools/lyxos_syscall_abgleich.sh"
@@ -118,17 +190,43 @@ sort -n -u "$TMP/a.txt" "$TMP/b.txt" > "$TMP/alle.txt"
 } > "$TMP/neu.txt"
 
 ANZ=$(wc -l < "$TMP/alle.txt")
+RC=0
+
+ARGC_ANZ=$(wc -l < "$TMP/argc.txt")
+
+{
+  echo "# Argumentzahl je LyxOS-Syscallnummer — erzeugt von tools/lyxos_syscall_abgleich.sh"
+  echo "# NICHT von Hand pflegen. Quelle (nur gelesen), Stand $HERKUNFT:"
+  echo "#   doku/syscalls_ist.md, Spalte Bedeutung (Signatur), aus kernel/ring3.lyx erzeugt"
+  echo "#"
+  echo "# Spalten: nummer<TAB>name<TAB>argumentzahl"
+  echo "# Nummern ohne lesbare Signatur stehen NICHT hier — fuer die gilt"
+  echo "# 'nicht erfasst', und die Gestaltpruefung laesst sie durch (#2482)."
+  cat "$TMP/argc.txt"
+} > "$TMP/argc_stand.txt"
 
 if [ "$SCHREIBEN" = "1" ]; then
     mkdir -p "$(dirname "$STAND")"
     cp "$TMP/neu.txt" "$STAND"
+    cp "$TMP/argc_stand.txt" "$ARGC_STAND"
     echo "geschrieben: $STAND ($ANZ Nummern, LyxOS $HERKUNFT)"
+    echo "geschrieben: $ARGC_STAND ($ARGC_ANZ Nummern mit Argumentzahl)"
+    echo "Jetzt die Tabelle erzeugen: tools/lyxos_abi_erzeugen.sh"
     exit 0
 fi
 
+echo "LyxOS $HERKUNFT: $ARGC_ANZ Nummern mit lesbarer Signatur (Argumentzahl)"
+if [ -f "$ARGC_STAND" ] && ! diff -q <(grep -v '^#' "$ARGC_STAND") <(grep -v '^#' "$TMP/argc_stand.txt") >/dev/null; then
+    echo "ABWEICHUNG der Argumentzahlen zum abgelegten Stand ($ARGC_STAND):"
+    diff -u <(grep -v '^#' "$ARGC_STAND") <(grep -v '^#' "$TMP/argc_stand.txt") | sed -n '3,$p' | head -20
+    echo "  Mit --schreiben nachziehen, dann tools/lyxos_abi_erzeugen.sh."
+    RC=1
+elif [ ! -f "$ARGC_STAND" ]; then
+    echo "FEHLT: $ARGC_STAND — mit --schreiben anlegen"
+    RC=1
+fi
 echo "LyxOS $HERKUNFT: $ANZ belegte Nummern (A: $(wc -l < "$TMP/a.txt"), nur B: $(comm -13 <(sort "$TMP/a.txt") <(sort "$TMP/b.txt") | sort -n | tr '\n' ' '))"
 
-RC=0
 if [ ! -f "$STAND" ]; then
     echo "FEHLT: $STAND — mit --schreiben anlegen"
     RC=1
