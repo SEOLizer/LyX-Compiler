@@ -78,20 +78,27 @@ if [ -x "$T/p" ]; then
   fi
 fi
 
-# 4) ZWEI SEITEN: eine Bindung MIT @capabilities wird NICHT beschrieben. Sie
-#    entscheidet ueber Rechte; eine wiederhergestellte Deklaration ohne sie
-#    waere eine andere als die geschriebene. Die Unit bleibt dann
-#    quellpflichtig -- laut statt still falsch.
+# 4) Eine Bindung MIT @capabilities wird seit #2449 BESCHRIEBEN, und zwar
+#    samt Angabe -- vorher blieb die Unit dafuer quellpflichtig (allein
+#    std/net/dns.lyx kostete 50 Faelle). Hier zaehlt, dass die Angabe
+#    MITKOMMT: ohne sie waere die wiederhergestellte Bindung eine andere als
+#    die geschriebene, und die FFI-Sandbox ist fail-closed.
+#
+#    Die Gegenprobe fuer das, was weiter NICHT beschrieben wird (Angabe mit
+#    Argumenten), steht in tests/lyu_dekl_2449_test.sh.
 if "$LYXC" --std-path="$T/src" --with-objcode --compile-unit "$T/src/ff/mitcap.lyx" \
        -o "$T/nur/ff/mitcap.lyu" > "$T/bau2.log" 2>&1; then
   I2="$("$LYXC" --unit-info "$T/nur/ff/mitcap.lyu" 2>&1)"
-  if printf '%s' "$I2" | grep -q "extern fn atol"; then
-    pr no "eine @capabilities-Bindung wurde beschrieben -- die Angabe ginge verloren"
+  if printf '%s' "$I2" | grep -q "extern fn atol" \
+     && printf '%s' "$I2" | grep -q '@capabilities(\[system.exit\])'; then
+    pr ok "eine @capabilities-Bindung wird samt Angabe beschrieben (#2449)"
+  elif printf '%s' "$I2" | grep -q "extern fn atol"; then
+    pr no "die Bindung ist beschrieben, die Capability-Angabe fehlt -- Rechte gingen verloren"
   else
-    pr ok "eine @capabilities-Bindung wird nicht beschrieben (Angabe bleibt bei der Quelle)"
+    pr no "die @capabilities-Bindung wird nicht beschrieben: $(printf '%s' "$I2" | grep -i extern | head -2)"
   fi
 else
-  pr ok "Unit mit @capabilities-Bindung liefert keine .lyu-Beschreibung (laut)"
+  pr no "Unit mit @capabilities-Bindung nicht uebersetzbar: $(grep -i error "$T/bau2.log" | head -2)"
 fi
 
 # 5) Eine echte stdlib-Unit mit FFI: vorher der Grund fuer 11 gescheiterte

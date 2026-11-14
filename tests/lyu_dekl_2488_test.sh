@@ -87,11 +87,16 @@ fn main(): int64 {
   fi
 fi
 
-echo "-- Gegenseite: nicht beschreibbarer Alias scheitert LAUT --"
-# Ein Alias auf einen Funktionstyp kann die .lyu nicht beschreiben
-# (_typText kennt keine Funktionstypen). Der Schreiber muss den Eintrag
-# WEGLASSEN und der Codegen weiter die Quelle verlangen -- statt etwas
-# hinzuschreiben, das nachher still falsch ist.
+echo "-- Funktionstyp-Alias: beschrieben und RECHNET (seit #2449) --"
+# Bis 1.2.39A konnte die .lyu einen Alias auf einen Funktionstyp nicht
+# beschreiben (_typText kannte keine Funktionstypen), und dieser Test
+# verlangte hier die LAUTE Ablehnung -- richtig, solange der Eintrag nur
+# still falsch gewesen waere.
+#
+# Seit #2449 schreibt _typText die Schreibweise der Sprache (`fn(T): R`), und
+# der lesende Compiler parst sie mit seinem eigenen Parser. Geprueft wird
+# deshalb nicht mehr die Ablehnung, sondern die WIRKUNG: der Zeiger muss ueber
+# die .lyu-Grenze hinweg das Richtige rechnen. `h` addiert 1, also ist c(1) = 2.
 if vorkompilieren fnalias 'unit probe.fnalias;
 pub type ProbeCb = fn(int64): int64;
 '; then
@@ -105,16 +110,18 @@ fn main(): int64 {
   return 0;
 }' > "$TMP/d.lyx"
   out="$("$LYXC" -I"$TMP/u" --std-path="$ROOT" "$TMP/d.lyx" -o "$TMP/d" 2>&1)"
-  rc=$?
-  if [ "$rc" = "0" ]; then
-    echo "FAIL Funktionstyp-Alias uebersetzte klaglos — der Eintrag beschreibt ihn falsch"
-    FAIL=$((FAIL+1))
-  elif printf '%s' "$out" | grep -q "Nicht beschrieben: ProbeCb"; then
-    echo "PASS Funktionstyp-Alias scheitert laut und nennt ProbeCb"
-    PASS=$((PASS+1))
+  if [ -x "$TMP/d" ]; then
+    aus="$("$TMP/d" 2>&1)"
+    if [ "$aus" = "2" ]; then
+      echo "PASS Funktionstyp-Alias aus der .lyu rechnet richtig (c(1) = 2)"
+      PASS=$((PASS+1))
+    else
+      echo "FAIL Funktionstyp-Alias laeuft, rechnet aber falsch: '$aus' statt 2"
+      FAIL=$((FAIL+1))
+    fi
   else
-    echo "FAIL scheitert, aber nicht mit der erwarteten Ursache:"
-    printf '%s\n' "$out" | grep -iE "error" | head -2 | sed 's/^/    /'
+    echo "FAIL Funktionstyp-Alias uebersetzt nicht:"
+    printf '%s\n' "$out" | grep -iE "error|Nicht beschrieben" | head -2 | sed 's/^/    /'
     FAIL=$((FAIL+1))
   fi
 fi
