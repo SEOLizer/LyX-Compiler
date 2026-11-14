@@ -52,6 +52,17 @@ EOF
 # Aus dem TMP-Verzeichnis heraus, ohne --std-path: nur der Installationspfad
 # kann std.fs noch liefern.
 cd "$TMP" || exit 1
+
+# #2484: Das Paket liefert die Units ARCHITEKTURGEBUNDEN aus (units/<arch>/std,
+# seit #2499). Die Frage nach der vierten Stufe zerfaellt damit in zwei:
+#
+#   a) Wird der Import ueberhaupt AUFGELOEST? Das entscheidet sema und haengt
+#      nicht am Ziel -- deshalb weiter mit --target=lyxos gemessen.
+#   b) Kann die IR-Strecke die gefundene Datei auch BENUTZEN? Das kann sie nur
+#      fuer das Ziel, dessen Baum installiert ist. Bis 1.2.39B verlangte diese
+#      Pruefung Benutzbarkeit unter --target=lyxos, obwohl das Paket keinen
+#      lyxos-Baum enthaelt: sie konnte nicht gruen werden, und die Ursache war
+#      nicht der Compiler, sondern die Prämisse der Pruefung.
 log="$TMP/l"
 timeout 300 "$LYXC" --target=lyxos --trace-imports "$TMP/t.lyx" -o "$TMP/t.out" >"$log" 2>&1
 
@@ -63,12 +74,45 @@ else
   bad "Import ohne --std-path" "$(grep -E '^\[import\] std\.fs' "$log" | head -1)"
 fi
 
-# 2. Und die Meldung aus #1724 darf nicht wiederkommen. Sie zeigte auf einen
-#    fehlenden Builtin, obwohl bloss die Unit nicht gefunden wurde.
-if grep -q 'Import nicht lesbar' "$log"; then
-  bad "Import ohne --std-path" "meldet weiterhin 'Import nicht lesbar'"
+# 2. Fuer das Ziel, dessen Baum installiert ist, darf die Meldung aus #1724
+#    nicht kommen. Sie zeigte auf einen fehlenden Builtin, obwohl bloss die
+#    Unit nicht gefunden wurde. Gemessen wird ohne --target, also fuer den
+#    Host -- genau die Architektur, die das Paket hier abgelegt hat.
+#
+#    Genau DAS war bis 1.2.39B rot, und zwar an einer vierten Stelle:
+#    `cg_lyuPfadZu` zaehlte nur -I und --std-path auf, nicht die Installation.
+hlog="$TMP/lh"
+timeout 300 "$LYXC" --trace-imports "$TMP/t.lyx" -o "$TMP/t.host" >"$hlog" 2>&1
+if grep -q 'Import nicht lesbar' "$hlog"; then
+  bad "Host-Ziel" "meldet weiterhin 'Import nicht lesbar'"
 else
-  ok "keine Meldung 'Import nicht lesbar'"
+  ok "fuer das installierte Ziel keine Meldung 'Import nicht lesbar'"
+fi
+
+# 3. Die WIRKUNG, nicht bloss die Abwesenheit einer Meldung (#1943 verlangte
+#    zu Recht, die installierte Unit nicht zu uebersetzen -- aber ein Paket,
+#    das seine eigenen Units nicht benutzbar macht, ist genau der Defekt aus
+#    #2484). Gemessen wird der RUECKGABEWERT: FileExists("/tmp") ist wahr,
+#    also 1. Ein Erzeugnis, das blosses Vorhandensein prueft, waere blind
+#    gegen eine Unit, die 0 zurueckgibt.
+if [ -x "$TMP/t.host" ]; then
+  "$TMP/t.host"; rc=$?
+  if [ "$rc" -eq 1 ]; then
+    ok "das Erzeugnis aus der installierten .lyu liefert FileExists(/tmp) = 1"
+  else
+    bad "Wirkung" "Rueckgabe $rc, erwartet 1"
+  fi
+else
+  bad "Wirkung" "kein Erzeugnis entstanden"
+fi
+
+# 4. Gegenprobe, zweiseitig: fuer ein Ziel OHNE installierten Baum muss die
+#    Meldung kommen. Ohne diese Haelfte waere Pruefung 2 auch von einem
+#    Compiler erfuellt, der die Meldung gar nicht mehr kennt.
+if grep -q 'Import nicht lesbar' "$log"; then
+  ok "fuer ein Ziel ohne installierten Baum (lyxos) wird laut gemeldet"
+else
+  bad "Gegenprobe" "lyxos meldet NICHTS, obwohl kein lyxos-Baum installiert ist"
 fi
 
 echo "Ergebnis: $P PASS, $F FAIL"
