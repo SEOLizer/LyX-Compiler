@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.39C
+VERSION   := 1.2.39D
 VERSION_DATE := 2026-11-14
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -828,6 +828,10 @@ test: lyxc
 	@bash tests/paket_bau_2499_test.sh
 	@echo "--- die Unit-Herkunft steht je Backend in der Tabelle (#2472) ---"
 	@bash tests/dist_units_ziel_2472_test.sh
+	@echo "--- der Fehlerwortschatz ist Teil der Schnittstelle (#2509, #2515) ---"
+	@bash tests/stdlib_fehlerwortschatz_2509_test.sh
+	@echo "--- portables Warten, x86-Teil getrennt (#2511, #2512) ---"
+	@bash tests/net_wait_portabel_2511_test.sh
 	@bash tests/embed_test.sh
 	@bash tests/lyu_import_test.sh
 	@bash tests/lyu_arch_test.sh

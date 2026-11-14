@@ -484,6 +484,7 @@ der eingesetzte Wert steht jeweils fest.
 | 549 | Linux-Syscall symlinkat (Nr. 36) | `symlink` | #2156; nur arm64/riscv, newdirfd AT_FDCWD |
 | 550 | Linux-Syscall fstat (Nr. 80) | `sys_fstat` | #2156; nur arm64/riscv |
 | 551 | Linux-Syscall unlinkat (Nr. 35) | `rmdir` | #2450; nur arm64/riscv, dirfd AT_FDCWD, Flag AT_REMOVEDIR (0x200). Auf lyxos bleibt `rmdir` die ID 236 (sys_unlink mit UNLINK_DIR) — und die meldet dort, dass es die Nummer nicht gibt (#2011) |
+| 552 | Linux-Syscall pselect6 (Nr. 72 generisch, 270 auf x86-64) | `sys_pselect6(nfds, r, w, e, timespec, sigmask)` | x86-64 (codegen_x86, 270), arm64/riscv (Nr. 72 ueber linux_syscalls); auf lyxos laut abgewiesen (unbekannte ID, emit_lyxos) | #2511; der sechste Zeiger ist `{ sigset_t *ss; size_t ss_len }`, Nullzeiger = Maske nicht aendern. `sys_select` bleibt auf arm64/riscv abgewiesen; portabel wartet man ueber `std.net.wait` |
 
 ## Bereich 267 … 272 — IOFS-Volumes und Partitions-Mounts (#2439)
 
