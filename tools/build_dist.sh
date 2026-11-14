@@ -43,25 +43,32 @@
 #     sich aber aus dem Host-Baum heraus auf win64 anstandslos benutzen
 #     (gemessen: Ausgabe 5 unter wine).
 #
-# Darum werden die Units mit dem HOST-Ziel uebersetzt (UNITS_ZIEL=host, Vorgabe):
-# vollstaendig, klein, und am Erzeugnis nachweislich dasselbe. Wer die
-# zielweise Form braucht oder die Messung wiederholen will, setzt
-# UNITS_ZIEL=ziel — dann gilt die Ausnahmeliste
-# tools/dist_units_ausnahmen_<backend>.txt.
+# Fuer x86-64-ZIELE gilt das: dort ist der Host-Baum vollstaendig, klein und
+# am Erzeugnis nachweislich dasselbe. Fuer Nicht-x86 gilt es NICHT, und die
+# Messung oben war dafuer blind -- sie verglich linux gegen win64, BEIDE
+# x86-64, und sah damit den Punkt nicht, der wirklich zielabhaengig ist: das
+# TYPLAYOUT. `StringBuilder` ist auf x86-64 32 Byte gross (Typwort 1), auf
+# arm64 24 (Typwort 0); der Codegen prueft das beim Import einer .lyu und
+# bricht zu Recht ab.
 #
-# ACHTUNG — die Messung oben gilt nur fuer x86-64-Ziele (#2472). Sie verglich
-# linux gegen win64, BEIDE x86-64, und war damit blind fuer den Punkt, der
-# wirklich zielabhaengig ist: das TYPLAYOUT. `StringBuilder` ist auf x86-64
-# 32 Bytes gross (Typwort 1), auf arm64 24 (Typwort 0); der Codegen prueft das
-# beim Import einer .lyu und bricht zu Recht ab. Gemessen am Beispielbaum von
-# linux-arm64: mit Host-Units 40 von 87 uebersetzbar, mit zielweisen Units 62 —
-# die 22 Unterschiede sind genau die 11 StringBuilder- und 6
-# EthernetHeader-Layoutmeldungen plus Folgefehler.
+# #2472: Die Unit-Herkunft steht deshalb JE BACKEND in der Tabelle (Spalte
+# "Units"), nicht global. Gemessen am 2026-11-14 mit lyxc 1.2.39B:
 #
-# Fuer arm64, riscv64, macos-arm64 und lyxos ist UNITS_ZIEL=host also FALSCH,
-# und die Baeume liefern Beispiele mit, die mit ihrem eigenen Unit-Baum nicht
-# uebersetzen. Die Umstellung haengt an je einer begruendeten Ausnahmeliste
-# (fuer arm64: 16 von 500 Units) und ist in #2472 beschrieben.
+#   zielweise uebersetzbar      arm64 497/501, riscv64 497/501,
+#                               macos-arm64 497/501, macos-x86_64 497/501
+#   Ausnahmen je Ziel           4, zwei Ursachen: select fehlt auf der
+#                               generischen Linux-ABI (#2511, 3 Units),
+#                               arch_prctl ist x86-spezifisch (#2512, 1 Unit)
+#   lyxos                       411/501 -- 90 Units an EINER Ursache
+#                               (sys_sendto-Argumentzahl, #2513); steht
+#                               deshalb weiter auf `host`
+#
+# Am Beispielbaum von linux-arm64, zielweise gebaut: 62 von 87 uebersetzen
+# (mit Host-Units waren es 40). Die 22 Unterschiede sind genau die 11
+# StringBuilder- und 6 EthernetHeader-Layoutmeldungen plus Folgefehler.
+#
+# Wer gegen die Tabelle bauen will, setzt UNITS_ZIEL von aussen -- das gewinnt
+# weiter, aber die Vorgabe ist jetzt je Ziel richtig.
 #
 # Aufruf:
 #   tools/build_dist.sh                 # alle Backends aus BACKENDS
@@ -73,10 +80,10 @@
 #   JOBS=<n>      parallele Unit-Uebersetzungen (Vorgabe: nproc)
 #   NUR_UNITS=1   den Compiler fuer das Ziel nicht bauen (schneller Durchlauf)
 #   UNITS_ZIEL=host|ziel
-#                 host (Vorgabe): Units mit dem Host-Ziel uebersetzen — klein,
-#                 vollstaendig, Erzeugnis nachweislich gleich (s. oben).
-#                 ziel: Units mit --target=<backend> uebersetzen; dann greift
-#                 die Ausnahmeliste, und der Baum ist bei win64 unvollstaendig.
+#                 Ueberschreibt die Spalte "Units" der Backend-Tabelle (#2472).
+#                 Ohne Angabe entscheidet die Tabelle: host fuer x86-64-Ziele
+#                 und lyxos (#2513), ziel fuer arm64, riscv64 und macos-arm64.
+#                 Bei `ziel` greift tools/dist_units_ausnahmen_<backend>.txt.
 #
 # Rueckgabe: 0 nur, wenn fuer jedes Backend der Compiler steht und JEDE Unit
 # uebersetzt ist, die nicht in tools/dist_units_ausnahmen_<backend>.txt mit
@@ -91,7 +98,11 @@ cd "$ROOT"
 LYXC="${LYXC:-$ROOT/lyxc}"
 JOBS="${JOBS:-$(nproc)}"
 NUR_UNITS="${NUR_UNITS:-0}"
-UNITS_ZIEL="${UNITS_ZIEL:-host}"
+# #2472: Von aussen gesetzt gewinnt; sonst entscheidet die Backend-Tabelle je
+# Ziel (Spalte "Units"). Vorher stand hier global `host`, und damit bekamen
+# arm64, riscv64, macos-arm64 und lyxos die Units des Hosts -- mit dessen
+# Typlayout.
+UNITS_ZIEL_GESETZT="${UNITS_ZIEL:-}"
 AUS="$ROOT/build"
 
 # ── eine Unit uebersetzen (von xargs aufgerufen) ─────────────────────────────
@@ -139,15 +150,31 @@ if [ "${1:-}" = "--ein-beispiel" ]; then
 fi
 
 # ── Backend-Tabelle ──────────────────────────────────────────────────────────
-# name|--target=|--format=|Binaername|Compiler selbst baubar (ja/nein)
+# name|--target=|--format=|Binaername|Compiler selbst baubar (ja/nein)|Units
+#
+# #2472: Die SPALTE "Units" sagt, mit welchem Ziel die Vorkompilate entstehen:
+#
+#   host  die .lyu des Hosts gelten -- nur fuer x86-64-Ziele, deren Typlayout
+#         mit dem Host uebereinstimmt
+#   ziel  je Ziel uebersetzt; dann gilt tools/dist_units_ausnahmen_<name>.txt
+#
+# Die Angabe steht HIER und nicht in einer zweiten Aufzaehlung daneben: eine
+# .lyu traegt das Layout ihres Ziels (StringBuilder ist auf x86-64 32 Byte mit
+# Typwort 1, auf arm64 24 Byte mit Typwort 0), und wer das an zwei Stellen
+# pflegt, liefert stillschweigend die falschen Units aus.
+#
+# lyxos steht auf `host`, obwohl es ein Nicht-x86-Ziel ist: zielweise
+# scheitern dort 90 von 501 Units an EINER Ursache (sys_sendto-Argumentzahl,
+# #2513). Eine Ausnahmeliste mit 90 Zeilen waere keine Liste, sondern ein
+# Feigenblatt. Sobald #2513 zu ist, gehoert lyxos auf `ziel`.
 BACKEND_TABELLE=(
-  "linux-x86_64|linux|elf|lyxc|ja"
-  "win64|win64|pe|lyxc.exe|ja"
-  "linux-arm64|arm64|elf|lyxc|ja"
-  "linux-riscv64|riscv|elf|lyxc|ja"
-  "macos-x86_64|macosx64|macho|lyxc|ja"
-  "macos-arm64|macos-arm64|macho|lyxc|ja"
-  "lyxos|lyxos|elf|lyxc|nein"
+  "linux-x86_64|linux|elf|lyxc|ja|host"
+  "win64|win64|pe|lyxc.exe|ja|host"
+  "linux-arm64|arm64|elf|lyxc|ja|ziel"
+  "linux-riscv64|riscv|elf|lyxc|ja|ziel"
+  "macos-x86_64|macosx64|macho|lyxc|ja|host"
+  "macos-arm64|macos-arm64|macho|lyxc|ja|ziel"
+  "lyxos|lyxos|elf|lyxc|nein|host"
 )
 # Vorgabe: nur die zwei Ziele, die hier gemessen laufen. Die uebrigen baut man
 # namentlich — ungemessen in die Vorgabe zu nehmen hiesse, ihren Zustand zu
@@ -260,7 +287,15 @@ backend_bauen() {
   local name="$1"
   local z target format binname selbstbaubar
   z="$(zeile_fuer "$name")" || { echo "FEHLER: unbekanntes Backend '$name'. Bekannt: $(alle_backends | tr '\n' ' ')" >&2; return 1; }
-  IFS='|' read -r _ target format binname selbstbaubar <<<"$z"
+  IFS='|' read -r _ target format binname selbstbaubar units_sp <<<"$z"
+
+  # #2472: Die Unit-Herkunft kommt aus der Backend-Tabelle. Eine von aussen
+  # gesetzte UNITS_ZIEL-Variable gewinnt weiter -- wer bewusst gegen die
+  # Tabelle baut, soll das koennen -- aber die VORGABE ist jetzt je Ziel
+  # richtig, statt global `host` zu sein und fuer Nicht-x86 das falsche
+  # Typlayout auszuliefern.
+  local UNITS_ZIEL="${UNITS_ZIEL_GESETZT:-$units_sp}"
+  [ -n "$UNITS_ZIEL" ] || UNITS_ZIEL=host
 
   local D="$AUS/$name"
   echo "=== Backend $name (--target=$target --format=$format) -> $D"

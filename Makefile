@@ -826,6 +826,8 @@ test: lyxc
 	@bash tests/lyu_ffi_index_2505_test.sh
 	@echo "--- der Paketbau laeuft und das Paket traegt sich selbst ---"
 	@bash tests/paket_bau_2499_test.sh
+	@echo "--- die Unit-Herkunft steht je Backend in der Tabelle (#2472) ---"
+	@bash tests/dist_units_ziel_2472_test.sh
 	@bash tests/embed_test.sh
 	@bash tests/lyu_import_test.sh
 	@bash tests/lyu_arch_test.sh
