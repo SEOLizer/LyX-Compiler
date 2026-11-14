@@ -1,0 +1,61 @@
+// std/net/wait.lyx — #2511: portables Warten auf Deskriptoren.
+//
+// WARUM DIESE UNIT EXISTIERT. `select` gibt es in der generischen Linux-ABI
+// nicht: arm64 und riscv kennen nur `pselect6` (Nr. 72, auf x86-64 die 270).
+// Drei stdlib-Units riefen `sys_select` und liessen sich deshalb fuer diese
+// Ziele nicht vorkompilieren (std/db/postgres.lyx, std/net/ssh.lyx,
+// std/net/syscalls.lyx).
+//
+// `pselect6` ist kein Ersatz mit erfundenem Argument: sein sechster Zeiger
+// ist `{ sigset_t *ss; size_t ss_len }`, und ein NULLZEIGER bedeutet
+// ausdruecklich "Signalmaske nicht aendern" -- genau das, was `select` tut.
+//
+// DIESE UNIT IMPORTIERT NICHTS, und das ist Absicht. Eine erste Fassung
+// importierte `std.alloc`, um den Zeitwert in einen frischen Puffer
+// umzurechnen. Gemessen am 2026-11-14: jedes Programm, das `std.net.socket`
+// UND `src.std.io` importiert, brach danach ab --
+//
+//   sema error: mehrdeutiges Symbol 'alloc' -- exportiert von
+//   'src.std.alloc' und 'std.alloc'
+//
+// -- denn `std.net.socket` zieht `std.net.syscalls` und damit diese Unit
+// nach. Es gibt zwei Allokatoren im Repo, und eine Unit so tief in der Kette
+// darf sich fuer keinen entscheiden.
+//
+// DER ZEITWERT WIRD DESHALB GELIEHEN. `select` nimmt ein `timeval`
+// (Sekunden, MIKROsekunden), `pselect6` ein `timespec` (Sekunden,
+// NANOsekunden) -- dieselben zwei Felder, nur die zweite Einheit
+// unterscheidet sich. Der Puffer des Aufrufers wird fuer die Dauer des
+// Aufrufs umgerechnet und danach WIEDER AUF DEN ALTEN WERT gesetzt. Der
+// Aufrufer sieht seinen Puffer unveraendert; es wird nichts allokiert, und
+// die Umrechnung steht an EINER Stelle statt an jeder Aufrufstelle.
+//
+// Linux schreibt bei `pselect6` den Zeitwert nicht zurueck (bei `select`
+// tut es das). Das Zurueckschreiben hier ist deshalb exakt und nicht
+// geraten. GEMESSEN am Bestand: keine der drei Aufrufstellen liest den Wert
+// nach dem Aufruf -- wer sich kuenftig auf eine Restzeit stuetzt, muss sie
+// selbst mitrechnen.
+
+unit std.net.wait;
+
+// Warten mit einem `timeval`-Zeiger, wie `select` ihn nimmt.
+// tv == 0 heisst "ohne Zeitgrenze blockieren": derselbe Nullzeiger geht
+// durch, es wird nichts eingesetzt.
+pub fn SelectTimeval(nfds: int64, readfds: int64, writefds: int64,
+                     exceptfds: int64, tv: int64): int64 {
+  if (tv == 0) {
+    return sys_pselect6(nfds, readfds, writefds, exceptfds, 0, 0);
+  }
+  var usec: int64 := peek64(tv + 8);
+  poke64(tv + 8, usec * 1000);            // timeval -> timespec, geliehen
+  var res: int64 := sys_pselect6(nfds, readfds, writefds, exceptfds, tv, 0);
+  poke64(tv + 8, usec);                   // Puffer unveraendert zuruecklassen
+  return res;
+}
+
+// Warten mit einem fertigen `timespec`-Zeiger, fuer Aufrufer, die ihre Zeit
+// schon in Nanosekunden fuehren. Hier wird nichts umgerechnet.
+pub fn SelectTimespec(nfds: int64, readfds: int64, writefds: int64,
+                      exceptfds: int64, ts: int64): int64 {
+  return sys_pselect6(nfds, readfds, writefds, exceptfds, ts, 0);
+}
