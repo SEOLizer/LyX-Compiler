@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.38J
+VERSION   := 1.2.38K
 VERSION_DATE := 2026-11-13
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -821,6 +821,8 @@ test: lyxc
 	@bash tests/lyu_externfn_2502_test.sh
 	@echo "--- FFI-Aufrufstellen im Abbild nennen das richtige Symbol (#2505) ---"
 	@bash tests/lyu_ffi_index_2505_test.sh
+	@echo "--- der Paketbau laeuft und das Paket traegt sich selbst ---"
+	@bash tests/paket_bau_2499_test.sh
 	@bash tests/embed_test.sh
 	@bash tests/lyu_import_test.sh
 	@bash tests/lyu_arch_test.sh
