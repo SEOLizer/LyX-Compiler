@@ -21,8 +21,8 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.39E
-VERSION_DATE := 2026-11-14
+VERSION   := 1.2.40A
+VERSION_DATE := 2026-11-15
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
 # #2499: Die Vorkompilate liegen je Architektur. Sobald eine .lyu Maschinencode
@@ -834,6 +834,8 @@ test: lyxc
 	@bash tests/net_wait_portabel_2511_test.sh
 	@echo "--- lyxos-Gestaltpruefung ist nicht mehr fail-open (#2482) ---"
 	@bash tests/lyxos_argc_2482_test.sh
+	@echo "--- faltbarer Zweig wird nicht gesenkt, Gates bleiben scharf (#2513) ---"
+	@bash tests/ir_faltbarer_zweig_2513_test.sh
 	@bash tests/embed_test.sh
 	@bash tests/lyu_import_test.sh
 	@bash tests/lyu_arch_test.sh
