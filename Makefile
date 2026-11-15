@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.40C
+VERSION   := 1.2.40D
 VERSION_DATE := 2026-11-15
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -374,6 +374,7 @@ test: lyxc
 	@bash tests/ausgabe_ascii_2475_test.sh
 	@echo "--- zielgebundene Builtins nennen die Ursache, Liste weder zu weit noch zu eng (#2427) ---"
 	@bash tests/nurlyxos_2427_test.sh
+	@bash tests/shani_lyxos_2438_test.sh
 	@bash tests/lyxos_syscallnamen_2522_test.sh
 	@echo "--- fs-Builtins wirken auf x86, arm64 und riscv; mkdir-Modus 0755 (#2463, #2465) ---"
 	@bash tests/zielmatrix_2463_test.sh

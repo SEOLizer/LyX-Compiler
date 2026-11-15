@@ -1,0 +1,222 @@
+// src/backend/sha_ni.lyx — die SHA-NI-Befehlsfolge, EINMAL beschrieben.
+//
+// WARUM DIESE DATEI EXISTIERT (#2438). Die Folge stand nur in
+// `codegen_x86.lyx`. Fuer lyxos fehlte sie, und `sha256_compress` fiel dort
+// auf `IRO_PANIC`. Sie fuer das zweite Backend abzuschreiben waere die
+// naheliegende und die falsche Loesung: zwei Emitter aus zwei Beschreibungen
+// laufen auseinander, und bei einer Kryptoprimitive heisst auseinanderlaufen
+// "ein Ziel rechnet still falsch". Deshalb rendern hier beide Backends aus
+// DERSELBEN Beschreibung.
+//
+// Die Funktionen schreiben Bytes in einen Puffer, den der Aufrufer stellt,
+// und geben den neuen Schreibstand zurueck. Sie kennen weder Codelaenge noch
+// Datensegment noch Zielformat — alles Lagerabhaengige bleibt beim Aufrufer.
+//
+// WAS NICHT HIERHER GEHOERT, und warum: die Adresse der K-Tabelle. x86 legt
+// sie ins Datensegment und laedt sie RIP-relativ ueber `cg_emitLeaRaxData`;
+// lyxos hat dafuer keinen Datenbereich und legt sie hinter einem Sprung in
+// den Codestrom. Das ist echt zielabhaengig, nicht nur anders geschrieben.
+// Darum ist die Folge in KOPF und RUMPF geteilt, und die Adressladung steht
+// dazwischen beim Aufrufer.
+//
+// REGISTERPLAN (unveraendert aus #2391; dort gegen eine Assembler-Fassung
+// verifiziert, die beide NIST-Vektoren fuer SHA-256 bitgleich liefert):
+//   xmm0       Nachricht — ZWINGEND, `sha256rnds2` liest sie implizit
+//   xmm1/xmm2  abef / cdgh (der Zustand in der Form, die die Befehle
+//              brauchen; NICHT ABCDEFGH)
+//   xmm3       Arbeitsregister
+//   xmm4..xmm7 die vier Nachrichtenviertel m0..m3
+//   xmm8/xmm9  Sicherung des Zustands fuer die Schlussaddition
+//   xmm10      die Byteumkehrmaske
+//   r8         K-Tabelle, r9 Maske, rdi Zustand, rsi Daten, rdx Bloecke
+//
+// Geladen wird mit `movdqu`, NICHT ueber einen Speicheroperanden von `paddd`:
+// ein Legacy-SSE-Befehl mit m128-Operand verlangt 16-Byte-Ausrichtung, und die
+// ist weder im Datensegment noch im Codestrom zugesagt. Dieselbe Entscheidung
+// wie im Vektorkern seit 1.2.31A (#2372).
+
+@description("SHA-NI instruction sequence, rendered once for every backend")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+unit src.backend.sha_ni;
+
+// Laengen, die der Aufrufer zum Puffern braucht. Gemessen, nicht geschaetzt:
+// `tests/shani_renderer_2438_test.sh` prueft sie gegen die Rueckgabewerte.
+pub con SHA_NI_K_LEN:     int64 := 272;    // 256 Byte Tabelle + 16 Byte Maske
+pub con SHA_NI_KOPF_LEN:  int64 := 9;      // test rdx,rdx + jz rel32
+pub con SHA_NI_RUMPF_MAX: int64 := 2048;   // gemessen 870; Luft fuer Aenderungen
+
+// ── Bausteine ──────────────────────────────────────────────────────────────
+
+fn _sn8(buf: int64, off: int64, b: int64): int64 {
+  poke8(buf + off, b & 255);
+  return off + 1;
+}
+
+// 32 Bit little-endian. Eigene Funktion, weil die K-Tabelle 64 davon braucht
+// und ein Byteschreiber je Konstante vier Zeilen kostet.
+fn _sn32(buf: int64, off: int64, w: int64): int64 {
+  var o: int64 := off;
+  o := _sn8(buf, o,  w        & 255);
+  o := _sn8(buf, o, (w >>  8) & 255);
+  o := _sn8(buf, o, (w >> 16) & 255);
+  o := _sn8(buf, o, (w >> 24) & 255);
+  return o;
+}
+
+// Ein Rundenpaar. `koff` ist der Byteabstand in der K-Tabelle.
+fn _snRnds(buf: int64, off: int64, mm: int64, koff: int64): int64 {
+  var o: int64 := off;
+  o := _sn8(buf, o, 0x66); o := _sn8(buf, o, 0x0F); o := _sn8(buf, o, 0x6F);
+  o := _sn8(buf, o, 0xC0 + mm);                          // movdqa xmm0, xmm<mm>
+  // movdqu xmm3, [r8 + koff] — ModRM reg=3, rm=0 (r8 ueber REX.B)
+  o := _sn8(buf, o, 0xF3); o := _sn8(buf, o, 0x41);
+  o := _sn8(buf, o, 0x0F); o := _sn8(buf, o, 0x6F);
+  if (koff == 0) {
+    o := _sn8(buf, o, 0x18);
+  } else if (koff < 128) {
+    o := _sn8(buf, o, 0x58); o := _sn8(buf, o, koff);
+  } else {
+    o := _sn8(buf, o, 0x98); o := _sn32(buf, o, koff);
+  }
+  o := _sn8(buf, o, 0x66); o := _sn8(buf, o, 0x0F); o := _sn8(buf, o, 0xFE);
+  o := _sn8(buf, o, 0xC3);                               // paddd xmm0, xmm3
+  o := _sn8(buf, o, 0x0F); o := _sn8(buf, o, 0x38); o := _sn8(buf, o, 0xCB);
+  o := _sn8(buf, o, 0xD1);                               // sha256rnds2 xmm2, xmm1 (, xmm0)
+  o := _sn8(buf, o, 0x66); o := _sn8(buf, o, 0x0F); o := _sn8(buf, o, 0x70);
+  o := _sn8(buf, o, 0xC0); o := _sn8(buf, o, 0x0E);       // pshufd xmm0, xmm0, 0x0E
+  o := _sn8(buf, o, 0x0F); o := _sn8(buf, o, 0x38); o := _sn8(buf, o, 0xCB);
+  o := _sn8(buf, o, 0xCA);                               // sha256rnds2 xmm1, xmm2 (, xmm0)
+  return o;
+}
+
+// Ein Viertel des Nachrichtenplans: x := msg2(msg1(x, y) + (w:z >> 4), w).
+// Die vier Viertel rotieren durch, siehe Aufrufreihenfolge im Rumpf.
+fn _snSched(buf: int64, off: int64, x: int64, y: int64, z: int64, w: int64): int64 {
+  var o: int64 := off;
+  o := _sn8(buf, o, 0x0F); o := _sn8(buf, o, 0x38); o := _sn8(buf, o, 0xCC);
+  o := _sn8(buf, o, 0xC0 + x * 8 + y);                   // sha256msg1 x, y
+  o := _sn8(buf, o, 0x66); o := _sn8(buf, o, 0x0F); o := _sn8(buf, o, 0x6F);
+  o := _sn8(buf, o, 0xD8 + w);                           // movdqa xmm3, w
+  o := _sn8(buf, o, 0x66); o := _sn8(buf, o, 0x0F); o := _sn8(buf, o, 0x3A);
+  o := _sn8(buf, o, 0x0F); o := _sn8(buf, o, 0xD8 + z); o := _sn8(buf, o, 0x04);  // palignr xmm3, z, 4
+  o := _sn8(buf, o, 0x66); o := _sn8(buf, o, 0x0F); o := _sn8(buf, o, 0xFE);
+  o := _sn8(buf, o, 0xC3 + x * 8);                       // paddd x, xmm3
+  o := _sn8(buf, o, 0x0F); o := _sn8(buf, o, 0x38); o := _sn8(buf, o, 0xCD);
+  o := _sn8(buf, o, 0xC0 + x * 8 + w);                   // sha256msg2 x, w
+  return o;
+}
+
+// ── Die drei Teile, die ein Backend zusammensetzt ──────────────────────────
+
+// Die 64 Rundenkonstanten aus FIPS 180-4, dahinter die Byteumkehrmaske.
+// WOERTLICH aus der Spezifikation; nicht aus den Kubikwurzeln neu gerechnet.
+// Rueckgabe: geschriebene Laenge (== SHA_NI_K_LEN).
+pub fn ShaNiKBytes(buf: int64): int64 {
+  var o: int64 := 0;
+  o := _sn32(buf, o, 0x428a2f98); o := _sn32(buf, o, 0x71374491); o := _sn32(buf, o, 0xb5c0fbcf); o := _sn32(buf, o, 0xe9b5dba5);
+  o := _sn32(buf, o, 0x3956c25b); o := _sn32(buf, o, 0x59f111f1); o := _sn32(buf, o, 0x923f82a4); o := _sn32(buf, o, 0xab1c5ed5);
+  o := _sn32(buf, o, 0xd807aa98); o := _sn32(buf, o, 0x12835b01); o := _sn32(buf, o, 0x243185be); o := _sn32(buf, o, 0x550c7dc3);
+  o := _sn32(buf, o, 0x72be5d74); o := _sn32(buf, o, 0x80deb1fe); o := _sn32(buf, o, 0x9bdc06a7); o := _sn32(buf, o, 0xc19bf174);
+  o := _sn32(buf, o, 0xe49b69c1); o := _sn32(buf, o, 0xefbe4786); o := _sn32(buf, o, 0x0fc19dc6); o := _sn32(buf, o, 0x240ca1cc);
+  o := _sn32(buf, o, 0x2de92c6f); o := _sn32(buf, o, 0x4a7484aa); o := _sn32(buf, o, 0x5cb0a9dc); o := _sn32(buf, o, 0x76f988da);
+  o := _sn32(buf, o, 0x983e5152); o := _sn32(buf, o, 0xa831c66d); o := _sn32(buf, o, 0xb00327c8); o := _sn32(buf, o, 0xbf597fc7);
+  o := _sn32(buf, o, 0xc6e00bf3); o := _sn32(buf, o, 0xd5a79147); o := _sn32(buf, o, 0x06ca6351); o := _sn32(buf, o, 0x14292967);
+  o := _sn32(buf, o, 0x27b70a85); o := _sn32(buf, o, 0x2e1b2138); o := _sn32(buf, o, 0x4d2c6dfc); o := _sn32(buf, o, 0x53380d13);
+  o := _sn32(buf, o, 0x650a7354); o := _sn32(buf, o, 0x766a0abb); o := _sn32(buf, o, 0x81c2c92e); o := _sn32(buf, o, 0x92722c85);
+  o := _sn32(buf, o, 0xa2bfe8a1); o := _sn32(buf, o, 0xa81a664b); o := _sn32(buf, o, 0xc24b8b70); o := _sn32(buf, o, 0xc76c51a3);
+  o := _sn32(buf, o, 0xd192e819); o := _sn32(buf, o, 0xd6990624); o := _sn32(buf, o, 0xf40e3585); o := _sn32(buf, o, 0x106aa070);
+  o := _sn32(buf, o, 0x19a4c116); o := _sn32(buf, o, 0x1e376c08); o := _sn32(buf, o, 0x2748774c); o := _sn32(buf, o, 0x34b0bcb5);
+  o := _sn32(buf, o, 0x391c0cb3); o := _sn32(buf, o, 0x4ed8aa4a); o := _sn32(buf, o, 0x5b9cca4f); o := _sn32(buf, o, 0x682e6ff3);
+  o := _sn32(buf, o, 0x748f82ee); o := _sn32(buf, o, 0x78a5636f); o := _sn32(buf, o, 0x84c87814); o := _sn32(buf, o, 0x8cc70208);
+  o := _sn32(buf, o, 0x90befffa); o := _sn32(buf, o, 0xa4506ceb); o := _sn32(buf, o, 0xbef9a3f7); o := _sn32(buf, o, 0xc67178f2);
+  // Byteumkehrmaske: 03 02 01 00 07 06 05 04 0B 0A 09 08 0F 0E 0D 0C
+  var j: int64 := 0;
+  while (j < 4) {
+    var k: int64 := 3;
+    while (k >= 0) { o := _sn8(buf, o, j * 4 + k); k := k - 1; }
+    j := j + 1;
+  }
+  return o;
+}
+
+// KOPF: null Bloecke heisst nichts tun. Ohne diese Frage liefe die Schleife
+// 2^64 mal durch, denn geprueft wird unten mit `dec`/`jnz`.
+//
+// Das rel32 des `jz` bleibt 0 und wird vom AUFRUFER gepatcht: zwischen Kopf
+// und Rumpf steht die zielabhaengige Adressladung, die Weite ist hier also
+// nicht bekannt. Die Patchstelle liegt bei Rueckgabe - 4.
+pub fn ShaNiKopf(buf: int64): int64 {
+  var o: int64 := 0;
+  o := _sn8(buf, o, 0x48); o := _sn8(buf, o, 0x85); o := _sn8(buf, o, 0xD2);  // test rdx, rdx
+  o := _sn8(buf, o, 0x0F); o := _sn8(buf, o, 0x84);                          // jz rel32
+  o := _sn32(buf, o, 0);                                                    // Aufrufer patcht
+  return o;
+}
+
+// RUMPF: ab `movdqu xmm10, [r9]` bis zum Zurueckschreiben des Zustands.
+// Erwartet r8 = K-Tabelle, r9 = Maske, rdi = Zustand, rsi = Daten,
+// rdx = Blockzahl (> 0, der Kopf hat null abgefangen).
+//
+// Der Rueckwaertssprung am Schleifenende ist PUFFERLOKAL: sein rel32 zaehlt
+// von einer Stelle im Rumpf zu einer anderen, die Folge ist damit
+// lagerunabhaengig und kann an jede Codeadresse kopiert werden.
+pub fn ShaNiRumpf(buf: int64): int64 {
+  var o: int64 := 0;
+  o := _sn8(buf, o, 0xF3); o := _sn8(buf, o, 0x45); o := _sn8(buf, o, 0x0F); o := _sn8(buf, o, 0x6F); o := _sn8(buf, o, 0x11);  // movdqu xmm10, [r9]
+  // Zustand laden und nach ABEF / CDGH umordnen. Der Zustand kommt und geht
+  // in ABCDEFGH (FIPS 180-4); die Befehle brauchen ihn lane-verdreht. Diese
+  // Umordnung steht hier, nicht beim Aufrufer.
+  o := _sn8(buf, o, 0xF3); o := _sn8(buf, o, 0x0F); o := _sn8(buf, o, 0x6F); o := _sn8(buf, o, 0x0F);                      // movdqu xmm1, [rdi]
+  o := _sn8(buf, o, 0xF3); o := _sn8(buf, o, 0x0F); o := _sn8(buf, o, 0x6F); o := _sn8(buf, o, 0x57); o := _sn8(buf, o, 0x10);  // movdqu xmm2, [rdi+16]
+  o := _sn8(buf, o, 0x66); o := _sn8(buf, o, 0x0F); o := _sn8(buf, o, 0x70); o := _sn8(buf, o, 0xC9); o := _sn8(buf, o, 0xB1);  // pshufd xmm1, xmm1, 0xB1
+  o := _sn8(buf, o, 0x66); o := _sn8(buf, o, 0x0F); o := _sn8(buf, o, 0x70); o := _sn8(buf, o, 0xD2); o := _sn8(buf, o, 0x1B);  // pshufd xmm2, xmm2, 0x1B
+  o := _sn8(buf, o, 0x66); o := _sn8(buf, o, 0x0F); o := _sn8(buf, o, 0x6F); o := _sn8(buf, o, 0xD9);                      // movdqa xmm3, xmm1
+  o := _sn8(buf, o, 0x66); o := _sn8(buf, o, 0x0F); o := _sn8(buf, o, 0x3A); o := _sn8(buf, o, 0x0F); o := _sn8(buf, o, 0xCA); o := _sn8(buf, o, 0x08);  // palignr xmm1, xmm2, 8
+  o := _sn8(buf, o, 0x66); o := _sn8(buf, o, 0x0F); o := _sn8(buf, o, 0x3A); o := _sn8(buf, o, 0x0E); o := _sn8(buf, o, 0xD3); o := _sn8(buf, o, 0xF0);  // pblendw xmm2, xmm3, 0xF0
+  var top: int64 := o;
+  o := _sn8(buf, o, 0x66); o := _sn8(buf, o, 0x44); o := _sn8(buf, o, 0x0F); o := _sn8(buf, o, 0x6F); o := _sn8(buf, o, 0xC1);  // movdqa xmm8, xmm1
+  o := _sn8(buf, o, 0x66); o := _sn8(buf, o, 0x44); o := _sn8(buf, o, 0x0F); o := _sn8(buf, o, 0x6F); o := _sn8(buf, o, 0xCA);  // movdqa xmm9, xmm2
+  // Die vier Nachrichtenviertel laden und byteweise drehen (big-endian im
+  // Standard, little-endian im Register).
+  o := _sn8(buf, o, 0xF3); o := _sn8(buf, o, 0x0F); o := _sn8(buf, o, 0x6F); o := _sn8(buf, o, 0x26);                      // movdqu xmm4, [rsi]
+  o := _sn8(buf, o, 0x66); o := _sn8(buf, o, 0x41); o := _sn8(buf, o, 0x0F); o := _sn8(buf, o, 0x38); o := _sn8(buf, o, 0x00); o := _sn8(buf, o, 0xE2);  // pshufb xmm4, xmm10
+  o := _sn8(buf, o, 0xF3); o := _sn8(buf, o, 0x0F); o := _sn8(buf, o, 0x6F); o := _sn8(buf, o, 0x6E); o := _sn8(buf, o, 0x10);  // movdqu xmm5, [rsi+16]
+  o := _sn8(buf, o, 0x66); o := _sn8(buf, o, 0x41); o := _sn8(buf, o, 0x0F); o := _sn8(buf, o, 0x38); o := _sn8(buf, o, 0x00); o := _sn8(buf, o, 0xEA);  // pshufb xmm5, xmm10
+  o := _sn8(buf, o, 0xF3); o := _sn8(buf, o, 0x0F); o := _sn8(buf, o, 0x6F); o := _sn8(buf, o, 0x76); o := _sn8(buf, o, 0x20);  // movdqu xmm6, [rsi+32]
+  o := _sn8(buf, o, 0x66); o := _sn8(buf, o, 0x41); o := _sn8(buf, o, 0x0F); o := _sn8(buf, o, 0x38); o := _sn8(buf, o, 0x00); o := _sn8(buf, o, 0xF2);  // pshufb xmm6, xmm10
+  o := _sn8(buf, o, 0xF3); o := _sn8(buf, o, 0x0F); o := _sn8(buf, o, 0x6F); o := _sn8(buf, o, 0x7E); o := _sn8(buf, o, 0x30);  // movdqu xmm7, [rsi+48]
+  o := _sn8(buf, o, 0x66); o := _sn8(buf, o, 0x41); o := _sn8(buf, o, 0x0F); o := _sn8(buf, o, 0x38); o := _sn8(buf, o, 0x00); o := _sn8(buf, o, 0xFA);  // pshufb xmm7, xmm10
+  // Runden 0..15: noch ohne Plan, die Nachricht steht schon da.
+  o := _snRnds(buf, o, 4, 0);
+  o := _snRnds(buf, o, 5, 16);
+  o := _snRnds(buf, o, 6, 32);
+  o := _snRnds(buf, o, 7, 48);
+  // Runden 16..63: je vier Viertel fortschreiben und verrechnen. Die Viertel
+  // rotieren (4,5,6,7 -> 5,6,7,4 -> ...), darum die vier Zeilen je Gruppe und
+  // nicht eine Schleife — der Renderer rollt sie aus, das Erzeugnis hat sie
+  // dann ohne Zaehler.
+  var r: int64 := 64;
+  while (r < 256) {
+    o := _snSched(buf, o, 4, 5, 6, 7); o := _snRnds(buf, o, 4, r);
+    o := _snSched(buf, o, 5, 6, 7, 4); o := _snRnds(buf, o, 5, r + 16);
+    o := _snSched(buf, o, 6, 7, 4, 5); o := _snRnds(buf, o, 6, r + 32);
+    o := _snSched(buf, o, 7, 4, 5, 6); o := _snRnds(buf, o, 7, r + 48);
+    r := r + 64;
+  }
+  o := _sn8(buf, o, 0x66); o := _sn8(buf, o, 0x41); o := _sn8(buf, o, 0x0F); o := _sn8(buf, o, 0xFE); o := _sn8(buf, o, 0xC8);  // paddd xmm1, xmm8
+  o := _sn8(buf, o, 0x66); o := _sn8(buf, o, 0x41); o := _sn8(buf, o, 0x0F); o := _sn8(buf, o, 0xFE); o := _sn8(buf, o, 0xD1);  // paddd xmm2, xmm9
+  o := _sn8(buf, o, 0x48); o := _sn8(buf, o, 0x83); o := _sn8(buf, o, 0xC6); o := _sn8(buf, o, 0x40);                      // add rsi, 64
+  o := _sn8(buf, o, 0x48); o := _sn8(buf, o, 0xFF); o := _sn8(buf, o, 0xCA);                                              // dec rdx
+  o := _sn8(buf, o, 0x0F); o := _sn8(buf, o, 0x85);                                                                      // jnz top
+  o := _sn32(buf, o, top - o - 4);
+  // zurueck nach ABCDEFGH
+  o := _sn8(buf, o, 0x66); o := _sn8(buf, o, 0x0F); o := _sn8(buf, o, 0x70); o := _sn8(buf, o, 0xC9); o := _sn8(buf, o, 0x1B);  // pshufd xmm1, xmm1, 0x1B
+  o := _sn8(buf, o, 0x66); o := _sn8(buf, o, 0x0F); o := _sn8(buf, o, 0x70); o := _sn8(buf, o, 0xD2); o := _sn8(buf, o, 0xB1);  // pshufd xmm2, xmm2, 0xB1
+  o := _sn8(buf, o, 0x66); o := _sn8(buf, o, 0x0F); o := _sn8(buf, o, 0x6F); o := _sn8(buf, o, 0xD9);                      // movdqa xmm3, xmm1
+  o := _sn8(buf, o, 0x66); o := _sn8(buf, o, 0x0F); o := _sn8(buf, o, 0x3A); o := _sn8(buf, o, 0x0E); o := _sn8(buf, o, 0xCA); o := _sn8(buf, o, 0xF0);  // pblendw xmm1, xmm2, 0xF0
+  o := _sn8(buf, o, 0x66); o := _sn8(buf, o, 0x0F); o := _sn8(buf, o, 0x3A); o := _sn8(buf, o, 0x0F); o := _sn8(buf, o, 0xD3); o := _sn8(buf, o, 0x08);  // palignr xmm2, xmm3, 8
+  o := _sn8(buf, o, 0xF3); o := _sn8(buf, o, 0x0F); o := _sn8(buf, o, 0x7F); o := _sn8(buf, o, 0x0F);                      // movdqu [rdi], xmm1
+  o := _sn8(buf, o, 0xF3); o := _sn8(buf, o, 0x0F); o := _sn8(buf, o, 0x7F); o := _sn8(buf, o, 0x57); o := _sn8(buf, o, 0x10);  // movdqu [rdi+16], xmm2
+  return o;
+}

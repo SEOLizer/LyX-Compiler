@@ -582,7 +582,7 @@ arbeiten auf 16-Byte-Bloecken im Speicher, weil Lyx keinen 128-Bit-Werttyp hat.
 | 566 | Hardware-Saat (`RDSEED`) | `rdseed64()` | wie 560 | #2390 |
 | 567 | verschmolzene Multiplikation und Addition (`VFMADD213SD`) | `fma(a, b, c)` | x86-Familie; lyxos ueber die ID (`emit_lyxos` 2500) | #2403 |
 
-| 568 | ganze SHA-256-Kompression (`SHA256RNDS2`/`MSG1`/`MSG2`) | `sha256_compress(state, data, blocks)` | **nur ELF-x86** (0/1/5/6/13), NICHT lyxos (14) — dort PANIC, weil `emit_lyxos` keine SHA-NI-Fassung hat und unbehandelte IDs stumm verwirft | #2391 |
+| 568 | ganze SHA-256-Kompression (`SHA256RNDS2`/`MSG1`/`MSG2`) | `sha256_compress(state, data, blocks)` | #2391; ELF-x86 (0/1/5/6/13) **und lyxos (14) seit #2438**. Beide Backends rendern die Folge aus `src/backend/sha_ni.lyx` — eine Beschreibung, zwei Emitter; der Nachweis ist Byte-Gleichheit der Erzeugnisse. Zielabhaengig ist nur die Adresse der K-Tabelle (x86 Datensegment, lyxos hinter einem Sprung im Codestrom, RIP-relativ). arm64/riscv/arm-cm bleiben bei `IRO_PANIC`: die Befehle gibt es dort nicht, und `cpu_id` liefert 0 |
 
 ## Bereich 569 … 570 — obere Produkthaelfte (#2460)
 
