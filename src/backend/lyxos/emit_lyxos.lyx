@@ -19,6 +19,7 @@
 
 import src.ir;
 import src.backend.lyxos.lyxos_abi;   // #2482: Argumentzahl je Nummer, aus dem Kernel ausgelesen
+import src.backend.sha_ni;   // #2438: die SHA-NI-Folge, EINMAL beschrieben
 
 // #2184: die drei Rumpfformen der Vektorschleife (siehe emitSimdSchleife).
 con SIMD_RUMPF_BINOP: int64 := 0;
@@ -2616,6 +2617,61 @@ pub type EmitLyxOS = class {
             self.emit8(0x48); self.emit8(0x83); self.emit8(0xC4); self.emit8(0x10);   // add rsp, 16
             self.emit8(0x31); self.emit8(0xC0);                                       // xor eax, eax
             self.emitMovSlotFromRax(dest);
+        }
+        // #2438: sha256_compress(state, data, blocks) — SHA-NI.
+        //
+        // Die Befehlsfolge wird aus src/backend/sha_ni.lyx gerendert, also aus
+        // DERSELBEN Beschreibung wie der x86-Weg. Abgeschrieben wird nichts:
+        // zwei Fassungen einer Kryptoprimitive laufen auseinander, und das
+        // heisst bei SHA-256 "ein Ziel rechnet still falsch". Der Nachweis
+        // dafuer ist Byte-Gleichheit beider Erzeugnisse
+        // (tests/shani_lyxos_2438_test.sh).
+        //
+        // Zielabhaengig ist allein die Adresse der K-Tabelle. x86 legt sie ins
+        // Datensegment; hier gibt es dafuer keinen Bereich (die rodata-Mechanik
+        // haengt an der Globals-Patchkette, und ein Kratzpuffer waere eine
+        // Allokation je Aufruf). Stattdessen liegt die Tabelle HINTER EINEM
+        // SPRUNG im Codestrom und wird RIP-relativ adressiert: der Abstand ist
+        // zur Uebersetzungszeit bekannt und von der Ladeadresse unabhaengig,
+        // es braucht also keine Relokation.
+        else if id == 568 {
+            self.emitMovRdiFromSlot(argBase);                                      // Zustand
+            self.emitMovRsiFromSlot(argBase + 1);                                  // Daten
+            self.emitMovRdxFromSlot(argBase + 2);                                  // Blockzahl
+            // Ueber die Tabelle springen, damit sie nicht ausgefuehrt wird.
+            self.emit8(0xE9); self.emit32(SHA_NI_K_LEN);                           // jmp +272
+            var shTbl: int64 := self.codeLen;
+            var shKb: int64 := alloc(SHA_NI_K_LEN);
+            if (shKb == 0) {
+                // Kein Speicher: laut scheitern, nicht still falsch rechnen.
+                self.emitPanicExit();
+            } else {
+                var shKl: int64 := ShaNiKBytes(shKb);
+                var shKi: int64 := 0;
+                while (shKi < shKl) { self.emit8(peek8(shKb + shKi) & 255); shKi := shKi + 1; }
+                free(shKb, SHA_NI_K_LEN);
+                // lea r8, [rip + disp32] — Anfang der Tabelle
+                self.emit8(0x4C); self.emit8(0x8D); self.emit8(0x05);
+                self.emit32(shTbl - (self.codeLen + 4));
+                // lea r9, [r8 + 256] — die Byteumkehrmaske hinter der Tabelle
+                self.emit8(0x4D); self.emit8(0x8D); self.emit8(0x88); self.emit32(256);
+                var shBuf: int64 := alloc(SHA_NI_RUMPF_MAX);
+                if (shBuf == 0) {
+                    self.emitPanicExit();
+                } else {
+                    var shHl: int64 := ShaNiKopf(shBuf);
+                    var shHi: int64 := 0;
+                    while (shHi < shHl) { self.emit8(peek8(shBuf + shHi) & 255); shHi := shHi + 1; }
+                    var shEnde: int64 := self.codeLen - 4;   // rel32 des jz, s. ShaNiKopf
+                    var shRl: int64 := ShaNiRumpf(shBuf);
+                    var shRi: int64 := 0;
+                    while (shRi < shRl) { self.emit8(peek8(shBuf + shRi) & 255); shRi := shRi + 1; }
+                    free(shBuf, SHA_NI_RUMPF_MAX);
+                    self.patch32(shEnde, self.codeLen - (shEnde + 4));
+                    self.emit8(0x31); self.emit8(0xC0);                            // xor eax, eax
+                    self.emitMovSlotFromRax(dest);
+                }
+            }
         }
         else if id == 567 {                                                        // fma(a, b, c) — #2403
             // Dieselben Bytes wie im x86-Weg (codegen_x86, "fma").
