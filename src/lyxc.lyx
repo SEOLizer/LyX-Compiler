@@ -1872,7 +1872,7 @@ pub type CompilerConfig = class {
     if StrCmp(arg, "--version"c) == 0 {
       PrintStr("lyxc"c);
       PrintStr(" "c);
-      PrintStrLn("1.2.40D"c);
+      PrintStrLn("1.2.40E"c);
       PrintStr("Build: "c);
       PrintStrLn("bootstrap"c);
       self.exitCode := 0;
@@ -1894,7 +1894,7 @@ pub type CompilerConfig = class {
       PrintStr("  Name: "c);
       PrintStrLn("lyxc"c);
       PrintStr("  Version: "c);
-      PrintStrLn("1.2.40D"c);
+      PrintStrLn("1.2.40E"c);
       PrintStr("  Build: "c);
       PrintStrLn("bootstrap"c);
       PrintStr("  Target: "c);
@@ -2150,7 +2150,7 @@ pub type CompilerConfig = class {
   }
 
   fn printHelp(): void {
-    PrintStrLn("lyxc 1.2.40D (bootstrap)");
+    PrintStrLn("lyxc 1.2.40E (bootstrap)");
     PrintStrLn("Copyright (c) 2026 Andreas Roene. All rights reserved.");
     PrintStrLn("");
     PrintStrLn("Verwendung: lyxc <datei.lyx> [-o <ausgabe>] [--target=TARGET] [--arch=ARCH]");
@@ -2366,6 +2366,15 @@ pub type CompilerConfig = class {
     // CAPS-TLV: Union aller @capabilities-Bits für LBF-Nativ. Linearer Scan über alle
     // NK_CAPABILITY_DECL-Nodes (auch verschachtelt unter NK_CAPABILITY_ATTR), Pfad-sVal
     // → LBF_CAP_*-Bit. Ohne dies bleibt CAPS=0 → Pledge-Gate denied File-Zugriff.
+    // #2534/#2537: ZWEI Durchgaenge, und das ist der ganze Punkt. Die Warnung
+    // unten sagt etwas ueber das ERZEUGNIS ("kommt an wie eines ohne
+    // Manifest"), ihre Aussage haengt also an der Union ALLER Namen — nicht an
+    // dem einen, der gerade geprueft wird. In einem Durchgang gemeldet, stand
+    // sie zwangslaeufig auf einer halb gefuellten Union und behauptete
+    // Totalverlust, sobald irgendein Name kein Bit setzt. Gemessen an den
+    // Erzeugnissen: `[fs.read, fs.write, fs.create]` unterscheidet sich in 56
+    // Bytes von einem ohne Attribut und traegt CAPS=3 — die Warnung nannte es
+    // manifestlos. Erst Union bilden, dann reden.
     self.lyxosCapBits := 0;
     var capScan: int64 := 0;
     while capScan < parser.nodeCount {
@@ -2373,16 +2382,31 @@ pub type CompilerConfig = class {
       if peek64(capOff + 0) == NK_CAPABILITY_DECL {
         var capPtr: int64 := (parser.src as int64) + peek64(capOff + NODE_OFF_SVAL);
         var capLen: int64 := peek64(capOff + NODE_OFF_SLEN);
-        var capBit: int64 := self._capBitsFromPath(capPtr, capLen);
-        // #1755: system.* sind die impliziten Rechte (exit, Heap, Zufall, Zeit)
-        // — sie brauchen kein Bit und werden nicht gemeldet. Alles andere ohne
-        // Bit ist eine Zusage, die dieses Ziel nicht einloest.
-        if capBit == 0 && self.target == LYX_TC_LYXOS {
-          if !self._capMatch(capPtr, capLen, "system"c, 6) { self._meldeCapOhneBit(capPtr, capLen); }
-        }
-        self.lyxosCapBits := self.lyxosCapBits | capBit;
+        self.lyxosCapBits := self.lyxosCapBits | self._capBitsFromPath(capPtr, capLen);
       }
       capScan += 1;
+    }
+
+    // Zweiter Durchgang: melden, was auf diesem Ziel nichts bewirkt. Jetzt ist
+    // die Union vollstaendig und die Meldung kann die Wahrheit sagen.
+    if self.target == LYX_TC_LYXOS {
+      capScan := 0;
+      while capScan < parser.nodeCount {
+        var capOff2: int64 := parser.nodes + capScan * PARSER_NODE_SIZE;
+        if peek64(capOff2 + 0) == NK_CAPABILITY_DECL {
+          var capPtr2: int64 := (parser.src as int64) + peek64(capOff2 + NODE_OFF_SVAL);
+          var capLen2: int64 := peek64(capOff2 + NODE_OFF_SLEN);
+          // #1755: system.* sind die impliziten Rechte (exit, Heap, Zufall, Zeit)
+          // — sie brauchen kein Bit und werden nicht gemeldet. Alles andere ohne
+          // Bit ist eine Zusage, die dieses Ziel nicht einloest.
+          if self._capBitsFromPath(capPtr2, capLen2) == 0 {
+            if !self._capMatch(capPtr2, capLen2, "system"c, 6) {
+              self._meldeCapOhneBit(capPtr2, capLen2, self.lyxosCapBits);
+            }
+          }
+        }
+        capScan += 1;
+      }
     }
 
     // Dump AST if requested and return early
@@ -4174,14 +4198,35 @@ pub type CompilerConfig = class {
   // andere Ziele gueltig, und ein Abbruch wuerde Programme unuebersetzbar
   // machen, die heute laufen. Wer den Namen liest, soll aber wissen, dass er
   // auf diesem Ziel nichts bewirkt.
-  fn _meldeCapOhneBit(ptr: int64, len: int64): void {
+  // #2534/#2537: `unionBits` ist die Union ALLER @capabilities-Bits dieses
+  // Erzeugnisses. Satz 2 darf nur dann von einem manifestlosen LBF sprechen,
+  // wenn sie 0 ist — sonst traegt das Erzeugnis sehr wohl ein Manifest, nur
+  // nicht wegen DIESES Namens. Beide Faelle sind am Erzeugnis gemessen
+  // (CAPS-TLV, Tag 5): `[fs.read, fs.write, fs.create]` -> 3, `[fs.create]` -> 0.
+  //
+  // Die Aufzaehlung darunter war zweifach falsch, beides je Name am Erzeugnis
+  // nachgemessen: `process.*` versprach zu viel (nur process.exec und
+  // process.fork setzen 8; exit, signal, sched und privileges setzen keines und
+  // werden selbst gewarnt — dieselbe Praefix-Falle wie #1823), und audio.play
+  // (1024) wie ui.notify (2048) fehlten, obwohl sie Bits setzen. Wer die Liste
+  // liest, um einen tragenden Namen zu finden, soll ihn darin finden.
+  fn _meldeCapOhneBit(ptr: int64, len: int64, unionBits: int64): void {
     EPrintStr("warning: --target=lyxos: @capabilities("c);
     sys_write(2, ptr, len);
     EPrintStrLn(") setzt kein Bit in der CAPS-TLV."c);
-    EPrintStrLn("  Das LBF kommt beim Ladeprogramm an wie eines ohne Manifest (nur Standardausgabe)."c);
-    EPrintStrLn("  Abgebildet sind: fs.read, fs.write, network.*, process.*, ki.embed, ki.graph,"c);
-    EPrintStrLn("  audio.mic, system.config, hardware.block, hardware.i2c/usb/gpio/spi."c);
-    EPrintStrLn("  Siehe #1755, #1759, #1797 und #1826."c);
+    if unionBits == 0 {
+      EPrintStrLn("  Keine der Angaben setzt ein Bit: das LBF kommt beim Ladeprogramm an wie eines"c);
+      EPrintStrLn("  ohne Manifest (nur Standardausgabe)."c);
+    }
+    if unionBits != 0 {
+      EPrintStrLn("  Die anderen Angaben tragen das Manifest; dieser Name allein bewirkt auf diesem"c);
+      EPrintStrLn("  Ziel nichts -- das Erzeugnis ist deshalb NICHT manifestlos."c);
+    }
+    EPrintStrLn("  Ein Bit setzen: fs.read, fs.write, network.* (tcp/udp bind+connect, unix, raw),"c);
+    EPrintStrLn("  process.exec, process.fork, ki.embed, ki.graph, audio.mic, audio.play,"c);
+    EPrintStrLn("  ui.notify, system.config, hardware.block, hardware.gpio/i2c/spi/usb."c);
+    EPrintStrLn("  Jeder andere deklarierbare Name setzt keines. Zuordnung: _capBitsFromPath"c);
+    EPrintStrLn("  in src/lyxc.lyx, Kernelseite: lbf_map_caps in kernel/lbf_exec.lyx. Siehe #2534."c);
   }
 
   fn emitLyxOS(irMod: int64): int64 {
@@ -6751,7 +6796,7 @@ pub type CompilerConfig = class {
     j := StrConcat(j, ",\"compiler\":{"c);
     // tools/next_version.sh ersetzt jedes Literal "x.y.zS"c in dieser Datei
     // global; diese Stelle wird also mitgezogen und driftet nicht weg.
-    j := StrConcat(j, self._cpTxt("version"c, "1.2.40D"c));
+    j := StrConcat(j, self._cpTxt("version"c, "1.2.40E"c));
     j := StrConcat(j, ","c);
     j := StrConcat(j, self._cpFehlt("commit"c, "NO_COMMIT_IN_BINARY"c));
     j := StrConcat(j, ","c);
@@ -7791,7 +7836,7 @@ pub fn main(argc: int64, argv: pchar): int64 {
 
   // Print version banner unless suppressed with --quiet
   if not cfg.quiet {
-    PrintStr("lyxc 1.2.40D -- Copyright (c) 2026 Andreas Roene. All rights reserved.\n"c);
+    PrintStr("lyxc 1.2.40E -- Copyright (c) 2026 Andreas Roene. All rights reserved.\n"c);
   }
 
   // WP-BC-50: --unit-info <file> — read .lyu file, print metadata, exit
