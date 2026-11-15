@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.40A
+VERSION   := 1.2.40B
 VERSION_DATE := 2026-11-15
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -836,6 +836,8 @@ test: lyxc
 	@bash tests/lyxos_argc_2482_test.sh
 	@echo "--- faltbarer Zweig wird nicht gesenkt, Gates bleiben scharf (#2513) ---"
 	@bash tests/ir_faltbarer_zweig_2513_test.sh
+	@echo "--- Herkunft ohne procfs: kein readlink fuer lyxos (#2524) ---"
+	@bash tests/herkunft_ohne_procfs_2524_test.sh
 	@bash tests/embed_test.sh
 	@bash tests/lyu_import_test.sh
 	@bash tests/lyu_arch_test.sh
