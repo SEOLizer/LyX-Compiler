@@ -345,6 +345,7 @@ abgebildet zu werden.
 
 | ID | Operation | Lowering von | Anmerkung |
 |---:|---|---|---|
+| 434 | Neustart (0) oder Abschalten (1); kehrt nicht zurueck | `sys_power` | #2522; LyxOS 210 — die Entsprechung zu Linux `reboot(magic1, magic2, cmd, arg)`. `std.sysadmin.Reboot` bildet die LINUX_REBOOT_CMD_* darauf ab; CAD_ON/CAD_OFF haben keine und liefern -ENOSYS |
 | 440 | Linux-Syscall getuid (Nr. 0) | `sys_getuid` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
 | 441 | Linux-Syscall chroot (Nr. 1) | `sys_chroot` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
 | 442 | Linux-Syscall clone (Nr. 5) | `sys_clone` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
