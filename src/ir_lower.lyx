@@ -1257,6 +1257,26 @@ pub type IRLower = class {
   // nmScope — Gueltigkeitsstapel des Vorpasses, je 40 B: Name, Laenge,
   //           eindeutiger Name (0 = durch Variable/Parameter verdeckt),
   //           Laenge, Deklarationsknoten.
+  // #2545: Verzeichnis der Typdeklarationen je KNOTENTABELLE, damit
+  // `_findTypeDecl` nicht linear über alle Knoten sucht. Die Tabelle wechselt
+  // im IR-Weg oft (75 Stellen setzen `self.nodes`, dieselbe Unit liegt in bis
+  // zu drei Tabellen) — ein Verzeichnis mit nur einem Platz würde bei jedem
+  // Wechsel neu gebaut und wäre teurer als die Suche. Deshalb TD_SLOTS Plätze,
+  // rundlaufend ersetzt.
+  //
+  // Schlüssel ist (nodes, nodeCount). Die Knotenzahl gehört dazu: entsteht
+  // während des Senkens ein Knoten, ändert sie sich, und ein veraltetes
+  // Verzeichnis fällt damit von selbst weg. Ohne diesen Teil des Schlüssels
+  // würde eine später angelegte Typdeklaration nicht gefunden — ein stilles
+  // falsches Ergebnis, nicht bloß eine langsame Suche.
+  //
+  // Je Platz: {nodes, nodeCount, Puffer, Anzahl}; je Eintrag im Puffer
+  // {Namenszeiger, Namenslänge, Knotenindex} zu 24 Byte, in aufsteigender
+  // Knotenreihenfolge — `_findTypeDecl` muss den ERSTEN Treffer liefern.
+  tdSlotNodes: int64;
+  tdSlotCnt:   int64;
+  tdSlotBuf:   int64;
+  tdSlotNext:  int64;
   nmMap:       int64;
   nmCnt:       int64;
   nmCap:       int64;
@@ -1469,6 +1489,22 @@ pub type IRLower = class {
     self.nestCap := 64;
     self.nestBuf := alloc(self.nestCap * 24);
     self.nestCnt := 0;
+    // #2545: acht Plätze je 32 Byte {nodes, nodeCount, Puffer, Anzahl}.
+    // Puffer je Platz erst beim Füllen, damit ein nie benutzter Platz nichts
+    // kostet.
+    self.tdSlotNodes := alloc(8 * 40);
+    self.tdSlotCnt := 0;
+    self.tdSlotBuf := 0;
+    self.tdSlotNext := 0;
+    var tdI: int64 := 0;
+    while tdI < 8 {
+      poke64(self.tdSlotNodes + tdI * 40 + 0,  0);
+      poke64(self.tdSlotNodes + tdI * 40 + 8,  0);
+      poke64(self.tdSlotNodes + tdI * 40 + 16, 0);
+      poke64(self.tdSlotNodes + tdI * 40 + 24, 0);
+      poke64(self.tdSlotNodes + tdI * 40 + 32, 0);
+      tdI := tdI + 1;
+    }
     self.nmCap := 64;
     self.nmMap := alloc(self.nmCap * 40);
     self.nmCnt := 0;
@@ -8755,16 +8791,82 @@ pub type IRLower = class {
   }
 
   // ARM64-OOP: NK_TYPE_DECL für einen Typ-Namen finden (-1 wenn keiner).
-  fn _findTypeDecl(np: pchar, nl: int64): int64 {
-    var ti: int64 := 0;
-    while ti < self.nodeCount {
-      if self.nodeKind(ti) == NK_TYPE_DECL {
-        if self.seq(self.nodeSVal(ti), self.nodeSLen(ti), np, nl) {
-          if self.zlAktiv != 0 { self.zlTdA += 1; self.zlTdV += ti + 1; }   // #2174
-          return ti;
-        }
+  // #2545: Platz des Verzeichnisses fuer die AKTUELLE Knotentabelle; legt ihn
+  // an, wenn es keinen gibt. Liefert den Platzindex.
+  fn _tdSlot(): int64 {
+    var i: int64 := 0;
+    while i < 8 {
+      var b: int64 := self.tdSlotNodes + i * 40;
+      if peek64(b + 0) == self.nodes && peek64(b + 8) == self.nodeCount {
+        // src gehoert in den Schluessel: die abgelegten Namenszeiger sind
+        // absolut und zeigen in die Quelle. Tabellenwechsel setzen src und
+        // nodes gemeinsam -- aber darauf baut dieses Verzeichnis nicht.
+        if peek64(b + 32) == (self.src as int64) && peek64(b + 16) != 0 { return i; }
       }
-      ti += 1;
+      i := i + 1;
+    }
+    // Keiner passt: rundlaufend einen Platz nehmen. Ein belegter Puffer wird
+    // freigegeben, sonst waechst der Verbrauch mit jeder Tabelle.
+    var s: int64 := self.tdSlotNext;
+    self.tdSlotNext := (s + 1) % 8;
+    var sb: int64 := self.tdSlotNodes + s * 40;
+    var alt: int64 := peek64(sb + 16);
+    var altN: int64 := peek64(sb + 24);
+    if alt != 0 { free(alt, altN * 24); }
+    // Einmal linear sammeln — danach ist jede Suche kurz.
+    var anz: int64 := 0;
+    var t1: int64 := 0;
+    while t1 < self.nodeCount {
+      if self.nodeKind(t1) == NK_TYPE_DECL { anz := anz + 1; }
+      t1 := t1 + 1;
+    }
+    var cap: int64 := anz;
+    if cap < 1 { cap := 1; }
+    var buf: int64 := alloc(cap * 24);
+    var k: int64 := 0;
+    var t2: int64 := 0;
+    while t2 < self.nodeCount {
+      if self.nodeKind(t2) == NK_TYPE_DECL {
+        poke64(buf + k * 24 + 0,  (self.nodeSVal(t2)) as int64);
+        poke64(buf + k * 24 + 8,  self.nodeSLen(t2));
+        poke64(buf + k * 24 + 16, t2);
+        k := k + 1;
+      }
+      t2 := t2 + 1;
+    }
+    poke64(sb + 0,  self.nodes);
+    poke64(sb + 8,  self.nodeCount);
+    poke64(sb + 16, buf);
+    poke64(sb + 24, k);
+    poke64(sb + 32, (self.src as int64));
+    return s;
+  }
+
+  // #2545: Bis 1.2.40F lief hier ein LINEARSCAN ueber alle Knoten, und die
+  // Funktion haengt an 28 Aufrufstellen — darunter `_layoutKern`, das selbst
+  // je Feldzugriff gerufen wird. Eine einzige zusaetzliche Frage je Feld
+  // (#2542) liess den arm64-Selbstbau von src/lyxc.lyx von 60 s auf ueber
+  // 14:48 min steigen; das war der Anlass.
+  //
+  // Die Antwort ist unveraendert: der ERSTE NK_TYPE_DECL mit diesem Namen in
+  // Knotenreihenfolge, oder -1. Das Verzeichnis wird genau so aufgebaut, und
+  // die Zaehlung aus #2174 bleibt wortgleich — bei einem Treffer `ti + 1`,
+  // sonst `nodeCount`. Wer das aendert, verschiebt die Messwerte von
+  // --zeitlupe, ohne dass es am Erzeugnis auffaellt.
+  fn _findTypeDecl(np: pchar, nl: int64): int64 {
+    var s: int64 := self._tdSlot();
+    var sb: int64 := self.tdSlotNodes + s * 40;
+    var buf: int64 := peek64(sb + 16);
+    var anz: int64 := peek64(sb + 24);
+    var i: int64 := 0;
+    while i < anz {
+      var e: int64 := buf + i * 24;
+      if self.seq(peek64(e + 0) as pchar, peek64(e + 8), np, nl) {
+        var ti: int64 := peek64(e + 16);
+        if self.zlAktiv != 0 { self.zlTdA += 1; self.zlTdV += ti + 1; }   // #2174
+        return ti;
+      }
+      i := i + 1;
     }
     if self.zlAktiv != 0 { self.zlTdA += 1; self.zlTdV += self.nodeCount; }   // #2174
     return 0 - 1;
