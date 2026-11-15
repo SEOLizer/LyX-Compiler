@@ -59,9 +59,12 @@
 #   Ausnahmen je Ziel           4, zwei Ursachen: select fehlt auf der
 #                               generischen Linux-ABI (#2511, 3 Units),
 #                               arch_prctl ist x86-spezifisch (#2512, 1 Unit)
-#   lyxos                       411/501 -- 90 Units an EINER Ursache
-#                               (sys_sendto-Argumentzahl, #2513); steht
-#                               deshalb weiter auf `host`
+#   lyxos                       494/503 (gemessen 2026-11-15, lyxc 1.2.40E)
+#                               Ausnahmen 9: drei dauerhaft (arch_prctl #2512,
+#                               zwei rohe Linux/Android-Wrapper), sechs offen
+#                               (sendto/recvfrom noch in Linux-Form, #2541).
+#                               Steht seit #2532 auf `ziel`; bis #2513 waren
+#                               es 90 Fehlschlaege und damit `host`.
 #
 # Am Beispielbaum von linux-arm64, zielweise gebaut: 62 von 87 uebersetzen
 # (mit Host-Units waren es 40). Die 22 Unterschiede sind genau die 11
@@ -81,8 +84,8 @@
 #   NUR_UNITS=1   den Compiler fuer das Ziel nicht bauen (schneller Durchlauf)
 #   UNITS_ZIEL=host|ziel
 #                 Ueberschreibt die Spalte "Units" der Backend-Tabelle (#2472).
-#                 Ohne Angabe entscheidet die Tabelle: host fuer x86-64-Ziele
-#                 und lyxos (#2513), ziel fuer arm64, riscv64 und macos-arm64.
+#                 Ohne Angabe entscheidet die Tabelle: host fuer x86-64-Ziele,
+#                 ziel fuer arm64, riscv64, macos-arm64 und lyxos (#2532).
 #                 Bei `ziel` greift tools/dist_units_ausnahmen_<backend>.txt.
 #
 # Rueckgabe: 0 nur, wenn fuer jedes Backend der Compiler steht und JEDE Unit
@@ -136,11 +139,21 @@ if [ "${1:-}" = "--ein-beispiel" ]; then
   # fail-closed zu (#2202). Erster Lauf: 209 von 346 Beispielen "rot", alle
   # mit derselben Meldung — ein Befund ueber mein Messverfahren, nicht ueber
   # die Beispiele. Ein ausgelieferter Baum steht nirgends neben einem std/.
+  # NICHT nach /dev/null uebersetzen. Der LBF-Schreiber des lyxos-Ziels
+  # scheitert daran ("error: lyxos: failed to write LBF") und meldete damit
+  # 57 von 87 Beispielen rot, die in Wahrheit uebersetzen: hello_world.lyx
+  # gibt mit `-o /dev/null` rc=1 und mit einer echten Datei rc=0 und 8192
+  # Byte. Das ist wieder ein Befund ueber das Messverfahren und nicht ueber
+  # die Beispiele -- derselbe Fehler wie beim Arbeitsverzeichnis darueber,
+  # nur am Ausgang statt am Eingang. Ein Ziel, dessen Erzeugnis sich nicht
+  # wegwerfen laesst, darf nicht wie ein Uebersetzungsfehler aussehen.
+  out="$BSP_LOG/$(echo "${q#examples/}" | tr / _).out"
   if ( cd "$BSP_LOG" && timeout 120 "$LYXC" --std-path="$BSP_UNITS" \
          ${ZIEL:+--target="$ZIEL"} ${FORMAT:+--format="$FORMAT"} \
-         "$ROOT/$q" -o /dev/null ) >"$log" 2>&1; then
-    rm -f "$log"; exit 0
+         "$ROOT/$q" -o "$out" ) >"$log" 2>&1; then
+    rm -f "$log" "$out"; exit 0
   fi
+  rm -f "$out"
   # KEIN zweiter Versuch gegen einen Quellenbaum: das Paket traegt keine
   # stdlib-Quellen mehr. Ein Beispiel, dem die .lyu nicht reicht ("Quelle der
   # importierten Unit nicht lesbar", "stammt aus einer .lyu ohne Objektcode"),
@@ -163,10 +176,20 @@ fi
 # Typwort 1, auf arm64 24 Byte mit Typwort 0), und wer das an zwei Stellen
 # pflegt, liefert stillschweigend die falschen Units aus.
 #
-# lyxos steht auf `host`, obwohl es ein Nicht-x86-Ziel ist: zielweise
-# scheitern dort 90 von 501 Units an EINER Ursache (sys_sendto-Argumentzahl,
+# lyxos stand auf `host`, obwohl es ein Nicht-x86-Ziel ist: zielweise
+# scheiterten dort 90 von 501 Units an EINER Ursache (sys_sendto-Argumentzahl,
 # #2513). Eine Ausnahmeliste mit 90 Zeilen waere keine Liste, sondern ein
-# Feigenblatt. Sobald #2513 zu ist, gehoert lyxos auf `ziel`.
+# Feigenblatt gewesen.
+#
+# #2513 ist zu, und damit ist die Bedingung von damals erfuellt: zielweise
+# uebersetzen 494 von 503 Units (gemessen 2026-11-15 mit lyxc 1.2.40E, jede
+# Datei einzeln). lyxos steht deshalb seit #2532 auf `ziel`; die neun
+# Fehlschlaege stehen begruendet in tools/dist_units_ausnahmen_lyxos.txt.
+#
+# Was `host` hier anrichtete, ist der Befund aus #2532: die ausgelieferten
+# .lyu waren x86-64-Units ohne IR-Abschnitt, und jedes Programm, das eine
+# std-Unit benutzt, war fuer --target=lyxos nicht uebersetzbar -- obwohl das
+# Paket den Eindruck machte, Units fuer dieses Ziel zu enthalten.
 BACKEND_TABELLE=(
   "linux-x86_64|linux|elf|lyxc|ja|host"
   "win64|win64|pe|lyxc.exe|ja|host"
@@ -174,7 +197,7 @@ BACKEND_TABELLE=(
   "linux-riscv64|riscv|elf|lyxc|ja|ziel"
   "macos-x86_64|macosx64|macho|lyxc|ja|host"
   "macos-arm64|macos-arm64|macho|lyxc|ja|ziel"
-  "lyxos|lyxos|elf|lyxc|nein|host"
+  "lyxos|lyxos|elf|lyxc|nein|ziel"
 )
 # Vorgabe: nur die zwei Ziele, die hier gemessen laufen. Die uebrigen baut man
 # namentlich — ungemessen in die Vorgabe zu nehmen hiesse, ihren Zustand zu
