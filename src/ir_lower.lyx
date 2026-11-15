@@ -8248,7 +8248,23 @@ pub type IRLower = class {
       // _exprTypeNode keinen Knoten — dann beantwortet _fremdArrInfo beide
       // Fragen im Kontext der deklarierenden Unit. Nur dann; sonst bleibt
       // alles wie bisher.
-      if ixTn < 0 && self._fremdArrInfo(self.nodeC0(expr)) != 0 {
+      // #2542: Ein inline liegendes `[N]T`-FELD traegt KEINEN {cap,len}-Kopf
+      // — es liegt unmittelbar im Objekt, und die Basis ist seit dem
+      // Feldzugriff schon die Adresse des nullten Elements. _elemBasis haette
+      // hier +16 gerechnet (_istKopfArray sagt zu NK_TYPE_ARRAY_FIXED ja, und
+      // fuer ein LOCAL `var a: [N]T` ist das richtig: dort legt der IR-Weg
+      // seit #2262 einen Kopf an). Die Schrittweite ist die Elementbreite,
+      // nicht acht: _arrStructElemGroesse gibt fuer NK_TYPE_ARRAY_FIXED
+      // ausdruecklich 0 zurueck, also waere `feld[i]` sonst i*8 statt i*32.
+      // Die Schrittweite gilt NUR fuer Struct-Elemente: dort liefert der Zweig
+      // unten die ADRESSE des Elements, und ein Feldzugriff darauf rechnet in
+      // place weiter. Bei SKALAREN Elementen (`[N]int64`) muss `feld[i]` den
+      // WERT liefern, nicht seine Adresse — die laufen weiter in das
+      // IRO_LOAD_IDX darunter.
+      var ixInl: int64 := self._feldInlineElemBytes(self.nodeC0(expr));
+      if ixInl > 0 {
+        ixSg := self._feldInlineStructElemBytes(self.nodeC0(expr));
+      } else if ixTn < 0 && self._fremdArrInfo(self.nodeC0(expr)) != 0 {
         ixSg := self._fremdArrSg;
         if self._fremdArrKopf != 0 {
           var fkC16: int64 := self.allocTemp();
@@ -8394,7 +8410,15 @@ pub type IRLower = class {
     var fd: int64 := self.nodeC0(typeDecl);
     while fd >= 0 {
       var w: int64 := 8;
-      if gepackt != 0 || natAlign != 0 { w := self.fieldTypeSize(self.nodeC0(fd)); }
+      // #2542: Ein inline liegendes Aggregat belegt seine ECHTE Breite, auch
+      // in einer Klasse. Das stand hier nicht, und der Kommentar darueber gab
+      // es als Absicht aus ("Klasse: acht Byte je Feld") — `feld: [32]TR` war
+      // damit ein nie gefuellter Zeigerplatz. Vorher MUSS die Aggregatbreite
+      // gefragt werden: fieldTypeSize kennt NK_TYPE_ARRAY_FIXED nicht und
+      // gibt dafuer acht zurueck, also haette ein `else` sie nie erreicht.
+      var inlW: int64 := self._inlineFeldBytes(self.nodeC0(fd));
+      if inlW > 0 { w := inlW; }
+      if inlW <= 0 && (gepackt != 0 || natAlign != 0) { w := self.fieldTypeSize(self.nodeC0(fd)); }
       var fo: int64 := off;
       if natAlign != 0 {
         var a: int64 := w;
@@ -8444,6 +8468,131 @@ pub type IRLower = class {
     if (self.nodeIVal(gd) & 16) != 0 && self.nodeC2(gd) < 0 && self._hasVmt(gd) == 0 { r := self.structGroesse(gd); }
     self.src := sS; self.nodes := sN; self.nodeCount := sC;
     return r;
+  }
+
+  // #2542: Bytes, die ein INLINE liegendes Aggregatfeld belegt — ein festes
+  // Array `[N]T` (N * Elementbreite) oder ein Wert-Struct (seine Groesse).
+  // 0 heisst „kein Aggregat": dann belegt das Feld die ueblichen acht Byte.
+  //
+  // Dieselbe Rechnung wie cg_buildClassLayout in codegen_x86.lyx (#1052 fuer
+  // `[N]T`, #1513 fuer das Struct-Feld) — die beiden MUESSEN uebereinstimmen.
+  // Weichen sie ab, hat dasselbe Objekt je Ziel ein anderes Layout, und die
+  // .lyu-Pruefung aus #2014 schlaegt beim Import an.
+  //
+  // Eine KLASSE als Feldtyp bleibt ein Verweis zu acht Byte; _wertStructBytes
+  // grenzt das ab (verlangt iVal-Bit 4, keine Basis, keine VMT).
+  // #2542: `_wertStructBytes` sucht mit `_findTypeDecl` LINEAR ueber alle
+  // Knoten, und `_layoutKern` ruft diese Frage je Feld — aufgerufen wird es
+  // selbst wieder je Feldzugriff (`_fieldOffsetIn`), ohne Zwischenspeicher.
+  // Ungefiltert kostete das den arm64-Selbstbau von `src/lyxc.lyx` statt
+  // 52-62 s ueber zehn Minuten (gemessen, ir_selbstbau_2266_test).
+  //
+  // Die Knotenart ist gratis zu pruefen, und ein SKALARER Typname kann nie
+  // ein inline liegendes Aggregat sein — das entscheidet sich an seinem
+  // Namen, ohne jede Suche. Gesucht wird deshalb nur noch bei einem festen
+  // Array oder einem Typnamen, der kein bekannter Skalar ist.
+  //
+  // Richtung der Unsicherheit: ein hier NICHT aufgezaehlter Skalar fuehrt
+  // zur alten, langsamen Suche — nie zu einem falschen Ergebnis.
+  fn _istSkalarTypName(tn: int64): int64 {
+    var p: pchar := self.nodeSVal(tn);
+    var l: int64 := self.nodeSLen(tn);
+    if l <= 0 { return 0; }
+    if self.seq(p, l, "int64"c,  5) { return 1; }
+    if self.seq(p, l, "int"c,    3) { return 1; }
+    if self.seq(p, l, "uint64"c, 6) { return 1; }
+    if self.seq(p, l, "u64"c,    3) { return 1; }
+    if self.seq(p, l, "f64"c,    3) { return 1; }
+    if self.seq(p, l, "float"c,  5) { return 1; }
+    if self.seq(p, l, "bool"c,   4) { return 1; }
+    if self.seq(p, l, "pchar"c,  5) { return 1; }
+    if self.seq(p, l, "void"c,   4) { return 1; }
+    // Die schmalen Breiten, dieselbe Aufzaehlung wie fieldTypeSize.
+    if self.seq(p, l, "int8"c,   4) { return 1; }
+    if self.seq(p, l, "u8"c,     2) { return 1; }
+    if self.seq(p, l, "uint8"c,  5) { return 1; }
+    if self.seq(p, l, "char"c,   4) { return 1; }
+    if self.seq(p, l, "int16"c,  5) { return 1; }
+    if self.seq(p, l, "u16"c,    3) { return 1; }
+    if self.seq(p, l, "uint16"c, 6) { return 1; }
+    if self.seq(p, l, "int32"c,  5) { return 1; }
+    if self.seq(p, l, "u32"c,    3) { return 1; }
+    if self.seq(p, l, "uint32"c, 6) { return 1; }
+    if self.seq(p, l, "f32"c,    3) { return 1; }
+    if self.seq(p, l, "i8"c,     2) { return 1; }
+    if self.seq(p, l, "i16"c,    3) { return 1; }
+    if self.seq(p, l, "i32"c,    3) { return 1; }
+    return 0;
+  }
+
+  // #2542: Breite EINES Elements bzw. eines Feldtyps — ein Wert-Struct mit
+  // seiner Groesse, sonst die Typbreite (wie cg_typeSize auf der x86-Seite).
+  // EINE Rechnung fuer alle drei Fragesteller unten; der Skalarfall nimmt den
+  // Linearscan aus `_wertStructBytes` vorweg.
+  fn _aggrElemBytes(et: int64): int64 {
+    if et < 0 { return 0; }
+    if self.nodeKind(et) == NK_TYPE_NAME && self._istSkalarTypName(et) != 0 {
+      return self.fieldTypeSize(et);
+    }
+    var w: int64 := self._wertStructBytes(et);
+    if w > 0 { return w; }
+    return self.fieldTypeSize(et);
+  }
+
+  fn _inlineFeldBytes(tn: int64): int64 {
+    if tn < 0 { return 0; }
+    if self.nodeKind(tn) == NK_TYPE_ARRAY_FIXED {
+      var anzN: int64 := self.nodeC1(tn);
+      if anzN < 0 { return 0; }
+      if self.nodeKind(anzN) != NK_LIT_INT { return 0; }
+      var anz: int64 := self.nodeIVal(anzN);
+      if anz <= 0 { return 0; }
+      var ew: int64 := self._aggrElemBytes(self.nodeC0(tn));
+      if ew <= 0 { return 0; }
+      return anz * ew;
+    }
+    // Alles, was kein Typname ist, kann kein inline liegendes Struct sein;
+    // ein bekannter Skalar auch nicht. Beides OHNE Suche entschieden.
+    if self.nodeKind(tn) != NK_TYPE_NAME { return 0; }
+    if self._istSkalarTypName(tn) != 0 { return 0; }
+    return self._wertStructBytes(tn);
+  }
+
+  // #2542: Belegt das Feld `fp` der Klasse/Struktur hinter `baseNode` inline?
+  // Dann seine Elementbreite (fuer `[N]T`) bzw. seine Groesse (Struct-Feld),
+  // sonst 0. Gefragt wird am TYPKNOTEN des Feldes, nicht am Ausdruck: der
+  // Feldname bezeichnet bei einem Inline-Aggregat die ADRESSE und nicht einen
+  // Zeiger, den man laden koennte (so haelt es cg_emitInlineArrayAddr).
+  fn _feldInlineElemBytes(baseNode: int64): int64 {
+    if baseNode < 0 { return 0; }
+    if self.nodeKind(baseNode) != NK_FIELD { return 0; }
+    var od: int64 := self._typeNodeToDecl(self._exprTypeNode(self.nodeC0(baseNode)));
+    if od < 0 { return 0; }
+    var ftn: int64 := self._fieldTypeNodeIn(od, self.nodeSVal(baseNode), self.nodeSLen(baseNode));
+    if ftn < 0 { return 0; }
+    if self.nodeKind(ftn) == NK_TYPE_ARRAY_FIXED {
+      return self._aggrElemBytes(self.nodeC0(ftn));
+    }
+    if self.nodeKind(ftn) != NK_TYPE_NAME { return 0; }
+    if self._istSkalarTypName(ftn) != 0 { return 0; }
+    return self._wertStructBytes(ftn);
+  }
+
+  // #2542: Nur fuer ein inline liegendes `[N]T`-Feld mit WERT-STRUCT-Elementen
+  // deren Groesse, sonst 0. Die Abgrenzung zu _feldInlineElemBytes ist keine
+  // Feinheit: bei Struct-Elementen ist `feld[i]` die ADRESSE des Elements
+  // (ein Feldzugriff darauf rechnet in place weiter), bei skalaren Elementen
+  // der WERT. Wer beides gleich behandelt, gibt fuer `[N]int64` Adressen aus,
+  // wo Zahlen erwartet werden.
+  fn _feldInlineStructElemBytes(baseNode: int64): int64 {
+    if baseNode < 0 { return 0; }
+    if self.nodeKind(baseNode) != NK_FIELD { return 0; }
+    var od: int64 := self._typeNodeToDecl(self._exprTypeNode(self.nodeC0(baseNode)));
+    if od < 0 { return 0; }
+    var ftn: int64 := self._fieldTypeNodeIn(od, self.nodeSVal(baseNode), self.nodeSLen(baseNode));
+    if ftn < 0 { return 0; }
+    if self.nodeKind(ftn) != NK_TYPE_ARRAY_FIXED { return 0; }
+    return self._wertStructBytes(self.nodeC0(ftn));
   }
 
   // #2157: Eine verborgene Modulvariable anlegen (Anfangswert 0) — dieselbe
@@ -9410,6 +9559,26 @@ pub type IRLower = class {
     var ifArt: int64 := self.letzteFeldArt;   // #2147 — vor lowerExpr, das sie ueberschreiben kann
     var ifF32: int64 := self.letzteFeldF32;   // #2160
     var base: int64 := self.lowerExpr(baseNode);
+    // #2542: Ein INLINE liegendes Aggregatfeld (`[N]T`, Wert-Struct) hat
+    // keinen Zeiger, den man laden koennte — der Feldname bezeichnet die
+    // ADRESSE der Daten im Objekt selbst. Genau so haelt es der x86-Weg
+    // (cg_emitInlineArrayAddr: `lea rax, [rax + off]`).
+    //
+    // Hier stand nur das LOAD_FIELD darunter. Es las den ersten acht Byte des
+    // Aggregats und gab sie als Basis aus — bei einem frischen Objekt also 0.
+    // `self.feld[0] := s` schrieb danach nach `0 + i*8` und faultete mit
+    // CR2 = 0x10 (#2542, gemessen auf lyxos, arm64 UND riscv: gemeinsamer
+    // IR-Weg, kein lyxos-Fehler).
+    //
+    // Diese eine Stelle traegt beide Faelle: `self.feld[i]` bekommt hierueber
+    // seine Basis, und bei `b.inner.a` ist `b.inner` die Basis, auf die der
+    // aeussere Feldzugriff mit dem Versatz von `a` rechnet.
+    if ifOff >= 0 && self._feldInlineElemBytes(expr) > 0 {
+      var inlOffT: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_CONST_INT, inlOffT, -1, -1, ifOff);
+      self.irAddInstrDirect(IRO_ADD, dest, base, inlOffT, 0);
+      return dest;
+    }
     if ifOff >= 0 {
       if ifF32 != 0 {
         var ifRoh: int64 := self.allocTemp();
@@ -10870,9 +11039,39 @@ pub type IRLower = class {
           if (aiKenn & IR_SIMD_GANZ) == 0 { valTemp := self._nachGleit(valTemp, val, 1); }
           self.irAddInstrDirect(IRO_SIMD_STORE_ELEM, aiIdx, valTemp, aiBase, aiKenn);   // #2199
         } else {
-          // #2262: hinter den {cap,len}-Kopf, wie beim Lesen (lowerIndex).
-          aiBase := self._elemBasis(self.nodeC0(target), aiBase);
-          self.irAddInstrDirect(IRO_STORE_IDX, aiIdx, valTemp, aiBase, 0);
+          // #2542: Ein INLINE liegendes `[N]T`-Feld hat keinen {cap,len}-Kopf,
+          // und bei STRUCT-Elementen ist eine Zuweisung eine KOPIE der Bytes
+          // an die Elementadresse — kein Ablegen eines Wortes.
+          //
+          // Vorher lief `self.feld[i] := s` genau hier durch: _elemBasis gab
+          // +16 dazu, STORE_IDX rechnete mit Schrittweite 8, und abgelegt
+          // wurde valTemp — bei einem Wert-Struct dessen ADRESSE. Gemessen am
+          // Objekt landeten dadurch zwei Zeigerwerte bei +24 und +32, 32 Byte
+          // auseinander (zwei `s` auf dem Rahmen), statt der Strukturinhalte
+          // ab +8. Dieselbe Kopie macht der x86-Weg mit
+          // cg_emitStructKopieNach (#1351).
+          //
+          // Angefasst wird NUR der Inline-Feldfall; ein Kopf-Array laeuft
+          // unveraendert weiter unten durch.
+          var aiInl: int64 := self._feldInlineElemBytes(self.nodeC0(target));
+          var aiStr: int64 := self._feldInlineStructElemBytes(self.nodeC0(target));
+          if aiInl > 0 && aiStr > 0 {
+            var aiSgT: int64 := self.allocTemp();
+            self.irAddInstrDirect(IRO_CONST_INT, aiSgT, -1, -1, aiStr);
+            var aiOffT: int64 := self.allocTemp();
+            self.irAddInstrDirect(IRO_MUL, aiOffT, aiIdx, aiSgT, 0);
+            var aiDstT: int64 := self.allocTemp();
+            self.irAddInstrDirect(IRO_ADD, aiDstT, aiBase, aiOffT, 0);
+            self._structKopieNach(aiDstT, valTemp, aiStr);
+          } else if aiInl > 0 {
+            // Skalare Elemente eines Inline-Feldes: Schrittweite acht wie
+            // beim Lesen, aber ohne Kopfzuschlag.
+            self.irAddInstrDirect(IRO_STORE_IDX, aiIdx, valTemp, aiBase, 0);
+          } else {
+            // #2262: hinter den {cap,len}-Kopf, wie beim Lesen (lowerIndex).
+            aiBase := self._elemBasis(self.nodeC0(target), aiBase);
+            self.irAddInstrDirect(IRO_STORE_IDX, aiIdx, valTemp, aiBase, 0);
+          }
         }
       }
       else {
