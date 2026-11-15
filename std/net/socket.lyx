@@ -385,10 +385,79 @@ pub fn UDPSocketBindTo(sock: UDPSocket, ip: int64, port: int64): int64 {
   return ret;
 }
 
+// #2513: Die beiden Datagramm-Aufrufe sind auf LyxOS ANDERS GESCHNITTEN als
+// unter Linux -- nicht bloss anders numeriert.
+//
+//   Linux:  sendto(fd, buf, n, flags, sockaddr*, addrlen)        -- 6 Argumente
+//   LyxOS:  sys_sendto(sock, buf, len, dst_uva)                  -- 4 Argumente
+//           dst_uva zeigt auf { ip: int64, port: int64 }; es gibt kein
+//           sockaddr_in und kein flags, weil der Kernel kein BSD-Socket-
+//           Modell hat (kernel/ring3.lyx, nr 323).
+//
+//   Linux:  recvfrom(fd, buf, n, flags, sockaddr*, addrlen*)     -- 6 Argumente
+//   LyxOS:  sys_recvfrom(sock, buf, maxlen, out_uva)             -- 4 Argumente
+//           out_uva: +0 Quell-IP, +8 Quellport, +16 Zeitlimit in ms als
+//           EINGABE. Rueckgabe 0 heisst Zeitablauf (nr 324).
+//
+// Die Umrechnung steht hier an EINER Stelle statt an sechs Aufrufstellen. Die
+// Zielweiche ist faltbar (`TARGET_OS == OS_LYXOS`), der nicht genommene Zweig
+// wird deshalb nicht gesenkt -- das ist die Voraussetzung dafuer, dass diese
+// Unit und die 70 Units, die sie mittelbar importieren, sich fuer
+// --target=lyxos vorkompilieren lassen (#2513; der Falter im Lowerer ist
+// Teil derselben Aenderung).
+//
+// IPv6 (addrlen 28) hat auf LyxOS keine Entsprechung: der Kernel kennt nur
+// {ip, port} mit einer 32-Bit-Adresse. Diese Faelle liefern -1 statt eine
+// Naeherung zu raten.
+fn _udpSendToSockAddr(fd: int64, buf: int64, n: int64, sa: int64, salen: int64): int64 {
+  if TARGET_OS == OS_LYXOS {
+    if (salen != 16) { return -1; }   // IPv6/Raw: auf LyxOS keine Entsprechung
+    // sockaddr_in: Port big-endian bei +2, Adresse network order bei +4.
+    var lport: int64 := (peek8(sa + 2) << 8) | peek8(sa + 3);
+    var lip: int64 := (peek8(sa + 4) << 24) | (peek8(sa + 5) << 16)
+                    | (peek8(sa + 6) << 8)  |  peek8(sa + 7);
+    var dst: int64 := mmap(0, 16, PROT_RW, MAP_ANON, FD_NONE, 0);
+    if (dst <= 0) { return -1; }
+    poke64(dst, lip);
+    poke64(dst + 8, lport);
+    var lr: int64 := sys_sendto(fd, buf, n, dst);
+    munmap(dst, 16);
+    return lr;
+  } else {
+    return sys_sendto(fd, buf, n, 0, sa, salen);
+  }
+}
+
+// Gegenstueck zu _udpSendToSockAddr. `sa` wird in BEIDEN Faellen in der
+// sockaddr_in-Form zurueckgeschrieben, damit die Aufrufer ihre Auswertung
+// (Bytes 2-3 Port, 4-7 Adresse) unveraendert behalten.
+fn _udpRecvFromSockAddr(fd: int64, buf: int64, n: int64, sa: int64,
+                        salenPtr: int64, salen: int64): int64 {
+  if TARGET_OS == OS_LYXOS {
+    if (salen != 16) { return -1; }   // IPv6/Raw: auf LyxOS keine Entsprechung
+    var out: int64 := mmap(0, 24, PROT_RW, MAP_ANON, FD_NONE, 0);
+    if (out <= 0) { return -1; }
+    poke64(out, 0);
+    poke64(out + 8, 0);
+    // Zeitlimit als Eingabe bei +16. 0 laesst der Kernel auf seinen eigenen
+    // Vorgabewert laufen (1000 ms) -- hier ausdruecklich gesetzt, damit die
+    // Zahl in dieser Datei steht und nicht nur im Kernel.
+    poke64(out + 16, 1000);
+    var lr: int64 := sys_recvfrom(fd, buf, n, out);
+    if (lr >= 0) {
+      SockAddrInCreate(sa, peek64(out), peek64(out + 8));
+    }
+    munmap(out, 24);
+    return lr;
+  } else {
+    return sys_recvfrom(fd, buf, n, 0, sa, salenPtr);
+  }
+}
+
 // Send data to address (raw sockaddr_in pointer)
 pub fn UDPSocketSendTo(sock: UDPSocket, buf: int64, n: int64, dest: pchar): int64 {
   var destAdr: int64 := dest as int64;   // #1613
-  return sys_sendto(sock.fd, buf, n, 0, destAdr, 16);
+  return _udpSendToSockAddr(sock.fd, buf, n, destAdr, 16);
 }
 
 // Send data to IP and port (convenience)
@@ -404,14 +473,14 @@ pub fn UDPSocketSendToAddr(sock: UDPSocket, buf: int64, n: int64, ip: int64, por
   // Fill sockaddr_in using helper
   SockAddrInCreate(addr, ip, port);
   
-  ret := sys_sendto(sock.fd, buf, n, 0, addr, 16);
+  ret := _udpSendToSockAddr(sock.fd, buf, n, addr, 16);
   munmap(addr, 16);
   return ret;
 }
 
 // Receive data and sender address (raw)
 pub fn UDPSocketRecvFrom(sock: UDPSocket, buf: int64, n: int64, src: int64, addrlen: int64): int64 {
-  return sys_recvfrom(sock.fd, buf, n, 0, src, addrlen);
+  return _udpRecvFromSockAddr(sock.fd, buf, n, src, addrlen, 16);
 }
 
 // Receive data with sender info (convenience)
@@ -437,7 +506,7 @@ pub fn UDPSocketRecv(sock: UDPSocket, buf: int64, n: int64, senderIP: int64, sen
   poke8(addrlen + 6, 0);
   poke8(addrlen + 7, 0);
   
-  ret := sys_recvfrom(sock.fd, buf, n, 0, addr, addrlen);
+  ret := _udpRecvFromSockAddr(sock.fd, buf, n, addr, addrlen, 16);
   
   if (ret >= 0) {
     // Extract sender IP (bytes 4-7, network order)
@@ -556,12 +625,12 @@ pub fn RawSocketNew(protocol: int64): RawSocket {
 
 // Send raw packet
 pub fn RawSocketSendTo(sock: RawSocket, buf: int64, n: int64, destAddr: int64): int64 {
-  return sys_sendto(sock.fd, buf, n, 0, destAddr, 16);
+  return _udpSendToSockAddr(sock.fd, buf, n, destAddr, 16);
 }
 
 // Receive raw packet
 pub fn RawSocketRecvFrom(sock: RawSocket, buf: int64, n: int64, srcAddr: int64, addrlen: int64): int64 {
-  return sys_recvfrom(sock.fd, buf, n, 0, srcAddr, addrlen);
+  return _udpRecvFromSockAddr(sock.fd, buf, n, srcAddr, addrlen, 16);
 }
 
 // Close raw socket
@@ -1561,7 +1630,7 @@ pub fn UDPSocketSendToIPv6(sock: UDPSocket, buf: int64, n: int64,
   }
 
   SockAddrIn6Create(addr, ip6Hi, ip6Lo, port);
-  ret := sys_sendto(sock.fd, buf, n, 0, addr, 28);
+  ret := _udpSendToSockAddr(sock.fd, buf, n, addr, 28);
   munmap(addr, 28);
   return ret;
 }
@@ -1700,7 +1769,7 @@ pub fn UDPSocketRecvFromIPv6(sock: UDPSocket, buf: int64, n: int64,
   var lenBuf: int64 := mmap(0, 8, PROT_RW, MAP_ANON, FD_NONE, 0);
   if (lenBuf <= 0) { munmap(addr, 28); return -1; }
   poke32(lenBuf, 28);
-  var r: int64 := sys_recvfrom(sock.fd, buf, n, 0, addr, lenBuf);
+  var r: int64 := _udpRecvFromSockAddr(sock.fd, buf, n, addr, lenBuf, 28);
   if (r >= 0) {
     if (outHi   != 0) { poke64(outHi,   sockAddrIn6ReadHi(addr));   }
     if (outLo   != 0) { poke64(outLo,   sockAddrIn6ReadLo(addr));   }
@@ -1709,6 +1778,29 @@ pub fn UDPSocketRecvFromIPv6(sock: UDPSocket, buf: int64, n: int64,
   munmap(lenBuf, 8);
   munmap(addr, 28);
   return r;
+}
+
+// #2513: LyxOS hat sys_getpeername(sock, out_uva) -- ZWEI Argumente
+// (kernel/ring3.lyx, nr 326). out_uva bekommt { ip: int64, port: int64 }, und
+// der Aufruf gilt NUR fuer TCP: ein UDP-Socket hat dort keine feste
+// Gegenstelle. Zurueckgeschrieben wird in der sockaddr_in-Form, damit die
+// Aufrufer ihre Auswertung behalten. IPv6 (addrlen 28) hat keine Entsprechung.
+fn _getPeerSockAddr(fd: int64, sa: int64, salenPtr: int64, salen: int64): int64 {
+  if TARGET_OS == OS_LYXOS {
+    if (salen != 16) { return -1; }
+    var out: int64 := mmap(0, 16, PROT_RW, MAP_ANON, FD_NONE, 0);
+    if (out <= 0) { return -1; }
+    poke64(out, 0);
+    poke64(out + 8, 0);
+    var lr: int64 := sys_getpeername(fd, out);
+    if (lr == 0) {
+      SockAddrInCreate(sa, peek64(out), peek64(out + 8));
+    }
+    munmap(out, 16);
+    return lr;
+  } else {
+    return sys_getpeername(fd, sa, salenPtr);
+  }
 }
 
 // SocketGetPeerAddrIPv6: liest die Remote-IPv6-Adresse einer verbundenen Verbindung.
@@ -1721,7 +1813,7 @@ pub fn SocketGetPeerAddrIPv6(fd: int64,
   var lenBuf: int64 := mmap(0, 8, PROT_RW, MAP_ANON, FD_NONE, 0);
   if (lenBuf <= 0) { munmap(addr, 28); return -1; }
   poke32(lenBuf, 28);
-  var r: int64 := sys_getpeername(fd, addr, lenBuf);
+  var r: int64 := _getPeerSockAddr(fd, addr, lenBuf, 28);
   if (r == 0) {
     if (outHi   != 0) { poke64(outHi,   sockAddrIn6ReadHi(addr));   }
     if (outLo   != 0) { poke64(outLo,   sockAddrIn6ReadLo(addr));   }
@@ -1785,7 +1877,7 @@ pub fn SocketGetPeerAddr(fd: int64, addrBuf: int64, addrLen: int64): int64 {
   var lenBuf: int64 := mmap(0, 8, PROT_RW, MAP_ANON, FD_NONE, 0);
   if (lenBuf <= 0) { return -1; }
   poke32(lenBuf, addrLen);
-  var r: int64 := sys_getpeername(fd, addrBuf, lenBuf);
+  var r: int64 := _getPeerSockAddr(fd, addrBuf, lenBuf, addrLen);
   munmap(lenBuf, 8);
   return r;
 }
