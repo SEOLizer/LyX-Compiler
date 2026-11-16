@@ -25,17 +25,26 @@
 //   Rollen           Client und Server
 //   Cipher-Suites    TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384,
 //                    TLS_CHACHA20_POLY1305_SHA256
-//   Schluesseltausch X25519
+//   Schluesseltausch X25519 und secp256r1, je Rolle ueber TlsConfigGruppen
+//                    waehlbar; passt der Anteil des Clients nicht, schickt
+//                    der Server einen HelloRetryRequest
 //   Signaturen       ecdsa_secp256r1_sha256, rsa_pss_rsae_sha256/384/512,
 //                    ed25519 — je mit eigener Signatur und Pruefung
 //   Erweiterungen    supported_versions, supported_groups, key_share,
-//                    server_name (SNI), application_layer_protocol_negotiation
-//   Nicht enthalten  HelloRetryRequest, PSK/0-RTT, Tickets, TLS 1.2,
-//                    secp256r1 als Schluesseltausch, ecdsa_secp384r1_sha384.
-//                    Jeder dieser Faelle wird mit einem benannten Fehler
-//                    abgewiesen, nicht still uebergangen. rsa_pkcs1_* ist in
-//                    CertificateVerify nach RFC 8446 §4.2.3 verboten und
-//                    wird darum auch abgewiesen.
+//                    server_name (SNI), application_layer_protocol_negotiation,
+//                    cookie (HRR-Echo)
+//   Nachhandschlag   KeyUpdate in beiden Richtungen (§4.6.3);
+//                    NewSessionTicket wird verworfen
+//   Server-Ketten    eine einzelne (TlsConfigKette) oder mehrere nach SNI
+//                    (TlsConfigKetten) mit Jokernamen, Standardeintrag und
+//                    Austausch im Betrieb (Hot-Reload)
+//   Widerruf         Hook der Anwendung (OCSP/CRL), TlsConfigWiderrufHook
+//   Nicht enthalten  PSK/0-RTT, Tickets, TLS 1.2, secp384r1 als
+//                    Schluesseltausch und ecdsa_secp384r1_sha384 (std.crypto.ec
+//                    rechnet bisher nur auf 256 Bit). Jeder dieser Faelle wird
+//                    mit einem benannten Fehler abgewiesen, nicht still
+//                    uebergangen. rsa_pkcs1_* ist in CertificateVerify nach
+//                    RFC 8446 §4.2.3 verboten und wird darum auch abgewiesen.
 
 unit std.net.tls13;
 
@@ -84,6 +93,8 @@ con E_KONFIG:        int64 := -11;   // Konfiguration unvollstaendig
 con E_UNTERSTUETZT:  int64 := -12;   // Verfahren nicht unterstuetzt
 con E_WARNUNG:       int64 := -13;   // Alert der Gegenseite
 con E_GESCHLOSSEN:   int64 := -14;   // close_notify
+con E_WIDERRUFEN:    int64 := -15;   // Widerruf-Hook der Anwendung lehnt ab
+con E_HRR:           int64 := -16;   // HelloRetryRequest unzulaessig
 
 pub fn TlsFehlerText(rc: int64): pchar {
     if (rc == 0)  { return "ok"c; }
@@ -103,6 +114,8 @@ pub fn TlsFehlerText(rc: int64): pchar {
     if (rc == -12) { return "Verfahren nicht unterstuetzt"c; }
     if (rc == -13) { return "Alert der Gegenseite"c; }
     if (rc == -14) { return "Verbindung geschlossen (close_notify)"c; }
+    if (rc == -15) { return "Zertifikat vom Widerruf-Hook abgelehnt"c; }
+    if (rc == -16) { return "HelloRetryRequest unzulaessig (zweites HRR oder unbekannte Gruppe)"c; }
     return "unbekannter Fehler"c;
 }
 
@@ -110,6 +123,13 @@ pub fn TlsFehlerText(rc: int64): pchar {
 con CS_AES128_GCM_SHA256:   int64 := 0x1301;
 con CS_AES256_GCM_SHA384:   int64 := 0x1302;
 con CS_CHACHA20_SHA256:     int64 := 0x1303;
+
+// Schluesselgruppen (RFC 8446 §4.2.7, Zahlenwerte wie im Protokoll)
+con GRP_X25519:    int64 := 0x001d;
+con GRP_SECP256R1: int64 := 0x0017;
+// Bitmaske in der Konfiguration (C_GRUPPEN)
+pub fn TlsGruppeX25519(): int64 { return 1; }
+pub fn TlsGruppeSecp256r1(): int64 { return 2; }
 
 // Record-Typen
 con RT_CCS:        int64 := 20;
@@ -127,6 +147,7 @@ con HS_CERT_VERIFY:   int64 := 15;
 con HS_FINISHED:      int64 := 20;
 con HS_CERT_REQUEST:  int64 := 13;
 con HS_KEY_UPDATE:    int64 := 24;
+con HS_MESSAGE_HASH:  int64 := 254;    // §4.4.1, Ersatz fuer ClientHello1 bei HRR
 
 // Zustaende
 con Z_START:        int64 := 0;
@@ -137,6 +158,7 @@ con Z_WARTE_CF:     int64 := 4;    // Server wartet auf Client-Finished
 con Z_FERTIG:       int64 := 5;
 con Z_FEHLER:       int64 := 6;
 con Z_ZU:           int64 := 7;
+con Z_WARTE_CH2:    int64 := 8;    // Server wartet nach HRR auf ClientHello2
 
 // ---------------------------------------------------------------------------
 // Konfiguration
@@ -159,9 +181,27 @@ con C_ALPNLEN:    int64 := 80;
 con C_CLIENTAUTH: int64 := 88;     // 0 keine, 1 optional, 2 verlangt
 con C_JETZT:      int64 := 96;     // Unix-Zeit fuer die Kettenpruefung
 con C_PRUEFEN:    int64 := 104;    // 1 = Kette pruefen (Standard), 0 = nicht
-con C_SIZE:       int64 := 112;
+// Mehrere Ketten nach SNI: Tabelle aus 48-Byte-Eintraegen des Aufrufers
+//   0 Name (Zeiger)    8 Namenslaenge   16 Kette (Zeiger)
+//  24 Kettenlaenge     32 Schluessel    40 Schluessellaenge
+// Ein Eintrag mit Namenslaenge 0 ist der Standard fuer Clients ohne SNI und
+// fuer Namen, die auf keinen Eintrag passen. Fehlt er, wird laut abgewiesen
+// (E_KONFIG) statt still ein fremdes Zertifikat ausgeliefert.
+// Hot-Reload: die Tabelle wird JE HANDSCHLAG gelesen und nichts davon
+// zwischengespeichert — die Anwendung tauscht Inhalt oder Zeiger im Betrieb.
+con C_KETTEN:     int64 := 112;
+con C_KETTENN:    int64 := 120;
+// Widerruf-Hook (OCSP/CRL in der Anwendung): fn(satz: int64): int64,
+// 0 = gueltig, alles andere lehnt die Verbindung mit E_WIDERRUFEN ab.
+// `satz` ist der X509-Satz des Blattzertifikats der Gegenseite.
+con C_WIDERRUF:   int64 := 128;
+// Erlaubte Schluesselgruppen als Bitmaske (1 x25519, 2 secp256r1).
+// 0 heisst "Standard": beide.
+con C_GRUPPEN:    int64 := 136;
+con C_SIZE:       int64 := 144;
 
 pub fn TlsConfigGroesse(): int64 { return C_SIZE; }
+pub fn TlsKetteEintragGroesse(): int64 { return 48; }
 
 // rolle: 1 Server, 2 Client
 pub fn TlsConfigNeu(cfg: int64, rolle: int64): void {
@@ -178,6 +218,37 @@ pub fn TlsConfigKette(cfg: int64, kette: int64, ketteN: int64,
     poke64(cfg + C_CERTN, ketteN);
     poke64(cfg + C_KEY, key);
     poke64(cfg + C_KEYLEN, keyLen);
+}
+
+// Mehrere Ketten nach SNI. `tabelle` zeigt auf n Eintraege von je 48 Byte
+// (Aufbau siehe C_KETTEN). Die Unit kopiert nichts.
+pub fn TlsConfigKetten(cfg: int64, tabelle: int64, n: int64): void {
+    poke64(cfg + C_KETTEN, tabelle);
+    poke64(cfg + C_KETTENN, n);
+}
+
+// Einen Eintrag der Tabelle fuellen. Namenslaenge 0 macht den Eintrag zum
+// Standard. Gibt die Adresse des Eintrags zurueck, damit der Aufrufer ihn im
+// Betrieb neu belegen kann (Hot-Reload).
+pub fn TlsKetteEintrag(tabelle: int64, idx: int64, name: int64, nameLen: int64,
+                       kette: int64, ketteN: int64,
+                       key: int64, keyLen: int64): int64 {
+    var e: int64 := tabelle + idx * 48;
+    poke64(e, name);      poke64(e + 8, nameLen);
+    poke64(e + 16, kette); poke64(e + 24, ketteN);
+    poke64(e + 32, key);  poke64(e + 40, keyLen);
+    return e;
+}
+
+// Widerruf-Hook: fn(satz: int64): int64, 0 = gueltig. Als int64 uebergeben
+// (`meinHook as int64`), weil die Konfiguration ein reiner Byteblock ist.
+pub fn TlsConfigWiderrufHook(cfg: int64, hook: int64): void {
+    poke64(cfg + C_WIDERRUF, hook);
+}
+
+// Erlaubte Schluesselgruppen (Bitmaske aus TlsGruppeX25519/TlsGruppeSecp256r1).
+pub fn TlsConfigGruppen(cfg: int64, maske: int64): void {
+    poke64(cfg + C_GRUPPEN, maske);
 }
 
 pub fn TlsConfigTrust(cfg: int64, trust: int64, trustN: int64): void {
@@ -267,7 +338,27 @@ con V_CHLEN:      int64 := 1076;
 // dieser Puffer wird gleich danach wieder benutzt. Ein Zeiger darauf zeigte
 // nach dem Handschlag auf fremde Byte.
 con V_ALPNBUF:    int64 := 1088;
-con V_KOPF:       int64 := 1120;   // Ende des Kopfteils
+// Schluesselgruppe dieses Handschlags und das Material dazu. X25519 nutzt
+// V_EPH_*, secp256r1 die EC-Felder: der Punkt ist 65 Byte (0x04||X||Y) und
+// passt nicht in die 32-Byte-Felder.
+con V_GRUPPE:     int64 := 1120;
+con V_HRR:        int64 := 1128;   // 1 = HRR gesendet/empfangen, 2 = HRR faellig
+con V_EC_SK:      int64 := 1136;   // 32 Byte Skalar
+con V_EC_PK:      int64 := 1168;   // 65 Byte eigener Punkt
+con V_EC_PEER:    int64 := 1240;   // 65 Byte Punkt der Gegenseite
+con V_KETTE:      int64 := 1312;   // gewaehlter Eintrag der SNI-Tabelle, 0 = keiner
+con V_SNILEN:     int64 := 1320;
+con V_KUSEND:     int64 := 1328;   // 1 = KeyUpdate der Gegenseite beantworten
+con V_SNIBUF:     int64 := 1336;   // 256 Byte SNI der Gegenseite (Server)
+// Cookie aus einem HelloRetryRequest. Der Client MUSS es im ClientHello2
+// unveraendert zuruecksenden (§4.2.2); ein Server, der zustandslos arbeitet,
+// bricht sonst ab.
+con V_COOKIELEN:  int64 := 1592;
+con V_COOKIE:     int64 := 1600;   // 256 Byte
+// Gruppe, die ein HelloRetryRequest verlangt hat — das ClientHello2 muss
+// genau diese bringen, sonst wird abgewiesen.
+con V_HRRGRP:     int64 := 1856;
+con V_KOPF:       int64 := 1920;   // Ende des Kopfteils
 
 con B_IN:   int64 := 20480;
 con B_OUT:  int64 := 20480;
@@ -275,14 +366,14 @@ con B_APP:  int64 := 17408;
 con B_HS:   int64 := 16384;
 
 // Die Puffer liegen hinter dem Kopf, auf 64 ausgerichtet angefuegt.
-con O_IN:   int64 := 1152;
-con O_OUT:  int64 := 21632;
-con O_APP:  int64 := 42112;
-con O_HS:   int64 := 59520;
+con O_IN:   int64 := 1920;
+con O_OUT:  int64 := 22400;
+con O_APP:  int64 := 42880;
+con O_HS:   int64 := 60288;
 // Der Client muss sein ClientHello aufbewahren: der Transkript-Hash haengt an
 // der Cipher-Suite, und die kennt er erst mit dem ServerHello. Darum wird das
 // ClientHello hier abgelegt und erst danach in den Hash gegeben.
-con O_CH:   int64 := 75904;
+con O_CH:   int64 := 76672;
 con B_CH:   int64 := 2048;
 
 // Kratzspeicher der Verbindung. Nach TlsNeu wird NICHTS mehr belegt: jede
@@ -292,7 +383,7 @@ con B_CH:   int64 := 2048;
 // Eintraegen je Funktion und in verschachtelten Rahmen gemessen zu frueh
 // freigab — zwei alloc(8) bekamen dieselbe Adresse, und der Schaden fiel erst
 // im zweiten Handschlag auf.
-con O_SCR:  int64 := 77952;      // 2432 Byte kleine Puffer
+con O_SCR:  int64 := 78720;      // 2560 Byte kleine Puffer
 con S_TP:    int64 := 0;         // Typ/Position/Laenge beim Nachrichtenlesen
 con S_PP:    int64 := 8;
 con S_LP:    int64 := 16;
@@ -321,9 +412,15 @@ con S_EXP2:  int64 := 1512;      // 64 Byte Exporter-Kontexthash
 con S_FK:    int64 := 1576;      // 64 Byte finished_key
 con S_SIGBUF: int64 := 1640;     // 512 Byte fertige Signatur (RSA bis 4096 Bit)
 con S_SEED:  int64 := 2152;      // 32 Byte Ed25519-Seed
+con S_ECX:   int64 := 2184;      // 32 Byte X des ECDH-Punktes
+con S_ECY:   int64 := 2216;      // 32 Byte Y des ECDH-Punktes
+con S_MH:    int64 := 2248;      // 64 Byte Hash des ClientHello1 (HRR, §4.4.1)
+con S_KU:    int64 := 2312;      // 64 Byte neues Verkehrsgeheimnis (KeyUpdate)
+con S_HRRC:  int64 := 2376;      // 32 Byte erwarteter HRR-Zufallswert
+// 2408 belegt, Bereich ist 2560 gross.
 
-con O_REC:  int64 := 80384;      // 17408 Byte Recordzusammenbau
-con O_MSG:  int64 := 97792;      // 8192 Byte Nachrichtenzusammenbau
+con O_REC:  int64 := 81280;      // 17408 Byte Recordzusammenbau
+con O_MSG:  int64 := 98688;      // 8192 Byte Nachrichtenzusammenbau
 con B_MSG:  int64 := 8192;
 // Das Zertifikat der Gegenseite wird HIERHER kopiert, bevor es gelesen wird.
 // Der X509-Satz haelt nur Positionen in seinem DER-Puffer; stand dieser
@@ -331,12 +428,12 @@ con B_MSG:  int64 := 8192;
 // fremde Byte. Gemessen: mit ECDSA und Ed25519 fiel es nicht auf (die
 // folgende CertificateVerify-Nachricht ist kurz), mit RSA wurde der Modulus
 // ueberschrieben und die Pruefung lehnte den eigenen Partner ab.
-con O_CERT:   int64 := 105984;      // 8192 Byte Blattzertifikat
+con O_CERT:   int64 := 106880;      // 8192 Byte Blattzertifikat
 con B_CERT:   int64 := 8192;
 // Dahinter der RSA-Schluessel der eigenen Seite; seine Groesse kommt aus der
 // Unit, darum als Summe in TlsSpeicherBedarf.
-con O_RSAKEY: int64 := 114176;
-con V_SIZE: int64 := 114176;
+con O_RSAKEY: int64 := 115072;
+con V_SIZE: int64 := 115072;
 
 pub fn TlsSpeicherBedarf(): int64 {
     return V_SIZE + RsaSchluesselGroesse() + X509Groesse();
@@ -383,6 +480,16 @@ pub fn TlsSuite(c: int64): int64 { return peek64(c + V_SUITE); }
 // Ausgewaehltes ALPN-Protokoll (Ausschnitt im ALPN-Puffer der Konfiguration).
 pub fn TlsAlpnPos(c: int64): int64 { return peek64(c + V_ALPNSEL); }
 pub fn TlsAlpnLen(c: int64): int64 { return peek64(c + V_ALPNSELLEN); }
+
+// Ausgehandelte Schluesselgruppe (0x001d x25519, 0x0017 secp256r1).
+pub fn TlsGruppe(c: int64): int64 { return peek64(c + V_GRUPPE); }
+
+// SNI der Gegenseite (Server-Rolle): Zeiger und Laenge, 0 wenn keines kam.
+pub fn TlsSniPos(c: int64): int64 {
+    if (peek64(c + V_SNILEN) == 0) { return 0; }
+    return c + V_SNIBUF;
+}
+pub fn TlsSniLen(c: int64): int64 { return peek64(c + V_SNILEN); }
 
 // X509-Satz der Gegenseite, oder 0 wenn keines geprueft wurde.
 pub fn TlsPeerZertifikat(c: int64): int64 {
@@ -822,12 +929,85 @@ fn suiteSetzen(c: int64, suite: int64): bool {
     return false;
 }
 
-// Eigenes X25519-Paar und Zufall erzeugen.
-fn eigeneWerte(c: int64, mitSessionId: bool): bool {
+// Erlaubte Gruppen der Konfiguration; 0 heisst beide.
+fn gruppenMaske(c: int64): int64 {
+    var m: int64 := peek64(peek64(c + V_CFG) + C_GRUPPEN);
+    if (m == 0) { return 3; }
+    return m;
+}
+
+// Laenge des key_share-Anteils einer Gruppe im Protokoll.
+fn gruppenRohLen(grp: int64): int64 {
+    if (grp == GRP_SECP256R1) { return 65; }
+    if (grp == GRP_X25519) { return 32; }
+    return 0;
+}
+
+fn gruppeErlaubt(c: int64, grp: int64): bool {
+    var m: int64 := gruppenMaske(c);
+    if (grp == GRP_X25519) { return (m & 1) != 0; }
+    if (grp == GRP_SECP256R1) { return (m & 2) != 0; }
+    return false;
+}
+
+// Eigenes Paar fuer die gewaehlte Gruppe erzeugen. Wird bei HRR ein zweites
+// Mal mit einer anderen Gruppe aufgerufen.
+fn gruppenPaar(c: int64): bool {
+    var grp: int64 := peek64(c + V_GRUPPE);
+    if (grp == GRP_SECP256R1) {
+        var x: int64 := pScr(c) + S_ECX;
+        var y: int64 := pScr(c) + S_ECY;
+        if (!EcGenerateKey(EC_P256, c + V_EC_SK, x, y)) { return false; }
+        poke8(c + V_EC_PK, 4);
+        var i: int64 := 0;
+        while (i < 32) {
+            poke8(c + V_EC_PK + 1 + i, peek8(x + i));
+            poke8(c + V_EC_PK + 33 + i, peek8(y + i));
+            i += 1;
+        }
+        return true;
+    }
+    if (grp != GRP_X25519) { return false; }
     var seed: int64 := pScr(c) + S_K1;
     if (RandBytesExact(seed, 32) != 32) { return false; }
     X25519KeyGen(seed, c + V_EPH_PK, c + V_EPH_SK);
     SecureZero(seed, 32);
+    return true;
+}
+
+// Laenge des eigenen oeffentlichen Anteils in der gewaehlten Gruppe.
+fn gruppenPkLen(c: int64): int64 {
+    if (peek64(c + V_GRUPPE) == GRP_SECP256R1) { return 65; }
+    return 32;
+}
+
+fn gruppenPk(c: int64): int64 {
+    if (peek64(c + V_GRUPPE) == GRP_SECP256R1) { return c + V_EC_PK; }
+    return c + V_EPH_PK;
+}
+
+// Gemeinsames Geheimnis nach V_SHARED. Der Punkt der Gegenseite wird
+// geprueft, nicht geglaubt: ein Punkt ausserhalb der Kurve ist ein
+// Angriffsversuch, kein Formatfehler.
+fn gruppenGeheimnis(c: int64): bool {
+    if (peek64(c + V_GRUPPE) == GRP_SECP256R1) {
+        if ((peek8(c + V_EC_PEER) & 0xFF) != 4) { return false; }
+        var px: int64 := c + V_EC_PEER + 1;
+        var py: int64 := c + V_EC_PEER + 33;
+        if (!EcValidatePublicKey(EC_P256, px, py)) { return false; }
+        return EcdhSharedSecret(EC_P256, c + V_EC_SK, px, py, c + V_SHARED);
+    }
+    X25519SharedSecret(c + V_EPH_SK, c + V_PEER_PK, c + V_SHARED);
+    return true;
+}
+
+// Eigenes Schluesselpaar und Zufall erzeugen.
+fn eigeneWerte(c: int64, mitSessionId: bool): bool {
+    if (peek64(c + V_GRUPPE) == 0) {
+        if ((gruppenMaske(c) & 1) != 0) { poke64(c + V_GRUPPE, GRP_X25519); }
+        else { poke64(c + V_GRUPPE, GRP_SECP256R1); }
+    }
+    if (!gruppenPaar(c)) { return false; }
     if (RandBytesExact(c + V_RANDOM, 32) != 32) { return false; }
     // Nur der Client erfindet eine session_id; der Server spiegelt die des
     // ClientHello zurueck und darf sie hier nicht ueberschreiben.
@@ -858,7 +1038,10 @@ fn alpnSchreiben(buf: int64, pos: int64, liste: int64, len: int64): int64 {
     return p;
 }
 
-fn clientHelloSenden(c: int64): int64 {
+// `zweites` unterscheidet ClientHello1 (wird aufbewahrt, nicht gehasht, weil
+// die Suite noch nicht feststeht) von ClientHello2 nach einem HRR (Suite
+// steht, geht also direkt in den Hash).
+fn clientHelloBauen(c: int64, zweites: bool): int64 {
     var cfg: int64 := peek64(c + V_CFG);
     // Rumpf im hinteren Teil des Nachrichtenpuffers zusammenbauen; hsSendenRoh
     // setzt den Kopf davor und benutzt den vorderen Teil.
@@ -882,14 +1065,22 @@ fn clientHelloSenden(c: int64): int64 {
     // supported_versions
     p := w16(buf, p, 43); p := w16(buf, p, 3);
     p := wByte(buf, p, 2); p := w16(buf, p, 0x0304);
-    // supported_groups: nur x25519
-    p := w16(buf, p, 10); p := w16(buf, p, 4);
-    p := w16(buf, p, 2); p := w16(buf, p, 0x001d);
-    // key_share
-    p := w16(buf, p, 51); p := w16(buf, p, 38);
-    p := w16(buf, p, 36);
-    p := w16(buf, p, 0x001d); p := w16(buf, p, 32);
-    p := wBytes(buf, p, c + V_EPH_PK, 32);
+    // supported_groups: alles, was die Konfiguration erlaubt
+    var maske: int64 := gruppenMaske(c);
+    var anz: int64 := 0;
+    if ((maske & 1) != 0) { anz += 1; }
+    if ((maske & 2) != 0) { anz += 1; }
+    p := w16(buf, p, 10); p := w16(buf, p, 2 + anz * 2);
+    p := w16(buf, p, anz * 2);
+    if ((maske & 1) != 0) { p := w16(buf, p, GRP_X25519); }
+    if ((maske & 2) != 0) { p := w16(buf, p, GRP_SECP256R1); }
+    // key_share: ein Anteil, in der Gruppe aus V_GRUPPE. Bietet der Server
+    // sie nicht an, kommt ein HelloRetryRequest — darum reicht einer.
+    var pkLen: int64 := gruppenPkLen(c);
+    p := w16(buf, p, 51); p := w16(buf, p, pkLen + 6);
+    p := w16(buf, p, pkLen + 4);
+    p := w16(buf, p, peek64(c + V_GRUPPE)); p := w16(buf, p, pkLen);
+    p := wBytes(buf, p, gruppenPk(c), pkLen);
     // signature_algorithms (RFC 8446 §4.2.3), in unserer Vorliebe:
     // ecdsa_secp256r1_sha256, rsa_pss_rsae_sha256/384/512, ed25519
     p := w16(buf, p, 13); p := w16(buf, p, 12);
@@ -919,10 +1110,24 @@ fn clientHelloSenden(c: int64): int64 {
         w16(buf, merk + 4, listenLen);
     }
 
+    // Cookie aus dem HelloRetryRequest unveraendert zurueckgeben (§4.2.2).
+    var ckLen: int64 := peek64(c + V_COOKIELEN);
+    if (zweites && ckLen > 0) {
+        p := w16(buf, p, 44); p := w16(buf, p, ckLen + 2);
+        p := w16(buf, p, ckLen);
+        p := wBytes(buf, p, c + V_COOKIE, ckLen);
+    }
+
     w16(buf, extLenPos, p - extStart);
+    if (zweites) {
+        return hsSendenRoh(c, HS_CLIENT_HELLO, buf, p, true, false);
+    }
     // Nicht hashen, sondern aufbewahren (siehe O_CH).
     return hsSendenRoh(c, HS_CLIENT_HELLO, buf, p, false, true);
 }
+
+fn clientHelloSenden(c: int64): int64 { return clientHelloBauen(c, false); }
+fn clientHello2Senden(c: int64): int64 { return clientHelloBauen(c, true); }
 
 fn serverHelloSenden(c: int64): int64 {
     var buf: int64 := pMsg(c) + 4096;
@@ -938,9 +1143,76 @@ fn serverHelloSenden(c: int64): int64 {
     // supported_versions
     p := w16(buf, p, 43); p := w16(buf, p, 2); p := w16(buf, p, 0x0304);
     // key_share
-    p := w16(buf, p, 51); p := w16(buf, p, 36);
-    p := w16(buf, p, 0x001d); p := w16(buf, p, 32);
-    p := wBytes(buf, p, c + V_EPH_PK, 32);
+    var pkLen: int64 := gruppenPkLen(c);
+    p := w16(buf, p, 51); p := w16(buf, p, pkLen + 4);
+    p := w16(buf, p, peek64(c + V_GRUPPE)); p := w16(buf, p, pkLen);
+    p := wBytes(buf, p, gruppenPk(c), pkLen);
+    w16(buf, extLenPos, p - extStart);
+    return hsSenden(c, HS_SERVER_HELLO, buf, p);
+}
+
+// Der feste Zufallswert, der ein ServerHello als HelloRetryRequest
+// kennzeichnet (RFC 8446 §4.1.3): SHA-256 von "HelloRetryRequest".
+fn hrrRandom(out: int64): void {
+    poke8(out +  0, 0xCF); poke8(out +  1, 0x21); poke8(out +  2, 0xAD);
+    poke8(out +  3, 0x74); poke8(out +  4, 0xE5); poke8(out +  5, 0x9A);
+    poke8(out +  6, 0x61); poke8(out +  7, 0x11); poke8(out +  8, 0xBE);
+    poke8(out +  9, 0x1D); poke8(out + 10, 0x8C); poke8(out + 11, 0x02);
+    poke8(out + 12, 0x1E); poke8(out + 13, 0x65); poke8(out + 14, 0xB8);
+    poke8(out + 15, 0x91); poke8(out + 16, 0xC2); poke8(out + 17, 0xA2);
+    poke8(out + 18, 0x11); poke8(out + 19, 0x16); poke8(out + 20, 0x7A);
+    poke8(out + 21, 0xBB); poke8(out + 22, 0x8C); poke8(out + 23, 0x5E);
+    poke8(out + 24, 0x07); poke8(out + 25, 0x9E); poke8(out + 26, 0x09);
+    poke8(out + 27, 0xE2); poke8(out + 28, 0xC8); poke8(out + 29, 0xA8);
+    poke8(out + 30, 0x33); poke8(out + 31, 0x9C);
+}
+
+// Ist dieses ServerHello ein HelloRetryRequest? Der Wert ist oeffentlich,
+// der Vergleich braucht also keine konstante Laufzeit.
+fn istHrr(c: int64, zufall: int64): bool {
+    var erw: int64 := pScr(c) + S_HRRC;
+    hrrRandom(erw);
+    var i: int64 := 0;
+    var gleich: bool := true;
+    while (i < 32) {
+        if ((peek8(zufall + i) & 0xFF) != (peek8(erw + i) & 0xFF)) { gleich := false; }
+        i += 1;
+    }
+    return gleich;
+}
+
+// Das Transkript bei HRR: ClientHello1 wird durch eine synthetische
+// message_hash-Nachricht ersetzt (RFC 8446 §4.4.1). Danach HRR und
+// ClientHello2 wie gewoehnlich.
+fn transkriptMessageHash(c: int64, ch: int64, chLen: int64): void {
+    var hl: int64 := peek64(c + V_HASHLEN);
+    var mh: int64 := pScr(c) + S_MH;
+    if (hl == 48) { Sha384(ch, chLen, mh); } else { SHA256(ch, chLen, mh); }
+    var kopf: int64 := pScr(c) + S_KOPF;
+    poke8(kopf, HS_MESSAGE_HASH);
+    poke8(kopf + 1, 0); poke8(kopf + 2, 0); poke8(kopf + 3, hl & 0xFF);
+    hashInit(c);
+    hashUpdate(c, kopf, 4);
+    hashUpdate(c, mh, hl);
+}
+
+// HelloRetryRequest senden: ServerHello-Form mit dem festen Zufallswert und
+// einem key_share, das NUR die gewaehlte Gruppe nennt (§4.1.4).
+fn hrrSenden(c: int64): int64 {
+    var buf: int64 := pMsg(c) + 4096;
+    var p: int64 := w16(buf, 0, 0x0303);
+    hrrRandom(buf + p);
+    p += 32;
+    p := wByte(buf, p, peek64(c + V_SESSIDLEN));
+    p := wBytes(buf, p, c + V_SESSID, peek64(c + V_SESSIDLEN));
+    p := w16(buf, p, peek64(c + V_SUITE));
+    p := wByte(buf, p, 0);
+    var extLenPos: int64 := p;
+    p += 2;
+    var extStart: int64 := p;
+    p := w16(buf, p, 43); p := w16(buf, p, 2); p := w16(buf, p, 0x0304);
+    p := w16(buf, p, 51); p := w16(buf, p, 2);
+    p := w16(buf, p, peek64(c + V_GRUPPE));
     w16(buf, extLenPos, p - extStart);
     return hsSenden(c, HS_SERVER_HELLO, buf, p);
 }
@@ -981,9 +1253,8 @@ fn certRequestSenden(c: int64): int64 {
 }
 
 fn certSenden(c: int64): int64 {
-    var cfg: int64 := peek64(c + V_CFG);
-    var n: int64 := peek64(cfg + C_CERTN);
-    var liste: int64 := peek64(cfg + C_CERT);
+    var n: int64 := aktKetteN(c);
+    var liste: int64 := aktKette(c);
     var gesamt: int64 := 0;
     var i: int64 := 0;
     while (i < n) { gesamt += 5 + peek64(liste + i * 16 + 8); i += 1; }
@@ -1019,13 +1290,135 @@ fn signaturInhalt(c: int64, serverRolle: bool, out: int64): int64 {
     return p;
 }
 
+// ---------------------------------------------------------------------------
+// Eigene Kette: entweder die einzelne aus TlsConfigKette oder der nach SNI
+// gewaehlte Eintrag der Tabelle aus TlsConfigKetten.
+// ---------------------------------------------------------------------------
+
+fn aktKette(c: int64): int64 {
+    var e: int64 := peek64(c + V_KETTE);
+    if (e != 0) { return peek64(e + 16); }
+    return peek64(peek64(c + V_CFG) + C_CERT);
+}
+
+fn aktKetteN(c: int64): int64 {
+    var e: int64 := peek64(c + V_KETTE);
+    if (e != 0) { return peek64(e + 24); }
+    return peek64(peek64(c + V_CFG) + C_CERTN);
+}
+
+fn aktKey(c: int64): int64 {
+    var e: int64 := peek64(c + V_KETTE);
+    if (e != 0) { return peek64(e + 32); }
+    return peek64(peek64(c + V_CFG) + C_KEY);
+}
+
+fn aktKeyLen(c: int64): int64 {
+    var e: int64 := peek64(c + V_KETTE);
+    if (e != 0) { return peek64(e + 40); }
+    return peek64(peek64(c + V_CFG) + C_KEYLEN);
+}
+
+// Kette nach dem SNI des ClientHello waehlen. Die Tabelle wird JE
+// HANDSCHLAG gelesen; damit wirkt ein Austausch im Betrieb sofort
+// (Hot-Reload) ohne Neustart und ohne Zwischenspeicher.
+//
+// Reihenfolge: genauer Name, dann Jokereintrag "*.beispiel.de", dann der
+// Eintrag mit Namenslaenge 0 als Standard. Passt nichts, wird abgewiesen —
+// ein beliebiges anderes Zertifikat auszuliefern waere der stille Default,
+// der in diesem Repo schon oft genug Schaden gemacht hat.
+fn ketteWaehlen(c: int64): int64 {
+    var cfg: int64 := peek64(c + V_CFG);
+    poke64(c + V_KETTE, 0);
+    var tab: int64 := peek64(cfg + C_KETTEN);
+    var n: int64 := peek64(cfg + C_KETTENN);
+
+    if (tab != 0 && n > 0) {
+        var host: int64 := c + V_SNIBUF;
+        var hostLen: int64 := peek64(c + V_SNILEN);
+        var treffer: int64 := 0;
+        var standard: int64 := 0;
+        var joker: int64 := 0;
+        var i: int64 := 0;
+        while (i < n) {
+            var e: int64 := tab + i * 48;
+            var nm: int64 := peek64(e);
+            var nl: int64 := peek64(e + 8);
+            if (nl == 0) {
+                if (standard == 0) { standard := e; }
+            } else {
+                if (hostLen > 0 && treffer == 0) {
+                    if (namenGleichKlein(nm, nl, host, hostLen)) { treffer := e; }
+                    else {
+                        if (joker == 0 && jokerPasst(nm, nl, host, hostLen)) { joker := e; }
+                    }
+                }
+            }
+            i += 1;
+        }
+        if (treffer == 0) { treffer := joker; }
+        if (treffer == 0) { treffer := standard; }
+        if (treffer == 0) { return E_KONFIG; }
+        if (peek64(treffer + 16) == 0 || peek64(treffer + 24) <= 0
+            || peek64(treffer + 32) == 0) { return E_KONFIG; }
+        poke64(c + V_KETTE, treffer);
+        return 0;
+    }
+
+    if (peek64(cfg + C_CERT) == 0 || peek64(cfg + C_CERTN) <= 0
+        || peek64(cfg + C_KEY) == 0) { return E_KONFIG; }
+    return 0;
+}
+
+fn kleinbuchstabe(b: int64): int64 {
+    if (b >= 65 && b <= 90) { return b + 32; }
+    return b;
+}
+
+fn namenGleichKlein(a: int64, aLen: int64, b: int64, bLen: int64): bool {
+    if (aLen != bLen) { return false; }
+    var i: int64 := 0;
+    while (i < aLen) {
+        if (kleinbuchstabe(peek8(a + i) & 0xFF) != kleinbuchstabe(peek8(b + i) & 0xFF)) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+// Jokereintrag "*.rest": ersetzt GENAU die linkeste Marke, und der Rest muss
+// selbst noch mindestens zwei Marken haben — "*.de" trifft damit nichts.
+fn jokerPasst(muster: int64, musterLen: int64, host: int64, hostLen: int64): bool {
+    if (musterLen < 3) { return false; }
+    if ((peek8(muster) & 0xFF) != 42) { return false; }
+    if ((peek8(muster + 1) & 0xFF) != 46) { return false; }
+    var rest: int64 := muster + 2;
+    var restLen: int64 := musterLen - 2;
+    var punkte: int64 := 0;
+    var i: int64 := 0;
+    while (i < restLen) {
+        if ((peek8(rest + i) & 0xFF) == 46) { punkte += 1; }
+        i += 1;
+    }
+    if (punkte < 1) { return false; }
+    var ersterPunkt: int64 := -1;
+    i := 0;
+    while (i < hostLen) {
+        if ((peek8(host + i) & 0xFF) == 46 && ersterPunkt < 0) { ersterPunkt := i; }
+        i += 1;
+    }
+    if (ersterPunkt <= 0) { return false; }
+    return namenGleichKlein(rest, restLen,
+                            host + ersterPunkt + 1, hostLen - ersterPunkt - 1);
+}
+
 // Eigene Schluesselart bestimmen: 1 = EC secp256r1, 3 = RSA, 4 = Ed25519,
 // 0 = nicht lesbar. Die Reihenfolge der Versuche ist festgelegt, damit ein
 // Schluessel nicht zufaellig als etwas anderes gelesen wird.
 fn eigeneSchluesselart(c: int64): int64 {
-    var cfg: int64 := peek64(c + V_CFG);
-    var der: int64 := peek64(cfg + C_KEY);
-    var len: int64 := peek64(cfg + C_KEYLEN);
+    var der: int64 := aktKey(c);
+    var len: int64 := aktKeyLen(c);
     if (der == 0 || len <= 0) { return 0; }
     var priv: int64 := pScr(c) + S_PRIV;
     if (PkeyLiesEcPrivat(der, len, priv) == 1) { return 1; }
@@ -1196,10 +1589,43 @@ fn serverHelloLesen(c: int64, pos: int64, len: int64): int64 {
     var sv: int64 := extSuchen(pos, p, len - p, 43, extLen);
     if (sv < 0 || peek64(extLen) != 2 || r16(sv, 0) != 0x0304) { return E_VERSION; }
     var ks: int64 := extSuchen(pos, p, len - p, 51, extLen);
-    if (ks < 0 || peek64(extLen) != 36) { return E_GRUPPE; }
-    if (r16(ks, 0) != 0x001d || r16(ks, 2) != 32) { return E_GRUPPE; }
+
+    // HelloRetryRequest: key_share nennt nur die Gruppe, ohne Anteil.
+    // Rueckgabe 1 statt 0, damit der Aufrufer den anderen Weg geht.
+    if (istHrr(c, pos + 2)) {
+        if (peek64(c + V_HRR) != 0) { return E_HRR; }   // zweites HRR verboten
+        if (ks < 0 || peek64(extLen) != 2) { return E_HRR; }
+        var neu: int64 := r16(ks, 0);
+        if (!gruppeErlaubt(c, neu)) { return E_HRR; }
+        // Dieselbe Gruppe erneut zu verlangen ist nach §4.1.4 verboten.
+        if (neu == peek64(c + V_GRUPPE)) { return E_HRR; }
+        poke64(c + V_GRUPPE, neu);
+        // Cookie mitnehmen, falls eines dabei ist.
+        poke64(c + V_COOKIELEN, 0);
+        var ck: int64 := extSuchen(pos, p, len - p, 44, extLen);
+        if (ck >= 0 && peek64(extLen) >= 2) {
+            var ckL: int64 := r16(ck, 0);
+            if (ckL <= 0 || ckL > 256 || ckL + 2 > peek64(extLen)) { return E_FORMAT; }
+            var z: int64 := 0;
+            while (z < ckL) { poke8(c + V_COOKIE + z, peek8(ck + 2 + z)); z += 1; }
+            poke64(c + V_COOKIELEN, ckL);
+        }
+        return 1;
+    }
+
+    var roh: int64 := 0;
+    if (ks < 0) { return E_GRUPPE; }
+    var grp: int64 := r16(ks, 0);
+    roh := gruppenRohLen(grp);
+    if (roh == 0 || !gruppeErlaubt(c, grp)) { return E_GRUPPE; }
+    // Der Server darf nur die Gruppe nehmen, zu der wir einen Anteil
+    // geschickt haben.
+    if (grp != peek64(c + V_GRUPPE)) { return E_GRUPPE; }
+    if (peek64(extLen) != roh + 4 || r16(ks, 2) != roh) { return E_GRUPPE; }
+    var ziel: int64 := c + V_PEER_PK;
+    if (grp == GRP_SECP256R1) { ziel := c + V_EC_PEER; }
     i := 0;
-    while (i < 32) { poke8(c + V_PEER_PK + i, peek8(ks + 4 + i)); i := i + 1; }
+    while (i < roh) { poke8(ziel + i, peek8(ks + 4 + i)); i := i + 1; }
     return 0;
 }
 
@@ -1259,23 +1685,80 @@ fn clientHelloLesen(c: int64, pos: int64, len: int64): int64 {
     }
     if (!gefunden) { return E_VERSION; }
 
-    // key_share: x25519
+    // key_share: einen Anteil in einer erlaubten Gruppe suchen. Die
+    // Reihenfolge ist die des Servers (x25519 vor secp256r1), nicht die des
+    // Clients.
     var ks: int64 := extSuchen(pos, p, len - p, 51, el);
     if (ks < 0) { return E_GRUPPE; }
     var ksGesamt: int64 := r16(ks, 0);
-    var r: int64 := 2;
     var habe: bool := false;
-    while (r + 4 <= 2 + ksGesamt && !habe) {
-        var grp: int64 := r16(ks, r);
-        var kl: int64 := r16(ks, r + 2);
-        if (grp == 0x001d && kl == 32) {
-            var j: int64 := 0;
-            while (j < 32) { poke8(c + V_PEER_PK + j, peek8(ks + r + 4 + j)); j := j + 1; }
-            habe := true;
+    var wunschG: int64 := 0;
+    var wg: int64 := 0;
+    while (wg < 2 && !habe) {
+        if (wg == 0) { wunschG := GRP_X25519; } else { wunschG := GRP_SECP256R1; }
+        if (gruppeErlaubt(c, wunschG)) {
+            var r: int64 := 2;
+            while (r + 4 <= 2 + ksGesamt && !habe) {
+                var grp: int64 := r16(ks, r);
+                var kl: int64 := r16(ks, r + 2);
+                if (grp == wunschG && kl == gruppenRohLen(wunschG)) {
+                    poke64(c + V_GRUPPE, wunschG);
+                    var ziel: int64 := c + V_PEER_PK;
+                    if (wunschG == GRP_SECP256R1) { ziel := c + V_EC_PEER; }
+                    var j: int64 := 0;
+                    while (j < kl) { poke8(ziel + j, peek8(ks + r + 4 + j)); j := j + 1; }
+                    habe := true;
+                }
+                r := r + 4 + kl;
+            }
         }
-        r := r + 4 + kl;
+        wg += 1;
     }
-    if (!habe) { return E_GRUPPE; }
+
+    // Kein brauchbarer Anteil: nennt der Client in supported_groups eine
+    // Gruppe, die wir koennen, wird ein HelloRetryRequest faellig (§4.1.4).
+    // Sonst ist hier Schluss — und zwar mit Meldung, nicht mit stillem
+    // Rueckfall auf etwas Plausibles.
+    if (!habe) {
+        var sg: int64 := extSuchen(pos, p, len - p, 10, el);
+        if (sg < 0) { return E_GRUPPE; }
+        var sgLen: int64 := r16(sg, 0);
+        var gWahl: int64 := 0;
+        var wg2: int64 := 0;
+        while (wg2 < 2 && gWahl == 0) {
+            var kand: int64 := GRP_X25519;
+            if (wg2 == 1) { kand := GRP_SECP256R1; }
+            if (gruppeErlaubt(c, kand)) {
+                var t2: int64 := 2;
+                while (t2 + 2 <= 2 + sgLen) {
+                    if (r16(sg, t2) == kand) { gWahl := kand; }
+                    t2 += 2;
+                }
+            }
+            wg2 += 1;
+        }
+        if (gWahl == 0) { return E_GRUPPE; }
+        if (peek64(c + V_HRR) != 0) { return E_HRR; }   // zweites HRR ist verboten
+        poke64(c + V_GRUPPE, gWahl);
+        poke64(c + V_HRR, 2);                            // HRR faellig
+    }
+
+    // SNI aufbewahren: der Zeiger in den Empfangspuffer ueberlebt den
+    // naechsten Record nicht, der Name wird aber fuer die Kettenwahl und von
+    // der Anwendung gebraucht.
+    poke64(c + V_SNILEN, 0);
+    var sn: int64 := extSuchen(pos, p, len - p, 0, el);
+    if (sn >= 0 && peek64(el) >= 5) {
+        var listeLen2: int64 := r16(sn, 0);
+        if ((peek8(sn + 2) & 0xFF) == 0 && listeLen2 >= 3) {
+            var nl: int64 := r16(sn, 3);
+            if (nl > 0 && nl <= 256 && 5 + nl <= peek64(el)) {
+                var z: int64 := 0;
+                while (z < nl) { poke8(c + V_SNIBUF + z, peek8(sn + 5 + z)); z += 1; }
+                poke64(c + V_SNILEN, nl);
+            }
+        }
+    }
 
     // ALPN: erste gemeinsame Kennung in der Reihenfolge des Servers
     var cfg: int64 := peek64(c + V_CFG);
@@ -1312,6 +1795,13 @@ fn clientHelloLesen(c: int64, pos: int64, len: int64): int64 {
     }
     return 0;
 }
+
+// Widerruf-Hook der Anwendung: bekommt den X509-Satz des Blattes, liefert 0
+// fuer "gueltig". Der Umweg ueber int64 ist nötig, weil die Konfiguration ein
+// reiner Byteblock ist.
+type TlsWiderrufFn = fn(int64): int64;
+
+fn widerrufRufen(f: TlsWiderrufFn, satz: int64): int64 { return f(satz); }
 
 // Certificate: erstes Zertifikat lesen und die Kette pruefen.
 fn certLesen(c: int64, pos: int64, len: int64, serverSeite: bool): int64 {
@@ -1365,6 +1855,15 @@ fn certLesen(c: int64, pos: int64, len: int64, serverSeite: bool): int64 {
                                          peek64(cfg + C_TRUSTN), host, hostLen,
                                          peek64(cfg + C_JETZT), zweck);
         if (rc != 0) { return E_ZERTIFIKAT; }
+    }
+
+    // Widerruf (OCSP/CRL) macht die Anwendung: sie bekommt den geprueften
+    // Satz des Blattes und entscheidet. 0 = gueltig.
+    var hook: int64 := peek64(cfg + C_WIDERRUF);
+    if (hook != 0) {
+        if (widerrufRufen(hook as TlsWiderrufFn, peek64(c + V_PEERCERT)) != 0) {
+            return E_WIDERRUFEN;
+        }
     }
     return 0;
 }
@@ -1459,14 +1958,31 @@ fn clientServerHello(c: int64): int64 {
     if (!hsAnsehen(c, tp, pp, lp)) { return TlsWantRead(); }
     if (peek64(tp) != HS_SERVER_HELLO) { return fehlerSetzen(c, E_ABLAUF); }
     var rc: int64 := serverHelloLesen(c, peek64(pp), peek64(lp));
-    if (rc != 0) { return fehlerSetzen(c, rc); }
+    if (rc < 0) { return fehlerSetzen(c, rc); }
+
+    if (rc == 1) {
+        // HelloRetryRequest (§4.1.4): Transkript auf message_hash umstellen,
+        // neues Schluesselpaar in der verlangten Gruppe, ClientHello2.
+        transkriptMessageHash(c, pCh(c), peek64(c + V_CHLEN));
+        hsVerbrauchen(c, peek64(lp), true);
+        poke64(c + V_HRR, 1);
+        if (!gruppenPaar(c)) { return fehlerSetzen(c, E_KONFIG); }
+        // ClientHello2 geht diesmal direkt in den Hash: die Suite steht fest.
+        var rc2: int64 := clientHello2Senden(c);
+        if (rc2 != 0) { return fehlerSetzen(c, rc2); }
+        return 0;
+    }
+
     // Jetzt steht die Suite fest: Transkript beginnt mit dem aufbewahrten
-    // ClientHello, dann das ServerHello.
-    hashInit(c);
-    hashUpdate(c, pCh(c), peek64(c + V_CHLEN));
+    // ClientHello, dann das ServerHello. Nach einem HRR laeuft der Hash
+    // bereits (message_hash, HRR, ClientHello2) und darf NICHT neu beginnen.
+    if (peek64(c + V_HRR) == 0) {
+        hashInit(c);
+        hashUpdate(c, pCh(c), peek64(c + V_CHLEN));
+    }
     hsVerbrauchen(c, peek64(lp), true);
 
-    X25519SharedSecret(c + V_EPH_SK, c + V_PEER_PK, c + V_SHARED);
+    if (!gruppenGeheimnis(c)) { return fehlerSetzen(c, E_GRUPPE); }
     if (!planHandschlag(c)) { return fehlerSetzen(c, E_KONFIG); }
     if (!leseSchluessel(c, c + V_SEC_SHS, 1)) { return fehlerSetzen(c, E_KONFIG); }
     if (!schreibSchluessel(c, c + V_SEC_CHS, 1)) { return fehlerSetzen(c, E_KONFIG); }
@@ -1541,43 +2057,66 @@ fn clientHandschlag(c: int64): int64 {
             if (!leseSchluessel(c, c + V_SEC_SAP, 2)) { return fehlerSetzen(c, E_KONFIG); }
             if (!schreibSchluessel(c, c + V_SEC_CAP, 2)) { return fehlerSetzen(c, E_KONFIG); }
             poke64(c + V_ZUSTAND, Z_FERTIG);
-            free(el,8);
             return 0;
         } else {
         if (typ == HS_NEW_TICKET) {
             hsVerbrauchen(c, len, false);        // Tickets werden verworfen
         } else {
-            free(el,8);
             return fehlerSetzen(c, E_ABLAUF);
         } } } } } }
     }
-    free(el,8);
     return TlsWantRead();
 }
 
 fn serverClientHello(c: int64): int64 {
     var cfg: int64 := peek64(c + V_CFG);
-    if (peek64(cfg + C_CERT) == 0 || peek64(cfg + C_CERTN) <= 0
-        || peek64(cfg + C_KEY) == 0) {
-        return fehlerSetzen(c, E_KONFIG);
-    }
-    if (eigeneSchluesselart(c) == 0) { return fehlerSetzen(c, E_KONFIG); }
     var tp: int64 := pScr(c) + S_TP;
     var pp: int64 := pScr(c) + S_PP;
     var lp: int64 := pScr(c) + S_LP;
     if (!hsAnsehen(c, tp, pp, lp)) { return TlsWantRead(); }
     if (peek64(tp) != HS_CLIENT_HELLO) { return fehlerSetzen(c, E_ABLAUF); }
+    var zweites: bool := peek64(c + V_ZUSTAND) == Z_WARTE_CH2;
     var rc: int64 := clientHelloLesen(c, peek64(pp), peek64(lp));
     if (rc != 0) { return fehlerSetzen(c, rc); }
+    // Nach einem HRR muss das ClientHello2 genau die verlangte Gruppe
+    // bringen; alles andere ist ein Protokollfehler, kein Verhandeln.
+    if (zweites && peek64(c + V_GRUPPE) != peek64(c + V_HRRGRP)) {
+        return fehlerSetzen(c, E_HRR);
+    }
+
+    // Kette nach SNI waehlen, bevor irgendetwas gesendet wird: ohne
+    // brauchbare Kette gibt es keinen Handschlag.
+    rc := ketteWaehlen(c);
+    if (rc != 0) { return fehlerSetzen(c, rc); }
+    if (eigeneSchluesselart(c) == 0) { return fehlerSetzen(c, E_KONFIG); }
+
+    // HelloRetryRequest faellig (§4.1.4): Transkript auf message_hash
+    // umstellen, HRR senden, auf ClientHello2 warten.
+    if (peek64(c + V_HRR) == 2) {
+        if (zweites) { return fehlerSetzen(c, E_HRR); }
+        poke64(c + V_HRR, 1);
+        poke64(c + V_HRRGRP, peek64(c + V_GRUPPE));
+        var chPos: int64 := peek64(pp) - 4;
+        var chLen: int64 := peek64(lp) + 4;
+        transkriptMessageHash(c, chPos, chLen);
+        hsVerbrauchen(c, peek64(lp), false);
+        var rh: int64 := hrrSenden(c);
+        if (rh != 0) { return fehlerSetzen(c, rh); }
+        poke64(c + V_ZUSTAND, Z_WARTE_CH2);
+        return 0;
+    }
+
     if (!eigeneWerte(c, false)) { return fehlerSetzen(c, E_KONFIG); }
 
-    hashInit(c);
+    // Nach einem HRR laeuft der Hash schon (message_hash, HRR) und darf
+    // nicht neu beginnen.
+    if (!zweites) { hashInit(c); }
     hsVerbrauchen(c, peek64(lp), true);
 
     rc := serverHelloSenden(c);
     if (rc != 0) { return fehlerSetzen(c, rc); }
 
-    X25519SharedSecret(c + V_EPH_SK, c + V_PEER_PK, c + V_SHARED);
+    if (!gruppenGeheimnis(c)) { return fehlerSetzen(c, E_GRUPPE); }
     if (!planHandschlag(c)) { return fehlerSetzen(c, E_KONFIG); }
     if (!schreibSchluessel(c, c + V_SEC_SHS, 1)) { return fehlerSetzen(c, E_KONFIG); }
     if (!leseSchluessel(c, c + V_SEC_CHS, 1)) { return fehlerSetzen(c, E_KONFIG); }
@@ -1652,6 +2191,7 @@ fn zustandSchritt(c: int64): int64 {
     if (z == Z_WARTE_SH) { return clientServerHello(c); }
     if (z == Z_WARTE_HS) { return clientHandschlag(c); }
     if (z == Z_WARTE_CH) { return serverClientHello(c); }
+    if (z == Z_WARTE_CH2) { return serverClientHello(c); }
     if (z == Z_WARTE_CF) { return serverClientFinished(c); }
     return 0;
 }
@@ -1735,6 +2275,14 @@ pub fn TlsLese(c: int64, buf: int64, cap: int64): int64 {
     if (rc != 0 && rc != E_GESCHLOSSEN) { return fehlerSetzen(c, rc); }
     if (rc == E_GESCHLOSSEN) { poke64(c + V_ZUSTAND, Z_ZU); }
 
+    // Nach dem Handschlag koennen Handschlagnachrichten kommen (KeyUpdate,
+    // NewSessionTicket). Wer sie liegen laesst, liest nach einem KeyUpdate
+    // der Gegenseite nur noch Muell und meldet -5.
+    if (peek64(c + V_HSPOS) > peek64(c + V_HSGELESEN)) {
+        var rp: int64 := nachHandschlag(c);
+        if (rp != 0) { return fehlerSetzen(c, rp); }
+    }
+
     var gelesen: int64 := peek64(c + V_APPGELESEN);
     var da: int64 := peek64(c + V_APPPOS) - gelesen;
     if (da <= 0) {
@@ -1753,6 +2301,88 @@ pub fn TlsLese(c: int64, buf: int64, cap: int64): int64 {
         poke64(c + V_APPGELESEN, gelesen);
     }
     return n;
+}
+
+// ---------------------------------------------------------------------------
+// KeyUpdate (RFC 8446 §4.6.3)
+//
+// Jede Richtung hat ihr eigenes Verkehrsgeheimnis; ein KeyUpdate ersetzt
+// GENAU eines davon durch
+//   application_traffic_secret_N+1 =
+//       HKDF-Expand-Label(secret_N, "traffic upd", "", Hash.length)
+// und setzt die Sequenznummer dieser Richtung auf 0. Das Transkript bleibt
+// unberuehrt — KeyUpdate steht nicht darin.
+// ---------------------------------------------------------------------------
+
+fn eigenesSecret(c: int64): int64 {
+    if (peek64(c + V_ROLLE) == 1) { return c + V_SEC_SAP; }
+    return c + V_SEC_CAP;
+}
+
+fn fremdesSecret(c: int64): int64 {
+    if (peek64(c + V_ROLLE) == 1) { return c + V_SEC_CAP; }
+    return c + V_SEC_SAP;
+}
+
+fn secretFortschreiben(c: int64, secret: int64): bool {
+    var hl: int64 := peek64(c + V_HASHLEN);
+    var neu: int64 := pScr(c) + S_KU;
+    if (!HkdfExpandLabel(hl, secret, hl, "traffic upd"c as int64, 11,
+                         0, 0, neu, hl)) { return false; }
+    var i: int64 := 0;
+    while (i < hl) { poke8(secret + i, peek8(neu + i)); i := i + 1; }
+    SecureZero(neu, 64);
+    return true;
+}
+
+// Eigenen Schreibschluessel erneuern und das der Gegenseite ankuendigen.
+// `anfordern` setzt request_update, verlangt also auch von der Gegenseite
+// ein KeyUpdate.
+pub fn TlsKeyUpdateSenden(c: int64, anfordern: bool): int64 {
+    if (peek64(c + V_ZUSTAND) != Z_FERTIG) { return E_ABLAUF; }
+    var b: int64 := pScr(c) + S_KOPF;
+    if (anfordern) { poke8(b, 1); } else { poke8(b, 0); }
+    var rc: int64 := hsSendenRoh(c, HS_KEY_UPDATE, b, 1, false, false);
+    if (rc != 0) { return rc; }
+    if (!secretFortschreiben(c, eigenesSecret(c))) { return E_KONFIG; }
+    if (!schreibSchluessel(c, eigenesSecret(c), 2)) { return E_KONFIG; }
+    return 0;
+}
+
+// Nach dem Handschlag eintreffende Handschlagnachrichten: KeyUpdate wirkt,
+// NewSessionTicket wird verworfen (PSK-Resumption ist Stufe 3). Alles andere
+// ist an dieser Stelle ein Ablauffehler und wird gemeldet.
+fn nachHandschlag(c: int64): int64 {
+    var tp: int64 := pScr(c) + S_TP;
+    var pp: int64 := pScr(c) + S_PP;
+    var lp: int64 := pScr(c) + S_LP;
+    while (hsAnsehen(c, tp, pp, lp)) {
+        var typ: int64 := peek64(tp);
+        var pos: int64 := peek64(pp);
+        var len: int64 := peek64(lp);
+        if (typ == HS_KEY_UPDATE) {
+            if (len != 1) { return E_FORMAT; }
+            var anf: int64 := peek8(pos) & 0xFF;
+            if (anf > 1) { return E_FORMAT; }
+            hsVerbrauchen(c, len, false);
+            if (!secretFortschreiben(c, fremdesSecret(c))) { return E_KONFIG; }
+            if (!leseSchluessel(c, fremdesSecret(c), 2)) { return E_KONFIG; }
+            // Eine Anforderung wird mit genau EINEM eigenen KeyUpdate
+            // beantwortet, und das traegt request_update = 0 (§4.6.3) —
+            // sonst schaukeln sich zwei Seiten gegenseitig hoch.
+            if (anf == 1) {
+                var rc: int64 := TlsKeyUpdateSenden(c, false);
+                if (rc != 0) { return rc; }
+            }
+        } else {
+            if (typ == HS_NEW_TICKET) {
+                hsVerbrauchen(c, len, false);
+            } else {
+                return E_ABLAUF;
+            }
+        }
+    }
+    return 0;
 }
 
 // close_notify senden (§6.1).
