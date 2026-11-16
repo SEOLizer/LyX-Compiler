@@ -54,10 +54,23 @@ for z in "linux||0|62" "lyxos|--target=lyxos|8|-" "arm64|--target=arm64|1|-"; do
 done
 
 echo "--- 2. Der Name der Ebene steht EINMAL (LyuArchName) ---"
-if grep -q 'if a == 8 { return "lyxos"c; }' "$ROOT/src/lyu_reader.lyx"; then
-  pr ok "LyuArchName fuehrt 8 -> lyxos"
+# #2552: an der WIRKUNG gemessen, nicht an der Schreibweise. Vorher stand hier
+# ein grep auf 'if a == 8 { return "lyxos"c; }'. Seit die LYU_ARCH_*-Kennungen
+# in lyu_reader liegen, nennt LyuArchName sie beim Namen -- der grep wurde rot,
+# obwohl der Name richtig herauskam. Ein Test auf die Schreibweise haelt die
+# Schreibweise fest, nicht das Verhalten.
+_ui="$("$LYXC" --unit-info "$TMP/lyxos.lyu" 2>&1 || true)"
+if printf '%s' "$_ui" | grep -qE '^[[:space:]]*Target:[[:space:]]+lyxos$'; then
+  pr ok "LyuArchName fuehrt 8 -> lyxos (--unit-info: Target: lyxos)"
 else
   pr no "LyuArchName kennt die lyxos-Ebene nicht"
+fi
+# Beide Seiten: ein anderes Ziel darf dort NICHT lyxos melden.
+_ui2="$("$LYXC" --unit-info "$TMP/arm64.lyu" 2>&1 || true)"
+if printf '%s' "$_ui2" | grep -qE '^[[:space:]]*Target:[[:space:]]+arm64$'; then
+  pr ok "und arm64 meldet arm64, nicht lyxos"
+else
+  pr no "arm64 meldet nicht arm64"
 fi
 # Das Makefile muss denselben Namen annehmen, sonst liegt der Baum, wo niemand sucht.
 if grep -qE '^[[:space:]]+lyxos\)[[:space:]]+z="--target=lyxos"' "$ROOT/Makefile"; then
@@ -66,14 +79,23 @@ else
   pr no "Makefile kennt LYU_BAEUME=lyxos nicht"
 fi
 
-echo "--- 3. BEIDE Aufzaehlungen der Zuordnung nennen lyxos ---"
-# lyxc._lyuArchFuerZiel und ir_lower._irLyuArchFuerZiel sind zwei getrennte
-# Aufzaehlungen derselben Sache; fehlt die Art in einer, bleibt das IR ungenutzt.
-grep -q "LYX_TC_LYXOS[[:space:]]*{[[:space:]]*return LYU_ARCH_LYXOS" "$ROOT/src/lyxc.lyx" \
-  && pr ok "lyxc._lyuArchFuerZiel kennt lyxos" || pr no "lyxc._lyuArchFuerZiel fehlt lyxos"
-grep -qE "zielCode == 14\) \{ return 8; \}" "$ROOT/src/ir_lower.lyx" \
-  && pr ok "ir_lower._irLyuArchFuerZiel kennt lyxos" || pr no "ir_lower._irLyuArchFuerZiel fehlt lyxos"
-
+echo "--- 3. Die Zuordnung steht EINMAL und nennt lyxos ---"
+# #2552: Bis 1.2.41C waren lyxc._lyuArchFuerZiel und ir_lower._irLyuArchFuerZiel
+# zwei getrennte Aufzaehlungen derselben Sache, und dieser Test forderte beide
+# ein ("BEIDE Aufzaehlungen"). Damit schrieb er die Doppelung fest: wer sie
+# beseitigt, machte ihn rot, obwohl die Zuordnung richtig blieb. Jetzt steht sie
+# als ZielLyuArch in src/backend/ziel_modell.lyx. Geprueft wird, dass SIE lyxos
+# kennt und dass keine der beiden Aufrufstellen wieder eine eigene Liste
+# aufbaut -- die Wirkung selbst haengt in Teil 1 am arch-Byte.
+_zm="$ROOT/src/backend/ziel_modell.lyx"
+grep -q "LYX_TC_LYXOS)[[:space:]]*{[[:space:]]*return LYU_ARCH_LYXOS" "$_zm" \
+  && pr ok "ZielLyuArch kennt lyxos" || pr no "ZielLyuArch fehlt lyxos"
+grep -q "return ZielLyuArch(self.target)" "$ROOT/src/lyxc.lyx" \
+  && pr ok "lyxc._lyuArchFuerZiel fragt die eine Stelle" \
+  || pr no "lyxc._lyuArchFuerZiel hat wieder eine eigene Aufzaehlung"
+grep -q "return ZielLyuArch(zielCode)" "$ROOT/src/ir_lower.lyx" \
+  && pr ok "ir_lower._irLyuArchFuerZiel fragt die eine Stelle" \
+  || pr no "ir_lower._irLyuArchFuerZiel hat wieder eine eigene Aufzaehlung"
 echo "--- 4. Aufloesung: der eigene Baum wird genommen, der fremde NICHT still ---"
 mkdir -p "$TMP/baum/lyxos/std" "$TMP/baum/x86_64/std" "$TMP/leer"
 ( cd "$ROOT" && timeout 200 "$LYXC" --std-path="$ROOT" --target=lyxos \
