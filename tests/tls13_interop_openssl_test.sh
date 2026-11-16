@@ -227,6 +227,13 @@ fn main(): int64 {
       satzBlatt := "/edleaf.pem"c; satzKey := "/edleafkey.pem"c; satzCa := "/edca.pem"c;
     }
   }
+  // "p256": EC-Zertifikat, aber als Schluesseltausch NUR secp256r1. Gegen
+  // einen Client, der x25519 anbietet, erzwingt das einen
+  // HelloRetryRequest — genau der Weg, den #2096 Stufe 1 verlangt.
+  var nurP256: int64 := 0;
+  if (GetArgC() > 2) {
+    if (StrCharAt(GetArg(2) as pchar, 0) == 112) { nurP256 := 1; }
+  }
   var dSrv: int64 := alloc(8192); var lSrv := ladeDer(StrConcat(basis, satzBlatt), "CERTIFICATE"c, dSrv);
   var dCa: int64 := alloc(8192);  var lCa := ladeDer(StrConcat(basis, satzCa), "CERTIFICATE"c, dCa);
   var dSk: int64 := alloc(8192);  var lSk := ladeDer(StrConcat(basis, satzKey), "PRIVATE KEY"c, dSk);
@@ -241,6 +248,7 @@ fn main(): int64 {
   TlsConfigKette(cfg, kette, 2, dSk, lSk);
   TlsConfigAlpn(cfg, alpn as int64, StrLen(alpn));
   TlsConfigZeit(cfg, 1800000000);
+  if (nurP256 > 0) { TlsConfigGruppen(cfg, TlsGruppeSecp256r1()); }
   // Zweites Argument: Client-Zertifikat verlangen (mTLS)
   if (GetArgC() > 3) {
     var trust: int64 := alloc(16);
@@ -274,6 +282,7 @@ fn main(): int64 {
   if (!TlsFertig(c)) { PrintLn("HANDSCHLAG-UNFERTIG"); return 1; }
   var pz: int64 := TlsPeerZertifikat(c);
   if (pz != 0) { Print("client-zertifikat-geprueft "); PrintInt(X509SubjectLen(pz) > 0); PrintLn(""); }
+  Print("gruppe "); PrintInt(TlsGruppe(c)); PrintLn("");
   Print("handschlag-fertig suite "); PrintInt(TlsSuite(c));
   Print(" alpn ");
   var i: int64 := 0;
@@ -343,6 +352,12 @@ fn main(): int64 {
       caPfad := "/edca.pem"c; erwartet := "ed.example"c;
     }
   }
+  // "p256": nur secp256r1 anbieten — dann muss ein Server, der x25519 will,
+  // ein HelloRetryRequest schicken, und wir muessen ihm folgen.
+  var nurP256: int64 := 0;
+  if (GetArgC() > 2) {
+    if (StrCharAt(GetArg(2) as pchar, 0) == 112) { nurP256 := 1; }
+  }
   var dCa: int64 := alloc(8192);  var lCa := ladeDer(StrConcat(basis, caPfad), "CERTIFICATE"c, dCa);
   var dCli: int64 := alloc(4096); var lCli := ladeDer(StrConcat(basis, "/tlscli.pem"c), "CERTIFICATE"c, dCli);
   var dCk: int64 := alloc(4096);  var lCk := ladeDer(StrConcat(basis, "/tlsclikey.pem"c), "PRIVATE KEY"c, dCk);
@@ -358,6 +373,7 @@ fn main(): int64 {
   TlsConfigAlpn(cfg, alpn as int64, StrLen(alpn));
   TlsConfigZeit(cfg, 1800000000);
   if (mtls > 0) { TlsConfigKette(cfg, kette, 1, dCk, lCk); }
+  if (nurP256 > 0) { TlsConfigGruppen(cfg, TlsGruppeSecp256r1()); }
 
   var conn: TCPConn := TCPConnect(0x7F000001, port);
   var c: int64 := TlsNeu(cfg);
@@ -376,6 +392,7 @@ fn main(): int64 {
     runden := runden + 1;
   }
   if (!TlsFertig(c)) { PrintLn("HANDSCHLAG-UNFERTIG"); return 1; }
+  Print("gruppe "); PrintInt(TlsGruppe(c)); PrintLn("");
   Print("handschlag-fertig suite "); PrintInt(TlsSuite(c)); PrintLn("");
   var pz: int64 := TlsPeerZertifikat(c);
   Print("serverzertifikat-geprueft ");
@@ -657,6 +674,65 @@ for satz in "rsa rsaca rsa.example" "ed edca ed.example"; do
   if [ "$ok" != 1 ]; then echo "  lyx: $(tr '\n' ' ' < "$TMP/cli_$art.txt")"; fi
 done
 
+
+# --- 6. secp256r1 und HelloRetryRequest gegen OpenSSL ---
+#
+# Beide Richtungen des HRR:
+#  a) Unser Server kann nur secp256r1, s_client bietet x25519 zuerst an
+#     (-groups X25519:P-256). openssl muss "Server Temp Key: ECDH, P-256"
+#     melden — damit ist belegt, dass der zweite Anlauf wirklich auf unserer
+#     Gruppe endete und nicht etwa x25519 durchgelaufen ist.
+#  b) Unser Client bietet nur secp256r1, s_server will x25519 zuerst
+#     (-groups X25519:P-256) und schickt uns ein HelloRetryRequest.
+p="$(freierPort)"; PORT=$((PORT+1))
+( ulimit -v 4000000 -c 0; "$TMP/srv" "$p" p256 > "$TMP/srv_p256.txt" 2>&1 ) &
+srvpid=$!
+warteAufPort "$p" 20 || echo "  HINWEIS: Server lauscht nach 20 s nicht auf $p"
+rm -f "$TMP/fifo_p256"; mkfifo "$TMP/fifo_p256"
+( printf 'GET / HTTP/1.0\r\n\r\n'; sleep 30 ) > "$TMP/fifo_p256" &
+feedpid=$!
+timeout 40 openssl s_client -connect "127.0.0.1:$p" -ign_eof \
+   -servername nexus.example -CAfile "$TMP/certs/tlsca.pem" \
+   -groups X25519:P-256 -tls1_3 < "$TMP/fifo_p256" > "$TMP/os_p256.txt" 2>&1 &
+ospid=$!
+warteAufMuster "$TMP/os_p256.txt" "Lyx TLS 1.3" 30
+kill "$ospid" "$feedpid" "$srvpid" 2>/dev/null
+wait "$ospid" "$feedpid" "$srvpid" 2>/dev/null
+rm -f "$TMP/fifo_p256"
+ok=1; fehlend=""
+# OpenSSL 3.5 nennt die Zeile "Peer Temp Key", nicht "Server Temp Key" —
+# mit dem falschen Anker war die Bedingung immer gefallen.
+grep -qE "Peer Temp Key: ECDH, (P-256|prime256v1|secp256r1)" "$TMP/os_p256.txt" || fehlend="$fehlend temp-key-p256"
+grep -q "Verify return code: 0 (ok)" "$TMP/os_p256.txt" || fehlend="$fehlend verify"
+grep -q "Lyx TLS 1.3" "$TMP/os_p256.txt" || fehlend="$fehlend nutzdaten"
+grep -q "^gruppe 23" "$TMP/srv_p256.txt" || fehlend="$fehlend gruppe-im-server"
+[ -n "$fehlend" ] && ok=0
+pruefe "Server nur secp256r1: s_client folgt dem HelloRetryRequest" "$ok"
+if [ "$ok" != 1 ]; then
+  echo "  gefallene Bedingungen:$fehlend"
+  echo "  openssl: $(grep -E 'Peer Temp Key|Verify return code|Cipher is' "$TMP/os_p256.txt" | tr '\n' ' ')"
+  echo "  lyx:     $(tr '\n' ' ' < "$TMP/srv_p256.txt")"
+fi
+
+p="$(freierPort)"; PORT=$((PORT+1))
+rm -f "$TMP/fifo_cp256"; mkfifo "$TMP/fifo_cp256"
+openssl s_server -accept "$p" -cert "$TMP/certs/tlssrv.pem" -key "$TMP/certs/tlssrvkey.pem" \
+  -groups X25519:P-256 -tls1_3 -quiet < "$TMP/fifo_cp256" > "$TMP/os_srv_cp256.txt" 2>&1 &
+( printf 'pong aus openssl\n'; sleep 8 ) > "$TMP/fifo_cp256" &
+warteAufPort "$p" 20 || echo "  HINWEIS: s_server lauscht nach 20 s nicht auf $p"
+( ulimit -v 4000000 -c 0; timeout 25 "$TMP/cli" "$p" p256 ) > "$TMP/cli_p256.txt" 2>&1
+pkill -f "s_server -accept $p" 2>/dev/null
+rm -f "$TMP/fifo_cp256"
+ok=1; fehlend=""
+grep -q "^gruppe 23" "$TMP/cli_p256.txt" || fehlend="$fehlend gruppe"
+grep -q "handschlag-fertig suite 4865" "$TMP/cli_p256.txt" || fehlend="$fehlend handschlag"
+grep -q "antwort 17 pong aus openssl" "$TMP/cli_p256.txt" || fehlend="$fehlend nutzdaten"
+[ -n "$fehlend" ] && ok=0
+pruefe "Client nur secp256r1: HelloRetryRequest von s_server beantwortet" "$ok"
+if [ "$ok" != 1 ]; then
+  echo "  gefallene Bedingungen:$fehlend"
+  echo "  lyx: $(tr '\n' ' ' < "$TMP/cli_p256.txt")"
+fi
 
 echo "--- $PASS PASS, $FAIL FAIL"
 if [ "$FAIL" != 0 ]; then exit 1; fi
