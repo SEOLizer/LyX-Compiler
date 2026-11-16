@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.41B
+VERSION   := 1.2.41C
 VERSION_DATE := 2026-11-16
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -51,6 +51,23 @@ LYU_TARGET ?=
 #
 # Ueberschreibbar: `make package LYU_OBJCODE=` baut ohne Abbilder.
 LYU_OBJCODE ?= --with-objcode
+
+# #2536: WELCHE Baeume `deb` und `package` ausliefern. Ein Name je Architektur,
+# wie LyuArchName ihn schreibt.
+#
+# Die Vorgabe ist x86_64 ALLEIN, und das ist eine gemessene Entscheidung, keine
+# Bequemlichkeit: der lyxos-Baum ist installiert 274 MB gross gegen 2,4 MB bei
+# x86_64, weil seine .lyu den IR-Abschnitt tragen. Gepackt faellt das nicht auf
+# (64,5 MB Rohdaten -> 678 KB xz, also 1,05 %) -- der Preis liegt vollstaendig
+# auf der Platte des Nutzers. Solange der IR-Abschnitt das RAM-Layout verbatim
+# traegt (#2538: zwei Drittel Nullbytes), ist das zu teuer fuer eine Vorgabe.
+#
+#   make deb LYU_BAEUME="x86_64 lyxos"    beide Baeume
+#
+# Nach #2538 (Feldmaske + Varint, gemessen -66 %) gehoert diese Vorgabe neu
+# entschieden -- dann mit der dann gueltigen Zahl, nicht mit dieser.
+LYU_BAEUME ?= x86_64
+
 UNITS_DST := $(PKG_DIR)/usr/include/lyx/units/$(LYU_ARCH)/std
 DATA_DST  := $(PKG_DIR)/usr/include/lyx/units/$(LYU_ARCH)/data
 BIN_DST   := $(PKG_DIR)/usr/local/bin
@@ -319,6 +336,7 @@ test: lyxc
 	@bash tests/lyxos_unlink_dir_test.sh
 	@echo "--- Hintergrunddienste und Graph-Stelligkeit (#2544, #2529) ---"
 	@bash tests/lyxos_dienste_2544_test.sh
+	@bash tests/lyu_arch_lyxos_2536_test.sh
 	@bash tests/lyxos_caps_warnung_test.sh
 	@bash tests/ir_if_kette_test.sh
 	@echo "--- match und switch auf dem IR-Weg (#1825) ---"
@@ -1383,13 +1401,13 @@ dist-linux: lyxc
 # Paketbaum (std, data, KassenSichV), räumt verwaiste Dateien weg, stempelt
 # DEBIAN/control und prüft anschließend, was tatsächlich im Paket liegt.
 # `package` (darunter) baut ohne diese Prüfungen und ohne Architektur im Namen.
-deb: precompile-units install-data
+deb: units-baeume install-data
 	@bash tools/make_deb.sh $(DEB_ARCH)
 
 # #2447: `sync-units-src` stand hier als erste Abhaengigkeit und kopierte die
 # .lyx-Quelltexte in den Paketbaum. Das Paket liefert keine mehr aus; die .lyu
 # erzeugt `precompile-units` direkt an ihren Platz im Baum.
-package: precompile-units install-bin install-data
+package: units-baeume install-bin install-data
 	dpkg-deb --build $(PKG_DIR) $(DEB_NAME)
 	@echo ""
 	@echo "Paket fertig: $(DEB_NAME)"
@@ -1412,6 +1430,58 @@ package: precompile-units install-bin install-data
 # hinzufuegt und es nicht fahrt, checkt einen Paketbaum ohne deren .lyu ein --
 # 15 Units waren so unbemerkt ohne Vorkompilat (#2444). Dagegen wacht
 # tests/paket_lyu_vollstaendig_test.sh im `test`-Ziel.
+# #2536: jeden Baum aus LYU_BAEUME bauen und PRUEFEN.
+#
+# Der Bau laeuft hier mit `-k` und sein Ergebnis wird verworfen; geurteilt wird
+# nicht am Rueckgabewert des Compilers, sondern am BAUM:
+# tools/lyu_baum_pruefen.sh zaehlt, was fehlt, und haelt es gegen
+# tools/dist_units_ausnahmen_<arch>.txt. Der Grund ist zielbedingt: fuer lyxos
+# uebersetzen neun Units NICHT und sollen es nicht (Bluetooth-Sockets, rohe
+# Linux-Wrapper, security_ext_x86). Pass 2 von precompile-units ist streng und
+# braeche daran ab, obwohl der Baum in Ordnung ist.
+#
+# Der Pruefer urteilt in BEIDE Richtungen: eine unerklaerte Luecke ist ein
+# Fehler, und ein Eintrag, dessen Unit wieder uebersetzt, ebenfalls -- sonst
+# verfault die Liste und verdeckt den naechsten echten Fall.
+units-baeume: lyxc
+	@# Die Liste bestimmt den INHALT des Pakets, nicht nur den Bau: ein Baum, der
+	@# von einem frueheren Lauf noch dasteht, wuerde sonst mitgepackt. Genau so
+	@# ist beim Entwickeln dieser Regel ein 274-MB-lyxos-Baum in ein `make deb`
+	@# geraten und hat es an der Plattenquote scheitern lassen.
+	@for d in $(PKG_DIR)/usr/include/lyx/units/*/; do \
+	  [ -d "$$d" ] || continue; \
+	  n="$$(basename "$$d")"; \
+	  case " $(LYU_BAEUME) " in \
+	    *" $$n "*) ;; \
+	    *) if [ "$$(git ls-files "$$d" 2>/dev/null | wc -l)" -gt 0 ]; then \
+	         echo "units/$$n steht nicht in LYU_BAEUME, traegt aber VERSIONIERTE Dateien." >&2; \
+	         echo "Das Loeschen eines eingecheckten Baums ist kein Nebeneffekt eines Paketbaus." >&2; \
+	         echo "Entweder nach LYU_BAEUME aufnehmen oder bewusst entfernen (git rm -r $$d)." >&2; \
+	         exit 1; \
+	       fi; \
+	       echo "   entferne nicht gelisteten Baum units/$$n"; rm -rf "$$d" ;; \
+	  esac; \
+	done
+	@for a in $(LYU_BAEUME); do \
+	  case "$$a" in \
+	    x86_64)     z="" ;; \
+	    lyxos)      z="--target=lyxos" ;; \
+	    arm64)      z="--target=arm64" ;; \
+	    riscv64)    z="--target=riscv64" ;; \
+	    macosx64)   z="--target=macos-x86_64" ;; \
+	    x86_64_win) z="--target=win64" ;; \
+	    win_arm64)  z="--target=windows-arm64" ;; \
+	    arm_cm)     z="--target=arm-cm" ;; \
+	    xtensa)     z="--target=xtensa" ;; \
+	    *) echo "LYU_BAEUME: '$$a' ist kein Baumname aus LyuArchName (src/lyu_reader.lyx)." >&2; \
+	       echo "Gueltig: x86_64 arm64 x86_64_win macosx64 riscv64 xtensa win_arm64 arm_cm lyxos" >&2; \
+	       exit 1 ;; \
+	  esac; \
+	  echo "== Unit-Baum $$a ($${z:-Standardziel}) =="; \
+	  $(MAKE) --no-print-directory -k LYU_ARCH=$$a LYU_TARGET="$$z" precompile-units >/dev/null 2>&1 || true; \
+	  bash tools/lyu_baum_pruefen.sh $$a || exit 1; \
+	done
+
 precompile-units: lyxc
 	@echo "Pass 1: Kompiliere Units..."
 	@$(MAKE) --no-print-directory -k $(UNITS_LYU) $(DATA_LYU) 2>/dev/null; true
