@@ -5,13 +5,20 @@
 # `IRCodeOffset` stand im Kopf und wurde immer als 0 geschrieben. Eine allein
 # ausgelieferte Unit lieferte deshalb keine einzige Funktion.
 #
-# GEMESSEN WIRD DER INHALT des Abschnitts, nicht sein Vorhandensein: die
-# Satzgroessen muessen aufgehen (Instruktionen 80 Byte, Funktionen 80 Byte),
-# und die Byte-Laengen muessen zu den Anzahlen im Kopf des Abschnitts passen.
-# Ein Test auf "LYIR kommt vor" waere auch von einem Abschnitt erfuellt, in
-# dem Muell steht — und genau so sah der erste Wurf aus: `instr 7 Byte`,
-# `func 1 Byte`, weil die Laengenfelder des IR-Moduls NICHT einheitlich
-# zaehlen (instr/func/global/capture zaehlen SAETZE, str/label zaehlen BYTES).
+# GEMESSEN WIRD DER INHALT des Abschnitts, nicht sein Vorhandensein: ein Test
+# auf "LYIR kommt vor" waere auch von einem Abschnitt erfuellt, in dem Muell
+# steht — und genau so sah der erste Wurf aus: `instr 7 Byte`, `func 1 Byte`,
+# weil die Laengenfelder des IR-Moduls NICHT einheitlich zaehlen
+# (instr/func/global/capture zaehlen SAETZE, str/label zaehlen BYTES).
+#
+# #2538 hat das MITTEL geaendert, nicht den Zweck. Bis Fassung 1 war der
+# Abschnitt eine Bytekopie des RAM-Layouts, und die Pruefung lautete
+# `instr == nInstr * 80`. Seit Fassung 2 sind die Satzpuffer feldweise
+# kodiert (Maske + Varint), also sagt die Bytelaenge nichts mehr ueber die
+# Satzzahl. Geprueft wird deshalb SCHAERFER als vorher: der Puffer wird
+# DEKODIERT, seine Satzzahl gegen die im Kopf gehalten, und er muss genau an
+# seinem angekuendigten Ende aufhoeren. Eine Rechnung konnte nur aufgehen
+# oder nicht; ein Umlauf faellt auch dann auf, wenn Felder verloren gehen.
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LYXC="${LYXC:-$ROOT/lyxc}"
@@ -49,11 +56,53 @@ if i < 0:
 p = i + 4
 ver, = struct.unpack_from("<I", d, p); p += 4
 nInstr, nFunc, nGlob = struct.unpack_from("<III", d, p); p += 12
+# #2538: Zickzack-Varint lesen — Spiegelbild von lyu_writer._eVarint,
+# einschliesslich der Fluchtform (nach acht Fortsetzungsbytes wird das neunte
+# ROH genommen).
+def _varint(d, q):
+    z = 0; sh = 0
+    for _ in range(8):
+        b = d[q]; q += 1
+        z |= (b & 127) << sh
+        if not (b & 128):
+            return ((z >> 1) ^ -(z & 1)), q
+        sh += 7
+    z |= d[q] << 56; q += 1
+    return ((z >> 1) ^ -(z & 1)), q
+
+# Einen feldweise kodierten Satzpuffer dekodieren. Gibt die Satzzahl und die
+# Zahl BELEGTER Felder zurueck -- letztere faellt auf, wenn die Maske und die
+# Varints auseinanderlaufen.
+def _dekod(d, q, laenge, felder):
+    if laenge <= 0: return 0, 0, q
+    ende = q + laenge
+    saetze, = struct.unpack_from("<I", d, q); q += 4
+    mb = (felder + 7) // 8
+    belegt = 0
+    for _ in range(saetze):
+        maske = int.from_bytes(d[q:q+mb], "little"); q += mb
+        for f in range(felder):
+            if maske & (1 << f):
+                _, q = _varint(d, q); belegt += 1
+    if q != ende:
+        raise AssertionError(f"Puffer endet bei {q}, angekuendigt {ende}")
+    return saetze, belegt, ende
+
 laengen = {}
+dek = {}
+satzfelder = {"instr": (80, 10), "func": (80, 10), "global": (8, 1), "capture": (8, 1)}
 for name in ("instr", "str", "label", "func", "global", "capture"):
     ln, = struct.unpack_from("<I", d, p); p += 4
     laengen[name] = ln
-    p += ln
+    if ver >= 2 and name in satzfelder:
+        _satz, felder = satzfelder[name]
+        try:
+            saetze, belegt, p = _dekod(d, p, ln, felder)
+        except (AssertionError, IndexError, struct.error) as e:
+            print(f"KAPUTT {name}: {e}"); raise SystemExit
+        dek[name] = (saetze, belegt)
+    else:
+        p += ln
 
 # Der Abschnitt muss GENAU dort enden, wo der naechste anfaengt — bleibt etwas
 # uebrig oder laeuft er darueber hinaus, stimmen die Laengen nicht.
@@ -79,8 +128,10 @@ offs = struct.unpack_from("<IIII", d, q) # konstanten, ir, debug, ressourcen
 spaeter = [o for o in offs if 0 < o and o > i]
 grenze = min(spaeter) if spaeter else len(d)
 
+dI = dek.get("instr", (0, 0)); dF = dek.get("func", (0, 0)); dG = dek.get("global", (0, 0))
 print(f"ver={ver} nInstr={nInstr} nFunc={nFunc} nGlob={nGlob} "
       f"instr={laengen['instr']} func={laengen['func']} str={laengen['str']} "
+      f"dInstr={dI[0]} dFunc={dF[0]} dGlob={dG[0]} fInstr={dI[1]} "
       f"ende={p} grenze={grenze} datei={len(d)}")
 PY
 )"
@@ -93,18 +144,29 @@ ok "die .lyu traegt einen IR-Abschnitt"
 
 eval "$(printf '%s\n' "$befund" | tr ' ' '\n' | sed 's/^/lyu_/')"
 
-# Die Satzgroessen muessen aufgehen — sonst steht dort Muell.
-if [ $(( lyu_instr % 80 )) -eq 0 ] && [ "$lyu_instr" -eq $(( lyu_nInstr * 80 )) ]; then
-    ok "Instruktionen: $lyu_nInstr Saetze = $lyu_instr Byte"
+# #2538: Der dekodierte Puffer muss so viele Saetze hergeben, wie der Kopf
+# nennt. Das ist die Nachfolgepruefung von `instr == nInstr * 80`: sie faellt
+# bei gemischter Zaehlweise genauso auf, und zusaetzlich dann, wenn Maske und
+# Varints auseinanderlaufen (der Umlauf endet dann nicht am Pufferende).
+if [ "$lyu_dInstr" -eq "$lyu_nInstr" ] && [ "$lyu_nInstr" -gt 0 ]; then
+    ok "Instruktionen: $lyu_nInstr Saetze dekodiert, $lyu_fInstr belegte Felder, $lyu_instr Byte kodiert"
 else
-    nok "Instruktionen passen nicht: $lyu_nInstr Saetze, $lyu_instr Byte"
+    nok "Instruktionen passen nicht: Kopf $lyu_nInstr, dekodiert $lyu_dInstr"
+fi
+
+# Die Kodierung muss auch GREIFEN: ein Encoder, der jedes Feld schreibt, waere
+# von der Satzzahl allein erfuellt. Das RAM-Layout waere nInstr * 80 Byte.
+if [ "$lyu_instr" -lt $(( lyu_nInstr * 80 )) ]; then
+    ok "kodiert kleiner als das RAM-Layout: $lyu_instr < $(( lyu_nInstr * 80 )) Byte"
+else
+    nok "kodierter Puffer nicht kleiner als $(( lyu_nInstr * 80 )) Byte — Bytekopie zurueck?"
 fi
 
 # Zwei pub-Funktionen — die Unit deklariert genau zwei.
-if [ "$lyu_func" -eq $(( lyu_nFunc * 80 )) ] && [ "$lyu_nFunc" -ge 2 ]; then
-    ok "Funktionen: $lyu_nFunc Saetze = $lyu_func Byte"
+if [ "$lyu_dFunc" -eq "$lyu_nFunc" ] && [ "$lyu_nFunc" -ge 2 ]; then
+    ok "Funktionen: $lyu_nFunc Saetze dekodiert, $lyu_func Byte kodiert"
 else
-    nok "Funktionen passen nicht: $lyu_nFunc Saetze, $lyu_func Byte"
+    nok "Funktionen passen nicht: Kopf $lyu_nFunc, dekodiert $lyu_dFunc"
 fi
 
 # Der Abschnitt endet GENAU dort, wo der naechste anfaengt (oder am Dateiende,
