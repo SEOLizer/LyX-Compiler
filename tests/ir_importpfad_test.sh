@@ -117,7 +117,13 @@ fi
 #    Genau DAS war bis 1.2.39B rot, und zwar an einer vierten Stelle:
 #    `cg_lyuPfadZu` zaehlte nur -I und --std-path auf, nicht die Installation.
 hlog="$TMP/lh"
-timeout 300 "$LYXC" --trace-imports "$TMP/t.lyx" -o "$TMP/t.host" >"$hlog" 2>&1
+# #2518: MIT $INS_SCHALTER -- wie der Lauf darueber. Ohne ihn fand dieser
+# zweite Lauf die Unit nicht, sobald es keine echte Installation gibt; auf
+# der CI war das genau der Fall und der Test rot ("kein Erzeugnis
+# entstanden"), obwohl die Aufloesung einen Schritt davor PASS meldete.
+# Zwei Laeufe derselben Frage, und nur einer trug den Schalter -- dieselbe
+# Klasse "zweite Stelle nicht nachgezogen", gegen die dieser Test antritt.
+timeout 300 "$LYXC" $INS_SCHALTER --trace-imports "$TMP/t.lyx" -o "$TMP/t.host" >"$hlog" 2>&1
 if grep -q 'Import nicht lesbar' "$hlog"; then
   bad "Host-Ziel" "meldet weiterhin 'Import nicht lesbar'"
 else
@@ -138,7 +144,9 @@ if [ -x "$TMP/t.host" ]; then
     bad "Wirkung" "Rueckgabe $rc, erwartet 1"
   fi
 else
-  bad "Wirkung" "kein Erzeugnis entstanden"
+  # Die Meldung mitgeben: "kein Erzeugnis" allein sagt nicht, woran es lag,
+  # und auf der CI ist der Lauf nicht wiederholbar.
+  bad "Wirkung" "kein Erzeugnis entstanden -- $(grep -m2 -iE 'error|nicht lesbar|nicht gefunden' "$hlog" | tr '\n' ' ' | cut -c1-160)"
 fi
 
 # 4. Gegenprobe, zweiseitig: fuer ein Ziel OHNE Baum darf KEIN Erzeugnis
