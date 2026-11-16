@@ -26,12 +26,67 @@ pub fn NetConnect(sockfd: int64, addr: int64, addrlen: int64): int64 {
   return sys_connect(sockfd, addr, addrlen);
 }
 
+// #2541: sendto und recvfrom haben auf LyxOS eine ANDERE Gestalt, nicht bloss
+// eine andere Nummer (LyxOS-ABI 10.9/10.10):
+//
+//   Linux:  sendto(fd, buf, n, flags, sockaddr*, addrlen)   -- 6 Argumente
+//   LyxOS:  sys_sendto(sock, buf, len, dst_uva)             -- 4 Argumente
+//   Linux:  recvfrom(fd, buf, n, flags, sockaddr*, addrlen*)-- 6 Argumente
+//   LyxOS:  sys_recvfrom(sock, buf, maxlen, out_uva)        -- 4 Argumente
+//
+// `dst_uva` zeigt auf {ip, port}; es gibt kein sockaddr_in und kein flags, weil
+// der Kernel kein BSD-Socket-Modell hat. Bis hierher wurde die Linux-Form
+// emittiert, und die Gestaltpruefung (#2482) wies die Unit deshalb ab -- sie
+// liess sich fuer --target=lyxos gar nicht vorkompilieren.
+//
+// DIESELBE RECHNUNG wie `_udpSendToSockAddr` und ihre Empfangsseite in
+// std/net/socket.lyx -- die beiden muessen uebereinstimmen. Wiederholt statt
+// aufgerufen, weil socket.lyx DIESE Unit importiert; ein Aufruf in die andere
+// Richtung waere ein Importkreis.
+//
+// Die Zielweiche ist faltbar (`TARGET_OS == OS_LYXOS`), der nicht genommene
+// Zweig entsteht gar nicht. IPv6/Raw (addrlen != 16) hat auf LyxOS keine
+// Entsprechung: der Kernel kennt nur {ip, port} mit 32-Bit-Adresse. Diese
+// Faelle liefern -1, statt eine Naeherung zu raten.
 pub fn RecvFrom(sockfd: int64, buf: pchar, len: int64, flags: int64, src_addr: int64, addrlen: int64): int64 {
-  return sys_recvfrom(sockfd, buf, len, flags, src_addr, addrlen);
+  if TARGET_OS == OS_LYXOS {
+    var out: int64 := mmap(0, 24, PROT_RW, MAP_ANON, FD_NONE, 0);
+    if (out <= 0) { return -1; }
+    poke64(out, 0);
+    poke64(out + 8, 0);
+    // Zeitlimit in ms als EINGABE bei +16 -- wie in socket.lyx. 0 laesst den
+    // Kernel auf seinen eigenen Vorgabewert zurueckfallen.
+    poke64(out + 16, 1000);
+    var lr: int64 := sys_recvfrom(sockfd, buf, len, out);
+    // Absenderadresse nachtragen, soweit der Aufrufer danach gefragt hat.
+    if (src_addr != 0) {
+      poke64(src_addr, peek64(out));
+      poke64(src_addr + 8, peek64(out + 8));
+    }
+    munmap(out, 24);
+    return lr;
+  } else {
+    return sys_recvfrom(sockfd, buf, len, flags, src_addr, addrlen);
+  }
 }
 
 pub fn SendTo(sockfd: int64, buf: int64, len: int64, flags: int64, dest_addr: int64, addrlen: int64): int64 {
-  return sys_sendto(sockfd, buf, len, flags, dest_addr, addrlen);
+  if TARGET_OS == OS_LYXOS {
+    if (addrlen != 16) { return -1; }   // IPv6/Raw: auf LyxOS keine Entsprechung
+    // sockaddr_in: Port big-endian bei +2, Adresse network order bei +4.
+    var lport: int64 := (peek8(dest_addr + 2) << 8) | peek8(dest_addr + 3);
+    var lip: int64 := (peek8(dest_addr + 4) << 24) | (peek8(dest_addr + 5) << 16)
+                    | (peek8(dest_addr + 6) << 8)  |  peek8(dest_addr + 7);
+    var dst: int64 := mmap(0, 16, PROT_RW, MAP_ANON, FD_NONE, 0);
+    if (dst <= 0) { return -1; }
+    poke64(dst, lip);
+    poke64(dst + 8, lport);
+    var sr: int64 := sys_sendto(sockfd, buf, len, dst);
+    munmap(dst, 16);
+    return sr;
+  } else {
+    return sys_sendto(sockfd, buf, len, flags, dest_addr, addrlen);
+  }
 }
 
 pub fn NetClose(fd: int64): int64 {

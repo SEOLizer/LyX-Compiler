@@ -2113,9 +2113,28 @@ pub type EmitLyxOS = class {
             var lx16ac: int64 := 2;
             if id == 122 { lx16ac := 3; }      // sys_sem_annotate(addr,size,embed_fd)
             else if id == 123 { lx16ac := 5; } // sys_sem_query(query_vec,dim,k,results,max)
-            else if id == 125 { lx16ac := 5; } // sys_graph_edge_add(src,rel_type,dst,meta,meta_len)
+            // #2529: 125 und 127 standen auf 5 und wurden von der
+            // Gestaltpruefung (#2482) abgewiesen -- die Zahl war unsere eigene
+            // Annahme, nicht die des Kernels. Beide nehmen VIER Argumente:
+            //
+            //   2064 sys_graph_edge_add(src, rel_type, dst, meta)
+            //   2066 sys_graph_query(start_id, depth, out_uva, out_max)
+            //
+            // Bei 2066 ist der Unterschied nicht bloss die Zahl: der Kernel hat
+            // KEIN rel_type. Haette die Pruefung nicht abgewiesen, waere
+            // rel_type als depth gelesen worden -- eine falsche Abfrage ohne
+            // jede Meldung. `start_id == 0` listet alle Knoten, `> 0` macht
+            // eine Breitensuche ab diesem Knoten.
+            //
+            // Bei 2064 nannten die Quellen zeitweise drei Zahlen (Doku 3,
+            // Handler 4, wir 5). Mit dem ABI-Abgleich auf lyx-os 1fe08f7
+            // (#2531) sagen Doku und Handler beide 4, und `meta_len` kommt in
+            // der Doku nicht mehr vor -- die kanonische Form ist vierstellig.
+            // Maschinell massgeblich ist work/lyxos/syscall-argc.txt:
+            // dort stehen 2064 und 2066 je mit 4.
+            else if id == 125 { lx16ac := 4; } // sys_graph_edge_add(src,rel_type,dst,meta)
             else if id == 126 { lx16ac := 1; } // sys_graph_edge_remove(edge_id)
-            else if id == 127 { lx16ac := 5; } // sys_graph_query(node_id,rel_type,depth,results,max)
+            else if id == 127 { lx16ac := 4; } // sys_graph_query(start_id,depth,out_uva,out_max)
             self.emitVfsSyscall(lx16nr, lx16ac, dest);
         }
         // LX-17: Lyra Agent Interface (0x0900–0x090B) — id 128+k → 0x0900+k
@@ -2213,6 +2232,10 @@ pub type EmitLyxOS = class {
         else if id == 189 { self.emitVfsSyscall(317, 2, dest); }    // sys_futex_wake
         else if id == 190 { self.emitVfsSyscall(318, 3, dest); }    // sys_futex_requeue
         else if id == 191 { self.emitVfsSyscall(319, 2, dest); }    // sys_kill
+        // #2544: Steuercodes. 359 laeuft unter PLEDGE_PROC wie sys_kill,
+        // 360 braucht kein Recht -- es betrifft nur den Aufrufer.
+        else if id == 273 { self.emitVfsSyscall(359, 2, dest); }    // sys_sig_post(tid, code)
+        else if id == 274 { self.emitVfsSyscall(360, 0, dest); }    // sys_sig_poll()
         else if id == 192 { self.emitVfsSyscall(320, 2, dest); }    // sys_pipe2
         else if id == 193 { self.emitVfsSyscall(321, 1, dest); }    // sys_udp_open
         else if id == 194 { self.emitVfsSyscall(322, 1, dest); }    // sys_udp_close
@@ -2383,19 +2406,19 @@ pub type EmitLyxOS = class {
         else if id == 231 { self.emitVfsSyscallAB(0x020C, 3, argBase, dest); }  // pipe(rfd_out,wfd_out,flags)
         else if id == 232 { self.emitVfsSyscallAB(0x020D, 2, argBase, dest); }  // truncate(fd,size)
         // nanosleep(ts, rem): timespec→ns (sec*1e9 + nsec) dann sys_sleep_ns(0x000A). rem ignoriert.
-        else if id == 233 {
-            self.emitMovRdiFromSlot(argBase);                              // rdi = ts ptr
-            self.emit8(0x48); self.emit8(0x8B); self.emit8(0x07);          // mov rax, [rdi] (tv_sec)
-            self.emit8(0xB9); self.emit32(1000000000);                     // mov ecx, 1e9
-            self.emit8(0x48); self.emit8(0x0F); self.emit8(0xAF); self.emit8(0xC1);  // imul rax, rcx
-            self.emit8(0x48); self.emit8(0x03); self.emit8(0x47); self.emit8(0x08);  // add rax, [rdi+8] (tv_nsec)
-            self.emit8(0x48); self.emit8(0x89); self.emit8(0xC7);          // mov rdi, rax (ns)
-            self.emitNsZuTicks();                                          // #1741: ns → Ticks
-            self.emitMovRaxImm(25);                                        // sleep_ticks
-            self.emitSyscall();
-            self.emit8(0x31); self.emit8(0xC0);                            // xor eax, eax (return 0)
-            self.emitMovSlotFromRax(dest);
-        }
+        // #2544: nanosleep geht auf sys_nanosleep (358), nicht auf
+        // sleep_ticks (25). Die Gestalt passt eins zu eins -- (ts, rem) --,
+        // die Umrechnung in Ticks entfaellt, sie passiert im Kernel.
+        //
+        // Drei Zusagen waren mit 25 gebrochen, alle gemessen (#2544):
+        // es wurde ZU KURZ geschlafen (sleep_ticks setzt die Weckmarke auf
+        // CD_TICK_COUNT + ticks, der laufende Tick ist schon angebrochen --
+        // 297 ms fuer 300 ms, 97 ms fuer zehn Schlafe à 10 ms), `rem` wurde
+        // nie geschrieben, und die Rueckgabe war immer 0, auch bei unlesbarer
+        // Adresse oder tv_nsec >= 1e9. Fuer einen Hintergrunddienst ist das
+        // Erste der Knackpunkt: wer darauf eine Warteschleife baut, bekommt
+        // genau die Schleife ohne Pause, die der Aufruf verhindern soll.
+        else if id == 233 { self.emitVfsSyscallAB(358, 2, argBase, dest); }
         // #1720: sys_clock_nanosleep(clockid, flags, ts, rem).
         //
         // Anders als bei nanosleep (233) steht der timespec am DRITTEN
@@ -2408,29 +2431,57 @@ pub type EmitLyxOS = class {
         //
         // clockid wird nicht ausgewertet: LyxOS kennt genau eine Zeitquelle.
         else if id == 237 {
+            // #2544: Der Schlaf geht auf sys_nanosleep (358) statt auf
+            // sleep_ticks (25) -- aus denselben Gruenden wie bei ID 233.
+            //
+            // ZWEITER BEFUND, am Erzeugnis gemessen: dieser Block trug zwei von
+            // Hand gerechnete rel8-Weiten, und die zweite war falsch. `JLE`
+            // sprang 15 Byte, zu ueberspringen waren 37 (MOV rdi,r12 = 3,
+            // emitNsZuTicks = 22, MOV rax,25 = 10, SYSCALL = 2). Der Sprung
+            // landete auf `98 00 31 D2 ...`, also MITTEN im Direktwort von
+            // `MOV ecx, 10000000` -- ein TIMER_ABSTIME auf einen bereits
+            // vergangenen Zeitpunkt fuehrte Muell aus, darunter einen
+            // Speicherschreibzugriff. Der erste Sprung (JZ +15) stimmte; genau
+            // so entstehen diese Fehler, denn wer den Rumpf aendert, sieht die
+            // Weite daneben nicht.
+            //
+            // Deshalb hat dieser Block KEINEN Sprung mehr. Beide Entscheidungen
+            // laufen ueber CMOV: `now` wird nur bei TIMER_ABSTIME abgezogen
+            // (CMOVNE), ein negativer Rest auf 0 geklemmt (CMOVLE). Ein
+            // timespec {0,0} ist fuer den Kernel gueltig und schlaeft nicht
+            // messbar -- semantisch dasselbe wie "nicht schlafen", nur ohne
+            // Flickstelle. clockid bleibt unausgewertet: LyxOS kennt genau
+            // eine Zeitquelle.
             self.emitMovRdiFromSlot(argBase + 2);                          // rdi = ts
-            self.emit8(0x48); self.emit8(0x8B); self.emit8(0x07);          // MOV rax, [rdi]      (tv_sec)
+            self.emit8(0x48); self.emit8(0x8B); self.emit8(0x07);          // MOV rax, [rdi]  (tv_sec)
             self.emit8(0xB9); self.emit32(1000000000);                     // MOV ecx, 1e9
             self.emit8(0x48); self.emit8(0x0F); self.emit8(0xAF); self.emit8(0xC1);  // IMUL rax, rcx
             self.emit8(0x48); self.emit8(0x03); self.emit8(0x47); self.emit8(0x08);  // ADD rax, [rdi+8] (tv_nsec)
-            self.emit8(0x49); self.emit8(0x89); self.emit8(0xC4);          // MOV r12, rax        (Zielwert)
+            self.emit8(0x49); self.emit8(0x89); self.emit8(0xC4);          // MOV r12, rax    (Zielwert)
+            self.emitMovRaxImm(117);                                       // sys_time_ns
+            self.emitSyscall();                                            // rdx = jetzt (ns)
             self.emitMovRaxFromSlot(argBase + 1);                          // rax = flags
             self.emit8(0x48); self.emit8(0x83); self.emit8(0xE0); self.emit8(0x01);  // AND rax, 1 (TIMER_ABSTIME)
+            self.emit8(0x31); self.emit8(0xC9);                            // XOR ecx, ecx
             self.emit8(0x48); self.emit8(0x85); self.emit8(0xC0);          // TEST rax, rax
-            self.emit8(0x74); self.emit8(0x0F);                            // JZ relativ (+15)
-            // absolut: r12 := r12 - jetzt
-            self.emitMovRaxImm(117);                                       // sys_time_ns
-            self.emitSyscall();
-            self.emit8(0x49); self.emit8(0x29); self.emit8(0xD4);          // SUB r12, rdx
-            // relativ:
-            self.emit8(0x4D); self.emit8(0x85); self.emit8(0xE4);          // TEST r12, r12
-            self.emit8(0x7E); self.emit8(0x0F);                            // JLE fertig (+15) — Zeitpunkt vorbei
-            self.emit8(0x4C); self.emit8(0x89); self.emit8(0xE7);          // MOV rdi, r12
-            self.emitNsZuTicks();                                          // #1741: ns → Ticks
-            self.emitMovRaxImm(25);                                        // sleep_ticks
-            self.emitSyscall();
-            // fertig:
+            self.emit8(0x48); self.emit8(0x0F); self.emit8(0x45); self.emit8(0xCA);  // CMOVNE rcx, rdx
+            self.emit8(0x49); self.emit8(0x29); self.emit8(0xCC);          // SUB r12, rcx
             self.emit8(0x31); self.emit8(0xC0);                            // XOR eax, eax
+            self.emit8(0x4D); self.emit8(0x85); self.emit8(0xE4);          // TEST r12, r12
+            self.emit8(0x4C); self.emit8(0x0F); self.emit8(0x4E); self.emit8(0xE0);  // CMOVLE r12, rax
+            self.emit8(0x4C); self.emit8(0x89); self.emit8(0xE0);          // MOV rax, r12
+            self.emit8(0x31); self.emit8(0xD2);                            // XOR edx, edx
+            self.emit8(0xB9); self.emit32(1000000000);                     // MOV ecx, 1e9
+            self.emit8(0x48); self.emit8(0xF7); self.emit8(0xF1);          // DIV rcx -> rax=sec, rdx=nsec
+            self.emitMovSlotFromRax(argBase + 4);                          // sec
+            self.emit8(0x48); self.emit8(0x89); self.emit8(0xD0);          // MOV rax, rdx
+            self.emitMovSlotFromRax(argBase + 5);                          // nsec
+            self.emitLeaRaxFromSlot(argBase + 4);                          // rax = &{sec,nsec}
+            self.emit8(0x48); self.emit8(0x89); self.emit8(0xC7);          // MOV rdi, rax
+            self.emitMovRsiFromSlot(argBase + 3);                          // rsi = rem
+            self.emitMovRaxImm(358);
+            self.emitSyscall();
+            self.emit8(0x48); self.emit8(0x89); self.emit8(0xD0);          // MOV rax, rdx (LyxOS: Ergebnis in rdx)
             self.emitMovSlotFromRax(dest);
         }
         // #1720: sys_gettimeofday(tv, tz) — timeval {tv_sec, tv_usec} fuellen.

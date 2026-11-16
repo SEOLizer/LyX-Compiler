@@ -508,6 +508,8 @@ alten Block frei.
 | 270 | 196 | `sys_mount_part` | 3 (disk_id, part_no, name) | 0 oder Fehlercode |
 | 271 | 198 | `sys_mount_list` | 2 (idx, out) | 0 oder −1; füllt 48 Byte je Eintrag |
 | 272 | 199 | `sys_mount_count` | 0 | Anzahl der Einträge |
+| 273 | 359 | `sys_sig_post` | 2 (tid, code) | 0 zugestellt, -1 kein solcher Strang oder Code unzulaessig, -12 Schlange voll, -13 von der Maske blockiert; tid == 0 heisst an sich selbst; laeuft unter PLEDGE_PROC wie sys_kill (#2544) |
+| 274 | 360 | `sys_sig_poll` | 0 | aeltester wartender Code, 0 = nichts da; braucht kein Recht, betrifft nur den Aufrufer (#2544) |
 
 **`sys_mount_part` nimmt DREI Argumente, nicht vier.** Die Entwurfssignatur
 nennt `(disk_id, part_no, name, flags)`; gebaut ist
