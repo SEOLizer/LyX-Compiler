@@ -1,0 +1,187 @@
+// src/backend/ziel_modell.lyx — #2552: Was ein Ziel ausmacht, an EINER Stelle.
+//
+// WARUM DIESE DATEI. Die Eigenschaften eines Ziels standen bisher als
+// Aufzaehlung an jeder Stelle, die sie braucht. Gezaehlt vor dieser Datei:
+// 140 Nennungen von LYX_TC_* in src/lyxc.lyx und 7 in src/ir_lower.lyx,
+// darunter 54 Vergleiche der Form `self.target == ...`. Drei Folgen davon
+// sind belegt, nicht befuerchtet:
+//
+//  1. ir_lower sah die Konstanten gar nicht und schrieb die Ziele als ROHE
+//     ZAHLEN (`if ziel == 14`, `if (zielCode == 2)`). Wer ein Ziel hinzufuegt,
+//     muss diese Zahlen finden, ohne dass ein Name danach greifbar ist.
+//  2. Dieselbe Zuordnung stand zweimal: `lyxc._lyuArchFuerZiel` und
+//     `_irLyuArchFuerZiel` in ir_lower, mit dem Kommentar "die beiden muessen
+//     uebereinstimmen". Genau so laufen Aufzaehlungen auseinander (#2432,
+//     #2450, #2463).
+//  3. Eigenschaftsfragen entstanden als Oder-Ketten an der Verwendungsstelle
+//     (`lyxc.lyx:3410`: sechs Ziele, die ihre Datei selbst schreiben). Ein
+//     neues Ziel faellt dort still durch und nimmt den falschen Zweig.
+//
+// DIESE DATEI HAT KEINE IMPORTE, und das ist Absicht: src.lyu_writer fuehrt
+// die LYU_ARCH_*-Kennungen und importiert selbst src.ir_lower, waehrend
+// ir_lower diese Datei importiert. Ein Import von lyu_writer waere also ein
+// Zyklus. Dieselbe Bauart haben src/backend/linux_syscalls.lyx und
+// src/backend/builtin_ziele.lyx — beide ebenfalls reine Auskunftsmodule.
+// Deshalb steht die LYU_ARCH-Zuordnung hier NOCH NICHT: sie braucht zuerst
+// einen Umzug der Formatkennungen nach src.lyu_reader, den beide Seiten schon
+// importieren. Bis dahin bleiben die zwei Stellen gekoppelt wie bisher.
+//
+// WAS HIER NICHT HINEINGEHOERT: CPU-Merkmale. Ob ein Erzeugnis SSE4 oder AVX2
+// benutzen darf, ist keine Frage an das Ziel, sondern an die Maschine — das
+// beantwortet cg_cpuHat. Eine Eigenschaft, die "Ziel X kann Vektoren" heisst,
+// waere eine Praefixaussage ueber alles, was spaeter dazukommt.
+
+// ============================================================================
+// Ziel-Kennungen. EINE Quelle; src/lyxc.lyx und src/ir_lower.lyx importieren
+// sie. Die Zahlen sind unveraenderlich: sie stehen im arch-Feld von .lyu und
+// in Meldungen, ein Umnummerieren macht vorhandene .lyu-Dateien fremd.
+// ============================================================================
+
+pub con LYX_TC_X86_64:         int64 := 1;
+pub con LYX_TC_ARM64:          int64 := 2;
+pub con LYX_TC_RISCV64:        int64 := 3;
+pub con LYX_TC_ARM_CM:         int64 := 4;
+pub con LYX_TC_MACOS_X86_64:   int64 := 5;
+pub con LYX_TC_WINDOWS_X86_64: int64 := 6;
+pub con LYX_TC_MACOS_ARM64:    int64 := 7;
+pub con LYX_TC_WINDOWS_ARM64:  int64 := 8;
+pub con LYX_TC_LINUX_RISCV64:  int64 := 9;
+pub con LYX_TC_ARM_CM4:        int64 := 10;
+pub con LYX_TC_XTENSA:         int64 := 11;
+pub con LYX_TC_ANDROID_ARM64:  int64 := 12;
+pub con LYX_TC_ANDROID_X86_64: int64 := 13;
+pub con LYX_TC_LYXOS:          int64 := 14;
+
+// Naechste freie Kennung: 15. Fuer die 32-Bit-Linux-Ziele vorgesehen
+// (#2554 i386, #2553 arm32); sie werden erst eingetragen, wenn ihr Backend
+// uebersetzt — ein Ziel, das man waehlen kann und das nichts erzeugt, ist
+// schlimmer als keines.
+pub con LYX_TC_MAX_BEKANNT: int64 := 14;
+
+// ============================================================================
+// Wortbreite des Ziels in Bytes.
+//
+// 8 ueberall, wo ein Maschinenwort 64 Bit hat; 4 auf den freistehenden
+// 32-Bit-Zielen. Die 4 ist dort KEINE ILP32-Faehigkeit: arm_cm und xtensa
+// behandeln int64 als EIN Wort von 32 Bit und weisen groessere Werte ab
+// (src/backend/arm_cm_backend.lyx:201-216 und :1137-1154, #2237). Ein
+// 32-Bit-LINUX-Ziel braucht stattdessen die Zerlegung in ein Registerpaar
+// (#2552) — die Breite allein sagt darueber nichts.
+// ============================================================================
+
+pub fn ZielWortBytes(ziel: int64): int64 {
+  if (ziel == LYX_TC_ARM_CM)  { return 4; }
+  if (ziel == LYX_TC_ARM_CM4) { return 4; }
+  if (ziel == LYX_TC_XTENSA)  { return 4; }
+  return 8;
+}
+
+// ============================================================================
+// ELF-Klasse des Erzeugnisses: 2 = ELFCLASS64, 1 = ELFCLASS32, 0 = kein ELF
+// (PE oder Mach-O).
+//
+// GEMESSEN, nicht abgeleitet — `readelf -h` am Erzeugnis eines leeren
+// Programms, uebersetzt mit diesem Compiler:
+//   --target=arm-cm4 -> ELF32      --target=arm64 -> ELF64
+//   --target=esp32   -> ELF32      --target=riscv -> ELF64
+// Der ELF32-Weg ist also vorhanden: src/backend/arm_cm/write_elf32.lyx mit
+// TElf32Header, TElf32Phdr und ELF_HDR_SIZE 52 / PHDR_SIZE 32 / SHDR_SIZE 40.
+// Er ist allerdings auf EM_ARM festgelegt (dort Zeile 190) und traegt die
+// STM32-Speicherkarte; fuer ein 32-Bit-Linux-Ziel muss e_machine beweglich
+// werden und die Lastadresse vom Ziel kommen.
+// ============================================================================
+
+pub con ZIEL_ELF_KEINS: int64 := 0;
+pub con ZIEL_ELF32:     int64 := 1;
+pub con ZIEL_ELF64:     int64 := 2;
+
+pub fn ZielElfKlasse(ziel: int64): int64 {
+  if (ziel == LYX_TC_WINDOWS_X86_64) { return ZIEL_ELF_KEINS; }   // PE
+  if (ziel == LYX_TC_WINDOWS_ARM64)  { return ZIEL_ELF_KEINS; }   // PE
+  if (ziel == LYX_TC_MACOS_X86_64)   { return ZIEL_ELF_KEINS; }   // Mach-O
+  if (ziel == LYX_TC_MACOS_ARM64)    { return ZIEL_ELF_KEINS; }   // Mach-O
+  if (ziel == LYX_TC_ARM_CM)         { return ZIEL_ELF32; }
+  if (ziel == LYX_TC_ARM_CM4)        { return ZIEL_ELF32; }
+  if (ziel == LYX_TC_XTENSA)         { return ZIEL_ELF32; }
+  return ZIEL_ELF64;
+}
+
+// ============================================================================
+// Syscall-Raum: welche Nummerntabelle gilt.
+//
+// Die Raeume sind verschieden, auch innerhalb von Linux: x86-64 zaehlt eigen
+// (write 1), die generische ABI von arm64 und riscv64 anders (write 64), und
+// src/backend/linux_syscalls.lyx sagt im Kopf selbst, dass es "eine Stelle
+// fuer arm64 UND riscv" ist. Wer ein Ziel nach dem falschen Raum fragt,
+// bekommt eine gueltige Nummer mit falscher Bedeutung — kein Fehler, ein
+// anderer Syscall.
+//
+// Fuer die 32-Bit-Linux-Ziele kommen eigene Raeume hinzu (i386: write 4), und
+// zwar mit den *64-Varianten und den time64-Syscalls; die generische Tabelle
+// nimmt bewusst clock_gettime 113 statt clock_gettime64 403
+// (linux_syscalls.lyx:150-151) und gilt daher dort nicht.
+// ============================================================================
+
+pub con SYSR_KEINER:           int64 := 0;   // freistehend, kein Betriebssystem
+pub con SYSR_LINUX_X86_64:     int64 := 1;
+pub con SYSR_LINUX_GENERISCH:  int64 := 2;   // arm64, riscv64
+pub con SYSR_LYXOS:            int64 := 3;
+pub con SYSR_WINDOWS:          int64 := 4;   // kein Syscall: Importtabelle
+pub con SYSR_MACOS:            int64 := 5;
+
+pub fn ZielSyscallRaum(ziel: int64): int64 {
+  if (ziel == LYX_TC_ARM_CM)         { return SYSR_KEINER; }
+  if (ziel == LYX_TC_ARM_CM4)        { return SYSR_KEINER; }
+  if (ziel == LYX_TC_XTENSA)         { return SYSR_KEINER; }
+  if (ziel == LYX_TC_LYXOS)          { return SYSR_LYXOS; }
+  if (ziel == LYX_TC_WINDOWS_X86_64) { return SYSR_WINDOWS; }
+  if (ziel == LYX_TC_WINDOWS_ARM64)  { return SYSR_WINDOWS; }
+  if (ziel == LYX_TC_MACOS_X86_64)   { return SYSR_MACOS; }
+  if (ziel == LYX_TC_MACOS_ARM64)    { return SYSR_MACOS; }
+  if (ziel == LYX_TC_ARM64)          { return SYSR_LINUX_GENERISCH; }
+  if (ziel == LYX_TC_ANDROID_ARM64)  { return SYSR_LINUX_GENERISCH; }
+  if (ziel == LYX_TC_RISCV64)        { return SYSR_LINUX_GENERISCH; }
+  if (ziel == LYX_TC_LINUX_RISCV64)  { return SYSR_LINUX_GENERISCH; }
+  return SYSR_LINUX_X86_64;                  // x86_64, android-x86_64
+}
+
+// ============================================================================
+// Schreibt der Emitter die Ausgabedatei selbst?
+//
+// Loest die Oder-Kette aus src/lyxc.lyx:3410 auf. Trifft die Antwort nicht,
+// wird die Datei entweder zweimal oder gar nicht geschrieben — ein neues Ziel
+// faellt in der Kette still auf "nein".
+// ============================================================================
+
+pub fn ZielSchreibtDateiSelbst(ziel: int64): int64 {
+  if (ziel == LYX_TC_WINDOWS_ARM64) { return 1; }
+  if (ziel == LYX_TC_LINUX_RISCV64) { return 1; }
+  if (ziel == LYX_TC_RISCV64)       { return 1; }
+  if (ziel == LYX_TC_ARM_CM4)       { return 1; }
+  if (ziel == LYX_TC_XTENSA)        { return 1; }
+  if (ziel == LYX_TC_LYXOS)         { return 1; }
+  return 0;
+}
+
+// ============================================================================
+// Name des Ziels fuer Meldungen. Gibt es die Kennung nicht, sagt die Auskunft
+// das — sie erfindet keinen Namen.
+// ============================================================================
+
+pub fn ZielName(ziel: int64): pchar {
+  if (ziel == LYX_TC_X86_64)         { return "x86_64"c; }
+  if (ziel == LYX_TC_ARM64)          { return "arm64"c; }
+  if (ziel == LYX_TC_RISCV64)        { return "riscv64"c; }
+  if (ziel == LYX_TC_ARM_CM)         { return "arm_cm"c; }
+  if (ziel == LYX_TC_MACOS_X86_64)   { return "macos-x86_64"c; }
+  if (ziel == LYX_TC_WINDOWS_X86_64) { return "windows-x86_64"c; }
+  if (ziel == LYX_TC_MACOS_ARM64)    { return "macos-arm64"c; }
+  if (ziel == LYX_TC_WINDOWS_ARM64)  { return "windows-arm64"c; }
+  if (ziel == LYX_TC_LINUX_RISCV64)  { return "linux-riscv64"c; }
+  if (ziel == LYX_TC_ARM_CM4)        { return "arm-cm4"c; }
+  if (ziel == LYX_TC_XTENSA)         { return "esp32"c; }
+  if (ziel == LYX_TC_ANDROID_ARM64)  { return "android-arm64"c; }
+  if (ziel == LYX_TC_ANDROID_X86_64) { return "android-x86_64"c; }
+  if (ziel == LYX_TC_LYXOS)          { return "lyxos"c; }
+  return "unbekanntes Ziel"c;
+}
