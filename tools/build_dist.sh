@@ -334,11 +334,24 @@ backend_bauen() {
     echo "  [1/5] Compiler: fuer $name nicht vorgesehen (nur Units)"
   else
     echo "  [1/5] Compiler uebersetzen ($binname) — dauert Minuten"
-    if "$LYXC" --std-path="$ROOT" --target="$target" --format="$format" \
+    # #2519: Fuer win64 ausdruecklich NACHSICHTIG uebersetzen. Seit 1.2.41I weist
+    # der win64-Pfad rohe Linux-Syscalls ab statt sie still ins PE zu
+    # uebernehmen -- und `lyxc` selbst laesst 62 davon stehen (stat, fork,
+    # execve, wait4, getdents64, clock_gettime, getrandom ...), weil es fuer sie
+    # noch keine Win32-Entsprechung gibt (#2519 Punkt 2).
+    #
+    # Ohne den Schalter waere der win64-Compiler ab sofort NICHT MEHR BAUBAR.
+    # Die Nachsicht ist deshalb keine Abschwaechung, sondern die Buchfuehrung:
+    # die Nummernliste landet unten in COMPILER-WARNUNGEN.txt und damit im
+    # ausgelieferten Baum, wo sie jemand sieht.
+    SYSCALL_NACHSICHT=""
+    [ "$target" = "win64" ] && SYSCALL_NACHSICHT="--win64-syscalls=warnen"
+    if "$LYXC" --std-path="$ROOT" --target="$target" --format="$format" $SYSCALL_NACHSICHT \
          src/lyxc.lyx -o "$D/bin/$binname" >"$D/bin/.bau.log" 2>&1; then
       chmod 755 "$D/bin/$binname"
-      # Die Warnung ueber rohe Linux-Syscalls (#1678) ist ein offener Defekt
-      # und gehoert in den Baum, nicht ins Lograuschen.
+      # Die Meldung ueber rohe Linux-Syscalls (#2519, vormals #1678) ist ein
+      # offener Defekt und gehoert in den Baum, nicht ins Lograuschen. Sie
+      # nennt seit 1.2.41I die NUMMERN, nicht bloss die Anzahl.
       grep -i 'warning' "$D/bin/.bau.log" > "$D/COMPILER-WARNUNGEN.txt" 2>/dev/null
       [ -s "$D/COMPILER-WARNUNGEN.txt" ] || rm -f "$D/COMPILER-WARNUNGEN.txt"
       mv "$D/bin/.bau.log" "$D/bin/compiler-bau.log"

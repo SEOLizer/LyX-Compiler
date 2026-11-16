@@ -27,7 +27,17 @@ fn main(): int64 { PrintLn(42); return 0; }
 LYX
 
 # 1) lyxc selbst nach win64 uebersetzen
-if ! ( cd "$ROOT" && timeout 900 "$LYXC" --std-path="$ROOT" --target=win64 --format=pe \
+# #2519: MIT --win64-syscalls=warnen. Seit 1.2.41I weist der win64-Pfad rohe
+# Linux-Syscalls ab, statt sie still ins PE zu uebernehmen -- und `lyxc`
+# selbst laesst 62 davon stehen (stat, fork, execve, wait4, getdents64,
+# clock_gettime, getrandom ...), weil fuer sie noch keine Win32-Entsprechung
+# existiert (#2519 Punkt 2).
+#
+# Dieser Test fragt "kann lyxc sich selbst nach win64 uebersetzen", nicht
+# "ist das PE syscallfrei" -- das zweite prueft win64_syscalls_test.sh mit
+# einer eigenen Schranke. Ohne den Schalter wuerde dieser Test etwas
+# anderes messen als seinen Zweck.
+if ! ( cd "$ROOT" && timeout 900 "$LYXC" --std-path="$ROOT" --target=win64 --format=pe --win64-syscalls=warnen \
          src/lyxc.lyx -o "$TMP/lyxc.exe" ) >"$TMP/bau.log" 2>&1; then
   nok "lyxc nach win64 uebersetzen: $(grep -m1 -i error "$TMP/bau.log")"
   echo; echo "Ergebnis: $PASS PASS, $FAIL FAIL"; exit 1
