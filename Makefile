@@ -903,6 +903,7 @@ test: lyxc
 	@bash tests/crypto_x509_test.sh
 	@bash tests/crypto_x509_kette_test.sh
 	@bash tests/crypto_kette_rsa_ed25519_test.sh
+	@bash tests/x509_nameconstraints_test.sh
 	@bash tests/tls13_handschlag_test.sh
 	@bash tests/tls13_schluesselarten_test.sh
 	@bash tests/tls13_hrr_gruppen_test.sh
