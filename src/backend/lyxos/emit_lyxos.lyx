@@ -1485,6 +1485,41 @@ pub type EmitLyxOS = class {
 
     // LX-06: generic N-arg LyxOS VFS syscall emitter
     // Args expected in slots 0..argc-1; return value (rdx) stored to dest.
+    // #2531: mov rsi, imm32 (vorzeichenerweitert) -- fuer ein KONSTANTES
+    // zweites Syscall-Argument. Es gab bisher nur emitMovRdiImm32.
+    fn emitMovRsiImm32(v: int64): void {
+        self.emit8(0x48); self.emit8(0xC7); self.emit8(0xC6); self.emit32(v);
+    }
+
+    // #2531: sys_unlink(97) in der FLACHEN Kernelform (path_phys, flags).
+    // Bit 0 der Flags ist UNLINK_DIR -- damit ist `rmdir` derselbe Aufruf wie
+    // `unlink`, nur mit gesetztem Bit (lyx-os doku/syscalls_ist.md, Nr 97).
+    //
+    // Der Pfad kommt aus einem Slot, die Flags sind eine Konstante; dafuer
+    // passt keine der beiden emitVfsSyscall*-Formen, die ihre Argumente
+    // ausschliesslich aus Slots laden.
+    //
+    // Die Pruefung ist hier kurz und nennt die EIGENE Ursache, statt die
+    // vierzig Zeilen Nummernspannen aus emitVfsSyscall ein drittes Mal zu
+    // fuehren -- zwei Aufzaehlungen derselben Sache laufen auseinander.
+    fn emitUnlinkFlach(pathSlot: int64, flags: int64, dest: int64): void {
+        if (self.lyxosNummerBelegt(97) == 0 || self.lyxosGestaltPasst(97, 2) == 0) {
+            EPrintStrLn("error: lyxos: sys_unlink(97) mit ZWEI Argumenten (path, flags) ist im"c);
+            EPrintStrLn("  abgelegten Stand nicht belegt. Der Kernel hat die Gestalt mit 1fe08f7"c);
+            EPrintStrLn("  von einem auf zwei Argumente geaendert (Bit 0 = UNLINK_DIR)."c);
+            EPrintStrLn("  Erneuern mit tools/lyxos_syscall_abgleich.sh --schreiben, dann"c);
+            EPrintStrLn("  tools/lyxos_abi_erzeugen.sh (#2531)."c);
+            exit(1);
+        }
+        self.emitMovRaxImm(97);
+        self.emitMovRdiFromSlot(pathSlot);
+        self.emitMovRsiImm32(flags);
+        self.emitSyscall();
+        self.emit8(0x49); self.emit8(0x89); self.emit8(0xC7);  // MOV r15, rax (Fehlercode)
+        self.emit8(0x48); self.emit8(0x89); self.emit8(0xD0);  // MOV rax, rdx (LyxOS: rdx=value)
+        self.emitMovSlotFromRax(dest);
+    }
+
     fn emitVfsSyscall(nr: int64, argc: int64, dest: int64): void {
         // #1734: Nummer gegen den TATSAECHLICH implementierten Raum pruefen.
         //
@@ -1542,7 +1577,7 @@ pub type EmitLyxOS = class {
               EPrintStrLn(" emittieren -- die gibt es in LyxOS nicht."c);
             }
             EPrintStrLn("  Belegt sind 0-3, 8-9, 11-12, 24-25, 60, 79-122, 124-191, 196-203, 205-207,"c);
-            EPrintStrLn("  210-215, 217-258, 300-356, 515-517, 522-524, 768-769, 1024-1036, 1280-1284,"c);
+            EPrintStrLn("  210-215, 217-258, 300-363, 515-517, 522-524, 768-769, 1024-1036, 1280-1284,"c);
             EPrintStrLn("  1536-1545, 1792-1800, 2063-2066, 2315, 2560-2565, 2816-2825, 3072-3076."c);
             EPrintStrLn("  (Stand work/lyxos/syscall-ist.txt)"c);
             EPrintStrLn("  Massgeblich ist work/lyxos/syscall-ist.txt; erneuern mit"c);
@@ -1689,15 +1724,35 @@ pub type EmitLyxOS = class {
             EPrintInt(nr);
             if (gestaltOk == 0) {
               EPrintStrLn(" emittieren -- die gibt es in LyxOS, aber nicht in dieser Aufrufform."c);
-              EPrintStrLn("  Die NUMMER gibt es (sys_pipe 524, seit LyxOS 564aa74) -- die GESTALT nicht:"c);
-              EPrintStrLn("  der Kernel nimmt (fds_uva, flags), also ZWEI Argumente und einen gemeinsamen"c);
-              EPrintStrLn("  Ausgabezeiger. Unsere Form pipe(rfd_out, wfd_out, flags) hat drei. Dasselbe"c);
-              EPrintStrLn("  gilt fuer sys_pipe2 (320). Anzubinden waere das an der Aufrufstelle."c);
+              // #2531: Hier stand der sys_pipe-Satz UNBEDINGT -- also auch fuer
+              // jede andere Nummer. Gemessen: `unlink` (Nr 97, zwei Argumente
+              // erwartet, eines geladen) bekam die Auskunft, der Kernel nehme
+              // (fds_uva, flags) und es gehe um sys_pipe 524. Das schickt den
+              // Leser an die falsche Stelle. Die Schwesterstelle in
+              // emitVfsSyscall hat seit #2482 die richtige Form -- sie wurde
+              // hier nicht nachgezogen. Dieselben Zeilen, dieselbe Bedingung.
+              var erwM: int64 := LyxosArgcFuerNr(nr);
+              if (erwM >= 0) {
+                EPrintStr("  Der Kernel liest hier "c); EPrintInt(erwM);
+                EPrintStr(" Argument(e), geladen wurden "c); EPrintInt(argc);
+                EPrintStrLn("."c);
+                var nmM: pchar := LyxosNameFuerNr(nr);
+                if ((nmM as int64) != 0) {
+                  EPrintStr("  Der Kernel fuehrt die Nummer als "c);
+                  EPrintStr(nmM); EPrintStrLn("."c);
+                }
+              }
+              if (nr == 0x020C) {
+                EPrintStrLn("  Die NUMMER gibt es (sys_pipe 524, seit LyxOS 564aa74) -- die GESTALT nicht:"c);
+                EPrintStrLn("  der Kernel nimmt (fds_uva, flags), also ZWEI Argumente und einen gemeinsamen"c);
+                EPrintStrLn("  Ausgabezeiger. Unsere Form pipe(rfd_out, wfd_out, flags) hat drei. Dasselbe"c);
+                EPrintStrLn("  gilt fuer sys_pipe2 (320). Anzubinden waere das an der Aufrufstelle."c);
+              }
               exit(1);
             }
             EPrintStrLn(" emittieren -- die gibt es in LyxOS nicht."c);
             EPrintStrLn("  Belegt sind 0-3, 8-9, 11-12, 24-25, 60, 79-122, 124-191, 196-203, 205-207,"c);
-            EPrintStrLn("  210-215, 217-258, 300-356, 515-517, 522-524, 768-769, 1024-1036, 1280-1284,"c);
+            EPrintStrLn("  210-215, 217-258, 300-363, 515-517, 522-524, 768-769, 1024-1036, 1280-1284,"c);
             EPrintStrLn("  1536-1545, 1792-1800, 2063-2066, 2315, 2560-2565, 2816-2825, 3072-3076."c);
             EPrintStrLn("  (Stand work/lyxos/syscall-ist.txt)"c);
             EPrintStrLn("  Massgeblich ist work/lyxos/syscall-ist.txt; erneuern mit"c);
@@ -1802,7 +1857,10 @@ pub type EmitLyxOS = class {
         else if id == 25 { self.emitVfsSyscall(0x0205, 4, dest); }    // sys_stat
         else if id == 26 { self.emitVfsSyscall(135, 2, dest); }    // sys_fstat §10.4=135
         else if id == 27 { self.emitVfsSyscall(139, 1, dest); }    // sys_mkdir §10.4=139 — flach (#1742)
-        else if id == 28 { self.emitVfsSyscall(97, 1, dest); }    // sys_unlink §10.4=97 — flach (#1742)
+        // #2531: Nr 97 nimmt seit lyx-os 1fe08f7 ZWEI Argumente (path, flags).
+        // Mit argc=1 blieb rsi ungesetzt, der Kernel las dort Muell als Flags
+        // -- und Bit 0 davon haette aus unlink ein rmdir gemacht.
+        else if id == 28 { self.emitUnlinkFlach(0, 0, dest); }    // sys_unlink §10.4=97 — flach (#1742)
         else if id == 29 { self.emitVfsSyscall(96, 2, dest); }    // sys_rename §10.4=96 — flach (#1742)
         else if id == 30 { self.emitVfsSyscall(0x020A, 3, dest); }    // sys_readdir
         else if id == 31 { self.emitVfsSyscall(0x020B, 2, dest); }    // sys_dup
@@ -2300,7 +2358,7 @@ pub type EmitLyxOS = class {
         else if id == 222 { self.emitVfsSyscallAB(0,  3, argBase, dest); }   // read(fd,buf,n)
         else if id == 223 { self.emitVfsSyscallAB(95, 3, argBase, dest); }   // write(fd,buf,n)
         else if id == 224 { self.emitVfsSyscallAB(96, 2, argBase, dest); }   // rename(old,new)
-        else if id == 225 { self.emitVfsSyscallAB(97, 1, argBase, dest); }   // unlink(path)
+        else if id == 225 { self.emitUnlinkFlach(argBase, 0, dest); }   // unlink(path) -> (path, flags=0), #2531
         else if id == 226 { self.emitVfsSyscallAB(139,1, argBase, dest); }   // mkdir(path) — mode verworfen
         else if id == 227 { self.emitVfsSyscallAB(60, 1, argBase, dest); }   // exit(code)
         // lyxc→LyxOS: 0x0200-Block. Hier stand "kernel-adoptiert via deferred
@@ -2428,7 +2486,14 @@ pub type EmitLyxOS = class {
             self.emitMovSlotFromRax(dest);
         }
         // rmdir → sys_unlink(AT_CWD, path, UNLINK_DIR=1) @ 0x0208 (deferred VFS-Block).
-        else if id == 236 { self.emitVfsSyscallAB(0x0208, 3, argBase, dest); }
+        // #2531: Der Kernel KANN es jetzt -- Nr 97 nimmt (path, flags), Bit 0
+        // ist UNLINK_DIR. 0x0208 (520) gab es nie; jeder --target=lyxos-Bau,
+        // der rmdir erreichte, brach mit "die gibt es in LyxOS nicht" ab.
+        //
+        // _lscAt legt die LINUX-Form ab: Slot argBase = dirfd (AT_FDCWD),
+        // argBase+1 = Pfad, argBase+2 = AT_REMOVEDIR (512). Fuer LyxOS gilt
+        // davon nur der Pfad, und das Flag ist 1, nicht 512.
+        else if id == 236 { self.emitUnlinkFlach(argBase + 1, 1, dest); }
         // WP-WSP: Kernel-Systemprimitive (cpu-ctrl / Fences / Atomics).
         else if id == 240 { self.emit8(0xF3); self.emit8(0x90); }                  // cpu_pause (PAUSE)
         else if id == 241 { self.emit8(0xF4); }                                    // cpu_hlt (HLT)
@@ -4535,7 +4600,14 @@ pub type EmitLyxOS = class {
         // #2011 (WP-G4) und #2441-Abgleich: 351 -> 356. Die Nummern 352-356
         // sind LX-09 -- thread_spawn, thread_exit, wait, priority und
         // signal_mask (lyx-os kernel/proc09.lyx, posix_ext).
-        if nr >= 300 && nr <= 356 { return 1; }   // 329-341 seit b3fad13 (PCI, NIC);
+        //
+        // #2544: 356 -> 363. Neu sind 357 sys_boot_info, 358 sys_nanosleep,
+        // 359 sys_sig_post, 360 sys_sig_poll, 361 sys_zeit_info,
+        // 362 sys_zeit_set_utc und 363 sys_zeit_tz (lyx-os 1fe08f7,
+        // kernel/ring3.lyx posix_ext und kernel/proc09.lyx). Quelle des
+        // Bereichs ist work/lyxos/syscall-ist.txt, nachgezogen mit
+        // tools/lyxos_syscall_abgleich.sh --schreiben.
+        if nr >= 300 && nr <= 363 { return 1; }   // 329-341 seit b3fad13 (PCI, NIC);
                                                   // 342-347 seit 68f7920 (USB-Diagnose,
                                                   // Toast: 344 post, 345 fetch, 346 seq);
                                                   // 348/349 Ereignisring lesen (#2011,

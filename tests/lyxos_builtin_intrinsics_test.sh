@@ -181,7 +181,13 @@ compile_ok "nanosleep_compiles" 'fn main(): int64 { var ts: int64 := 0; return n
 # die alte zu pruefen hiesse verlangen, dass der Compiler etwas Unwahres sagt.
 compile_fail "pipe_meldet"     'fn main(): int64 { var a: int64 := 0; var b: int64 := 0; return pipe(a, b, 0); }' "nicht in dieser Aufrufform"
 compile_fail "truncate_meldet" 'fn main(): int64 { return truncate(3, 100); }' "gibt es in LyxOS nicht"
-compile_fail "rmdir_meldet"    'fn main(): int64 { return rmdir("d"); }' "gibt es in LyxOS nicht"
+# #2531: Bis 1.2.40F wurde `rmdir` abgelehnt, weil es 0x0208 (520) emittierte
+# -- eine Nummer aus der Entwurfs-ABI, die es nie gab. Der Kernel hat es seit
+# lyx-os 1fe08f7: sys_unlink (97) nimmt (path, flags), Bit 0 ist UNLINK_DIR.
+# Die Ablehnung hier als Nachweis zu fuehren hiesse jetzt verlangen, dass die
+# Luecke offen BLEIBT. Dass die Bits stimmen, prueft tests/lyxos_unlink_dir_test.sh
+# am Erzeugnis -- hier genuegt, dass es uebersetzt.
+compile_ok "rmdir_compiles"    'fn main(): int64 { return rmdir("d"); }'
 compile_ok "eprintint_compiles" 'fn main(): int64 { EPrintInt(42); return 0; }'
 compile_ok "argvget_compiles"  'fn main(): int64 { var av: int64 := 0; var p: pchar := ArgvGet(av, 0); return 0; }'
 compile_ok "fork_compiles"     'fn main(): int64 { return sys_fork(); }'

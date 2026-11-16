@@ -21,8 +21,8 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.40F
-VERSION_DATE := 2026-11-15
+VERSION   := 1.2.41A
+VERSION_DATE := 2026-11-16
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
 # #2499: Die Vorkompilate liegen je Architektur. Sobald eine .lyu Maschinencode
@@ -315,6 +315,8 @@ test: lyxc
 	@bash tests/con_globals_test.sh
 	@bash tests/lyxos_argv_test.sh
 	@bash tests/lyxos_caps_geraete_test.sh
+	@echo "--- rmdir/unlink auf die flache sys_unlink-Form (#2531) ---"
+	@bash tests/lyxos_unlink_dir_test.sh
 	@bash tests/lyxos_caps_warnung_test.sh
 	@bash tests/ir_if_kette_test.sh
 	@echo "--- match und switch auf dem IR-Weg (#1825) ---"
