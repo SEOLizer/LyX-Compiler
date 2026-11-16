@@ -157,6 +157,9 @@ pub type WinX86Backend = class {
   outCap: int64;
 
   // WP-A2.2: base relocations from codegen (image RVAs of absolute pointers).
+  // #2519: 1 = rohe Linux-Syscalls nur MELDEN statt abzuweisen.
+  // Vorgabe ist 0 (abweisen). Gesetzt von --win64-syscalls=warnen.
+  syscallsNurWarnen: int64;
   baseRelocBuf:    int64;
   baseRelocCount:  int64;
   peRVAs:          int64;   // sorted .text RVAs of the relocated pointers
@@ -1671,23 +1674,142 @@ pub type WinX86Backend = class {
   // darueber war aber der Grund, warum #1678 so lange unentdeckt blieb.
   // tests/win64_syscalls_test.sh haelt die Zahl fest, damit keine neue
   // dazukommt.
+  // #2519: Welche NUMMERN bleiben als roher Syscall im PE stehen?
+  //
+  // Bis 1.2.41H zaehlte diese Pruefung nur und WARNTE. Das war ein stiller
+  // Default in der milderen Form: die Meldung kam, nannte aber nicht, WAS
+  // fehlt ("57 rohe Linux-Syscalls" ist keine Handlungsanweisung), und der Bau
+  // lief durch. Auf Windows trifft jeder dieser Befehle einen fremden
+  // NT-Dienst -- arm64, riscv und lyxos weisen denselben Aufruf benannt ab
+  // (ir_lower), nur der x86-Weg, ueber den win64 laeuft, nahm ihn mit.
+  //
+  // Jetzt: die Nummern werden GENANNT und gezaehlt, und der Bau SCHEITERT --
+  // es sei denn, der Aufrufer hat ausdruecklich `--win64-syscalls=warnen`
+  // gesetzt.
+  //
+  // WARUM DIE AUSNAHME UEBERHAUPT EXISTIERT, und das ist gemessen, nicht
+  // vermutet: `lyxc` selbst braucht sie. `--target=win64 src/lyxc.lyx` laesst
+  // 57 Syscalls stehen (u. a. 4/6 stat, 57 fork, 59 execve, 61 wait4, 217
+  // getdents64 neunmal, 228 clock_gettime neunmal, 318 getrandom), und zwei
+  // der 40 geprueften Beispiele ebenfalls (pqc_demo 15, build_apk_demo 27).
+  // Ohne Ausnahme waere `make dist-win64` ab sofort unmoeglich -- ein Fehler,
+  // der das Bauen des Compilers verhindert, ist keine Verbesserung.
+  //
+  // Die Ausnahme ist damit keine Abschwaechung, sondern die Buchfuehrung ueber
+  // eine offene Luecke: wer sie setzt, bekommt die Nummernliste und weiss, was
+  // auf dem Geraet fehlschlaegt. Wer sie NICHT setzt, bekommt kein Erzeugnis,
+  // das auf Windows abstuerzt.
+  //
+  // Der Weg zur echten Loesung steht in #2519 Punkt 2: je Nummer eine
+  // Win32-Entsprechung, wie es wxb_replaceSyscallNr fuer 0, 1, 2, 3, 8, 231
+  // und wxb_replaceMmap/Munmap fuer 9 und 11 vormachen. Jede neue Entsprechung
+  // verkuerzt diese Liste von selbst -- es gibt keine zweite Stelle zu pflegen.
   fn wxb_pruefeSyscalls(endOff: int64) {
+    // Bis zu 64 verschiedene Nummern merken; mehr nennt die Meldung nicht
+    // einzeln, die Gesamtzahl stimmt trotzdem.
+    var nrBuf: int64 := alloc(64 * 16);
+    var nrAnz: int64 := 0;
     var n: int64 := 0;
+    var ohneNr: int64 := 0;
     var i: int64 := WIN_USER_OFF;
     while (i + 2 <= endOff) {
-      if (peek8(self.code + i) == 0x0F && peek8(self.code + i + 1) == 0x05) { n := n + 1; }
-      i := i + 1;
+      if (peek8(self.code + i) == 0x0F && peek8(self.code + i + 1) == 0x05) {
+        n := n + 1;
+        // Nummer rueckwaerts lesen: die zwei Formen, die der Codegen erzeugt --
+        // `48 B8 imm64` (movabs rax) und `B8 imm32` (mov eax). Dieselben zwei
+        // Formen kennen die Ersetzer darueber; eine dritte gibt es nicht.
+        var nr: int64 := 0 - 1;
+        if (i >= WIN_USER_OFF + 10 && peek8(self.code + i - 10) == 0x48
+            && peek8(self.code + i - 9) == 0xB8) {
+          nr := peek32(self.code + i - 8) & 0xFFFFFFFF;
+        } else if (i >= WIN_USER_OFF + 5 && peek8(self.code + i - 5) == 0xB8) {
+          nr := peek32(self.code + i - 4) & 0xFFFFFFFF;
+        }
+        if (nr < 0) {
+          // #2324: `0F 05` im Bytestrom ist nicht zwingend ein BEFEHL -- es
+          // kann in der vier Byte langen Weite eines unmittelbar davor
+          // stehenden Ruf- oder Sprungbefehls liegen (E8/E9 rel32, 0F 8x
+          // rel32). Gesehen bei einer Verschiebung 0xFFFF050F. Ein solcher
+          // Treffer wandert mit dem Code-Layout und taucht auf, sobald sich
+          // irgendwo eine Laenge aendert.
+          //
+          // DIESELBE PRUEFUNG steht in tests/win64_syscalls_test.sh
+          // (Funktion `in_verschiebung`) -- dort ist sie entstanden, hier ist
+          // sie nachgezogen, weil diese Stelle seit #2519 ABWEIST und ein
+          // Fehlalarm damit einen Bau grundlos bricht. Die beiden muessen
+          // uebereinstimmen.
+          var istWeite: int64 := 0;
+          var k: int64 := 1;
+          while (k <= 3) {
+            var a: int64 := i - k;
+            if (a >= WIN_USER_OFF) {
+              var ob: int64 := peek8(self.code + a) & 255;
+              if (ob == 0xE8 || ob == 0xE9) { istWeite := 1; }
+              if (a >= WIN_USER_OFF + 1) {
+                if ((peek8(self.code + a - 1) & 255) == 0x0F && ob >= 0x80 && ob <= 0x8F) {
+                  istWeite := 1;
+                }
+              }
+            }
+            k := k + 1;
+          }
+          if (istWeite != 0) {
+            n := n - 1;        // kein Befehl, also auch kein Syscall
+          } else {
+            ohneNr := ohneNr + 1;
+          }
+        } else {
+          var k: int64 := 0;
+          var gefunden: int64 := 0;
+          while (k < nrAnz) {
+            if (peek64(nrBuf + k * 16) == nr) {
+              poke64(nrBuf + k * 16 + 8, peek64(nrBuf + k * 16 + 8) + 1);
+              gefunden := 1;
+              k := nrAnz;
+            }
+            k := k + 1;
+          }
+          if (gefunden == 0 && nrAnz < 64) {
+            poke64(nrBuf + nrAnz * 16, nr);
+            poke64(nrBuf + nrAnz * 16 + 8, 1);
+            nrAnz := nrAnz + 1;
+          }
+        }
+        i := i + 2;
+      } else {
+        i := i + 1;
+      }
     }
-    if (n > 0) {
-      EPrintStr("warning: win64: "c);
-      EPrintInt(n);
-      EPrintStrLn(" rohe Linux-Syscalls im erzeugten Code (#1678)."c);
-      EPrintStrLn("  Auf Windows trifft jeder davon einen fremden NT-Dienst."c);
-      EPrintStrLn("  Ersetzt sind mmap, munmap, write, read, open, close, lseek"c);
-      EPrintStrLn("  und exit_group;"c);
-      EPrintStrLn("  der Rest hat noch keinen Ersatz."c);
+    if (n <= 0) { free(nrBuf, 64 * 16); return; }
+
+    if (self.syscallsNurWarnen != 0) { EPrintStr("warning: "c); } else { EPrintStr("error: "c); }
+    EPrintStr("win64: "c); EPrintInt(n);
+    EPrintStrLn(" rohe Linux-Syscalls bleiben im PE stehen (#2519)."c);
+    EPrintStrLn("  Windows hat keine Linux-Syscall-ABI; jeder davon trifft dort"c);
+    EPrintStrLn("  einen fremden NT-Dienst statt der gemeinten Funktion."c);
+    EPrintStr("  Nummern:"c);
+    var m: int64 := 0;
+    while (m < nrAnz) {
+      EPrintStr(" "c); EPrintInt(peek64(nrBuf + m * 16));
+      var cnt: int64 := peek64(nrBuf + m * 16 + 8);
+      if (cnt > 1) { EPrintStr("x"c); EPrintInt(cnt); }
+      m := m + 1;
     }
+    if (ohneNr > 0) { EPrintStr("  (dazu "c); EPrintInt(ohneNr); EPrintStr(" ohne erkennbare Nummer)"c); }
+    EPrintStrLn(""c);
+    EPrintStrLn("  Eine Win32-Entsprechung haben bisher: mmap, munmap, read,"c);
+    EPrintStrLn("  write, open, close, lseek, exit_group."c);
+    if (self.syscallsNurWarnen == 0) {
+      EPrintStrLn("  Mit --win64-syscalls=warnen wird daraus eine Warnung und das"c);
+      EPrintStrLn("  PE entsteht trotzdem -- dann ist bekannt, was darin fehlschlaegt."c);
+      free(nrBuf, 64 * 16);
+      exit(1);
+    }
+    free(nrBuf, 64 * 16);
   }
+
+  // #2519: Vorgabe ist abweisen; der Aufrufer kann es auf Melden herabsetzen.
+  pub fn SetSyscallsNurWarnen(an: int64) { self.syscallsNurWarnen := an; }
 
   // WP-A2.2: For each base reloc (ELF image RVA of an 8-byte absolute pointer),
   // map it to the win code-buffer position, add the constant ELF→win delta to the
@@ -2433,6 +2555,7 @@ pub type WinX86Backend = class {
   pub fn GetCodeSize(): int64 { return self.codeLen; }
 
   pub fn Init() {
+    self.syscallsNurWarnen := 0;   // #2519: Vorgabe = abweisen
     self.codeCap := 65536;
     self.code    := alloc(self.codeCap);
     self.codeLen := 0;
