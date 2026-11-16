@@ -33,6 +33,8 @@
 //   X509PasstName(satz, host, hostLen): bool   — RFC 6125
 //   X509IstSelbstAusgestellt(satz): bool
 //   X509NameGleich(derA, posA, lenA, derB, posB, lenB): bool
+//   X509NcPos/X509NcLen/X509NcKritisch (nameConstraints, 2.5.29.30)
+//   X509PruefeNameConstraints(kind, ca): 0 oder 13
 
 unit std.crypto.x509;
 
@@ -70,7 +72,13 @@ con X_EKU:      int64 := 176;
 con X_HASBC:    int64 := 184;
 con X_SANPOS:   int64 := 192;
 con X_SANLEN:   int64 := 200;
-con X_SIZE:     int64 := 208;
+// nameConstraints (2.5.29.30, RFC 5280 §4.2.1.10): Ausschnitt des
+// NameConstraints-SEQUENCE und das Kritisch-Bit. Ohne die Erweiterung ist
+// X_NCPOS 0.
+con X_NCPOS:    int64 := 208;
+con X_NCLEN:    int64 := 216;
+con X_NCKRIT:   int64 := 224;
+con X_SIZE:     int64 := 232;
 
 // ---------------------------------------------------------------------------
 // Kratzspeicher der Unit
@@ -111,14 +119,18 @@ con XS_KU:       int64 := 384;    // 32
 con XS_EKU:      int64 := 416;    // 80
 con XS_ALG:      int64 := 496;    // 48
 con XS_SIG:      int64 := 544;    // 96
-con XS_KETTE:    int64 := 640;    // 416
-con XS_SANANZ:   int64 := 1056;   // 32
-con XS_SANAT:    int64 := 1088;   // 32
-con XS_PASST:    int64 := 1120;   // 24
-con XS_CN:       int64 := 1152;   // 176
-con XS_HASH:     int64 := 1344;   // 64 Byte Hash des TBS
-con XS_RSAKEY:   int64 := 1408;   // Platz fuer einen RSA-Schluessel
-con XS_GROESSE:  int64 := 2560;
+// Drei Saetze: Kind, Elternteil und das Blatt. Das Blatt wird mitgefuehrt,
+// weil die nameConstraints JEDER CA der Kette fuer das Blatt gelten, nicht
+// nur fuer ihr unmittelbares Kind (RFC 5280 §6.1.4).
+con XS_KETTE:    int64 := 640;    // 3 * X_SIZE = 696
+con XS_SANANZ:   int64 := 1336;   // 32
+con XS_SANAT:    int64 := 1368;   // 32
+con XS_PASST:    int64 := 1400;   // 24
+con XS_CN:       int64 := 1424;   // 176
+con XS_HASH:     int64 := 1600;   // 64 Byte Hash des TBS
+con XS_NC:       int64 := 1664;   // 128 Byte: nameConstraints-Pruefung
+con XS_RSAKEY:   int64 := 1792;   // Platz fuer einen RSA-Schluessel
+con XS_GROESSE:  int64 := 2944;
 
 var _x509Scr: int64 := 0;
 
@@ -154,6 +166,11 @@ pub fn X509HatBasicConstraints(s: int64): bool { return peek64(s + X_HASBC) != 0
 pub fn X509Version(s: int64): int64 { return peek64(s + X_VERSION); }
 pub fn X509SerienNrPos(s: int64): int64 { return peek64(s + X_SERPOS); }
 pub fn X509SerienNrLen(s: int64): int64 { return peek64(s + X_SERLEN); }
+// nameConstraints: Ausschnitt im DER (0/0 wenn die Erweiterung fehlt) und
+// ihr Kritisch-Bit.
+pub fn X509NcPos(s: int64): int64 { return peek64(s + X_NCPOS); }
+pub fn X509NcLen(s: int64): int64 { return peek64(s + X_NCLEN); }
+pub fn X509NcKritisch(s: int64): bool { return peek64(s + X_NCKRIT) != 0; }
 pub fn X509DerPuffer(s: int64): int64 { return peek64(s + X_DER); }
 pub fn X509DerLen(s: int64): int64 { return peek64(s + X_DERLEN); }
 
@@ -538,6 +555,14 @@ pub fn X509Lies(der: int64, derLen: int64, satz: int64): bool {
                                 if (DerTag(sanF) != 0x30) { return false; }
                                 poke64(satz + X_SANPOS, DerInhalt(sanF));
                                 poke64(satz + X_SANLEN, DerInhaltLen(sanF));
+                            } else {
+                                if (DerOidGleich(der, oidF, ob, oidExt(ob, 30))) {
+                                    if (!DerLies(der, wPos + wLen, wPos, sanF)) { return false; }
+                                    if (DerTag(sanF) != 0x30) { return false; }
+                                    poke64(satz + X_NCPOS, DerInhalt(sanF));
+                                    poke64(satz + X_NCLEN, DerInhaltLen(sanF));
+                                    poke64(satz + X_NCKRIT, kritisch);
+                                }
                             }
                         }
                     }
@@ -930,11 +955,212 @@ fn kettenSuche(kind: int64, liste: int64, n: int64, satzOut: int64): int64 {
     return -1;
 }
 
+// ---------------------------------------------------------------------------
+// nameConstraints (RFC 5280 §4.2.1.10)
+//
+// Geprueft werden dNSName und rfc822Name eines untergeordneten Zertifikats
+// gegen die permittedSubtrees/excludedSubtrees eines CA-Zertifikats darueber.
+//
+// Zwei Entscheidungen, die bewusst streng sind:
+//  * Eine Einschraenkung auf einen Typ, den diese Fassung nicht auswertet,
+//    fuehrt zur Ablehnung, SOBALD sie den Fall betreffen koennte: bei
+//    directoryName immer (jedes Zertifikat hat ein Subjekt), bei iPAddress,
+//    URI und otherName dann, wenn das Kind einen Namen dieses Typs traegt.
+//    Sie stillschweigend zu uebergehen waere der stille Default — eine
+//    Einschraenkung des Ausstellers wuerde einfach nicht gelten. Sie
+//    pauschal abzulehnen ginge am Bestand vorbei: fast jede echte CA
+//    schliesst kritisch ganze iPAddress-Bereiche aus, ohne dass ein
+//    DNS-Zertifikat darunter davon beruehrt waere.
+//  * minimum != 0 oder ein vorhandenes maximum wird abgewiesen. RFC 5280
+//    verlangt minimum = 0 und kein maximum; wer es anders schreibt, meint
+//    etwas, das hier niemand auswertet.
+// ---------------------------------------------------------------------------
+
+// Passt ein DNS-Name auf eine Einschraenkung? Die Basis trifft den Namen
+// selbst und jede Unterdomaene: "example.com" trifft "example.com" und
+// "a.example.com", aber NICHT "badexample.com". Eine Basis mit fuehrendem
+// Punkt trifft nur echte Unterdomaenen.
+fn dnsInBasis(name: int64, nameLen: int64, basis: int64, basisLen: int64): bool {
+    if (basisLen <= 0) { return true; }                 // leere Basis: alles
+    if (nameLen < basisLen) { return false; }
+    if ((peek8(basis) & 0xFF) == 46) {                  // ".example.com"
+        if (nameLen == basisLen) { return false; }
+        return nameGleichCi(name + nameLen - basisLen, basisLen, basis, basisLen);
+    }
+    if (nameLen == basisLen) {
+        return nameGleichCi(name, nameLen, basis, basisLen);
+    }
+    // Der Rest davor muss an einer Markengrenze enden.
+    if ((peek8(name + nameLen - basisLen - 1) & 0xFF) != 46) { return false; }
+    return nameGleichCi(name + nameLen - basisLen, basisLen, basis, basisLen);
+}
+
+// Passt eine Mailadresse auf eine Einschraenkung? Basis kann eine ganze
+// Adresse, ein Rechnername oder (mit Punkt) eine Domaene sein.
+fn mailInBasis(name: int64, nameLen: int64, basis: int64, basisLen: int64): bool {
+    if (basisLen <= 0) { return true; }
+    var at: int64 := -1;
+    var i: int64 := 0;
+    while (i < basisLen) {
+        if ((peek8(basis + i) & 0xFF) == 64) { at := i; i := basisLen; }
+        else { i += 1; }
+    }
+    if (at >= 0) { return nameGleichCi(name, nameLen, basis, basisLen); }
+    // Ohne '@': Rechnername oder Domaene — der Teil hinter dem '@' des
+    // Namens entscheidet.
+    var nAt: int64 := -1;
+    i := 0;
+    while (i < nameLen) {
+        if ((peek8(name + i) & 0xFF) == 64) { nAt := i; i := nameLen; }
+        else { i += 1; }
+    }
+    if (nAt < 0) { return false; }
+    return dnsInBasis(name + nAt + 1, nameLen - nAt - 1, basis, basisLen);
+}
+
+// Einen Teilbaum-Block ([0] oder [1]) gegen EINEN Namen pruefen.
+// Rueckgabe: 1 Treffer, 0 kein Treffer, -1 nicht auswertbar.
+fn teilbaumTrifft(der: int64, pos: int64, len: int64, art: int64,
+                  name: int64, nameLen: int64, feld: int64, unterF: int64): int64 {
+    var ende: int64 := pos + len;
+    var p: int64 := pos;
+    var treffer: int64 := 0;
+    while (p < ende) {
+        if (!DerLies(der, ende, p, feld)) { return -1; }
+        if (DerTag(feld) != 0x30) { return -1; }
+        var tEnde: int64 := DerInhalt(feld) + DerInhaltLen(feld);
+        if (!DerLies(der, tEnde, DerInhalt(feld), unterF)) { return -1; }
+        var bArt: int64 := DerTag(unterF) & 0x1F;
+        var bPos: int64 := der + DerInhalt(unterF);
+        var bLen: int64 := DerInhaltLen(unterF);
+        // minimum/maximum: RFC 5280 verlangt 0 bzw. nichts.
+        if (DerNaechste(unterF) < tEnde) { return -1; }
+        if (bArt == art) {
+            if (art == 2) {
+                if (dnsInBasis(name, nameLen, bPos, bLen)) { treffer := 1; }
+            } else {
+                if (art == 1) {
+                    if (mailInBasis(name, nameLen, bPos, bLen)) { treffer := 1; }
+                } else { return -1; }
+            }
+        }
+        // Eintraege anderer Typen gehen diesen Namen nichts an; ueber sie
+        // urteilt X509PruefeNameConstraints eigens.
+        p := DerNaechste(feld);
+    }
+    return treffer;
+}
+
+// Zaehlt, ob der Block Eintraege des gefragten Typs enthaelt.
+fn teilbaumHatArt(der: int64, pos: int64, len: int64, art: int64,
+                  feld: int64, unterF: int64): bool {
+    var ende: int64 := pos + len;
+    var p: int64 := pos;
+    var da: bool := false;
+    while (p < ende) {
+        if (!DerLies(der, ende, p, feld)) { return da; }
+        if (DerTag(feld) != 0x30) { return da; }
+        var tEnde: int64 := DerInhalt(feld) + DerInhaltLen(feld);
+        if (!DerLies(der, tEnde, DerInhalt(feld), unterF)) { return da; }
+        if ((DerTag(unterF) & 0x1F) == art) { da := true; }
+        p := DerNaechste(feld);
+    }
+    return da;
+}
+
+// Prueft das Zertifikat `kind` gegen die nameConstraints von `ca`.
+// 0 = in Ordnung, 13 = von einer Einschraenkung abgewiesen.
+pub fn X509PruefeNameConstraints(kind: int64, ca: int64): int64 {
+    var ncPos: int64 := peek64(ca + X_NCPOS);
+    var ncLen: int64 := peek64(ca + X_NCLEN);
+    if (ncPos == 0 || ncLen <= 0) { return 0; }
+
+    var caDer: int64 := peek64(ca + X_DER);
+    var kDer: int64 := peek64(kind + X_DER);
+    var fg: int64 := DerFeldGroesse();
+    var kr: int64 := x509Scr() + XS_NC;
+    var f: int64 := kr;
+    var g: int64 := kr + fg;
+    var u: int64 := kr + fg * 2;
+    var art: int64 := kr + fg * 3;
+    var np: int64 := art + 8;
+    var nl: int64 := np + 8;
+
+    // permitted- und excludedSubtrees heraussuchen.
+    var permPos: int64 := 0; var permLen: int64 := 0;
+    var exclPos: int64 := 0; var exclLen: int64 := 0;
+    var ende: int64 := ncPos + ncLen;
+    var p: int64 := ncPos;
+    while (p < ende) {
+        if (!DerLies(caDer, ende, p, f)) { return 13; }
+        var t: int64 := DerTag(f);
+        if (t == 0xA0) { permPos := DerInhalt(f); permLen := DerInhaltLen(f); }
+        else {
+            if (t == 0xA1) { exclPos := DerInhalt(f); exclLen := DerInhaltLen(f); }
+            else { return 13; }                     // unbekanntes Feld
+        }
+        p := DerNaechste(f);
+    }
+
+    // Jeder SAN-Eintrag des Kindes wird einzeln geprueft.
+    var n: int64 := X509SanAnzahl(kind);
+    var i: int64 := 0;
+    var hatDns: bool := false;
+    var hatMail: bool := false;
+    var dnsErlaubt: bool := false;
+    var mailErlaubt: bool := false;
+
+    // directoryName-Einschraenkungen betreffen jedes Zertifikat (jedes hat
+    // ein Subjekt) und werden hier nicht ausgewertet: abweisen, nicht
+    // uebergehen.
+    if (teilbaumHatArt(caDer, permPos, permLen, 4, f, u)) { return 13; }
+    if (teilbaumHatArt(caDer, exclPos, exclLen, 4, f, u)) { return 13; }
+
+    while (i < n) {
+        if (X509SanAt(kind, i, art, np, nl)) {
+            var a: int64 := peek64(art);
+            var nameP: int64 := kDer + peek64(np);
+            var nameL: int64 := peek64(nl);
+            if (a == 2 || a == 1) {
+                if (a == 2) { hatDns := true; } else { hatMail := true; }
+                if (exclPos != 0) {
+                    var rE: int64 := teilbaumTrifft(caDer, exclPos, exclLen, a,
+                                                    nameP, nameL, f, u);
+                    if (rE != 0) { return 13; }       // Treffer ODER unlesbar
+                }
+                if (permPos != 0) {
+                    if (teilbaumHatArt(caDer, permPos, permLen, a, f, u)) {
+                        var rP: int64 := teilbaumTrifft(caDer, permPos, permLen, a,
+                                                        nameP, nameL, f, u);
+                        if (rP != 1) { return 13; }
+                        if (a == 2) { dnsErlaubt := true; } else { mailErlaubt := true; }
+                    } else {
+                        // Kein Eintrag dieses Typs in permittedSubtrees: der
+                        // Typ ist damit nicht eingeschraenkt (§4.2.1.10).
+                        if (a == 2) { dnsErlaubt := true; } else { mailErlaubt := true; }
+                    }
+                }
+            } else {
+                // Namenstyp, den diese Fassung nicht gegen Einschraenkungen
+                // pruefen kann. Ist er eingeschraenkt, wird abgewiesen.
+                if (teilbaumHatArt(caDer, permPos, permLen, a, f, u)) { return 13; }
+                if (teilbaumHatArt(caDer, exclPos, exclLen, a, f, u)) { return 13; }
+            }
+        }
+        i += 1;
+    }
+
+    if (hatDns && permPos != 0 && !dnsErlaubt) { return 13; }
+    if (hatMail && permPos != 0 && !mailErlaubt) { return 13; }
+    return 0;
+}
+
 // Prueft eine Kette. `kette` ist ein Block aus 16-Byte-Eintraegen
 // (DER-Zeiger, DER-Laenge), Eintrag 0 ist das Blatt; `trust` ebenso mit den
 // Wurzeln, die der Aufrufer vertraut (kein System-Store, kein fs-Zugriff —
 // so verlangt es #2096). `zweck` ist 1 fuer serverAuth und 2 fuer clientAuth,
-// 0 prueft extKeyUsage nicht. `host` darf 0/0 sein (dann keine
+// 0 prueft extKeyUsage nicht. Code 13 heisst "von den nameConstraints einer
+// CA der Kette abgewiesen". `host` darf 0/0 sein (dann keine
 // Namenspruefung, etwa fuer Client-Zertifikate).
 pub fn X509PruefeKette(kette: int64, ketteN: int64, trust: int64, trustN: int64,
                        host: int64, hostLen: int64, jetzt: int64, zweck: int64): int64 {
@@ -944,8 +1170,11 @@ pub fn X509PruefeKette(kette: int64, ketteN: int64, trust: int64, trustN: int64,
     var gr: int64 := X509Groesse();
     var kind: int64 := x509Scr() + XS_KETTE;
     var eltern: int64 := kind + gr;
+    var blatt: int64 := eltern + gr;
 
     if (!X509Lies(peek64(kette), peek64(kette + 8), kind)) { return 1; }
+    var kb: int64 := 0;
+    while (kb < gr) { poke8(blatt + kb, peek8(kind + kb)); kb += 1; }
     if (!X509ZeitGueltig(kind, jetzt)) { return 2; }
     if (host != 0 && hostLen > 0) {
         if (!X509PasstName(kind, host, hostLen)) { return 3; }
@@ -980,6 +1209,16 @@ pub fn X509PruefeKette(kette: int64, ketteN: int64, trust: int64, trustN: int64,
 
         var rc: int64 := X509PruefeSignatur(kind, eltern);
         if (rc != 0) { return rc; }
+
+        // nameConstraints dieser CA gelten fuer das unmittelbare Kind UND
+        // fuer das Blatt (RFC 5280 §6.1.4). Bei einer zweistufigen Kette ist
+        // das dieselbe Pruefung; bei einer Zwischen-CA sind es zwei.
+        var rn: int64 := X509PruefeNameConstraints(kind, eltern);
+        if (rn != 0) { return rn; }
+        if (tiefe > 0) {
+            rn := X509PruefeNameConstraints(blatt, eltern);
+            if (rn != 0) { return rn; }
+        }
 
         if (!ausKette) { return 0; }                   // vertraute Wurzel erreicht
 

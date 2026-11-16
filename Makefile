@@ -898,13 +898,16 @@ test: lyxc
 	@bash tests/crypto_sha2_hkdf_test.sh
 	@bash tests/crypto_bignum_test.sh
 	@bash tests/crypto_rsa_test.sh
+	@bash tests/crypto_rsa_crt_test.sh
 	@bash tests/crypto_ed25519_test.sh
 	@bash tests/crypto_aead_test.sh
 	@bash tests/crypto_x509_test.sh
 	@bash tests/crypto_x509_kette_test.sh
 	@bash tests/crypto_kette_rsa_ed25519_test.sh
+	@bash tests/x509_nameconstraints_test.sh
 	@bash tests/tls13_handschlag_test.sh
 	@bash tests/tls13_schluesselarten_test.sh
+	@bash tests/tls13_hrr_gruppen_test.sh
 	@echo "--- TLS-Interop gegen OpenSSL: in tests/known-red.txt (!flaky, #2418) ---"
 	@bash tests/ir_datei_builtins_test.sh
 	@bash tests/unit_private_globals_test.sh

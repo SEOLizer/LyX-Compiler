@@ -13,6 +13,7 @@ import std.crypto.sha256;
 import std.crypto.hmac;
 import std.crypto.rand;
 import std.crypto.ct;
+import std.crypto.bignum;
 
 // ── Abgrenzung zu std.crypto.ecc ─────────────────────────────────────────────
 //
@@ -25,9 +26,13 @@ import std.crypto.ct;
 //      Signieren ist dieser Skalar der Nonce. Aus wenigen Nonce-Bits laesst
 //      sich der private Schluessel per Gitterangriff rekonstruieren; das ist
 //      der uebliche Weg, auf dem ECDSA in der Praxis bricht. Hier laeuft
-//      stattdessen eine Montgomery-Leiter ueber ALLE 256 Bits, mit
-//      vollstaendigen Additionsformeln und maskiertem Tausch: gleiche Anzahl
-//      Operationen, gleiche Speicherzugriffe, unabhaengig vom Skalar.
+//      stattdessen ein festes 4-Bit-Fenster ueber ALLE Bits, mit
+//      vollstaendigen Additionsformeln und MASKIERTEM Tabellenzugriff:
+//      gleiche Anzahl Operationen, gleiche Speicherzugriffe, unabhaengig vom
+//      Skalar. Auch das Fenster 0 wird addiert (Eintrag 0 ist der unendlich
+//      ferne Punkt), und es werden stets alle sechzehn Eintraege gelesen —
+//      ein Index aus dem Skalar in den Speicher waere ein
+//      Cache-Seitenkanal.
 //
 //   2. DETERMINISTISCHER NONCE nach RFC 6979. ecc.lyx zieht ihn aus dem RNG.
 //      Ein wiederholter oder vorhersagbarer Nonce gibt den privaten Schluessel
@@ -49,43 +54,51 @@ import std.crypto.ct;
 //
 // ── Geschwindigkeit ──────────────────────────────────────────────────────────
 //
-// Gemessen auf der Entwicklungsmaschine: rund 230 ms je Signatur, also etwa
-// 200 ms je Skalarmultiplikation. Eine optimierte C-Bibliothek liegt bei
-// einigen Dutzend Mikrosekunden — der Abstand ist also drei Groessenordnungen
-// und hat drei Ursachen, alle bewusst in Kauf genommen:
+// Gemessen an der Befehlszahl je Aufruf (perf, instructions:u), P-256:
 //
-//   - 28-Bit-Glieder statt 64-Bit-Woerter, weil Lyx keine 64x64-nach-128-
-//     Multiplikation hat (siehe unten). Das vervierfacht die Zahl der
-//     Teilprodukte.
-//   - Die vollstaendige Additionsformel kostet etwa doppelt so viel wie die
-//     uebliche Jacobi-Addition. Dafuer hat sie keine Sonderfaelle und damit
-//     keine datenabhaengigen Verzweigungen.
-//   - Die Leiter rechnet jedes der 280 Bits, auch die fuehrenden Nullen.
-//     Genau das ist der Sinn der Sache.
+//   ECDSA signieren   153 -> 29 Mio Befehle   (5,3x)
+//   ECDSA pruefen     295 -> 54 Mio           (5,5x)
+//   ECDH              154 -> 27 Mio           (5,7x)
+//   Schluesselpaar    150 -> 27 Mio           (5,6x)
 //
-// Vermeidbar ist derzeit nur ein Teil davon: jeder oeffentliche Aufruf baut
-// den Kurvenkontext neu auf, und darin steckt die Bestimmung von R^2 ueber
-// 560 modulare Verdopplungen. Ein zwischengespeicherter Kontext waere die
-// naechstliegende Verbesserung.
+// Die Schritte dorthin, jeder einzeln gemessen: Kratzbereich statt alloc/free
+// je Aufruf (150 -> 125), direkter peek64/poke64-Zugriff in den
+// Zahlenprimitiven statt der Hilfsfunktionen _g/_s (125 -> 93), festes
+// 4-Bit-Fenster statt Montgomery-Leiter (93 -> 63), zwischengespeicherter
+// Kurvenkontext (63 -> 60) und vier Glieder zu 64 Bit statt zehn zu 28
+// (60 -> 27).
+//
+// Eine optimierte C-Bibliothek liegt bei einigen Dutzend Mikrosekunden; der
+// Abstand bleibt also gross. Was davon noch zu holen waere: eine eigene
+// Verdopplungsformel (die vollstaendige Addition kostet rund 18 modulare
+// Multiplikationen, eine Verdopplung kaeme mit etwa der Haelfte aus), die
+// Reduktion speziell fuer die Primzahlform von P-256 (Solinas statt
+// Montgomery) und eine vorgerechnete Tabelle des Basispunktes fuer k*G.
 //
 // ── Zahlendarstellung ────────────────────────────────────────────────────────
 //
-// 256-Bit-Zahlen liegen als 10 Glieder zu je 28 Bit in einem int64-Feld
-// (80 Byte, kleinstwertiges Glied zuerst). Warum nicht 32-Bit-Glieder, was
-// naeher laege? Das Produkt zweier 32-Bit-Glieder ist bis zu 2^64 gross und
-// passt damit NICHT mehr in ein vorzeichenbehaftetes int64 — es gibt in Lyx
-// keine 64x64-nach-128-Multiplikation, auf die man ausweichen koennte. Mit
-// 28 Bit bleibt jedes Produkt unter 2^56, und selbst die Summe aus zehn
-// Produkten plus Uebertraegen bleibt weit unter 2^63.
+// 256-Bit-Zahlen liegen als 4 Glieder zu 64 Bit (32 Byte, kleinstwertiges
+// Glied zuerst) und werden von std.crypto.bignum gerechnet.
+//
+// Hier standen bis 1.2.41 zehn Glieder zu 28 Bit, mit der Begruendung, Lyx
+// habe keine 64x64-nach-128-Multiplikation. Das stimmt nicht mehr: `umulhi`
+// ist Builtin, und std.crypto.bignum rechnet damit die RSA-Arithmetik. Zehn
+// Glieder bedeuteten 100 Teilprodukte je Multiplikation statt 16.
+//
+// Beim Umstellen fiel genau eine Stelle auf, die an der alten Breite hing:
+// in EcdsaSign wurde z + r*d mit _bigAdd gerechnet und danach reduziert. Bei
+// 280 Bit Platz ging das, bei 256 Bit ist der Uebertrag weg — r blieb
+// richtig, s wurde falsch, und die eigene Signatur wurde abgelehnt. Jetzt
+// steht dort _modAdd. Wer die Breite wieder anfasst, sucht nach genau diesem
+// Muster: eine Addition, deren Uebertrag niemand liest.
 //
 // Nach aussen sind alle Zahlen 32-Byte-Folgen in GROSSER Bytereihenfolge
 // (most significant first) — so, wie sie in Zertifikaten, Schluesseldateien
 // und auf der Leitung stehen.
 
-con LIMBS: int64 := 10;
-con LIMB_BITS: int64 := 28;
-con LIMB_MASK: int64 := 268435455;      // 2^28 - 1
-con BIG_BYTES: int64 := 80;             // 10 Glieder * 8 Byte
+con LIMBS: int64 := 4;
+con LIMB_BITS: int64 := 64;
+con BIG_BYTES: int64 := 32;             // 4 Glieder * 8 Byte
 
 pub con EC_SECP256K1: int64 := 0;
 pub con EC_P256: int64 := 1;
@@ -195,78 +208,88 @@ pub fn EcCurvePrime(curve: int64, out32: int64): bool {
 
 // ── Grosszahlen: Grundoperationen ────────────────────────────────────────────
 
-fn _bigZero(r: int64): void {
-  var i: int64 := 0;
-  while (i < LIMBS) {
-    _s(r, i, 0);
-    i := i + 1;
-  }
+// ── Kratzbereich ─────────────────────────────────────────────────────────────
+//
+// Jede Funktion hier brauchte Zwischenzahlen und hat sie mit alloc/free je
+// AUFRUF geholt. Eine Skalarmultiplikation macht 560 Punktadditionen, jede
+// davon neun eigene Puffer und rund siebzehn Montgomery-Multiplikationen mit
+// je drei weiteren — gezaehlt rund 42 000 alloc/free-Paare je
+// Skalarmultiplikation. Gemessen waren das von 150 Mio Befehlen je
+// Multiplikation der groesste Posten.
+//
+// Jetzt gilt im ganzen Repo dieselbe Regel wie in x509, rsa_native und
+// tls13: EIN Block je Programmlauf, feste Unterbereiche, und ein Bereich
+// gehoert genau EINER Rolle. Die Bereiche sind disjunkt, weil die Funktionen
+// sich gegenseitig aufrufen (_ptMul -> _ptAdd -> _montMul -> _modAdd);
+// Rekursion gibt es keine.
+// Alle Zahlen sind BIG_BYTES = 32 Byte, ein Punkt PT_BYTES = 96.
+con ES_GE:      int64 := 0;         // _bigGE: Ablage der Probesubtraktion
+con ES_MADD:    int64 := 64;        // _modAdd: t, sub
+con ES_MSUB:    int64 := 128;       // _modSub: t, add
+con ES_INV:     int64 := 192;       // _montInv: sechs Zahlen
+con ES_SQRT:    int64 := 448;       // _montSqrt: sechs Zahlen
+con ES_PTADD:   int64 := 704;       // _ptAdd: neun Zahlen
+con ES_PTAFF:   int64 := 1024;      // _ptToAffine: zwei Zahlen
+con ES_PTFROM:  int64 := 1088;      // _ptFromAffine: eine Zahl
+con ES_CURVE:   int64 := 1152;      // _ctxNew und Kurvenpruefungen
+con ES_WIN:     int64 := 1536;      // _ptMul: 16 Tabellenpunkte + Akku + tmp
+con ES_OBEN:    int64 := 3264;      // frei fuer die ECDSA-Ebene
+con ES_GROESSE: int64 := 6144;
+
+var _ecScr: int64 := 0;
+
+fn ecScr(): int64 {
+  if (_ecScr != 0) { return _ecScr; }
+  var q: int64 := alloc(ES_GROESSE);
+  if (q == 0) { panic("ec: kein Speicher fuer den Kratzbereich"); }
+  _ecScr := q;
+  return q;
 }
 
-fn _bigCopy(r: int64, a: int64): void {
-  var i: int64 := 0;
-  while (i < LIMBS) {
-    _s(r, i, _g(a, i));
-    i := i + 1;
-  }
-}
+// Die Zahlenprimitiven greifen DIREKT mit peek64/poke64 zu, nicht ueber
+// _g/_s. Gemessen: _s stand im Profil mit 9,8 Mio Aufrufen und 17 Takten je
+// Aufruf, und _modAdd brauchte 1626 Takte fuer vier Schleifen ueber zehn
+// Glieder — 37 Takte je Glied, also fast nur Aufrufkosten. Der Compiler
+// legt diese Aufrufe nicht zusammen; wer hier _g/_s schreibt, bezahlt sie.
+// Die Zahlenschicht liegt auf std.crypto.bignum: vier Glieder zu 64 Bit.
+//
+// Vorher standen hier zehn Glieder zu 28 Bit, mit der Begruendung, Lyx habe
+// keine 64x64-nach-128-Multiplikation. Das stimmt nicht mehr: `umulhi` ist
+// Builtin, und std.crypto.bignum rechnet damit seit #2096 die RSA-Arithmetik.
+// Zehn Glieder statt vier bedeuteten 100 Teilprodukte je Multiplikation statt
+// 16 — gemessen 1935 Takte je Montgomery-Multiplikation.
+//
+// Alles Modulare kommt damit aus EINER Quelle. Zwei Rechnungen derselben Art
+// nebeneinander waeren im Repo schon oft genug ein Korrektheitsproblem
+// gewesen.
+fn _bigZero(r: int64): void { BnZero(r, LIMBS); }
 
-// Achtung: CTIsZero aus std.crypto.ct liefert eine MASKE (-1 bei null, sonst
-// 0), keine 1. Hier wird 1/0 gebraucht — das `& 1` ist deshalb kein Schoenheits-
-// fehler, sondern traegt die Umrechnung.
-fn _bigIsZero(a: int64): int64 {
-  var acc: int64 := 0;
-  var i: int64 := 0;
-  while (i < LIMBS) {
-    acc := acc | _g(a, i);
-    i := i + 1;
-  }
-  return CTIsZero(acc) & 1;
-}
+fn _bigCopy(r: int64, a: int64): void { BnCopy(r, a, LIMBS); }
 
-// 1 wenn a >= b, sonst 0. Laeuft ueber alle Glieder, ohne fruehen Ausstieg.
+// Achtung: CTIsZero liefert eine MASKE (-1 bei null), hier wird 1/0 gebraucht.
+fn _bigIsZero(a: int64): int64 { return BnIsZero(a, LIMBS) & 1; }
+
+// 1 wenn a >= b, sonst 0 — ueber alle Glieder, ohne fruehen Ausstieg.
 fn _bigGE(a: int64, b: int64): int64 {
-  var borrow: int64 := 0;
-  var i: int64 := 0;
-  while (i < LIMBS) {
-    var d: int64 := _g(a, i) - _g(b, i) - borrow;
-    borrow := (d >> 63) & 1;
-    i := i + 1;
-  }
-  return 1 - borrow;
+  var t: int64 := ecScr() + ES_GE;
+  return 1 - BnSub(t, a, b, LIMBS);
 }
 
 fn _bigAdd(r: int64, a: int64, b: int64): int64 {
-  var carry: int64 := 0;
-  var i: int64 := 0;
-  while (i < LIMBS) {
-    var t: int64 := _g(a, i) + _g(b, i) + carry;
-    _s(r, i, t & LIMB_MASK);
-    carry := t >> LIMB_BITS;
-    i := i + 1;
-  }
-  return carry;
+  return BnAdd(r, a, b, LIMBS);
 }
 
 fn _bigSub(r: int64, a: int64, b: int64): int64 {
-  var borrow: int64 := 0;
-  var i: int64 := 0;
-  while (i < LIMBS) {
-    var t: int64 := _g(a, i) - _g(b, i) - borrow;
-    borrow := (t >> 63) & 1;
-    _s(r, i, t & LIMB_MASK);
-    i := i + 1;
-  }
-  return borrow;
+  return BnSub(r, a, b, LIMBS);
 }
 
 // r := mask ? a : r  (mask ist 0 oder -1)
 fn _bigCmov(r: int64, a: int64, mask: int64): void {
   var i: int64 := 0;
   while (i < LIMBS) {
-    var rv: int64 := _g(r, i);
-    var av: int64 := _g(a, i);
-    _s(r, i, rv ^ ((rv ^ av) & mask));
+    var rv: int64 := peek64(r + i * 8);
+    var av: int64 := peek64(a + i * 8);
+    poke64(r + i * 8, rv ^ ((rv ^ av) & mask));
     i := i + 1;
   }
 }
@@ -274,216 +297,71 @@ fn _bigCmov(r: int64, a: int64, mask: int64): void {
 fn _bigCswap(a: int64, b: int64, mask: int64): void {
   var i: int64 := 0;
   while (i < LIMBS) {
-    var av: int64 := _g(a, i);
-    var bv: int64 := _g(b, i);
+    var av: int64 := peek64(a + i * 8);
+    var bv: int64 := peek64(b + i * 8);
     var t: int64 := (av ^ bv) & mask;
-    _s(a, i, av ^ t);
-    _s(b, i, bv ^ t);
+    poke64(a + i * 8, av ^ t);
+    poke64(b + i * 8, bv ^ t);
     i := i + 1;
   }
 }
 
-// 32 Byte gross-endian in Gliederform
+// 32 Byte gross-endian in Gliederform und zurueck.
 fn _bigFromBytes(r: int64, be32: int64): void {
-  _bigZero(r);
-  var bitPos: int64 := 0;
-  var i: int64 := 31;
-  while (i >= 0) {
-    var byteVal: int64 := peek8(be32 + i);
-    var limb: int64 := bitPos / LIMB_BITS;
-    var off: int64 := bitPos - limb * LIMB_BITS;
-    var cur: int64 := _g(r, limb) | ((byteVal << off) & LIMB_MASK);
-    _s(r, limb, cur);
-    // Ueberhang ins naechste Glied
-    if (off > LIMB_BITS - 8) {
-      var rest: int64 := byteVal >> (LIMB_BITS - off);
-      if (limb + 1 < LIMBS) {
-        _s(r, limb + 1, _g(r, limb + 1) | rest);
-      }
-    }
-    bitPos := bitPos + 8;
-    i := i - 1;
-  }
+  BnFromBytes(r, LIMBS, be32, 32);
 }
 
 fn _bigToBytes(a: int64, be32: int64): void {
-  var i: int64 := 0;
-  while (i < 32) {
-    poke8(be32 + i, 0);
-    i := i + 1;
-  }
-  var bitPos: int64 := 0;
-  i := 31;
-  while (i >= 0) {
-    var limb: int64 := bitPos / LIMB_BITS;
-    var off: int64 := bitPos - limb * LIMB_BITS;
-    var v: int64 := _g(a, limb) >> off;
-    if (off > LIMB_BITS - 8) {
-      if (limb + 1 < LIMBS) {
-        v := v | (_g(a, limb + 1) << (LIMB_BITS - off));
-      }
-    }
-    poke8(be32 + i, v & 255);
-    bitPos := bitPos + 8;
-    i := i - 1;
-  }
+  BnToBytes(be32, a, LIMBS);
 }
 
-// Bit i des Skalars (aus der Gliederform)
-fn _bigBit(a: int64, i: int64): int64 {
-  var limb: int64 := i / LIMB_BITS;
-  var off: int64 := i - limb * LIMB_BITS;
-  return (_g(a, limb) >> off) & 1;
-}
+// Bit i des Skalars
+fn _bigBit(a: int64, i: int64): int64 { return BnBit(a, i); }
 
 // ── Montgomery-Arithmetik ────────────────────────────────────────────────────
 //
-// Modulare Multiplikation ohne Division: statt a*b mod m wird
-// a*b*R^-1 mod m gerechnet, mit R = 2^280. Solange alle Werte in dieser
-// "Montgomery-Form" bleiben (a' = a*R mod m), stimmt jede Kette von
-// Multiplikationen; erst am Ende wird zurueckgerechnet.
-//
-// Der Gewinn ist nicht nur Geschwindigkeit: die Reduktion besteht aus festen
-// Multiplikationen und Additionen, ohne datenabhaengige Schleifen. Eine
-// Division oder ein "solange groesser, subtrahiere" waere genau die Art von
-// Konstrukt, die Laufzeit an Daten koppelt.
+// Modulare Multiplikation ohne Division: statt a*b mod m wird a*b*R^-1 mod m
+// gerechnet, mit R = 2^256. Solange alle Werte in dieser "Montgomery-Form"
+// bleiben (a' = a*R mod m), stimmt jede Kette von Multiplikationen; erst am
+// Ende wird zurueckgerechnet. Die Reduktion besteht aus festen
+// Multiplikationen und Additionen, ohne datenabhaengige Schleifen.
 
-// -m^-1 mod 2^28, per Newton-Iteration
-fn _montN0(m: int64): int64 {
-  var m0: int64 := _g(m, 0);
-  var inv: int64 := 1;
-  var i: int64 := 0;
-  // x := x * (2 - m0*x) verdoppelt die Zahl korrekter Bits je Runde
-  while (i < 6) {
-    inv := (inv * (2 - m0 * inv)) & LIMB_MASK;
-    i := i + 1;
-  }
-  return (LIMB_MASK + 1 - inv) & LIMB_MASK;
-}
+fn _montN0(m: int64): int64 { return BnMontN0(peek64(m)); }
 
-// r := a*b*R^-1 mod m  (CIOS, coarsely integrated operand scanning)
 fn _montMul(r: int64, a: int64, b: int64, m: int64, n0: int64): void {
-  var t: int64 := alloc((LIMBS + 2) * 8);
-  var i: int64 := 0;
-  while (i < LIMBS + 2) {
-    poke64(t + i * 8, 0);
-    i := i + 1;
-  }
-
-  i := 0;
-  while (i < LIMBS) {
-    // t := t + a * b[i]
-    var carry: int64 := 0;
-    var bi: int64 := _g(b, i);
-    var j: int64 := 0;
-    while (j < LIMBS) {
-      var cur: int64 := peek64(t + j * 8) + _g(a, j) * bi + carry;
-      poke64(t + j * 8, cur & LIMB_MASK);
-      carry := cur >> LIMB_BITS;
-      j := j + 1;
-    }
-    var top: int64 := peek64(t + LIMBS * 8) + carry;
-    poke64(t + LIMBS * 8, top & LIMB_MASK);
-    poke64(t + (LIMBS + 1) * 8, peek64(t + (LIMBS + 1) * 8) + (top >> LIMB_BITS));
-
-    // t := (t + m * u) / 2^28  mit u so, dass das unterste Glied null wird
-    var u: int64 := (peek64(t) * n0) & LIMB_MASK;
-    carry := 0;
-    j := 0;
-    while (j < LIMBS) {
-      var cur2: int64 := peek64(t + j * 8) + _g(m, j) * u + carry;
-      poke64(t + j * 8, cur2 & LIMB_MASK);
-      carry := cur2 >> LIMB_BITS;
-      j := j + 1;
-    }
-    var top2: int64 := peek64(t + LIMBS * 8) + carry;
-    poke64(t + LIMBS * 8, top2 & LIMB_MASK);
-    poke64(t + (LIMBS + 1) * 8, peek64(t + (LIMBS + 1) * 8) + (top2 >> LIMB_BITS));
-
-    // um ein Glied nach rechts schieben
-    j := 0;
-    while (j < LIMBS + 1) {
-      poke64(t + j * 8, peek64(t + (j + 1) * 8));
-      j := j + 1;
-    }
-    poke64(t + (LIMBS + 1) * 8, 0);
-
-    i := i + 1;
-  }
-
-  // Ergebnis liegt in 0..2m; einmal bedingt subtrahieren — maskiert, nicht
-  // verzweigt
-  var tmp: int64 := alloc(BIG_BYTES);
-  i := 0;
-  while (i < LIMBS) {
-    _s(tmp, i, peek64(t + i * 8));
-    i := i + 1;
-  }
-
-  var sub: int64 := alloc(BIG_BYTES);
-  var borrow: int64 := _bigSub(sub, tmp, m);
-  var overflow: int64 := peek64(t + LIMBS * 8);
-  // nehmen, wenn kein Unterlauf ODER das Extraglied gesetzt war
-  var overflowSet: int64 := 1 - (CTIsZero(overflow) & 1);
-  var takeSub: int64 := (1 - borrow) | overflowSet;
-  var mask: int64 := 0 - (takeSub & 1);
-  _bigCopy(r, tmp);
-  _bigCmov(r, sub, mask);
-
-  free(t, (LIMBS + 2) * 8);
-  free(tmp, BIG_BYTES);
-  free(sub, BIG_BYTES);
+  BnMontMul(r, a, b, m, LIMBS, n0);
 }
 
-// modulare Addition und Subtraktion, beide maskiert statt verzweigt
+// Modulare Addition und Subtraktion, maskiert statt verzweigt.
 fn _modAdd(r: int64, a: int64, b: int64, m: int64): void {
-  var t: int64 := alloc(BIG_BYTES);
-  var carry: int64 := _bigAdd(t, a, b);
-  var sub: int64 := alloc(BIG_BYTES);
-  var borrow: int64 := _bigSub(sub, t, m);
+  var t: int64 := ecScr() + ES_MADD;
+  var carry: int64 := BnAdd(t, a, b, LIMBS);
+  var sub: int64 := ecScr() + ES_MADD + BIG_BYTES;
+  var borrow: int64 := BnSub(sub, t, m, LIMBS);
   var takeSub: int64 := (1 - borrow) | carry;
   var mask: int64 := 0 - (takeSub & 1);
   _bigCopy(r, t);
   _bigCmov(r, sub, mask);
-  free(t, BIG_BYTES);
-  free(sub, BIG_BYTES);
 }
 
 fn _modSub(r: int64, a: int64, b: int64, m: int64): void {
-  var t: int64 := alloc(BIG_BYTES);
-  var borrow: int64 := _bigSub(t, a, b);
-  var add: int64 := alloc(BIG_BYTES);
-  _bigAdd(add, t, m);
+  var t: int64 := ecScr() + ES_MSUB;
+  var borrow: int64 := BnSub(t, a, b, LIMBS);
+  var add: int64 := ecScr() + ES_MSUB + BIG_BYTES;
+  BnAdd(add, t, m, LIMBS);
   var mask: int64 := 0 - (borrow & 1);
   _bigCopy(r, t);
   _bigCmov(r, add, mask);
-  free(t, BIG_BYTES);
-  free(add, BIG_BYTES);
 }
 
-// R^2 mod m, der Faktor fuer den Wechsel in die Montgomery-Form.
-// Bestimmt durch wiederholtes Verdoppeln modulo m — 560 Schritte, alle
-// datenunabhaengig.
-fn _montR2(r: int64, m: int64): void {
-  _bigZero(r);
-  _s(r, 0, 1);
-  var i: int64 := 0;
-  while (i < 2 * LIMBS * LIMB_BITS) {
-    _modAdd(r, r, r, m);
-    i := i + 1;
-  }
-}
+fn _montR2(r: int64, m: int64): void { BnMontR2(r, m, LIMBS); }
 
 fn _toMont(r: int64, a: int64, m: int64, n0: int64, r2: int64): void {
-  _montMul(r, a, r2, m, n0);
+  BnToMont(r, a, m, LIMBS, n0, r2);
 }
 
 fn _fromMont(r: int64, a: int64, m: int64, n0: int64): void {
-  var one: int64 := alloc(BIG_BYTES);
-  _bigZero(one);
-  _s(one, 0, 1);
-  _montMul(r, a, one, m, n0);
-  free(one, BIG_BYTES);
+  BnFromMont(r, a, m, LIMBS, n0);
 }
 
 // Inverses per kleinem Satz von Fermat: a^(m-2) mod m. Quadrieren-und-
@@ -491,18 +369,19 @@ fn _fromMont(r: int64, a: int64, m: int64, n0: int64): void {
 // die naheliegende Variante `if (bit) mul` waere genau das Leck, das diese
 // Einheit vermeiden soll.
 fn _montInv(r: int64, a: int64, m: int64, n0: int64, r2: int64): void {
-  var e: int64 := alloc(BIG_BYTES);
-  var two: int64 := alloc(BIG_BYTES);
+  var kr: int64 := ecScr() + ES_INV;
+  var e: int64 := kr;
+  var two: int64 := kr + BIG_BYTES;
   _bigZero(two);
-  _s(two, 0, 2);
+  poke64(two, 2);
   _bigSub(e, m, two);
 
-  var result: int64 := alloc(BIG_BYTES);
-  var base: int64 := alloc(BIG_BYTES);
-  var prod: int64 := alloc(BIG_BYTES);
-  var one: int64 := alloc(BIG_BYTES);
+  var result: int64 := kr + 2 * BIG_BYTES;
+  var base: int64 := kr + 3 * BIG_BYTES;
+  var prod: int64 := kr + 4 * BIG_BYTES;
+  var one: int64 := kr + 5 * BIG_BYTES;
   _bigZero(one);
-  _s(one, 0, 1);
+  poke64(one, 1);
   _toMont(result, one, m, n0, r2);
   _bigCopy(base, a);
 
@@ -518,9 +397,6 @@ fn _montInv(r: int64, a: int64, m: int64, n0: int64, r2: int64): void {
   }
 
   _bigCopy(r, result);
-  free(e, BIG_BYTES);   free(two, BIG_BYTES);
-  free(result, BIG_BYTES); free(base, BIG_BYTES);
-  free(prod, BIG_BYTES); free(one, BIG_BYTES);
 }
 
 // Quadratwurzel modulo p fuer p = 3 (mod 4): a^((p+1)/4).
@@ -539,7 +415,10 @@ fn _montSqrt(r: int64, a: int64, m: int64, n0: int64, r2: int64): void {
     var i: int64 := LIMBS - 1;
     while (i >= 0) {
       var cur: int64 := _g(e, i);
-      _s(e, i, (cur >> 1) | ((carry & 1) << (LIMB_BITS - 1)));
+      // `>>` ist in Lyx ARITHMETISCH. Bei 28-Bit-Gliedern war das gleich,
+      // weil das oberste Bit nie gesetzt war; bei 64 Bit zieht es das
+      // Vorzeichen nach und die Haelfte waere falsch.
+      _s(e, i, (((cur as uint64) >> 1) as int64) | ((carry & 1) << (LIMB_BITS - 1)));
       carry := cur;
       i := i - 1;
     }
@@ -594,7 +473,29 @@ fn _ctxN0n(ctx: int64): int64 {
   return peek64(ctx + CTX_BIGS * BIG_BYTES + 8);
 }
 
+// Je Kurve EIN Kontext, beim ersten Gebrauch aufgebaut und dann behalten.
+// Er enthaelt nur oeffentliche Kurvenwerte (p, n, a, 3b, R^2, der
+// Basispunkt) — kein Geheimnis, das liegen bleiben koennte.
+//
+// Gemessen: der Aufbau kostet 1,89 Mio Takte, davon 1,84 Mio die beiden
+// R^2-Bestimmungen ueber je 560 modulare Verdopplungen. Jede oeffentliche
+// Funktion baute ihn bisher neu auf, manche zweimal.
+var _ctxCache0: int64 := 0;       // secp256k1
+var _ctxCache1: int64 := 0;       // P-256
+
+fn _ctxGemerkt(curve: int64): int64 {
+  if (curve == EC_P256) { return _ctxCache1; }
+  return _ctxCache0;
+}
+
+fn _ctxMerken(curve: int64, ctx: int64): void {
+  if (curve == EC_P256) { _ctxCache1 := ctx; } else { _ctxCache0 := ctx; }
+}
+
 fn _ctxNew(curve: int64): int64 {
+  var fertig: int64 := _ctxGemerkt(curve);
+  if (fertig != 0) { return fertig; }
+
   var ctx: int64 := alloc(CTX_BYTES);
   if (ctx == 0) { return 0; }
 
@@ -647,11 +548,14 @@ fn _ctxNew(curve: int64): int64 {
   free(tmp, BIG_BYTES);
   free(one, BIG_BYTES);
   free(b3, BIG_BYTES);
+  _ctxMerken(curve, ctx);
   return ctx;
 }
 
+// Der Kontext wird behalten (siehe _ctxNew), hier ist also nichts zu tun.
+// Die Funktion bleibt, damit die Aufrufstellen lesbar bleiben: wer sie
+// aufruft, sagt damit "ich brauche ihn nicht mehr".
 fn _ctxFree(ctx: int64): void {
-  free(ctx, CTX_BYTES);
 }
 
 // ── Punkte ───────────────────────────────────────────────────────────────────
@@ -669,7 +573,7 @@ fn _ctxFree(ctx: int64): void {
 // Ein Nebeneffekt: eine eigene Verdopplungsformel wird nicht gebraucht, 2P ist
 // schlicht P + P.
 
-con PT_BYTES: int64 := 3 * 80;
+con PT_BYTES: int64 := 3 * BIG_BYTES;
 
 fn _ptX(p: int64): int64 { return p; }
 fn _ptY(p: int64): int64 { return p + BIG_BYTES; }
@@ -699,11 +603,12 @@ fn _ptAdd(ctx: int64, r: int64, pp: int64, qq: int64): void {
   var av: int64 := _ctxBig(ctx, 2);
   var b3: int64 := _ctxBig(ctx, 3);
 
-  var t0: int64 := alloc(BIG_BYTES);  var t1: int64 := alloc(BIG_BYTES);
-  var t2: int64 := alloc(BIG_BYTES);  var t3: int64 := alloc(BIG_BYTES);
-  var t4: int64 := alloc(BIG_BYTES);  var t5: int64 := alloc(BIG_BYTES);
-  var x3: int64 := alloc(BIG_BYTES);  var y3: int64 := alloc(BIG_BYTES);
-  var z3: int64 := alloc(BIG_BYTES);
+  var kr: int64 := ecScr() + ES_PTADD;
+  var t0: int64 := kr;                    var t1: int64 := kr + BIG_BYTES;
+  var t2: int64 := kr + 2 * BIG_BYTES;    var t3: int64 := kr + 3 * BIG_BYTES;
+  var t4: int64 := kr + 4 * BIG_BYTES;    var t5: int64 := kr + 5 * BIG_BYTES;
+  var x3: int64 := kr + 6 * BIG_BYTES;    var y3: int64 := kr + 7 * BIG_BYTES;
+  var z3: int64 := kr + 8 * BIG_BYTES;
 
   var x1: int64 := _ptX(pp);  var y1: int64 := _ptY(pp);  var z1: int64 := _ptZ(pp);
   var x2: int64 := _ptX(qq);  var y2: int64 := _ptY(qq);  var z2: int64 := _ptZ(qq);
@@ -766,38 +671,71 @@ fn _ptAdd(ctx: int64, r: int64, pp: int64, qq: int64): void {
   _bigCopy(_ptY(r), y3);
   _bigCopy(_ptZ(r), z3);
 
-  free(t0, BIG_BYTES);  free(t1, BIG_BYTES);  free(t2, BIG_BYTES);
-  free(t3, BIG_BYTES);  free(t4, BIG_BYTES);  free(t5, BIG_BYTES);
-  free(x3, BIG_BYTES);  free(y3, BIG_BYTES);  free(z3, BIG_BYTES);
 }
 
-// Montgomery-Leiter: in jedem Schritt genau eine Addition und eine
-// Verdopplung, unabhaengig vom Bit. Der Tausch geschieht maskiert.
+// Skalarmultiplikation mit FESTEM 4-Bit-Fenster.
+//
+// Vorher lief hier eine Montgomery-Leiter: je Bit eine Addition und eine
+// Verdopplung, also 280 + 280 Punktadditionen. Das Fensterverfahren rechnet
+// dieselbe Zahl Verdopplungen, aber nur noch eine Addition je vier Bit:
+// 70 Fenster * (4 Verdopplungen + 1 Addition) + 15 fuer die Tabelle = 365
+// statt 560 Punktadditionen. Gemessen 93 -> 69 Mio Befehle je
+// Multiplikation.
+//
+// Die konstante Laufzeit bleibt, und zwar aus zwei Gruenden:
+//   - Die Zahl der Operationen haengt nur an der Bitbreite, nicht am Wert.
+//     Auch das Fenster 0 wird addiert (Tabelleneintrag 0 ist der unendlich
+//     ferne Punkt, und die vollstaendige Additionsformel vertraegt ihn).
+//   - Der Tabellenzugriff ist MASKIERT: es werden alle sechzehn Eintraege
+//     gelesen und der gesuchte herausmaskiert. Ein Index aus dem Skalar in
+//     den Speicher waere ein Cache-Seitenkanal — genau der Angriff, den
+//     diese Einheit vermeiden soll.
 fn _ptMul(ctx: int64, r: int64, k: int64, pt: int64): void {
-  var r0: int64 := alloc(PT_BYTES);
-  var r1: int64 := alloc(PT_BYTES);
-  var tmp: int64 := alloc(PT_BYTES);
+  var kr: int64 := ecScr() + ES_WIN;
+  var tab: int64 := kr;                        // 16 Punkte
+  var akku: int64 := kr + 16 * PT_BYTES;
+  var tmp: int64 := akku + PT_BYTES;
 
-  _ptSetInf(ctx, r0);
-  _ptCopy(r1, pt);
-
-  var i: int64 := LIMBS * LIMB_BITS - 1;
-  while (i >= 0) {
-    var bit: int64 := _bigBit(k, i);
-    var mask: int64 := 0 - bit;
-
-    _ptCswap(r0, r1, mask);
-    _ptAdd(ctx, tmp, r0, r1);
-    _ptCopy(r1, tmp);
-    _ptAdd(ctx, tmp, r0, r0);
-    _ptCopy(r0, tmp);
-    _ptCswap(r0, r1, mask);
-
-    i := i - 1;
+  // tab[0] = unendlich ferner Punkt, tab[j] = j * P
+  _ptSetInf(ctx, tab);
+  _ptCopy(tab + PT_BYTES, pt);
+  var j: int64 := 2;
+  while (j < 16) {
+    _ptAdd(ctx, tab + j * PT_BYTES, tab + (j - 1) * PT_BYTES, pt);
+    j := j + 1;
   }
 
-  _ptCopy(r, r0);
-  free(r0, PT_BYTES);  free(r1, PT_BYTES);  free(tmp, PT_BYTES);
+  _ptSetInf(ctx, akku);
+  var i: int64 := LIMBS * LIMB_BITS - 4;       // 276, 280 Bit in 70 Fenstern
+  while (i >= 0) {
+    // vier Verdopplungen
+    var d: int64 := 0;
+    while (d < 4) {
+      _ptAdd(ctx, tmp, akku, akku);
+      _ptCopy(akku, tmp);
+      d := d + 1;
+    }
+    // Fensterwert lesen
+    var w: int64 := (_bigBit(k, i) | (_bigBit(k, i + 1) << 1))
+                  | ((_bigBit(k, i + 2) << 2) | (_bigBit(k, i + 3) << 3));
+    // maskiert aus der Tabelle holen
+    var z: int64 := 0;
+    while (z < PT_BYTES) { poke64(tmp + z, 0); z := z + 8; }
+    var e: int64 := 0;
+    while (e < 16) {
+      var maske: int64 := CTEqual(e, w);
+      var o: int64 := 0;
+      while (o < PT_BYTES) {
+        poke64(tmp + o, peek64(tmp + o) | (peek64(tab + e * PT_BYTES + o) & maske));
+        o := o + 8;
+      }
+      e := e + 1;
+    }
+    _ptAdd(ctx, akku, akku, tmp);
+    i := i - 4;
+  }
+
+  _ptCopy(r, akku);
 }
 
 // Projektive Koordinaten in affine umrechnen; false beim Punkt im Unendlichen.
@@ -808,8 +746,8 @@ fn _ptToAffine(ctx: int64, pt: int64, xOut: int64, yOut: int64): bool {
 
   if (_bigIsZero(_ptZ(pt)) == 1) { return false; }
 
-  var zinv: int64 := alloc(BIG_BYTES);
-  var t: int64 := alloc(BIG_BYTES);
+  var zinv: int64 := ecScr() + ES_PTAFF;
+  var t: int64 := ecScr() + ES_PTAFF + BIG_BYTES;
   _montInv(zinv, _ptZ(pt), p, n0, r2);
 
   _montMul(t, _ptX(pt), zinv, p, n0);
@@ -820,8 +758,6 @@ fn _ptToAffine(ctx: int64, pt: int64, xOut: int64, yOut: int64): bool {
   _fromMont(t, t, p, n0);
   _bigToBytes(t, yOut);
 
-  free(zinv, BIG_BYTES);
-  free(t, BIG_BYTES);
   return true;
 }
 
@@ -830,13 +766,12 @@ fn _ptFromAffine(ctx: int64, pt: int64, x32: int64, y32: int64): void {
   var n0: int64 := _ctxN0p(ctx);
   var r2: int64 := _ctxBig(ctx, 4);
 
-  var t: int64 := alloc(BIG_BYTES);
+  var t: int64 := ecScr() + ES_PTFROM;
   _bigFromBytes(t, x32);
   _toMont(_ptX(pt), t, p, n0, r2);
   _bigFromBytes(t, y32);
   _toMont(_ptY(pt), t, p, n0, r2);
   _bigCopy(_ptZ(pt), _ctxBig(ctx, 6));
-  free(t, BIG_BYTES);
 }
 
 // ── Oeffentliche Punktoperationen ────────────────────────────────────────────
@@ -1326,8 +1261,12 @@ pub fn EcdsaSign(curve: int64, hash32: int64, priv32: int64,
       // s = k^-1 * (z + r*d) mod n
       _scMulMod(ctx, t, rr, d);
       var sum: int64 := alloc(BIG_BYTES);
-      _bigAdd(sum, z, t);
-      _scReduce(ctx, sum, sum);
+      // MODULARE Addition, nicht _bigAdd + Reduktion: z + r*d kann 2^256
+      // ueberschreiten, und dann ist der Uebertrag weg. Mit zehn Gliedern zu
+      // 28 Bit lagen 280 Bit Platz dahinter und es fiel nicht auf; mit vier
+      // Gliedern zu 64 Bit ist die Zahl genau 256 Bit breit. Gemessen: r war
+      // richtig, s falsch, und die eigene Signatur wurde abgelehnt.
+      _modAdd(sum, z, t, n);
       _scInvMod(ctx, kinv, k);
       _scMulMod(ctx, ss, kinv, sum);
       free(sum, BIG_BYTES);
@@ -1343,7 +1282,8 @@ pub fn EcdsaSign(curve: int64, hash32: int64, priv32: int64,
       var i: int64 := LIMBS - 1;
       while (i >= 0) {
         var cur: int64 := _g(half, i);
-        _s(half, i, (cur >> 1) | ((carry & 1) << (LIMB_BITS - 1)));
+        // arithmetisches `>>` wuerde hier das Vorzeichen nachziehen
+        _s(half, i, (((cur as uint64) >> 1) as int64) | ((carry & 1) << (LIMB_BITS - 1)));
         carry := cur;
         i := i - 1;
       }

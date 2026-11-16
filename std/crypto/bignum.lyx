@@ -30,7 +30,7 @@
 //   BnMul(r, a, b, n)                    — 2n Glieder Ergebnis
 //   BnFromBytes/BnToBytes                — big-endian, wie in Zertifikaten
 //   BnBitLen/BnBit
-//   BnMontN0(m0) / BnMontMul / BnMontRedc / BnMontR2
+//   BnMontN0(m0) / BnMontMul / BnMontRedcWide / BnMontR2 / BnAddCond
 //   BnModExp(r, b, e, eLen, m, n)        — oeffentlicher Exponent
 //   BnModExpCT(r, b, e, eLen, m, n)      — geheimer Exponent
 
@@ -60,7 +60,8 @@ con BS_EXPT:  int64 := 5200;                   // BnModExp: Zwischenprodukt
 con BS_TAB:   int64 := 6240;                    // 16 Fenstereintraege
 con BS_MUL:   int64 := 22624;                  // BnMul-Zwischenergebnis 2n
 con BS_R2:    int64 := 24704;                  // BnMontR2
-con BS_GROESSE: int64 := 26784;
+con BS_REDW:  int64 := 26784;                  // BnMontRedcWide: 2n+2 Glieder
+con BS_GROESSE: int64 := 28864;
 
 var _bnScr: int64 := 0;
 
@@ -175,6 +176,28 @@ pub fn BnSubCond(r: int64, b: int64, n: int64, maske: int64): void {
         c := b1 + b2;
         i += 1;
     }
+}
+
+// r := r + b, wenn maske == -1; sonst bleibt r. Gegenstueck zu BnSubCond —
+// dieselbe Rechnung mit Addition statt Subtraktion, die beiden muessen
+// uebereinstimmen. Gebraucht fuer den chinesischen Restsatz: dort wird eine
+// Differenz, die negativ geworden ist, um den Modulus angehoben, und ob sie
+// negativ war, ist ein Geheimnis.
+pub fn BnAddCond(r: int64, b: int64, n: int64, maske: int64): int64 {
+    var c: int64 := 0;
+    var i: int64 := 0;
+    while (i < n) {
+        var x: int64 := peek64(r + i * 8);
+        var y: int64 := peek64(b + i * 8) & maske;
+        var s1: int64 := x + y;
+        var k1: int64 := bnCarry(x, y, s1);
+        var s2: int64 := s1 + c;
+        var k2: int64 := bnCarry(s1, c, s2);
+        poke64(r + i * 8, s2);
+        c := k1 + k2;
+        i += 1;
+    }
+    return c;
 }
 
 pub fn BnAddLimb(r: int64, n: int64, w: int64): int64 {
@@ -390,6 +413,66 @@ fn bnGeMaske(a: int64, b: int64, n: int64): int64 {
     return CTIsZero(c);
 }
 
+// Montgomery-Reduktion einer DOPPELT breiten Zahl: r (n Glieder) :=
+// x * R^-1 mod m, mit x aus 2n Gliedern und x < m * R.
+//
+// Gebraucht fuer den chinesischen Restsatz: dort muss die n-gliedrige
+// Nachricht modulo der halb so breiten Primzahlen p und q reduziert werden,
+// und eine Division gibt es in dieser Unit nicht. Der Weg ist
+//   x mod p = MontMul(RedcWide(x), R^2 mod p)
+// — die Reduktion liefert x*R^-1, die Multiplikation mit R^2 bringt ein R
+// zurueck. Die Bedingung x < m*R ist bei RSA erfuellt: x < n = p*q und
+// q < R.
+//
+// Laufzeit und Speicherzugriffe haengen nur an n.
+pub fn BnMontRedcWide(r: int64, x: int64, m: int64, n: int64, n0: int64): void {
+    if (n > BN_MAX) { panic("bignum: Gliedzahl ueber der Grenze"); }
+    var t: int64 := bnScr() + BS_REDW;
+    var i: int64 := 0;
+    while (i < 2 * n) { poke64(t + i * 8, peek64(x + i * 8)); i += 1; }
+    poke64(t + 2 * n * 8, 0);
+    poke64(t + (2 * n + 1) * 8, 0);
+
+    i := 0;
+    while (i < n) {
+        var mu: int64 := peek64(t + i * 8) * n0;
+        var c: int64 := 0;
+        var j: int64 := 0;
+        while (j < n) {
+            var mj: int64 := peek64(m + j * 8);
+            var lo: int64 := mj * mu;
+            var hi: int64 := umulhi(mj, mu);
+            var u0: int64 := peek64(t + (i + j) * 8);
+            var s1: int64 := u0 + lo;
+            var k1: int64 := bnCarry(u0, lo, s1);
+            var s2: int64 := s1 + c;
+            var k2: int64 := bnCarry(s1, c, s2);
+            poke64(t + (i + j) * 8, s2);
+            c := hi + k1 + k2;
+            j += 1;
+        }
+        // Uebertrag weitertragen; der Platz dafuer sind die zwei Glieder
+        // ueber 2n. Die Schleife laeuft IMMER bis zum Ende, nicht bis der
+        // Uebertrag 0 ist: sonst haengt die Rundenzahl am Wert, und der Wert
+        // ist hier das Geheimnis.
+        var p: int64 := i + n;
+        while (p <= 2 * n + 1) {
+            var xw: int64 := peek64(t + p * 8);
+            var s: int64 := xw + c;
+            c := bnCarry(xw, c, s);
+            poke64(t + p * 8, s);
+            p += 1;
+        }
+        i += 1;
+    }
+
+    // Die obere Haelfte ist das Ergebnis, noch < 2m.
+    BnCopy(r, t + n * 8, n);
+    var ueber: int64 := peek64(t + 2 * n * 8);
+    var hatUeber: int64 := CTIsZero(ueber) ^ 0xFFFFFFFFFFFFFFFF;
+    BnSubCond(r, m, n, hatUeber | bnGeMaske(r, m, n));
+}
+
 // R2 = R^2 mod m, gebraucht fuer den Wechsel in die Montgomery-Form.
 // Rechnung ohne Division: 2^(128n) mod m durch 128n Verdopplungen.
 pub fn BnMontR2(r2: int64, m: int64, n: int64): void {
@@ -435,12 +518,19 @@ pub fn BnFromMont(r: int64, a: int64, m: int64, n: int64, n0: int64): void {
 
 // Gemeinsamer Kern. `ct` entscheidet, ob die Fensterauswahl alle Eintraege
 // liest (geheimer Exponent) oder direkt zugreift (oeffentlicher Exponent).
+// `r2vor` darf 0 sein; dann wird R^2 mod m hier gerechnet. Wer denselben
+// Modulus oft benutzt (RSA mit CRT: p und q bei jeder Signatur), gibt den
+// vorgerechneten Wert mit — BnMontR2 kostet 128n Verdopplungen und war bei
+// halber Breite ein Drittel der Signaturzeit.
 fn modExpKern(r: int64, b: int64, e: int64, eBits: int64, m: int64, n: int64,
-              ct: bool): void {
+              ct: bool, r2vor: int64): void {
     var n0: int64 := BnMontN0(peek64(m));
     var scr: int64 := bnScr();
-    var r2: int64 := scr + BS_R2;
-    BnMontR2(r2, m, n);
+    var r2: int64 := r2vor;
+    if (r2 == 0) {
+        r2 := scr + BS_R2;
+        BnMontR2(r2, m, n);
+    }
 
     var basis: int64 := scr + BS_EXP;
     var akku: int64 := scr + BS_EXPA;
@@ -513,12 +603,28 @@ fn modExpKern(r: int64, b: int64, e: int64, eBits: int64, m: int64, n: int64,
 
 // r := b^e mod m, Exponent OEFFENTLICH (RSA-Verifikation, e = 65537).
 pub fn BnModExp(r: int64, b: int64, e: int64, eBits: int64, m: int64, n: int64): void {
-    modExpKern(r, b, e, eBits, m, n, false);
+    modExpKern(r, b, e, eBits, m, n, false, 0);
+}
+
+// Wie BnModExp, mit vorgerechnetem R^2 mod m. Beim Pruefen einer
+// RSA-Signatur ist der Exponent klein (65537: siebzehn Quadrierungen), und
+// BnMontR2 ueber die ganze Breite kostete dort MEHR als die Potenz selbst.
+pub fn BnModExpR2(r: int64, b: int64, e: int64, eBits: int64, m: int64,
+                  n: int64, r2: int64): void {
+    modExpKern(r, b, e, eBits, m, n, false, r2);
 }
 
 // r := b^e mod m mit GEHEIMEM Exponenten (RSA-Signatur). Die Fensterauswahl
 // liest alle Tabelleneintraege, die Rechenwege sind gliedzahlabhaengig, nicht
 // wertabhaengig.
 pub fn BnModExpCT(r: int64, b: int64, e: int64, eBits: int64, m: int64, n: int64): void {
-    modExpKern(r, b, e, eBits, m, n, true);
+    modExpKern(r, b, e, eBits, m, n, true, 0);
+}
+
+// Wie BnModExpCT, aber mit vorgerechnetem R^2 mod m. `r2` muss zu m und n
+// passen — ein fremdes R^2 ergibt eine falsche Potenz, darum gehoert es
+// neben den Modulus gelegt und nicht frei herumgereicht.
+pub fn BnModExpCTR2(r: int64, b: int64, e: int64, eBits: int64, m: int64,
+                    n: int64, r2: int64): void {
+    modExpKern(r, b, e, eBits, m, n, true, r2);
 }

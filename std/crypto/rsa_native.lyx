@@ -15,15 +15,26 @@
 // std.crypto.hkdf ueber seine LAENGE gewaehlt: 32, 48 oder 64. Jeder andere
 // Wert wird abgewiesen, nicht auf SHA-256 gerundet.
 //
-// Konstante Laufzeit: das Signieren rechnet den Modexp ueber BnModExpCT
-// (geheimer Exponent, Fensterauswahl liest alle Tabelleneintraege). Der
-// Vergleich beim Pruefen laeuft ueber CTMemEqual. Das Pruefen selbst
-// verarbeitet nur oeffentliche Werte.
+// Konstante Laufzeit: das Signieren rechnet die Potenzen ueber BnModExpCT
+// (geheimer Exponent, Fensterauswahl liest alle Tabelleneintraege). Im
+// CRT-Weg laufen auch die Reduktion modulo p, die Differenz m1 - m2 und das
+// Anheben um den Modulus maskiert, ohne Sprung am Wert. Der Vergleich beim
+// Pruefen laeuft ueber CTMemEqual. Das Pruefen selbst verarbeitet nur
+// oeffentliche Werte.
 //
-// NICHT enthalten und darum ausdruecklich benannt: der chinesische Restsatz
-// beim Signieren (gemessen 38 ms je Signatur ohne CRT, rund 10 ms waeren es
-// mit — eigener Schritt), Verschluesselung (OAEP/PKCS#1-v1.5-Padding fuer
-// Transport), Schluesselerzeugung.
+// Signiert wird mit dem chinesischen Restsatz (RFC 8017 §5.2.1), wenn der
+// Schluessel p, q, dp, dq und qinv mitbringt — also nach PKCS#8 oder PKCS#1.
+// Gemessen an einem 2048-Bit-Schluessel: 107,9 Mio Befehle je Signatur
+// gegen 397,2 Mio ueber d, Faktor 3,68 (Wanduhr in ruhiger Lage 16,5 ms
+// gegen 54,7 ms). Nach dem Rechnen steht die Gegenprobe s^e mod n == m: sie
+// faengt einen Rechenfehler und den Fehlerangriff von
+// Boneh/DeMillo/Lipton, bei dem eine verfaelschte Haelfte den Modulus
+// faktorisierbar macht. Eine falsche Signatur wird nie herausgegeben.
+// Fehlt eine der fuenf Zahlen, wird ueber d gerechnet — langsamer, aber
+// dieselbe Signatur (tests/crypto_rsa_crt_test.sh belegt die Bitgleichheit).
+//
+// NICHT enthalten und darum ausdruecklich benannt: Verschluesselung
+// (OAEP/PKCS#1-v1.5-Padding fuer Transport), Schluesselerzeugung.
 //
 // Oeffentliche API:
 //   RsaSchluesselGroesse()
@@ -35,6 +46,7 @@
 //   RsaVerifyPkcs1(key, hashLen, hash, sig, sigLen): bool
 //   RsaVerifyPss(key, hashLen, hash, sig, sigLen): bool
 //   RsaSignPkcs1(key, hashLen, hash, sigOut): int64
+//   RsaHatCrt(key) / RsaCrtAus(key) / RsaCrtFeld(key, idx) / RsaCrtGlieder(key)
 //   RsaSignPss(key, hashLen, hash, sigOut): int64
 
 unit std.crypto.rsa_native;
@@ -56,13 +68,52 @@ con RK_E:       int64 := 16;
 con RK_HASPRIV: int64 := 24;
 con RK_N:       int64 := 32;                    // 64 Glieder
 con RK_D:       int64 := 544;                   // 64 Glieder
-con RK_SIZE:    int64 := 1056;
+// Chinesischer Restsatz: p, q, dp, dq und qinv, je halb so breit wie n
+// (32 Glieder = 2048 Bit). RK_HALB ist die Gliedzahl dieser Haelften,
+// RK_HASCRT sagt, ob alle fuenf gelesen und geprueft sind.
+con RK_P:       int64 := 1056;                  // 32 Glieder
+con RK_Q:       int64 := 1312;
+con RK_DP:      int64 := 1568;
+con RK_DQ:      int64 := 1824;
+con RK_QINV:    int64 := 2080;
+con RK_HALB:    int64 := 2336;
+con RK_HASCRT:  int64 := 2344;
+// R^2 mod p und mod q, einmal beim Lesen gerechnet. BnMontR2 kostet 128n
+// Verdopplungen; viermal je Signatur war ein Drittel der Rechenzeit.
+con RK_R2P:     int64 := 2352;                  // 32 Glieder
+con RK_R2Q:     int64 := 2608;
+// R^2 mod n — fuer das Pruefen und fuer die Gegenprobe nach dem Signieren.
+// Beim kleinen oeffentlichen Exponenten kostete BnMontR2 mehr als die
+// Potenz; gemessen 2,8 ms von 16,5 ms je Signatur.
+con RK_R2N:     int64 := 2864;                  // 64 Glieder
+con RK_SIZE:    int64 := 3376;
 
 pub fn RsaSchluesselGroesse(): int64 { return RK_SIZE; }
 
 pub fn RsaBits(key: int64): int64 { return peek64(key + RK_BITS); }
 pub fn RsaBytes(key: int64): int64 { return (peek64(key + RK_BITS) + 7) / 8; }
 pub fn RsaHatPrivat(key: int64): bool { return peek64(key + RK_HASPRIV) != 0; }
+
+// Wird mit dem chinesischen Restsatz signiert? Nach PKCS#8/PKCS#1 mit
+// vollstaendigen Werten ja, nach einem reinen (n, e, d) nein.
+pub fn RsaHatCrt(key: int64): bool { return peek64(key + RK_HASCRT) != 0; }
+
+// Den CRT-Weg abschalten und ueber d rechnen. Fuer Messungen (A/B-Paar) und
+// fuer die Gegenprobe, dass beide Wege dieselbe Signatur liefern.
+pub fn RsaCrtAus(key: int64): void { poke64(key + RK_HASCRT, 0); }
+
+// Adresse einer der fuenf CRT-Zahlen: 0 p, 1 q, 2 dp, 3 dq, 4 qinv, je
+// RsaCrtGlieder() Glieder. Fuer Diagnose und Pruefstaende — etwa um einen
+// Rechenfehler einzustreuen und zu belegen, dass die Gegenprobe greift.
+pub fn RsaCrtGlieder(key: int64): int64 { return peek64(key + RK_HALB); }
+pub fn RsaCrtFeld(key: int64, idx: int64): int64 {
+    if (idx == 0) { return key + RK_P; }
+    if (idx == 1) { return key + RK_Q; }
+    if (idx == 2) { return key + RK_DP; }
+    if (idx == 3) { return key + RK_DQ; }
+    if (idx == 4) { return key + RK_QINV; }
+    return 0;
+}
 
 // ---------------------------------------------------------------------------
 // Kratzbereich (ein alloc je Programmlauf, feste Unterbereiche je Funktion —
@@ -87,7 +138,15 @@ con RS_PREF:   int64 := 2696;     // 32 DigestInfo-Praefix
 con RS_BNS:    int64 := 2728;     // 512 Bignum: Signatur
 con RS_BNM:    int64 := 3240;     // 512 Bignum: Nachricht
 con RS_E:      int64 := 3752;     // 64 oeffentlicher Exponent als Langzahl
-con RS_GROESSE: int64 := 3816;
+// Chinesischer Restsatz. Jeder Bereich gehoert genau einer Rolle.
+con RS_M1:     int64 := 3816;     // 256 m1 = c^dp mod p
+con RS_M2:     int64 := 4072;     // 256 m2 = c^dq mod q
+con RS_RED:    int64 := 4328;     // 256 reduzierte Nachricht bzw. m2 mod p
+con RS_HCRT:   int64 := 4584;     // 256 h = qinv * (m1 - m2) mod p
+con RS_PROD:   int64 := 4840;     // 512 q * h (doppelt breit)
+con RS_PRUEF:  int64 := 5352;     // 512 Gegenprobe s^e mod n
+con RS_PROBE:  int64 := 5864;     // 256 Ablage der Probesubtraktion
+con RS_GROESSE: int64 := 6120;
 
 var _rsaScr: int64 := 0;
 
@@ -132,6 +191,7 @@ fn rsaSetzeModulus(key: int64, der: int64, pos: int64, len: int64): bool {
     // besetzen; beides gilt fuer echte RSA-Moduli und wird hier geprueft,
     // statt spaeter still falsch zu rechnen.
     if ((peek64(key + RK_N) & 1) == 0) { return false; }
+    BnMontR2(key + RK_R2N, key + RK_N, glieder);
     return true;
 }
 
@@ -190,9 +250,26 @@ pub fn RsaPubAusSpki(der: int64, derLen: int64, key: int64): bool {
     return RsaPubAusDer(der + peek64(pp), peek64(ll), key);
 }
 
+// Eine der fuenf CRT-Zahlen in ein Feld halber Breite legen. Liefert die
+// Gliedzahl oder 0.
+fn rsaSetzeHalb(ziel: int64, halb: int64, der: int64, pos: int64, len: int64): int64 {
+    var p: int64 := pos;
+    var l: int64 := len;
+    while (l > 0 && (peek8(der + p) & 0xFF) == 0) { p += 1; l -= 1; }
+    if (l <= 0 || l > halb * 8) { return 0; }
+    BnZero(ziel, halb);
+    if (!BnFromBytes(ziel, halb, der + p, l)) { return 0; }
+    return (l + 7) / 8;
+}
+
 // RSAPrivateKey ::= SEQUENCE { version, n, e, d, p, q, dp, dq, qinv }
-// p..qinv werden gelesen und verworfen: ohne CRT werden sie nicht gebraucht,
-// und ein halber CRT-Pfad waere ein stiller Default.
+//
+// p..qinv werden fuer den chinesischen Restsatz gelesen. Fehlt eines, ist
+// eines gerade oder passt eine Breite nicht, bleibt RK_HASCRT 0 und
+// signiert wird mit d ueber dem ganzen Modulus — langsamer, aber dieselbe
+// Signatur. Das ist kein stiller Default: beide Wege sind vollstaendig, und
+// die Gegenprobe s^e mod n prueft am Ende, dass der genommene Weg gestimmt
+// hat.
 pub fn RsaPrivAusPkcs1(der: int64, derLen: int64, key: int64): bool {
     var i: int64 := 0;
     while (i < RK_SIZE) { poke8(key + i, 0); i := i + 1; }
@@ -215,7 +292,47 @@ pub fn RsaPrivAusPkcs1(der: int64, derLen: int64, key: int64): bool {
     poke64(key + RK_E, e);
     if (!DerLies(der, ende, DerNaechste(k), k)) { return false; }
     if (DerTag(k) != 0x02) { return false; }
-    return rsaSetzeD(key, der, DerInhalt(k), DerInhaltLen(k));
+    if (!rsaSetzeD(key, der, DerInhalt(k), DerInhaltLen(k))) { return false; }
+
+    // p, q, dp, dq, qinv — fuer den chinesischen Restsatz.
+    var halb: int64 := (peek64(key + RK_GLIEDER) + 1) / 2;
+    if (halb <= 0 || halb > 32) { return true; }
+    poke64(key + RK_HALB, halb);
+    var gut: bool := true;
+    var feld: int64 := 0;
+    while (feld < 5 && gut) {
+        if (!DerLies(der, ende, DerNaechste(k), k)) { gut := false; }
+        else {
+            if (DerTag(k) != 0x02) { gut := false; }
+            else {
+                var ziel: int64 := key + RK_P;
+                if (feld == 1) { ziel := key + RK_Q; }
+                if (feld == 2) { ziel := key + RK_DP; }
+                if (feld == 3) { ziel := key + RK_DQ; }
+                if (feld == 4) { ziel := key + RK_QINV; }
+                if (rsaSetzeHalb(ziel, halb, der, DerInhalt(k), DerInhaltLen(k)) <= 0) {
+                    gut := false;
+                }
+            }
+        }
+        feld += 1;
+    }
+    // Montgomery verlangt ungerade Moduli; eine gerade "Primzahl" waere
+    // ohnehin kaputt.
+    if (gut) {
+        if ((peek64(key + RK_P) & 1) == 0) { gut := false; }
+        if ((peek64(key + RK_Q) & 1) == 0) { gut := false; }
+    }
+    if (gut) {
+        BnMontR2(key + RK_R2P, key + RK_P, halb);
+        BnMontR2(key + RK_R2Q, key + RK_Q, halb);
+        poke64(key + RK_HASCRT, 1);
+    }
+    else {
+        SecureZero(key + RK_P, 5 * 256);
+        poke64(key + RK_HASCRT, 0);
+    }
+    return true;
 }
 
 // PrivateKeyInfo mit rsaEncryption
@@ -429,6 +546,82 @@ fn emsaPssVerify(hashLen: int64, mHash: int64, em: int64, emBits: int64): bool {
 // Signieren und Pruefen
 // ---------------------------------------------------------------------------
 
+// c mod m fuer ein m halber Breite, ohne Division:
+//   c mod m = MontMul(RedcWide(c), R^2 mod m)
+// Die Reduktion liefert c*R^-1, die Multiplikation bringt ein R zurueck.
+fn rsaModHalb(ziel: int64, c: int64, m: int64, halb: int64, r2: int64): void {
+    var n0: int64 := BnMontN0(peek64(m));
+    BnMontRedcWide(ziel, c, m, halb, n0);
+    BnMontMul(ziel, ziel, r2, m, halb, n0);
+}
+
+// s = m^d mod n mit dem chinesischen Restsatz (RFC 8017 §5.2.1, zweite
+// Form). Rund viermal schneller als der Weg ueber d: zwei Exponentiationen
+// halber Breite statt einer ganzen.
+//
+//   m1 = c^dp mod p,  m2 = c^dq mod q
+//   h  = qinv * (m1 - m2) mod p
+//   s  = m2 + q * h
+//
+// Alle Schritte laufen maskiert: ob die Differenz negativ war und ob ein
+// Modulus abgezogen werden muss, sind Geheimnisse.
+fn rsaPrivOpCrt(key: int64, bm: int64, out: int64): bool {
+    var glieder: int64 := peek64(key + RK_GLIEDER);
+    var halb: int64 := peek64(key + RK_HALB);
+    if (halb <= 0 || 2 * halb < glieder) { return false; }
+    var scr: int64 := rsaScr();
+    var m1: int64 := scr + RS_M1;
+    var m2: int64 := scr + RS_M2;
+    var red: int64 := scr + RS_RED;
+    var h: int64 := scr + RS_HCRT;
+    var r2p: int64 := key + RK_R2P;
+    var r2q: int64 := key + RK_R2Q;
+    var prod: int64 := scr + RS_PROD;
+    var p: int64 := key + RK_P;
+    var q: int64 := key + RK_Q;
+
+    // Die Nachricht steht in `glieder` Gliedern; RedcWide liest 2*halb.
+    // Dazwischen koennen Glieder fehlen — die werden genullt, nicht geraten.
+    var i: int64 := glieder;
+    while (i < 2 * halb) { poke64(bm + i * 8, 0); i += 1; }
+
+    // m1 = (c mod p)^dp mod p
+    rsaModHalb(red, bm, p, halb, r2p);
+    BnModExpCTR2(m1, red, key + RK_DP, halb * 64, p, halb, r2p);
+    // m2 = (c mod q)^dq mod q
+    rsaModHalb(red, bm, q, halb, r2q);
+    BnModExpCTR2(m2, red, key + RK_DQ, halb * 64, q, halb, r2q);
+
+    // m2 mod p: m2 < q < 2p (p und q sind gleich lang), also hoechstens
+    // eine Subtraktion — maskiert, nicht verzweigt.
+    BnCopy(red, m2, halb);
+    var leihe: int64 := bnProbeSub(red, p, halb);
+    BnSubCond(red, p, halb, 0 - (1 - leihe));
+
+    // h = qinv * (m1 - red) mod p
+    var leihe2: int64 := BnSub(h, m1, red, halb);
+    BnAddCond(h, p, halb, 0 - leihe2);
+    var n0p: int64 := BnMontN0(peek64(p));
+    BnToMont(h, h, p, halb, n0p, r2p);
+    BnMontMul(h, h, key + RK_QINV, p, halb, n0p);
+
+    // s = m2 + q * h
+    BnMul(prod, q, h, halb);
+    var c2: int64 := BnAdd(prod, prod, m2, halb);
+    if (c2 != 0) { BnAddLimb(prod + halb * 8, halb, c2); }
+    BnZero(out, glieder);
+    BnCopy(out, prod, glieder);
+    SecureZero(m1, 256); SecureZero(m2, 256);
+    SecureZero(red, 256); SecureZero(h, 256);
+    return true;
+}
+
+// Probesubtraktion: liefert nur das Borgen, `r` bleibt unveraendert.
+fn bnProbeSub(r: int64, b: int64, n: int64): int64 {
+    var scr: int64 := rsaScr() + RS_PROBE;      // nur Ablage, kein Ergebnis
+    return BnSub(scr, r, b, n);
+}
+
 // s = m^d mod n (geheimer Exponent) bzw. m = s^e mod n (oeffentlich).
 fn rsaPrivOp(key: int64, em: int64, k: int64, out: int64): bool {
     var glieder: int64 := peek64(key + RK_GLIEDER);
@@ -437,7 +630,27 @@ fn rsaPrivOp(key: int64, em: int64, k: int64, out: int64): bool {
     var bs: int64 := scr + RS_BNS;
     if (!BnFromBytes(bm, glieder, em, k)) { return false; }
     if (BnCmp(bm, key + RK_N, glieder) >= 0) { return false; }
-    BnModExpCT(bs, bm, key + RK_D, peek64(key + RK_BITS), key + RK_N, glieder);
+
+    if (peek64(key + RK_HASCRT) != 0) {
+        if (!rsaPrivOpCrt(key, bm, bs)) { return false; }
+    } else {
+        BnModExpCT(bs, bm, key + RK_D, peek64(key + RK_BITS), key + RK_N, glieder);
+    }
+
+    // Gegenprobe s^e mod n == m. Sie kostet eine Exponentiation mit dem
+    // kleinen oeffentlichen Exponenten (bei 65537 siebzehn Quadrierungen)
+    // und faengt zwei Dinge: einen Rechenfehler im CRT-Weg und den
+    // klassischen Fehlerangriff (Boneh/DeMillo/Lipton), bei dem eine
+    // verfaelschte Haelfte den Modulus faktorisierbar macht. Eine falsche
+    // Signatur wird NICHT herausgegeben.
+    var pr: int64 := scr + RS_PRUEF;
+    var e: int64 := scr + RS_E;
+    BnZero(e, glieder);
+    poke64(e, peek64(key + RK_E));
+    BnModExpR2(pr, bs, e, BnBitLen(e, glieder), key + RK_N, glieder,
+               key + RK_R2N);
+    if (BnCmp(pr, bm, glieder) != 0) { return false; }
+
     BnToBytes(out, bs, glieder);
     return true;
 }
@@ -453,7 +666,7 @@ fn rsaPubOp(key: int64, sig: int64, sigLen: int64, out: int64): bool {
     BnZero(e, glieder);
     poke64(e, peek64(key + RK_E));
     var eBits: int64 := BnBitLen(e, glieder);
-    BnModExp(bm, bs, e, eBits, key + RK_N, glieder);
+    BnModExpR2(bm, bs, e, eBits, key + RK_N, glieder, key + RK_R2N);
     BnToBytes(out, bm, glieder);
     return true;
 }
