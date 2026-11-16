@@ -898,6 +898,7 @@ test: lyxc
 	@bash tests/crypto_sha2_hkdf_test.sh
 	@bash tests/crypto_bignum_test.sh
 	@bash tests/crypto_rsa_test.sh
+	@bash tests/crypto_rsa_crt_test.sh
 	@bash tests/crypto_ed25519_test.sh
 	@bash tests/crypto_aead_test.sh
 	@bash tests/crypto_x509_test.sh
