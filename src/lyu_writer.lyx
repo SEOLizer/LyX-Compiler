@@ -218,7 +218,16 @@ con LYU_W_VER: int64 := 2;
 // #1974: Fassung des IR-Abschnitts. Eigenstaendig gezaehlt, damit sich das IR
 // weiterentwickeln kann, ohne die Fassung der .lyu selbst anzufassen — ein
 // Leser, der die Zahl nicht kennt, ueberspringt den Abschnitt.
-pub con LYU_IR_VER: int64 := 1;
+// #2538: Fassung 2 kodiert die SATZPUFFER feldweise (Maske + Varint) statt sie
+// als Bytekopie des RAM-Layouts zu schreiben. Die Bytefolgen (Strings, Labels)
+// bleiben roh -- dort gibt es keine Felder und nichts zu sparen.
+//
+// Der Leser in ir_lower prueft diese Zahl und BRICHT AB, wenn er sie nicht
+// kennt (`exit(1)`), statt zu raten. Beide Richtungen sind damit laut: eine
+// alte .lyu gegen einen neuen Compiler und eine neue gegen einen alten.
+// ACHTUNG: ir_lower._irUebernehmeLyu vergleicht gegen ein LITERAL. Wer diese
+// Zahl aendert, aendert sie DORT mit -- zwei Aufzaehlungen derselben Sache.
+pub con LYU_IR_VER: int64 := 2;
 
 // #2446: Den Quellpfad fuer den Debug-Abschnitt auf eine ORTSUNABHAENGIGE Form
 // bringen.
@@ -1517,6 +1526,95 @@ pub type LyuWriter = class {
   //
   // `satzGroesse` ist deshalb 1 fuer die byteweise gefuehrten Puffer und die
   // Satzgroesse fuer die anderen.
+  // #2538: ein Feld als Zickzack-Varint.
+  //
+  // Zickzack, damit kleine NEGATIVE Werte kurz bleiben: der IR benutzt -1 als
+  // "nicht belegt" (gemessen 11,6 % aller Felder), und ohne Zickzack waere
+  // genau dieser Wert mit zehn Byte der teuerste von allen.
+  //
+  // FLUCHTFORM: nach acht Fortsetzungsbytes (56 Bit) traegt das neunte die
+  // restlichen 8 Bit ROH. Damit kostet kein Wert mehr als 9 Byte, waehrend
+  // reines LEB128 fuer grosse Zahlen zehn braucht -- 8,7 % der Felder wuerden
+  // sonst WACHSEN statt zu schrumpfen (Zeiger und Sentinel-Nachbarn). Die
+  // Form ist eindeutig, weil der Leser nach acht Bytes nicht mehr auf das
+  // Fortsetzungsbit schaut, sondern das neunte roh nimmt.
+  fn _eVarint(v: int64) {
+    // Zickzack: (v << 1) ^ (v >> 63). `>>` ist in Lyx arithmetisch, liefert
+    // fuer negative v also -1 (alle Bits) und fuer nicht-negative 0.
+    var z: int64 := (v << 1) ^ (v >> 63);
+    var i: int64 := 0;
+    while (i < 8) {
+      // Rest nach dem Verschieben unsigned betrachten: nur die unteren
+      // 64-7i Bit sind noch da, das Vorzeichenbit ist nach dem Zickzack das
+      // oberste Datenbit und darf nicht durchgeschoben werden.
+      var rest: int64 := (z >> 7) & 0x01FFFFFFFFFFFFFF;
+      if (rest == 0) { self._e8(z & 127); return; }
+      self._e8((z & 127) | 128);
+      z := rest;
+      i := i + 1;
+    }
+    // Neuntes Byte: die restlichen 8 Bit roh.
+    self._e8(z & 255);
+  }
+
+  // #2538: Satzpuffer FELDWEISE schreiben statt byteweise zu kopieren.
+  //
+  // Bis Fassung 1 war das eine Bytekopie des RAM-Puffers: ein IR-Befehl
+  // belegt 80 Byte (zehn int64-Felder), ein typischer Befehl benutzt zwei bis
+  // vier davon, und der Rest stand als 0 in der Datei -- gemessen 72,4 %
+  // Nullbytes in lyxos/std/io.lyu. Das Dateiformat hatte die
+  // Speicherrepraesentation geerbt (#439 legte den festen Stride fuer die
+  // INDIZIERUNG im RAM fest, nicht fuer eine Datei).
+  //
+  // Jetzt: je Satz eine Feldmaske (ein Bit je Feld, gesetzt = Feld ist nicht
+  // null), dann die gesetzten Felder als Varint. Ein Nullfeld kostet damit ein
+  // BIT statt acht Byte. Gemessen an drei Units: 85,1 % kleiner.
+  fn _eIrSaetze(bufOff: int64, lenOff: int64, satzGroesse: int64, felder: int64) {
+    var b: int64 := peek64(self.irModulPtr + bufOff);
+    var saetze: int64 := peek64(self.irModulPtr + lenOff);
+    if (b == 0 || saetze <= 0) { self._e32le(0); return; }
+    // Die LAENGE steht vor den Bytes und wird nachgetragen, weil sie erst nach
+    // dem Kodieren bekannt ist -- dieselbe Zusage wie in Fassung 1: ein Leser
+    // kann den Abschnitt ueberspringen, ohne ihn zu verstehen.
+    var lenPos: int64 := self.len;
+    self._e32le(0);
+    var anfang: int64 := self.len;
+    // Die SATZZAHL gehoert in den Puffer, nicht in den Kopf. In Fassung 1 ergab
+    // sie sich aus Laenge/Satzgroesse; mit Varint geht das nicht mehr, und fuer
+    // den Capture-Puffer stand sie NIE im Kopf. Ein Puffer, der sich selbst
+    // beschreibt, braucht die drei Kopfzahlen gar nicht -- sie bleiben nur fuer
+    // einen Leser der Fassung 1 stehen.
+    self._e32le(saetze);
+    var maskBytes: int64 := (felder + 7) / 8;
+    var s: int64 := 0;
+    while (s < saetze) {
+      var satz: int64 := b + s * satzGroesse;
+      // Maske zuerst, damit der Leser weiss, welche Varints folgen.
+      var mb: int64 := 0;
+      while (mb < maskBytes) {
+        var byte: int64 := 0;
+        var bit: int64 := 0;
+        while (bit < 8) {
+          var f: int64 := mb * 8 + bit;
+          if (f < felder) {
+            if (peek64(satz + f * 8) != 0) { byte := byte | (1 << bit); }
+          }
+          bit := bit + 1;
+        }
+        self._e8(byte);
+        mb := mb + 1;
+      }
+      var f2: int64 := 0;
+      while (f2 < felder) {
+        var w: int64 := peek64(satz + f2 * 8);
+        if (w != 0) { self._eVarint(w); }
+        f2 := f2 + 1;
+      }
+      s := s + 1;
+    }
+    self._p32le(lenPos, self.len - anfang);
+  }
+
   fn _eIrPuffer(bufOff: int64, lenOff: int64, satzGroesse: int64) {
     var b: int64 := peek64(self.irModulPtr + bufOff);
     var n: int64 := peek64(self.irModulPtr + lenOff) * satzGroesse;
@@ -1648,12 +1746,14 @@ pub type LyuWriter = class {
       self._e32le(peek64(self.irModulPtr + IR_MOD_OFF_INSTRLEN));    // Saetze
       self._e32le(peek64(self.irModulPtr + IR_MOD_OFF_FUNCLEN));     // Saetze
       self._e32le(peek64(self.irModulPtr + IR_MOD_OFF_GLOBALLEN));   // Saetze
-      self._eIrPuffer(IR_MOD_OFF_INSTRBUF,   IR_MOD_OFF_INSTRLEN,   IR_INSTR_SIZE);
+      // #2538: Satzpuffer feldweise, Bytefolgen roh. Die Feldzahl ist
+      // satzGroesse/8 -- sie steht NICHT doppelt da, sondern wird gerechnet.
+      self._eIrSaetze(IR_MOD_OFF_INSTRBUF,   IR_MOD_OFF_INSTRLEN,   IR_INSTR_SIZE, IR_INSTR_SIZE / 8);
       self._eIrPuffer(IR_MOD_OFF_STRBUF,     IR_MOD_OFF_STRLEN,     1);
       self._eIrPuffer(IR_MOD_OFF_LABELBUF,   IR_MOD_OFF_LABELLEN,   1);
-      self._eIrPuffer(IR_MOD_OFF_FUNCBUF,    IR_MOD_OFF_FUNCLEN,    IR_FUNC_SIZE);
-      self._eIrPuffer(IR_MOD_OFF_GLOBALBUF,  IR_MOD_OFF_GLOBALLEN,  8);
-      self._eIrPuffer(IR_MOD_OFF_CAPTUREBUF, IR_MOD_OFF_CAPTURELEN, 8);
+      self._eIrSaetze(IR_MOD_OFF_FUNCBUF,    IR_MOD_OFF_FUNCLEN,    IR_FUNC_SIZE,  IR_FUNC_SIZE / 8);
+      self._eIrSaetze(IR_MOD_OFF_GLOBALBUF,  IR_MOD_OFF_GLOBALLEN,  8, 1);
+      self._eIrSaetze(IR_MOD_OFF_CAPTUREBUF, IR_MOD_OFF_CAPTURELEN, 8, 1);
     }
 
     // ── Debug-Abschnitt (#1555) ────────────────────────────────────────

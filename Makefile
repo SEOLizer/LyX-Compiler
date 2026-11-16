@@ -337,6 +337,7 @@ test: lyxc
 	@echo "--- Hintergrunddienste und Graph-Stelligkeit (#2544, #2529) ---"
 	@bash tests/lyxos_dienste_2544_test.sh
 	@bash tests/lyu_arch_lyxos_2536_test.sh
+	@bash tests/lyu_ir_varint_2538_test.sh
 	@bash tests/lyxos_caps_warnung_test.sh
 	@bash tests/ir_if_kette_test.sh
 	@echo "--- match und switch auf dem IR-Weg (#1825) ---"
