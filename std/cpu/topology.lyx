@@ -19,12 +19,51 @@
 unit std.cpu.topology;
 
 import std.cpu.status;
+import std.cpu.identity;   // #2413: CpuIstAmd fuer die zweite Herkunft
+
+// #2413: ZWEITE HERKUNFT fuer die SMT-Breite, AMD.
+//
+// AMD beantwortet dieselbe Frage in CPUID.Fn8000_001E: ecx Bit 8..15 nennt
+// "Threads per Compute Unit MINUS EINS" (AMD64 Architecture Programmer's
+// Manual Vol. 3, CPUID Fn8000_001E). Die +1 ist also nicht Vorsicht, sondern
+// die Definition des Feldes.
+//
+// ZWEI Waechter, und beide sind noetig — am Erzeugnis gemessen auf einem
+// Intel i5-8250U: dort ist das hoechste erweiterte Blatt 0x80000008, und eine
+// Abfrage von 0x8000001E liefert trotzdem eine Antwort (ecx = 100, also die
+// Daten von 0x80000008). CPUID gibt fuer ein Blatt ueber dem Maximum nicht 0
+// zurueck, sondern irgendetwas. Ohne die Pruefung auf das Maximum haette
+// dieser Weg auf Intel eine erfundene Zahl geliefert (((100>>8)&255)+1 = 1),
+// und zwar genau dann, wenn 0xB ausfaellt -- also im Fehlerfall eine falsche
+// Auskunft statt einer fehlenden.
+//
+// Gibt 1 zurueck, wenn ein Wert gesetzt wurde.
+fn tjkAusAmd(t: int64): int64 {
+  if (CpuIstAmd() == 0) { return 0; }
+  // Hoechstes erweitertes Blatt: eax von 0x80000000.
+  if (cpu_id(0x80000000, 0, 0) < 0x8000001E) { return 0; }
+  var tpcu: int64 := ((cpu_id(0x8000001E, 0, 2) >> 8) & 255) + 1;
+  if (tpcu <= 0) { return 0; }
+  CpuWertSetzen(t, tpcu, "cpuid.8000001e ecx[15:8]+1"c);
+  return 1;
+}
 
 // Threads je Kern (SMT-Breite) aus CPUID.0xB Unterblatt 0.
 // Blatt 0xB Unterblatt 0 beschreibt die SMT-Ebene; ebx nennt die Zahl der
 // logischen Prozessoren auf dieser Ebene.
+//
+// #2413: Faellt 0xB aus, wird AMDs eigene Herkunft gefragt, BEVOR der Wert
+// als fehlend gemeldet wird. Vorher war 0xB die einzige Quelle, und auf einem
+// AMD EPYC 7763 in einer VM (dem CI-Laeufer) fehlt dieses Blatt: die
+// Bibliothek meldete `unsupported`, obwohl `lscpu` dort 2 nennt.
+//
+// Das ist die bekannte Ursache "eine Aufzaehlung ist unvollstaendig": die
+// Auskunft zaehlt auf, woher eine Zahl kommen kann, und vergisst eine
+// Herkunft. Dreimal belegt im Bestand (#1787, #1806, #1812) -- hier bei der
+// Herkunft eines Messwerts statt bei der eines Namens.
 pub fn CpuThreadsJeKern(t: int64): void {
   if (cpu_id(0, 0, 0) < 11) {
+    if (tjkAusAmd(t) != 0) { return; }
     CpuWertFehlt(t, CPU_ST_UNSUPPORTED, "cpuid.b (Blatt fehlt)"c);
     return;
   }
@@ -32,11 +71,13 @@ pub fn CpuThreadsJeKern(t: int64): void {
   if (art != 1) {
     // Unterblatt 0 ist nicht die SMT-Ebene — dann nennt diese Maschine die
     // Ebenen anders, und wir raten nicht.
+    if (tjkAusAmd(t) != 0) { return; }
     CpuWertFehlt(t, CPU_ST_UNSUPPORTED, "cpuid.b.0 (keine SMT-Ebene)"c);
     return;
   }
   var n: int64 := cpu_id(11, 0, 1) & 65535;           // ebx Bit 0..15
   if (n <= 0) {
+    if (tjkAusAmd(t) != 0) { return; }
     CpuWertFehlt(t, CPU_ST_NOT_EXPOSED_BY_VM, "cpuid.b.0 ebx == 0"c);
     return;
   }
