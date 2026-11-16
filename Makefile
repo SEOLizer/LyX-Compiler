@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.41E
+VERSION   := 1.2.41F
 VERSION_DATE := 2026-11-16
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -338,6 +338,7 @@ test: lyxc
 	@bash tests/lyxos_dienste_2544_test.sh
 	@bash tests/lyu_arch_lyxos_2536_test.sh
 	@bash tests/lyu_ir_varint_2538_test.sh
+	@bash tests/laute_fehler_tanz1_test.sh
 	@bash tests/lyxos_caps_warnung_test.sh
 	@bash tests/ir_if_kette_test.sh
 	@echo "--- match und switch auf dem IR-Weg (#1825) ---"
