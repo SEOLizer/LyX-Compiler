@@ -1,0 +1,222 @@
+// tools/fuzz_tls.lyx — Fuzzer fuer die TLS- und X.509-Leser (#2096,
+// Abnahmekriterium 6).
+//
+// Aufruf: fuzz_tls <ziel> <runden> <saat> [<zertpfad>]
+//   ziel   record13 | record12 | x509 | alle
+//   runden Zahl der Faelle
+//   saat   Startwert des Generators; derselbe Wert ergibt denselben Lauf
+//
+// Was hier geprueft wird, ist eine EIGENSCHAFT, nicht ein Ergebnis: egal was
+// hereinkommt, die Leser muessen urteilen und dabei am Leben bleiben. Ein
+// Absturz beendet den Prozess, und genau daran faellt er auf — der Aufrufer
+// sieht einen Rueckgabewert >= 128. Zusaetzlich darf keine Verbindung
+// FERTIG melden, ohne dass ein echter Handschlag gelaufen ist: ein Leser,
+// der Muell als gueltigen Handschlag durchlaesst, waere schlimmer als einer,
+// der abstuerzt.
+//
+// Der Generator ist ein xorshift64 — kein Zufall fuer Krypto, sondern ein
+// reproduzierbarer Strom. Die Saat steht im Protokoll; damit laesst sich ein
+// Fund genau nachstellen.
+unit main;
+
+@capabilities([fs.read, memory.mmap, system.rand])
+
+import std.io;
+import std.string;
+import std.alloc;
+import std.fs;
+import std.crypto.der;
+import std.crypto.x509;
+import std.net.tls_config;
+import std.net.tls13;
+import std.net.tls12;
+
+var gZustand: int64 := 0;
+
+fn saatSetzen(s: int64): void {
+  gZustand := s;
+  if (gZustand == 0) { gZustand := 0x2545F4914F6CDD1D; }
+}
+
+fn naechste(): int64 {
+  var x: int64 := gZustand;
+  x := x ^ (x << 13);
+  x := x ^ (((x as uint64) >> 7) as int64);
+  x := x ^ (x << 17);
+  gZustand := x;
+  return x;
+}
+
+fn zahl(grenze: int64): int64 {
+  if (grenze <= 0) { return 0; }
+  var r: int64 := naechste();
+  if (r < 0) { r := 0 - r; }
+  if (r < 0) { r := 0; }                 // der kleinste int64 bleibt negativ
+  return r % grenze;
+}
+
+// Einen Puffer mit Zufallsbyte fuellen.
+fn fuellen(p: int64, n: int64): void {
+  var i: int64 := 0;
+  while (i < n) {
+    poke8(p + i, zahl(256));
+    i := i + 1;
+  }
+}
+
+// Eine Vorlage kopieren und darin wueten: Byte kippen, Stuecke abschneiden,
+// Laengenfelder verdrehen. Liefert die neue Laenge.
+fn mutieren(ziel: int64, vorlage: int64, len: int64, maxLen: int64): int64 {
+  var n: int64 := len;
+  var i: int64 := 0;
+  while (i < n) { poke8(ziel + i, peek8(vorlage + i)); i := i + 1; }
+
+  var art: int64 := zahl(5);
+  if (art == 0) {
+    // einzelne Byte kippen
+    var k: int64 := 1 + zahl(8);
+    while (k > 0) {
+      var pos: int64 := zahl(n);
+      poke8(ziel + pos, peek8(ziel + pos) ^ (1 << zahl(8)));
+      k := k - 1;
+    }
+  }
+  if (art == 1) {
+    // abschneiden
+    n := zahl(n + 1);
+  }
+  if (art == 2) {
+    // verlaengern mit Zufallsbyte
+    var extra: int64 := zahl(64);
+    if (n + extra > maxLen) { extra := maxLen - n; }
+    fuellen(ziel + n, extra);
+    n := n + extra;
+  }
+  if (art == 3) {
+    // ein Laengenfeld verdrehen: die ersten Byte sind Record- und
+    // Nachrichtenkopf, dort sitzen die Laengen.
+    if (n > 9) {
+      var pos2: int64 := zahl(9);
+      poke8(ziel + pos2, zahl(256));
+    }
+  }
+  if (art == 4) {
+    // ein ganzes Stueck durch Zufall ersetzen
+    if (n > 4) {
+      var start: int64 := zahl(n - 1);
+      var laenge: int64 := 1 + zahl(n - start);
+      fuellen(ziel + start, laenge);
+    }
+  }
+  return n;
+}
+
+fn main(): int64 {
+  var ziel: pchar := GetArg(1) as pchar;
+  var runden: int64 := StrToInt(GetArg(2) as pchar);
+  var saat: int64 := StrToInt(GetArg(3) as pchar);
+  saatSetzen(saat);
+
+  var machRec13: int64 := 0;
+  var machRec12: int64 := 0;
+  var machX509: int64 := 0;
+  if (StrCharAt(ziel, 0) == 97) { machRec13 := 1; machRec12 := 1; machX509 := 1; }  // "alle"
+  if (StrCharAt(ziel, 0) == 120) { machX509 := 1; }                                 // "x509"
+  if (StrCharAt(ziel, 0) == 114) {
+    machRec13 := 1;
+    if (StrCharAt(ziel, 6) == 50) { machRec13 := 0; machRec12 := 1; }               // "record12"
+  }
+
+  // Eine Vorlage: ein echtes ClientHello unserer eigenen Umsetzung. Damit
+  // trifft die Mutation auch die tiefen Zweige — rein zufaellige Byte
+  // scheitern fast immer schon am Recordkopf.
+  var cfgC: int64 := alloc(TlsConfigGroesse());
+  TlsConfigNeu(cfgC, 2);
+  TlsConfigZeit(cfgC, 1800000000);
+  TlsConfigMinVersion(cfgC, TlsVersion12());
+  var vorlage: int64 := alloc(4096);
+  var cl: int64 := TlsNeu(cfgC);
+  TlsSchritt(cl);
+  var vorLen: int64 := TlsAusgabe(cl, vorlage, 4096);
+  TlsFrei(cl);
+
+  var cfgS: int64 := alloc(TlsConfigGroesse());
+  TlsConfigNeu(cfgS, 1);
+  TlsConfigZeit(cfgS, 1800000000);
+  TlsConfigMinVersion(cfgS, TlsVersion12());
+
+  var puf: int64 := alloc(8192);
+  var satz: int64 := alloc(X509Groesse());
+  var zertDer: int64 := alloc(8192);
+  var zertLen: int64 := 0;
+  if (machX509 == 1) {
+    if (GetArgC() > 4) {
+      var pem: int64 := alloc(16384);
+      var n2: int64 := ReadFile(GetArg(4) as pchar, pem as pchar, 16383);
+      var lab: pchar := "CERTIFICATE"c;
+      zertLen := PemDekodiere(pem, n2, lab as int64, 11, zertDer, 8192);
+    }
+    if (zertLen <= 0) { PrintLn("KEIN ZERTIFIKAT"); return 1; }
+  }
+
+  var faelle: int64 := 0;
+  var fertigOhneHandschlag: int64 := 0;
+  var urteile: int64 := 0;
+  var i: int64 := 0;
+  while (i < runden) {
+    if (machRec13 == 1) {
+      var len: int64 := mutieren(puf, vorlage, vorLen, 8192);
+      // jeder zehnte Fall ist reiner Zufall, ohne Vorlage
+      if (zahl(10) == 0) { len := 1 + zahl(256); fuellen(puf, len); }
+      var c: int64 := TlsNeu(cfgS);
+      TlsFuetter(c, puf, len);
+      var rc: int64 := TlsSchritt(c);
+      if (TlsFertig(c)) { fertigOhneHandschlag := fertigOhneHandschlag + 1; }
+      if (rc < 0 || rc == 1 || rc == 2) { urteile := urteile + 1; }
+      // auch den Leseweg anfassen
+      TlsLese(c, puf + 4096, 1024);
+      TlsFrei(c);
+      faelle := faelle + 1;
+    }
+    if (machRec12 == 1) {
+      var len2: int64 := mutieren(puf, vorlage, vorLen, 8192);
+      if (zahl(10) == 0) { len2 := 1 + zahl(256); fuellen(puf, len2); }
+      var c2: int64 := Tls12Neu(cfgS);
+      Tls12Fuetter(c2, puf, len2);
+      var rc2: int64 := Tls12Schritt(c2);
+      if (Tls12Fertig(c2)) { fertigOhneHandschlag := fertigOhneHandschlag + 1; }
+      if (rc2 < 0 || rc2 == 1 || rc2 == 2) { urteile := urteile + 1; }
+      Tls12Lese(c2, puf + 4096, 1024);
+      Tls12Frei(c2);
+      faelle := faelle + 1;
+    }
+    if (machX509 == 1) {
+      var len3: int64 := mutieren(puf, zertDer, zertLen, 8192);
+      if (zahl(10) == 0) { len3 := 1 + zahl(256); fuellen(puf, len3); }
+      var gelesen: bool := X509Lies(puf, len3, satz);
+      if (gelesen) {
+        // Wenn der Satz gelesen wurde, muessen auch die Abfragen halten.
+        X509SanAnzahl(satz);
+        var host: pchar := "nexus.example"c;
+        X509PasstName(satz, host as int64, 13);
+        X509ZeitGueltig(satz, 1800000000);
+        var kette: int64 := alloc(16);
+        poke64(kette, puf); poke64(kette + 8, len3);
+        var trust: int64 := alloc(16);
+        poke64(trust, zertDer); poke64(trust + 8, zertLen);
+        X509PruefeKette(kette, 1, trust, 1, 0, 0, 1800000000, 1);
+        free(kette, 16); free(trust, 16);
+      }
+      urteile := urteile + 1;
+      faelle := faelle + 1;
+    }
+    i := i + 1;
+  }
+
+  Print("faelle "); PrintInt(faelle); PrintLn("");
+  Print("urteile "); PrintInt(urteile); PrintLn("");
+  Print("fertig-ohne-handschlag "); PrintInt(fertigOhneHandschlag); PrintLn("");
+  Print("saat "); PrintInt(saat); PrintLn("");
+  PrintLn("ueberlebt");
+  return 0;
+}

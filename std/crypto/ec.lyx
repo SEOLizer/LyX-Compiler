@@ -1475,11 +1475,32 @@ pub fn EcdsaSigToDer(r32: int64, s32: int64, out: int64): int64 {
 // aufgefuellt). false bei jeder Abweichung von der erwarteten Form — eine
 // nachlaessige Zerlegung ist der Ausgangspunkt fuer Signatur-Verformung, wie
 // sie Bitcoin 2015 mit BIP 66 abstellen musste.
+// Liest eine ECDSA-Signatur aus DER: SEQUENCE { INTEGER r, INTEGER s }.
+//
+// Die Lesung ist STRENG, und das ist kein Schoenheitspunkt: wer mehrere
+// Kodierungen derselben Signatur annimmt, macht sie verformbar. Vier Faelle
+// aus den Wycheproof-Vektoren (ecdsa_secp256r1_sha256, #2096) sind hier
+// durchgelaufen, bis die Regeln standen:
+//
+//   tcId 6    "s" ohne die fuehrende Null, obwohl das oberste Bit gesetzt ist
+//             — nach DER ein NEGATIVER Wert
+//   tcId 107  "r" mit fuehrendem 0xff, ebenfalls negativ
+//   tcId 145  "s" mit 33 Byte, erstes Byte 0x02 statt 0x00 — der Wert ist
+//             groesser als 2^256
+//   tcId 158  "r" ersetzt durch r + 2^256, dieselbe Ueberschreitung
+//
+// Die alte Fassung trug den Wert rechtsbuendig ein und schnitt vorne ab; aus
+// jedem dieser vier Faelle wurde damit dieselbe gueltige Signatur. Jetzt
+// gelten: positives Vorzeichen, kuerzeste Form, hoechstens 33 Byte und die
+// 33 nur mit fuehrender Null.
 pub fn EcdsaSigFromDer(der: int64, derLen: int64, r32: int64, s32: int64): bool {
   if (derLen < 8) { return false; }
   if (peek8(der) != 48) { return false; }
 
   var seqLen: int64 := peek8(der + 1);
+  // Nur die kurze Laengenform; eine lange Form (0x81/0x82) ist fuer eine
+  // Signatur dieser Groesse nicht die kuerzeste Kodierung.
+  if (seqLen >= 128) { return false; }
   if (seqLen + 2 != derLen) { return false; }
 
   var pos: int64 := 2;
@@ -1496,6 +1517,22 @@ pub fn EcdsaSigFromDer(der: int64, derLen: int64, r32: int64, s32: int64): bool 
         else {
           if (pos + 2 + l > derLen) { ok := false; idx := 2; }
           else {
+            var erstes: int64 := peek8(der + pos + 2) & 255;
+            // DER-INTEGER sind vorzeichenbehaftet: ein gesetztes oberstes Bit
+            // heisst negativ, und r und s sind nie negativ.
+            if ((erstes & 128) != 0) { ok := false; idx := 2; }
+            // Kuerzeste Form: eine fuehrende Null nur, wenn das naechste Byte
+            // sie braucht.
+            if (ok && l > 1 && erstes == 0) {
+              if ((peek8(der + pos + 3) & 128) == 0) { ok := false; idx := 2; }
+            }
+            // 33 Byte gibt es nur als 0x00 || 32 Byte; alles andere waere ein
+            // Wert jenseits von 2^256.
+            if (ok && l == 33 && erstes != 0) { ok := false; idx := 2; }
+            if (ok && l > 33) { ok := false; idx := 2; }
+          }
+          if (ok && idx < 2) {
+            var l2: int64 := peek8(der + pos + 1);
             var target: int64 := r32;
             if (idx == 1) { target := s32; }
 
@@ -1508,7 +1545,7 @@ pub fn EcdsaSigFromDer(der: int64, derLen: int64, r32: int64, s32: int64): bool 
             // rechtsbuendig eintragen; ein fuehrendes Nullbyte aus der
             // Vorzeichenregel faellt dabei von selbst weg
             var src: int64 := pos + 2;
-            var cnt: int64 := l;
+            var cnt: int64 := l2;
             if (cnt > 32) {
               src := src + (cnt - 32);
               cnt := 32;
@@ -1520,7 +1557,7 @@ pub fn EcdsaSigFromDer(der: int64, derLen: int64, r32: int64, s32: int64): bool 
               i := i + 1;
             }
 
-            pos := pos + 2 + l;
+            pos := pos + 2 + l2;
             idx := idx + 1;
           }
         }
