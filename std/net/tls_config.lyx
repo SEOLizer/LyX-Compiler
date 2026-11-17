@@ -71,9 +71,80 @@ con C_MINVER:     int64 := 144;
 // Groesste zugelassene Version, 0 heisst 0x0304. Nur fuer Pruefstaende, die
 // einen Partner ohne TLS 1.3 nachstellen wollen.
 con C_MAXVER:     int64 := 152;
-con C_SIZE:       int64 := 160;
+// ── Ticketschluessel fuer die Wiederaufnahme (#2577) ──────────────────────
+//
+// Zwei Generationen: ausgegeben wird mit der AKTUELLEN, angenommen werden
+// beide. Ohne die vorige waeren beim Schluesselwechsel alle ausgegebenen
+// Tickets im selben Augenblick wertlos.
+//
+// C_TKGEN traegt die Nummer der aktuellen Generation (1 oder 2, 0 = kein
+// Schluessel gesetzt). Ein Server ohne Ticketschluessel gibt KEINE Tickets
+// aus — er tut nicht etwas Plausibles, sondern laesst die Wiederaufnahme
+// weg, und das ist am ausbleibenden NewSessionTicket sichtbar.
+con C_TKGEN:      int64 := 160;   // 0 = aus, sonst 1 oder 2
+con C_TK1:        int64 := 168;   // 32 Byte Schluessel der Generation 1
+con C_TK2:        int64 := 200;   // 32 Byte Schluessel der Generation 2
+con C_TKLEBEN:    int64 := 232;   // Gueltigkeit in Sekunden
+con C_SIZE:       int64 := 240;
 
 pub fn TlsConfigGroesse(): int64 { return C_SIZE; }
+
+// Ticketschluessel setzen. `gen` ist 1 oder 2 und sagt, welche Generation
+// AUSGEGEBEN wird; die andere bleibt annehmbar, solange sie gesetzt ist.
+// `schluessel` zeigt auf 32 Byte.
+//
+// Der Schluessel kommt vom Betreiber, nicht aus einem Zufallsgenerator beim
+// Start: mehrere Server hinter einem Verteiler brauchen denselben, sonst
+// nimmt nur der Prozess ein Ticket an, der es ausgegeben hat — ein Fehler,
+// der im Betrieb als "Wiederaufnahme funktioniert manchmal" auffaellt und
+// schwer zu finden ist.
+//
+// `lebensdauer` in Sekunden. RFC 8446 §4.6.1 erlaubt bis 7 Tage
+// (604800); laenger wird abgewiesen, nicht gekuerzt.
+pub fn TlsConfigTicketSchluessel(cfg: int64, gen: int64, schluessel: int64,
+                                 lebensdauer: int64): bool {
+    if (gen != 1 && gen != 2) { return false; }
+    if (schluessel == 0) { return false; }
+    if (lebensdauer <= 0 || lebensdauer > 604800) { return false; }
+    var ziel: int64 := cfg + C_TK1;
+    if (gen == 2) { ziel := cfg + C_TK2; }
+    var i: int64 := 0;
+    while (i < 32) { poke8(ziel + i, peek8(schluessel + i)); i := i + 1; }
+    poke64(cfg + C_TKGEN, gen);
+    poke64(cfg + C_TKLEBEN, lebensdauer);
+    return true;
+}
+
+// Die VORIGE Generation nachtragen, ohne die aktuelle zu aendern — das ist
+// der Wechsel: erst die neue als aktuell setzen, dann die alte hierher.
+pub fn TlsConfigTicketSchluesselAlt(cfg: int64, gen: int64,
+                                    schluessel: int64): bool {
+    if (gen != 1 && gen != 2) { return false; }
+    if (schluessel == 0) { return false; }
+    if (peek64(cfg + C_TKGEN) == gen) { return false; }   // das ist die aktuelle
+    var ziel: int64 := cfg + C_TK1;
+    if (gen == 2) { ziel := cfg + C_TK2; }
+    var i: int64 := 0;
+    while (i < 32) { poke8(ziel + i, peek8(schluessel + i)); i := i + 1; }
+    return true;
+}
+
+pub fn TlsCfgTicketGen(cfg: int64): int64    { return peek64(cfg + C_TKGEN); }
+pub fn TlsCfgTicketLeben(cfg: int64): int64  { return peek64(cfg + C_TKLEBEN); }
+
+// Zeiger auf den Schluessel einer Generation, 0 wenn sie nicht gesetzt ist.
+// "Nicht gesetzt" heisst: alle 32 Byte null. Ein Schluessel aus Nullen waere
+// kein Schluessel, also ist das kein Sonderfall, den man verlieren kann.
+pub fn TlsCfgTicketKey(cfg: int64, gen: int64): int64 {
+    var z: int64 := cfg + C_TK1;
+    if (gen == 2) { z := cfg + C_TK2; }
+    else { if (gen != 1) { return 0; } }
+    var acc: int64 := 0;
+    var i: int64 := 0;
+    while (i < 32) { acc := acc | (peek8(z + i) & 0xFF); i := i + 1; }
+    if (acc == 0) { return 0; }
+    return z;
+}
 pub fn TlsKetteEintragGroesse(): int64 { return 48; }
 
 // rolle: 1 Server, 2 Client
