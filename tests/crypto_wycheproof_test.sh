@@ -235,7 +235,7 @@ fn main(): int64 {
           feld(buf, z, zEnde, "sig"c, posP, lenP);
           var sl: int64 := hexLesen(buf, peek64(posP), peek64(lenP), b4);
           SHA256(b3, ml, hash);
-          if (EcdsaSigFromDer(b4, sl, b5, b5 + 32)) {
+          if (EcdsaSigFromDer(b4, sl, b5, b5 + 32, 32)) {
             if (EcdsaVerify(EC_P256, hash, b1, b2, b5, b5 + 32)) { ok := 1; }
           }
         }
