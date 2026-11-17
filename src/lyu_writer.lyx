@@ -208,6 +208,28 @@ con LYU_DK_OBJ: int64 := 9;      // relozierbares Objektabbild
 //     ohne Bibliothek kann der einbindende Compiler kein DT_NEEDED setzen.
 con LYU_DK_EXTERNFN: int64 := 10;
 
+// #2514: `pub dim` und `pub utype` (§11, Einheitentypen).
+//
+// WARUM SIE FEHLTEN. std/units.lyx war die letzte quellpflichtige Unit des
+// Pakets (#2449 senkte 192 auf eine): ihre 17 Dimensionen und 66
+// Einheitentypen standen als Symbole in der .lyu, aber nicht als
+// Deklaration -- der Codegen brach mit "Nicht beschrieben: Length" ab.
+//
+// IDENTITAET, und das war die offene Frage des Issues. Eine Dimension wird
+// NICHT ueber einen Symbolindex identifiziert, sondern ueber einen VEKTOR
+// ueber Basisachsen (sema._dimRecord, DIM_MAXBASE = 16): eine Basisdimension
+// bekommt eine eigene Achse, eine abgeleitete ihren Vektor aus den bereits
+// eingetragenen. Die Achsen werden in DEKLARATIONSREIHENFOLGE vergeben.
+//
+// Daraus folgt, was hier gebraucht wird, und es ist keine Erfindung: Name,
+// Basis-oder-abgeleitet, der Ausdruck -- und die REIHENFOLGE. Der Leser
+// erzeugt daraus wieder Quelltext, den dieser Compiler mit seinem eigenen
+// Parser liest; dieselbe Reihenfolge ergibt dieselben Achsen und damit
+// dieselben Vektoren. Eine zweite Identitaetsabbildung (wie der Symbolindex
+// bei TY_USER, 1.1.14F) braucht es dafuer nicht.
+con LYU_DK_DIM:    int64 := 11;  // pub dim X [= DimAusdruck]
+con LYU_DK_UTYPE:  int64 := 12;  // pub utype x: Dim = Faktor
+
 // Magic 'LYU\0'
 con LYU_W_M0: int64 := 76;
 con LYU_W_M1: int64 := 89;
@@ -981,6 +1003,12 @@ pub type LyuWriter = class {
         // ganze Unit unbenutzbar (std/math/constants: "Nicht beschrieben: PI").
         var ci: int64 := self._nc(cur, 1);
         if (ci >= 0) { if (self._nk(ci) == NK_LIT_FLOAT) { self._dkAdd(LYU_DK_CONF64, cur); } }
+      } else if (k == NK_DIM_DECL && self._npub(cur) != 0) {
+        // #2514: Reihenfolge ist bedeutungstragend (Achsenvergabe), und
+        // _dkAdd haengt in Durchlaufreihenfolge an -- also stimmt sie.
+        self._dkAdd(LYU_DK_DIM, cur);
+      } else if (k == NK_UTYPE_DECL && self._npub(cur) != 0) {
+        self._dkAdd(LYU_DK_UTYPE, cur);
       } else if (k == NK_STRUCT_DECL && self._npub(cur) != 0) {
         if ((self._niv(cur) & 1) == 0 && self._feldMitAt(cur) == 0) {
           self._dkAdd(LYU_DK_STRUCT, cur);
@@ -1196,6 +1224,86 @@ pub type LyuWriter = class {
     return 1;
   }
 
+  // #2514: Dimensionsausdruck als Text. Gibt die Laenge zurueck, -1 wenn die
+  // Form nicht beschreibbar ist.
+  //
+  // VOLLSTAENDIG GEKLAMMERT, und das ist kein Schoenheitsfehler: `*` und `/`
+  // haben dieselbe Vorrangstufe und sind linksassoziativ, aber die
+  // Dimensionsalgebra addiert bzw. subtrahiert Exponenten --
+  // `A / (B / C)` ergibt A-B+C, `(A / B) / C` dagegen A-B-C. Eine flache
+  // Textform wuerde einen rechts geschachtelten Baum also STILL anders
+  // bedeuten. Mit Klammern baut der lesende Parser denselben Baum.
+  //
+  // Beschreibbar ist genau die Form, die sema._dimAddExpr akzeptiert: eine
+  // Zahl (neutrales Element, traegt den Kehrwert in `1 / Time`), ein
+  // Bezeichner, und `*`/`/` darueber. Alles andere gibt -1.
+  fn _dimAusdruckText(n: int64, buf: int64, at: int64, cap: int64): int64 {
+    if (n < 0) { return 0 - 1; }
+    var k: int64 := self._nk(n);
+    if (k == NK_LIT_FLOAT) {
+      // Ein Gleitkommaliteral traegt seinen Quelltext (wie LYU_DK_CONF64).
+      var zl: int64 := self._nsl(n);
+      if (zl <= 0 || at + zl >= cap) { return 0 - 1; }
+      memcpy(buf + at, self._nsp(n) as int64, zl);
+      return at + zl;
+    }
+    if (k == NK_LIT_INT) {
+      // Ein GANZZAHLliteral traegt seinen Wert in iVal, NICHT als Quelltext:
+      // sVal/sLen sind dort 0. Der erste Wurf nahm _nsp/_nsl wie beim
+      // Gleitkommafall und schrieb damit NICHTS -- aus `1 / Time` wurde
+      // `( / Time)`, und der lesende Parser meldete "expected expression".
+      // Aufgefallen beim Dumpen des Abschnitts, nicht beim Lesen des Codes.
+      var w: int64 := self._niv(n);
+      if (w < 0) { return 0 - 1; }          // negative Zahl: hier sinnlos
+      if (w == 0) {
+        if (at + 1 >= cap) { return 0 - 1; }
+        poke8(buf + at, 48);
+        return at + 1;
+      }
+      // Ziffern ruecklaeufig erzeugen und dann umdrehen.
+      var tmp: int64 := alloc(24);
+      var cnt: int64 := 0;
+      var r: int64 := w;
+      while (r > 0 && cnt < 20) {
+        poke8(tmp + cnt, 48 + (r % 10));
+        r := r / 10;
+        cnt := cnt + 1;
+      }
+      if (at + cnt >= cap) { free(tmp, 24); return 0 - 1; }
+      var j: int64 := 0;
+      while (j < cnt) {
+        poke8(buf + at + j, peek8(tmp + cnt - 1 - j));
+        j := j + 1;
+      }
+      free(tmp, 24);
+      return at + cnt;
+    }
+    if (k == NK_IDENT) {
+      var il: int64 := self._nsl(n);
+      if (at + il >= cap) { return 0 - 1; }
+      memcpy(buf + at, self._nsp(n) as int64, il);
+      return at + il;
+    }
+    if (k == NK_BINOP) {
+      var op: int64 := self._niv(n);
+      if (op != 72 && op != 73) { return 0 - 1; }      // nur * und /
+      if (at + 1 >= cap) { return 0 - 1; }
+      poke8(buf + at, 40);                             // '('
+      var p1: int64 := self._dimAusdruckText(self._nc(n, 0), buf, at + 1, cap);
+      if (p1 < 0) { return 0 - 1; }
+      if (p1 + 3 >= cap) { return 0 - 1; }
+      poke8(buf + p1, 32);                             // ' '
+      if (op == 72) { poke8(buf + p1 + 1, 42); } else { poke8(buf + p1 + 1, 47); }
+      poke8(buf + p1 + 2, 32);
+      var p2: int64 := self._dimAusdruckText(self._nc(n, 1), buf, p1 + 3, cap);
+      if (p2 < 0) { return 0 - 1; }
+      if (p2 + 1 >= cap) { return 0 - 1; }
+      poke8(buf + p2, 41);                             // ')'
+      return p2 + 1;
+    }
+    return 0 - 1;
+  }
+
   // Einen Eintrag schreiben; 0 = nicht beschreibbar (der Aufrufer setzt len
   // zurueck, es bleibt also nichts Halbes stehen).
   fn _eDekl(art: int64, n: int64): int64 {
@@ -1223,6 +1331,37 @@ pub type LyuWriter = class {
       var li: int64 := self._nc(n, 1);
       if (li < 0) { return 0; }
       self._eStr(self._nsp(li), self._nsl(li));
+    } else if (art == LYU_DK_DIM) {
+      // #2514: 0 = Basisdimension (eigene Achse), 1 = abgeleitet mit Ausdruck.
+      var dex: int64 := self._nc(n, 0);
+      if (dex < 0) {
+        self._e8(0);
+      } else {
+        var dbuf: int64 := alloc(1024);
+        var dlen: int64 := self._dimAusdruckText(dex, dbuf, 0, 1024);
+        if (dlen < 0) { free(dbuf, 1024); return 0; }   // unbeschreibbar
+        self._e8(1);
+        self._eStr(dbuf as pchar, dlen);
+        free(dbuf, 1024);
+      }
+    } else if (art == LYU_DK_UTYPE) {
+      // #2514: Dimensionsname, Faktor als Text wie im Quelltext (dieselbe
+      // Form wie LYU_DK_CONF64), und `wraps` aus Bit 1.
+      //
+      // range/wraps mit Grenzen (c2) wird NICHT beschrieben: die Unit bleibt
+      // dann quellpflichtig, also laut statt still falsch. Im Bestand kommt
+      // die Form nicht vor (gemessen: 0 von 66 in std/units.lyx), und eine
+      // ungemessene Kodierung waere geraten.
+      if (self._nc(n, 2) >= 0) { return 0; }
+      var udim: int64 := self._nc(n, 0);
+      if (udim < 0) { return 0; }
+      self._eStr(self._nsp(udim), self._nsl(udim));
+      var ufak: int64 := self._nc(n, 1);
+      if (ufak < 0) { self._eStr(""c, 0); }
+      else {
+        if (self._nk(ufak) != NK_LIT_FLOAT && self._nk(ufak) != NK_LIT_INT) { return 0; }
+        self._eStr(self._nsp(ufak), self._nsl(ufak));
+      }
     } else if (art == LYU_DK_FN) {
       if (self._eSignatur(n) == 0) { return 0; }
     } else if (art == LYU_DK_EXTERNFN) {
