@@ -24,7 +24,7 @@ unit std.net.mongo;
 import std.alloc;
 import std.net.socket;
 import std.net.dns;
-import std.net.tls;
+import std.net.tlsc;   // nativ statt OpenSSL (#2096)
 
 // OpenSSL crypto for SCRAM-SHA-256 (WP-4.2)
 extern fn EVP_sha256(): int64 link "libcrypto.so.3";
@@ -63,8 +63,13 @@ pub type MongoConn = struct {
   host: int64;         // host string pointer
   port: int64;         // port number
   tls_enabled: int64;  // 1 if TLS active (WP-4.1)
-  tls_ssl: int64;      // raw SSL* pointer
-  tls_ctx: int64;      // raw SSL_CTX* pointer
+  // Seit #2096 nativ: die Zustaende werden GANZ aufbewahrt. Vorher standen
+  // hier die rohen Zeiger SSL* und SSL_CTX*, und die Lese-, Schreib- und
+  // Abbauwege riefen OpenSSL direkt. Eine Zustandsmaschine ist aber kein
+  // Zeiger, sondern ein Block mit Puffern — herauskopieren laesst sich
+  // davon nichts.
+  tls_conn: TLSConn;
+  tls_ctxs: TLSContext;
 };
 
 // WP1: Connect to MongoDB
@@ -92,8 +97,6 @@ pub fn MongoConnect(host: int64, port: int64): MongoConn {
   conn.fd := tcp.fd;
   conn.connected := 1;
   conn.tls_enabled := 0;
-  conn.tls_ssl := 0;
-  conn.tls_ctx := 0;
 
   return conn;
 }
@@ -101,15 +104,10 @@ pub fn MongoConnect(host: int64, port: int64): MongoConn {
 // WP1: Disconnect from MongoDB
 pub fn MongoDisconnect(ref conn: MongoConn) {
   if (conn.tls_enabled != 0) {
-    if (conn.tls_ssl != 0) {
-      SSL_shutdown(conn.tls_ssl);
-      SSL_free(conn.tls_ssl);
-    }
-    if (conn.tls_ctx != 0) {
-      SSL_CTX_free(conn.tls_ctx);
-    }
-    conn.tls_ssl := 0;
-    conn.tls_ctx := 0;
+    // TLSClose schickt close_notify und gibt den Verbindungsblock frei; der
+    // Socket bleibt offen und wird unten geschlossen, wie vorher.
+    TLSClose(conn.tls_conn);
+    TLSFree(conn.tls_ctxs);
     conn.tls_enabled := 0;
   }
   if (conn.fd >= 0) {
@@ -257,7 +255,7 @@ pub con MONGO_OP_KILL_CURSORS: int64 := 2007;
 pub fn MongoSend(conn: MongoConn, data: int64, len: int64): int64 {
   if (conn.fd < 0 || conn.connected == 0) { return -1; }
   if (conn.tls_enabled != 0) {
-    return SSL_write(conn.tls_ssl, data, len);
+    return TLSWrite(conn.tls_conn, data, len);
   }
   return sys_write(conn.fd, data, len);
 }
@@ -266,7 +264,7 @@ pub fn MongoSend(conn: MongoConn, data: int64, len: int64): int64 {
 pub fn MongoRead(conn: MongoConn, data: int64, len: int64): int64 {
   if (conn.fd < 0 || conn.connected == 0) { return -1; }
   if (conn.tls_enabled != 0) {
-    return SSL_read(conn.tls_ssl, data, len);
+    return TLSRead(conn.tls_conn, data, len);
   }
   return sys_read(conn.fd, data, len);
 }
@@ -326,7 +324,7 @@ pub con MONGO_AUTH_SCRAM_SHA256: int64 := 2;   // recommended (WP-4.2)
 pub fn MongoConnectTLS(host: int64, port: int64, hostname: int64): MongoConn {
   var conn: MongoConn;
   conn.fd := -1; conn.connected := 0; conn.host := host; conn.port := port;
-  conn.tls_enabled := 0; conn.tls_ssl := 0; conn.tls_ctx := 0;
+  conn.tls_enabled := 0;
 
   var ip: int64 := GetHostByName(host as pchar);
   if (ip == 0) { return conn; }
@@ -348,8 +346,8 @@ pub fn MongoConnectTLS(host: int64, port: int64, hostname: int64): MongoConn {
   conn.fd := tcp.fd;
   conn.connected := 1;
   conn.tls_enabled := 1;
-  conn.tls_ssl := tlsConn.ssl;
-  conn.tls_ctx := ctx.ctx;
+  conn.tls_conn := tlsConn;
+  conn.tls_ctxs := ctx;
   return conn;
 }
 
