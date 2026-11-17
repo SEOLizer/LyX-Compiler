@@ -43,13 +43,39 @@ REF_TPC="$(LC_ALL=C lscpu | sed -n 's/^Thread(s) per core: *//p' | head -1)"
 # steht dort ein Status und keine Zahl — richtig so, siehe #2413. Dieselbe
 # Prueffrage wie in tests/cpu_describe_2397_test.sh; die beiden muessen
 # uebereinstimmen.
+#
+# Der Abgleich mit lscpu gilt nur, wenn der Gast die GANZE Maschine sieht:
+# Sockel * Threads je Paket == CPUs. Sonst beschreibt CPUID den Wirt und
+# lscpu den Gast, und das sind zwei verschiedene Fragen. Ohne diese
+# Unterscheidung war der Test auf einem CI-Laeufer mit beschnittener
+# Topologie rot (gemessen 2026-11-17: CLI 1, lscpu 2), waehrend derselbe
+# Stand auf einem anderen Laeufer gruen war.
+REF_SOCK="$(LC_ALL=C lscpu | sed -n 's/^Socket(s): *//p' | head -1)"
+REF_LOG="$(LC_ALL=C lscpu | sed -n 's/^CPU(s): *//p' | head -1)"
 TPC_FELD="$(feld threads_per_core)"
+TJP_FELD="$(feld threads_per_package)"
+ganze_maschine=0
+case "$REF_SOCK$REF_LOG$TJP_FELD" in
+  ''|*[!0-9]*) ;;
+  *) [ $(( REF_SOCK * TJP_FELD )) = "$REF_LOG" ] && ganze_maschine=1 ;;
+esac
 case "$TPC_FELD" in
   unsupported|permission_denied|not_implemented)
     echo "HINWEIS: threads_per_core = $TPC_FELD (CPUID.0xB fehlt, lscpu sagt ${REF_TPC:-?}) — #2413"
     ok "info: threads_per_core meldet einen Status statt einer erfundenen Zahl" ;;
+  ''|0)
+    no "threads_per_core" "'$TPC_FELD' — weder Zahl noch Status" ;;
   *)
-    [ -n "$REF_TPC" ] && { [ "$TPC_FELD" = "$REF_TPC" ] && ok "info: threads_per_core = $REF_TPC" || no "threads_per_core" "'$TPC_FELD'"; } ;;
+    if [ -n "$REF_TPC" ] && [ "$ganze_maschine" = 1 ]; then
+      [ "$TPC_FELD" = "$REF_TPC" ] && ok "info: threads_per_core = $REF_TPC (gegen lscpu)" \
+        || no "threads_per_core" "'$TPC_FELD' statt $REF_TPC"
+    else
+      echo "HINWEIS: CPUID sagt $TPC_FELD Threads je Kern, lscpu ${REF_TPC:-?} —"
+      echo "         der Gast sieht ${REF_LOG:-?} CPUs bei ${REF_SOCK:-?} Sockel und"
+      echo "         ${TJP_FELD:-?} Threads je Paket, also eine beschnittene Topologie."
+      echo "         Der Abgleich entfaellt (#2413)."
+      ok "info: threads_per_core = $TPC_FELD (Zahl, keine erfundene 0)"
+    fi ;;
 esac
 REF_LINE="$(cat /sys/devices/system/cpu/cpu0/cache/index0/coherency_line_size 2>/dev/null)"
 [ -n "$REF_LINE" ] && { [ "$(feld cache0_line_bytes)" = "$REF_LINE" ] && ok "info: cache0_line_bytes = $REF_LINE" || no "cache0_line_bytes" "'$(feld cache0_line_bytes)'"; }
