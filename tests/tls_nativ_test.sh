@@ -1,10 +1,16 @@
 #!/usr/bin/env bash
 # tests/tlsc_adapter_test.sh — #2096: die Konsumenten sprechen TLS nativ.
 #
-# std/net/tlsc.lyx bietet dieselbe Sechs-Funktionen-API wie der
-# OpenSSL-Wrapper std/net/tls.lyx (TLSInit, TLSConnect, TLSRead, TLSWrite,
-# TLSClose, TLSFree), rechnet aber mit std.net.tls13. Darum tauschen die
-# Konsumenten nur ihren Import.
+# std.net.tls bietet dieselbe Sechs-Funktionen-API wie bisher (TLSInit,
+# TLSConnect, TLSRead, TLSWrite, TLSClose, TLSFree), rechnet aber seit #2096
+# mit std.net.tls13 statt mit OpenSSL. Der NAME ist die API; getauscht wurde
+# die UMSETZUNG. Die FFI-Fassung heisst jetzt std.net.tls_openssl und bleibt
+# als Gegenprobe und fuer Faelle, die CBC-Suiten brauchen.
+#
+# Zwei Units mit denselben oeffentlichen Namen waeren fuer jeden, der beide
+# importiert, MEHRDEUTIG — daran ist tests/regression/net/test_https.lyx
+# zunaechst gescheitert ("mehrdeutiges Symbol 'TLSContext'"). Darum ein Name,
+# eine Umsetzung.
 #
 # Geprueft wird die WIRKUNG, nicht das Vorhandensein:
 #
@@ -72,7 +78,7 @@ fi
 # Ohne diesen Fall wuerde ein kaputtes `strings`-Kommando als Erfolg gelten.
 cat > "$TMP/nutzt_tls.lyx" <<'LYXEOF'
 import std.io;
-import std.net.tls;
+import std.net.tls_openssl;
 
 fn main(): int64 {
   if (0 != 0) {
@@ -88,14 +94,14 @@ if timeout 900 "$LYXC" "$TMP/nutzt_tls.lyx" --std-path=. -o "$TMP/nutzt_tls" \
   if command -v strings >/dev/null 2>&1; then
     alt="$(strings "$TMP/nutzt_tls" | grep -ciE 'libssl|SSL_connect' || true)"
     if [ "$alt" = 0 ]; then
-      echo "FAIL: der OpenSSL-Wrapper traegt keine libssl-Verweise — die Pruefung oben misst nichts"
+      echo "FAIL: std.net.tls_openssl traegt keine libssl-Verweise — die Pruefung oben misst nichts"
       fehler=$((fehler + 1))
     else
-      echo "PASS Gegenprobe: std.net.tls traegt $alt OpenSSL-Verweise"
+      echo "PASS Gegenprobe: std.net.tls_openssl traegt $alt OpenSSL-Verweise"
     fi
   fi
 else
-  echo "HINWEIS: std.net.tls uebersetzt hier nicht (libssl fehlt?) — Gegenprobe entfaellt"
+  echo "HINWEIS: std.net.tls_openssl uebersetzt hier nicht (libssl fehlt?) — Gegenprobe entfaellt"
 fi
 
 # ── 2.-4. Anker, Handschlag, Gegenproben ──────────────────────────────────
@@ -135,7 +141,7 @@ import std.io;
 import std.fs;
 import std.alloc;
 import std.crypto.der;
-import std.net.tlsc;
+import std.net.tls;
 import std.net.socket;
 
 fn ladeDer(pfad: pchar, etikett: pchar, out: int64): int64 {

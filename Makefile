@@ -919,7 +919,7 @@ test: lyxc
 	@bash tests/crypto_wycheproof_test.sh
 	@bash tests/ec_p384_test.sh
 	@bash tests/tls_p384_test.sh
-	@bash tests/tlsc_adapter_test.sh
+	@bash tests/tls_nativ_test.sh
 	@bash tests/tls_interop_test.sh
 	@bash tests/tls_fuzz_test.sh
 	@bash tests/tls13_tlsfuzzer_test.sh

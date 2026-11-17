@@ -1,262 +1,425 @@
-// Lyx TLS/SSL Library - OpenSSL 3.x Wrapper
-// Provides TLS client functionality via OpenSSL FFI
+// std/net/tls.lyx — die Sechs-Funktionen-API, seit #2096 auf nativem
+// Unterbau statt auf OpenSSL.
 //
-// CAPABILITIES (#1348): Wer dieses Modul unter @capabilities nutzt, braucht
-//   network.tcp.connect   Verbindung zum Server
-//   memory.mmap           OpenSSL-Puffer
-//   fs.read UND fs.meta   Zertifikatspruefung gegen den CA-Store des Systems:
-//                         OpenSSL scannt /usr/lib/ssl/certs und stattet die
-//                         Kandidaten ab (getdents64, stat, lstat, statx) —
-//                         das haengt an fs.meta, nicht an fs.read.
-// Fehlt fs.meta, laeuft der Handshake bis zur Zertifikatspruefung und der
-// Prozess stirbt dann an SIGSYS: kein Rueckgabewert, keine Meldung. Der
-// Compiler warnt beim Uebersetzen, wenn dieses Modul importiert ist und die
-// beiden Capabilities fehlen.
+// Der Bestand spricht TLS ueber std.net.tls (FFI auf libssl):
 //
-// Usage:
-//   import std.net.tls;
-//   var ctx: TLSContext := TLSInit();
-//   var conn: TLSConn := TLSConnect(ctx, sock_fd, "example.com");
-//   TLSWrite(conn, data, len);
-//   var n: int64 := TLSRead(conn, buf, bufsize);
-//   TLSClose(conn);
-//   TLSFree(ctx);
+//   TLSInit() -> TLSContext
+//   TLSConnect(ctx, fd, hostname) -> TLSConn
+//   TLSRead / TLSWrite / TLSClose / TLSFree
+//
+// Diese Unit bietet GENAU dieselbe API, rechnet aber mit std.net.tls13 statt
+// ueber FFI mit libssl. Damit braucht KEIN Konsument eine Aenderung — auch
+// nicht am Import: der Name std.net.tls ist die API, getauscht wurde die
+// Umsetzung. #2096 nennt elf Dateien mit zusammen ueber hundert Aufrufen, und
+// hundert handgeaenderte Stellen waeren hundert Gelegenheiten fuer einen
+// Fehler.
+//
+// Die FFI-Fassung steht als std.net.tls_openssl daneben: fuer Faelle, die
+// CBC-Suiten oder eine andere OpenSSL-Eigenheit brauchen, und als Gegenprobe
+// in tests/tls_nativ_test.sh. Zwei Units mit denselben oeffentlichen Namen
+// waeren fuer jeden, der beide importiert, MEHRDEUTIG — darum nicht beide
+// unter std.net.tls.
+//
+// ── Was sich fuer den Aufrufer AENDERT ──────────────────────────────────────
+//
+// Nichts an der Form, aber zwei Dinge an der Sache, und beide sind gewollt:
+//
+//   1. **Mindestversion ist TLS 1.2, Hoechstversion 1.3** — wie beim
+//      Wrapper. Eine Gegenstelle mit TLS 1.0/1.1 wird abgewiesen.
+//   2. **Nur ECDHE mit AEAD.** Der Wrapper liess OpenSSL waehlen und damit
+//      auch CBC-Suiten zu. Diese Fassung fuehrt sie nicht; ein Server, der
+//      nichts anderes kann, wird abgewiesen statt schwach verschluesselt.
+//
+// ── Der CA-Store ───────────────────────────────────────────────────────────
+//
+// OpenSSL fand ihn selbst (SSL_CTX_set_default_verify_paths). Die nativen
+// Units bekommen den Trust-Store als Puffer uebergeben und fassen keine
+// Datei an — also muss IHN HIER jemand laden, und das ist der Grund, warum
+// gerade diese Unit fs.read braucht, std.net.tls13 aber nicht.
+//
+// Geladen wird die erste Datei, die es gibt, aus einer ausdruecklichen
+// Liste; gibt es keine, ist der Kontext NICHT betriebsbereit und TLSConnect
+// scheitert. Ein Rueckfall auf "ungeprueft verbinden" waere hier das
+// Schlimmste von allem: er sieht aus wie TLS und ist keins.
+import std.io;
+import std.fs;
+import std.alloc;
+import std.crypto.der;
+import std.crypto.x509;
+import std.net.tls13;
+import std.net.tls_config;
+import std.time;        // Unix-Sekunden fuer die Gueltigkeitspruefung
+
+@capabilities([
+  memory.mmap,       // Verbindungsblock, Trust-Store, Puffer
+  system.rand,       // Schluesselmaterial je Verbindung
+  fs.read,           // der CA-Store, siehe oben — und NUR fs.read:
+                     // diese Unit stattet keine Datei ab und durchsucht
+                     // kein Verzeichnis, darum kein fs.meta
+  system.time        // Gueltigkeitszeitraum des Zertifikats
+])
+// Der SOCKET gehoert dem Aufrufer: diese Unit erzeugt keine Verbindung und
+// braucht darum kein network.tcp.connect. Sie liest und schreibt nur den
+// uebergebenen fd.
 
 unit std.net.tls;
 
-// OpenSSL 3.x function declarations (libssl.so.3 / libcrypto.so.3).
-// NOTE: OpenSSL 3.x auto-initializes on first use. The 1.x bootstrap routines
-// SSL_library_init / SSL_load_error_strings / OpenSSL_add_all_algorithms were
-// removed from the library — declaring or calling them makes the dynamic
-// loader abort with "undefined symbol", so they are intentionally absent.
+// Hoechstzahl der Zertifikate, die aus dem CA-Store uebernommen werden.
+// Debian/Ubuntu liefern derzeit rund 140; die Grenze ist absichtlich eine
+// Zahl und kein dynamisches Wachsen — ein Store mit 50 000 Eintraegen waere
+// ein Angriff auf den Speicher, nicht ein Vertrauensanker.
+con MAX_CA: int64 := 512;
 
-// TLS Method and Context
-extern fn TLS_client_method(): int64 link "libssl.so.3";
-extern fn SSL_CTX_new(method: int64): int64 link "libssl.so.3";
-extern fn SSL_CTX_free(ctx: int64) link "libssl.so.3";
-extern fn SSL_CTX_ctrl(ctx: int64, cmd: int64, larg: int64, parg: int64): int64 link "libssl.so.3";
+// Groesse des Lesepuffers fuer den Store. Der Debian-Bund ist rund 200 KB.
+con STORE_CAP: int64 := 1048576;
 
-// Set default verify paths (for certificate validation)
-extern fn SSL_CTX_set_default_verify_paths(ctx: int64): int32 link "libssl.so.3";
+// Netzpuffer je Richtung.
+con NETZ_CAP: int64 := 24576;
 
-// Hostname verification (WP-2)
-extern fn SSL_get1_peer_certificate(ssl: int64): int64 link "libssl.so.3";
-extern fn X509_check_host(cert: int64, chk: int64, chklen: int64, flags: int64, peername: int64): int32 link "libcrypto.so.3";
-extern fn X509_free(cert: int64) link "libcrypto.so.3";
-
-// SSL object
-extern fn SSL_new(ctx: int64): int64 link "libssl.so.3";
-extern fn SSL_free(ssl: int64) link "libssl.so.3";
-extern fn SSL_set_fd(ssl: int64, fd: int64): int32 link "libssl.so.3";
-
-// SNI hostname is set through the SSL_ctrl control interface — the public
-// SSL_set_tlsext_host_name name is a C preprocessor macro, not an exported
-// symbol, so it cannot be linked directly.
-extern fn SSL_ctrl(ssl: int64, cmd: int64, larg: int64, parg: int64): int64 link "libssl.so.3";
-con SSL_CTRL_SET_TLSEXT_HOSTNAME: int64 := 55;
-con TLSEXT_NAMETYPE_host_name:     int64 := 0;
-
-// Certificate verification
-extern fn SSL_set_verify(ssl: int64, mode: int64, callback: int64) link "libssl.so.3";
-extern fn SSL_get_verify_result(ssl: int64): int32 link "libssl.so.3";
-
-// TLS handshake
-// #1607: Diese Funktionen liefern in C ein `int`. Als int64 deklariert
-// blieben die oberen 32 Bit des Registers stehen — aus -1 wurde 4294967295,
-// und `if (n < 0)` erkannte den Fehler NIE. Bei SSL_read hiess das: ein
-// WANT_READ galt als vier Milliarden gelesene Bytes.
-extern fn SSL_connect(ssl: int64): int32 link "libssl.so.3";
-
-// Read/Write
-extern fn SSL_read(ssl: int64, buf: int64, num: int64): int32 link "libssl.so.3";
-extern fn SSL_write(ssl: int64, buf: int64, num: int64): int32 link "libssl.so.3";
-
-// Shutdown
-extern fn SSL_shutdown(ssl: int64): int32 link "libssl.so.3";
-
-// Error handling
-extern fn SSL_get_error(ssl: int64, ret: int64): int32 link "libssl.so.3";
-
-// Constants
-pub con SSL_VERIFY_NONE: int64 := 0;
-pub con SSL_VERIFY_PEER: int64 := 1;
-pub con X509_V_OK: int64 := 0;
-
-// TLS version constants (WP-2.4)
-con SSL_CTRL_SET_MIN_PROTO_VERSION: int64 := 123;
-pub con TLS1_2_VERSION: int64 := 771;   // 0x0303
-
-// TLS error codes
-pub con TLS_OK: int64 := 0;
-pub con TLS_ERR_INIT: int64 := -1;
-pub con TLS_ERR_CTX: int64 := -2;
-pub con TLS_ERR_SSL: int64 := -3;
-pub con TLS_ERR_CONNECT: int64 := -4;
-pub con TLS_ERR_READ: int64 := -5;
-pub con TLS_ERR_WRITE: int64 := -6;
-pub con TLS_ERR_VERIFY: int64 := -7;
-pub con TLS_ERR_HOSTNAME: int64 := -8;
-
-// TLS Context (opaque wrapper around SSL_CTX*)
 pub type TLSContext = struct {
-  ctx: int64;          // SSL_CTX* pointer
-  initialized: int64;  // 1 if successfully initialized
+  trust: int64;        // Feld mit MAX_CA Paaren (Zeiger, Laenge)
+  trustN: int64;       // Zahl der geladenen Zertifikate
+  roh: int64;          // der gelesene Store, bleibt liegen: die Paare zeigen hinein
+  initialized: int64;  // 1 = betriebsbereit
 };
 
-// TLS Connection (opaque wrapper around SSL*)
 pub type TLSConn = struct {
-  ssl: int64;          // SSL* pointer
-  fd: int64;           // underlying socket fd
-  connected: int64;    // 1 if handshake completed
+  c: int64;            // Verbindungsblock von std.net.tls13
+  cfg: int64;          // dessen Konfiguration
+  netz: int64;         // Netzpuffer
+  fd: int64;           // Socket des Aufrufers
+  connected: int64;    // 1 = Handschlag fertig
+  // Warum es NICHT geklappt hat. Der OpenSSL-Wrapper gab nur connected == 0
+  // zurueck, und damit stand man vor einem "ging nicht" ohne Grund. Die
+  // Zahlen sind die Fehlercodes von std.net.tls13 (TlsFehlerText nennt sie
+  // im Klartext); eigene Werte dieser Schicht sind negativ und kleiner als
+  // -100, damit sie sich nicht mit ihnen vermischen.
+  rc: int64;
 };
 
-// Initialize TLS library (call once per process)
-// Returns TLSContext, caller must call TLSFree() when done
+// Eigene Gruende dieser Schicht, ausserhalb des Bereichs von std.net.tls13.
+pub con TLSC_KEIN_STORE:  int64 := -101;   // Kontext nicht betriebsbereit
+pub con TLSC_KEIN_HOST:   int64 := -102;   // hostname == 0 oder leer
+pub con TLSC_FAULER_FD:   int64 := -103;   // fd < 0
+pub con TLSC_KEIN_SPEICHER: int64 := -104;
+pub con TLSC_NETZ:        int64 := -105;   // read/write auf dem fd scheiterte
+pub con TLSC_RUNDEN:      int64 := -106;   // Handschlag wurde nicht fertig
+
+// ── CA-Store ───────────────────────────────────────────────────────────────
+
+// Die Pfade, in dieser Reihenfolge. Ausdruecklich aufgezaehlt, nicht
+// geraten: ein Verzeichnis zu durchsuchen hiesse, jeder Datei darin zu
+// vertrauen.
+fn storePfad(i: int64): pchar {
+  if (i == 0) { return "/etc/ssl/certs/ca-certificates.crt"c; }       // Debian, Ubuntu
+  if (i == 1) { return "/etc/pki/tls/certs/ca-bundle.crt"c; }         // Fedora, RHEL
+  if (i == 2) { return "/etc/ssl/ca-bundle.pem"c; }                   // SUSE
+  if (i == 3) { return "/etc/ssl/cert.pem"c; }                        // Alpine, BSD
+  return 0 as pchar;
+}
+
+con STORE_PFADE: int64 := 4;
+
+// Sucht ab `von` die naechste Zeile "-----BEGIN CERTIFICATE-----" und
+// liefert ihre Position, sonst -1.
+fn naechsterBlock(buf: int64, len: int64, von: int64): int64 {
+  var marke: pchar := "-----BEGIN CERTIFICATE-----"c;
+  var ml: int64 := 27;
+  var p: int64 := von;
+  while (p + ml <= len) {
+    var i: int64 := 0;
+    var gleich: bool := true;
+    while (i < ml) {
+      if ((peek8(buf + p + i) & 0xFF) != (peek8((marke as int64) + i) & 0xFF)) {
+        gleich := false;
+        i := ml;
+      }
+      i := i + 1;
+    }
+    if (gleich) { return p; }
+    p := p + 1;
+  }
+  return -1;
+}
+
+// Liest den CA-Store in den Kontext. Rueckgabe ist die Zahl der
+// uebernommenen Zertifikate, 0 wenn keine Datei gefunden wurde.
+//
+// Uebernommen wird nur, was X509Lies auch LESEN kann. Ein unlesbarer Block
+// wird uebersprungen und nicht gezaehlt — er darf den ganzen Store nicht
+// unbrauchbar machen, aber er darf auch nicht als Anker gelten.
+fn storeLaden(ctx: int64): int64 {
+  var roh: int64 := alloc(STORE_CAP);
+  if (roh == 0) { return 0; }
+
+  var gelesen: int64 := 0;
+  var pi: int64 := 0;
+  while (pi < STORE_PFADE && gelesen <= 0) {
+    var pfad: pchar := storePfad(pi);
+    // Bewusst OHNE FileExists/FileSize: beide statten die Datei ab und
+    // haengen damit an fs.meta. ReadFile oeffnet und liest bis EOF und
+    // liefert -1, wenn es die Datei nicht gibt — damit braucht diese Unit
+    // nur fs.read. Fuer den Aufrufer ist das eine Capability weniger als
+    // beim OpenSSL-Wrapper, der den CA-ORDNER durchsucht und abstattet
+    // (getdents64, stat, lstat, statx — siehe den Kopf von std/net/https.lyx:
+    // fehlte fs.meta, starb der Prozess an SIGSYS, ohne Meldung).
+    var n: int64 := ReadFile(pfad, roh as pchar, STORE_CAP);
+    if (n > 0) { gelesen := n; }
+    pi := pi + 1;
+  }
+  if (gelesen <= 0) {
+    free(roh, STORE_CAP);
+    return 0;
+  }
+
+  // Platz fuer die DER-Fassungen. Jeder Eintrag bekommt seinen eigenen
+  // Bereich, damit die Paare (Zeiger, Laenge) dauerhaft gelten.
+  var derRaum: int64 := alloc(MAX_CA * 4096);
+  var paare: int64 := alloc(MAX_CA * 16);
+  if (derRaum == 0 || paare == 0) {
+    free(roh, STORE_CAP);
+    return 0;
+  }
+
+  var anz: int64 := 0;
+  var pos: int64 := 0;
+  var etikett: pchar := "CERTIFICATE"c;
+  while (anz < MAX_CA) {
+    var b: int64 := naechsterBlock(roh, gelesen, pos);
+    if (b < 0) { break; }
+    var ziel: int64 := derRaum + anz * 4096;
+    var dl: int64 := PemDekodiere(roh + b, gelesen - b, etikett as int64, 11,
+                                  ziel, 4096);
+    // Nach dem Block weitersuchen, egal ob er lesbar war: sonst laeuft die
+    // Schleife auf derselben Stelle.
+    pos := b + 27;
+    if (dl > 0) {
+      poke64(paare + anz * 16, ziel);
+      poke64(paare + anz * 16 + 8, dl);
+      anz := anz + 1;
+    }
+  }
+
+  poke64(ctx, paare);
+  poke64(ctx + 8, anz);
+  poke64(ctx + 16, roh);
+  return anz;
+}
+
+// ── API ────────────────────────────────────────────────────────────────────
+
+// Einmal je Prozess. Laedt den CA-Store; ohne ihn ist der Kontext NICHT
+// betriebsbereit, und das wird gemeldet statt umgangen.
 pub fn TLSInit(): TLSContext {
   var ctx: TLSContext;
-  var sslCtx: int64;
-  var method: int64;
-  
-  ctx.ctx := 0;
+  ctx.trust := 0;
+  ctx.trustN := 0;
+  ctx.roh := 0;
   ctx.initialized := 0;
 
-  // OpenSSL 3.x initializes itself on first use — no explicit init call needed.
-  // TLS_client_method: explicit client-only context, no DTLS (WP-2.5)
-  method := TLS_client_method();
-  if (method == 0) {
+  var felder: int64 := alloc(24);
+  if (felder == 0) { return ctx; }
+  poke64(felder, 0);
+  poke64(felder + 8, 0);
+  poke64(felder + 16, 0);
+
+  var n: int64 := storeLaden(felder);
+  if (n <= 0) {
+    free(felder, 24);
     return ctx;
   }
 
-  sslCtx := SSL_CTX_new(method);
-  if (sslCtx == 0) {
-    return ctx;
+  ctx.trust := peek64(felder);
+  ctx.trustN := peek64(felder + 8);
+  ctx.roh := peek64(felder + 16);
+  ctx.initialized := 1;
+  free(felder, 24);
+  return ctx;
+}
+
+// Handschlag auf einem bestehenden Socket. Der fd gehoert dem Aufrufer und
+// wird hier nur gelesen und beschrieben, nicht geschlossen.
+//
+// hostname == 0 wird ABGEWIESEN. Ohne Namen gibt es keine Namenspruefung,
+// und eine TLS-Verbindung ohne Namenspruefung ist gegen einen Angreifer in
+// der Mitte wertlos (dieselbe Falle wie SEC-BUG-04 im Wrapper).
+pub fn TLSConnect(ctx: TLSContext, fd: int64, hostname: pchar): TLSConn {
+  var conn: TLSConn;
+  conn.c := 0;
+  conn.cfg := 0;
+  conn.netz := 0;
+  conn.fd := fd;
+  conn.connected := 0;
+  conn.rc := 0;
+
+  if (ctx.initialized != 1) { conn.rc := TLSC_KEIN_STORE; return conn; }
+  if ((hostname as int64) == 0) { conn.rc := TLSC_KEIN_HOST; return conn; }
+  if (fd < 0) { conn.rc := TLSC_FAULER_FD; return conn; }
+  var hostLen: int64 := StrLen(hostname);
+  if (hostLen <= 0) { conn.rc := TLSC_KEIN_HOST; return conn; }
+
+  var cfg: int64 := alloc(TlsConfigGroesse());
+  if (cfg == 0) { conn.rc := TLSC_KEIN_SPEICHER; return conn; }
+  TlsConfigNeu(cfg, 2);                       // 2 = Client
+  TlsConfigTrust(cfg, ctx.trust, ctx.trustN);
+  TlsConfigHost(cfg, hostname as int64, hostLen);
+  TlsConfigKettePruefen(cfg, 1);
+  TlsConfigMinVersion(cfg, TlsVersion12());
+  TlsConfigMaxVersion(cfg, TlsVersion13());
+  // Die Gueltigkeit des Zertifikats wird gegen die ECHTE Uhr geprueft, nicht
+  // gegen einen festen Wert: ein abgelaufenes Zertifikat MUSS auffallen.
+  TlsConfigZeit(cfg, NowMs() / 1000);
+
+  var c: int64 := TlsNeu(cfg);
+  if (c == 0) {
+    free(cfg, TlsConfigGroesse());
+    conn.rc := TLSC_KEIN_SPEICHER;
+    return conn;
+  }
+  var netz: int64 := alloc(NETZ_CAP);
+  if (netz == 0) {
+    TlsFrei(c);
+    free(cfg, TlsConfigGroesse());
+    conn.rc := TLSC_KEIN_SPEICHER;
+    return conn;
   }
 
-  // Set default certificate verification paths
-  SSL_CTX_set_default_verify_paths(sslCtx);
+  // Blockierender Handschlag auf einer nichtblockierenden Zustandsmaschine:
+  // schreiben, was sie ausgibt, lesen, was kommt, bis sie fertig ist. Die
+  // Rundenzahl ist begrenzt — eine Gegenstelle, die nur Alerts schickt,
+  // darf uns nicht endlos beschaeftigen.
+  var runden: int64 := 0;
+  var ok: bool := false;
+  var grund: int64 := TLSC_RUNDEN;
+  while (runden < 64 && !ok) {
+    var rc: int64 := TlsSchritt(c);
+    if (rc < 0) { grund := rc; runden := 64; }
+    else {
+      var raus: int64 := TlsAusgabe(c, netz, NETZ_CAP);
+      var geschrieben: int64 := 0;
+      while (geschrieben < raus) {
+        var w: int64 := write(fd as fd, netz + geschrieben, raus - geschrieben);
+        if (w <= 0) { geschrieben := raus; grund := TLSC_NETZ; runden := 64; }
+        else { geschrieben := geschrieben + w; }
+      }
+      if (TlsFertig(c)) { ok := true; }
+      else {
+        var r: int64 := read(fd as fd, netz, NETZ_CAP);
+        if (r <= 0) { grund := TLSC_NETZ; runden := 64; }
+        else {
+          var fr: int64 := TlsFuetter(c, netz, r);
+          if (fr < 0) { grund := fr; runden := 64; }
+        }
+      }
+      runden := runden + 1;
+    }
+  }
 
-  // Require TLS 1.2 minimum — reject TLS 1.0 and 1.1 (WP-2.4)
-  SSL_CTX_ctrl(sslCtx, SSL_CTRL_SET_MIN_PROTO_VERSION, TLS1_2_VERSION, 0);
+  if (!ok) {
+    free(netz, NETZ_CAP);
+    TlsFrei(c);
+    free(cfg, TlsConfigGroesse());
+    conn.rc := grund;
+    return conn;
+  }
 
-  ctx.ctx := sslCtx;
+  conn.c := c;
+  conn.cfg := cfg;
+  conn.netz := netz;
+  conn.connected := 1;
+  conn.rc := 0;
+  return conn;
+}
+
+// Liest entschluesselte Anwendungsdaten. Rueckgabe wie beim Wrapper: die
+// Zahl der Byte, 0 bei ordentlichem Verbindungsende, negativ bei Fehler.
+pub fn TLSRead(conn: TLSConn, buf: int64, bufsize: int64): int64 {
+  if (conn.connected != 1) { return -1; }
+  if (bufsize <= 0) { return 0; }
+
+  var versuche: int64 := 0;
+  while (versuche < 64) {
+    var n: int64 := TlsLese(conn.c, buf, bufsize);
+    if (n > 0) { return n; }
+    if (n < 0) {
+      // Will die Zustandsmaschine mehr Byte, wird nachgelesen; jeder andere
+      // negative Wert ist ein Urteil und wird weitergegeben.
+      if (n != TlsWantRead()) { return n; }
+    }
+    var r: int64 := read(conn.fd as fd, conn.netz, NETZ_CAP);
+    if (r == 0) { return 0; }
+    if (r < 0) { return -1; }
+    if (TlsFuetter(conn.c, conn.netz, r) < 0) { return -1; }
+    versuche := versuche + 1;
+  }
+  return -1;
+}
+
+// Schreibt Anwendungsdaten. Gibt die Zahl der uebernommenen Byte zurueck.
+pub fn TLSWrite(conn: TLSConn, buf: int64, bufsize: int64): int64 {
+  if (conn.connected != 1) { return -1; }
+  if (bufsize <= 0) { return 0; }
+
+  var n: int64 := TlsSchreibe(conn.c, buf, bufsize);
+  if (n < 0) { return n; }
+
+  // Der Record liegt jetzt im Ausgabepuffer der Unit und muss auf das Netz.
+  var raus: int64 := TlsAusgabe(conn.c, conn.netz, NETZ_CAP);
+  var geschrieben: int64 := 0;
+  while (geschrieben < raus) {
+    var w: int64 := write(conn.fd as fd, conn.netz + geschrieben,
+                          raus - geschrieben);
+    if (w <= 0) { return -1; }
+    geschrieben := geschrieben + w;
+  }
+  return n;
+}
+
+// Schliesst die TLS-Sitzung ordentlich: close_notify hinaus, dann den
+// Speicher frei. Der Socket bleibt offen — er gehoert dem Aufrufer, genau
+// wie beim Wrapper.
+pub fn TLSClose(conn: TLSConn) {
+  if (conn.connected != 1) { return; }
+  TlsSchliessen(conn.c);
+  var raus: int64 := TlsAusgabe(conn.c, conn.netz, NETZ_CAP);
+  if (raus > 0) { write(conn.fd as fd, conn.netz, raus); }
+  free(conn.netz, NETZ_CAP);
+  TlsFrei(conn.c);
+  free(conn.cfg, TlsConfigGroesse());
+}
+
+pub fn TLSFree(ctx: TLSContext) {
+  if (ctx.initialized != 1) { return; }
+  // Nur was DIESE Unit belegt hat, wird auch freigegeben. Bei
+  // TLSInitMitStore gehoeren die Anker dem Aufrufer (roh == 0 ist das
+  // Merkmal) — sie hier freizugeben waere eine Freigabe fremden Speichers.
+  if (ctx.roh == 0) { return; }
+  free(ctx.roh, STORE_CAP);
+  if (ctx.trust != 0) { free(ctx.trust, MAX_CA * 16); }
+}
+
+// Wie TLSInit, aber mit MITGEBRACHTEN Vertrauensankern statt dem CA-Store
+// des Systems: `trust` ist ein Feld aus `n` Paaren (Zeiger auf DER, Laenge).
+//
+// Das ist kein Testhintertuerchen, sondern der Fall "eigene PKI": ein
+// Dienst, der nur Zertifikate seiner eigenen CA annehmen soll, will den
+// Systemstore GERADE NICHT. Wer ihn benutzt, bekommt ausschliesslich diese
+// Anker — es wird nichts dazugemischt.
+pub fn TLSInitMitStore(trust: int64, n: int64): TLSContext {
+  var ctx: TLSContext;
+  ctx.trust := 0;
+  ctx.trustN := 0;
+  ctx.roh := 0;
+  ctx.initialized := 0;
+  if (trust == 0 || n <= 0) { return ctx; }
+  ctx.trust := trust;
+  ctx.trustN := n;
   ctx.initialized := 1;
   return ctx;
 }
 
-// Create TLS connection on existing socket
-// ctx: TLS context from TLSInit()
-// fd: connected TCP socket file descriptor
-// hostname: server hostname for SNI and certificate verification
-// Returns TLSConn, caller must call TLSClose() when done
-pub fn TLSConnect(ctx: TLSContext, fd: int64, hostname: pchar): TLSConn {
-  var conn: TLSConn;
-  var ssl: int64;
-  var ret: int64;
-  
-  conn.ssl := 0;
-  conn.fd := fd;
-  conn.connected := 0;
-
-  // SEC-BUG-04: hostname == 0 würde X509_check_host überspringen → MITM möglich.
-  // TLSConnect erfordert immer einen Hostnamen; für IP-only-Verbindungen ohne
-  // Hostname-Prüfung muss eine separate Funktion mit explizitem Opt-in verwendet werden.
-  if (hostname == 0) {
-    return conn;
-  }
-
-  if (ctx.initialized == 0) {
-    return conn;
-  }
-  
-  // Create SSL object
-  ssl := SSL_new(ctx.ctx);
-  if (ssl == 0) {
-    return conn;
-  }
-  
-  // Attach socket
-  ret := SSL_set_fd(ssl, fd);
-  if (ret == 0) {
-    SSL_free(ssl);
-    return conn;
-  }
-  
-  // Set SNI hostname (required by many servers) via SSL_ctrl, since
-  // SSL_set_tlsext_host_name is a macro over SSL_ctrl in the C headers.
-  if (hostname != 0) {
-    SSL_ctrl(ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_host_name, hostname);
-  }
-  
-  // Enable certificate verification
-  SSL_set_verify(ssl, SSL_VERIFY_PEER, 0);
-  
-  // Perform TLS handshake
-  ret := SSL_connect(ssl);
-  if (ret != 1) {
-    SSL_free(ssl);
-    return conn;
-  }
-  
-  // Verify certificate chain (WP-2.1)
-  ret := SSL_get_verify_result(ssl);
-  if (ret != X509_V_OK) {
-    SSL_shutdown(ssl);
-    SSL_free(ssl);
-    return conn;
-  }
-
-  // Hostname verification against SubjectAltName / CommonName (WP-2.2 + 2.3)
-  if (hostname != 0) {
-    var cert: int64 := SSL_get1_peer_certificate(ssl);
-    if (cert == 0) {
-      SSL_shutdown(ssl);
-      SSL_free(ssl);
-      return conn;
-    }
-    var hostOk: int64 := X509_check_host(cert, hostname, 0, 0, 0);
-    X509_free(cert);
-    if (hostOk != 1) {
-      SSL_shutdown(ssl);
-      SSL_free(ssl);
-      return conn;
-    }
-  }
-
-  conn.ssl := ssl;
-  conn.fd := fd;
-  conn.connected := 1;
-  return conn;
-}
-
-// Read data from TLS connection
-// Returns number of bytes read, or -1 on error
-pub fn TLSRead(conn: TLSConn, buf: int64, bufsize: int64): int64 {
-  if (conn.connected == 0) {
-    return -1;
-  }
-  return SSL_read(conn.ssl, buf, bufsize);
-}
-
-// Write data to TLS connection
-// Returns number of bytes written, or -1 on error
-pub fn TLSWrite(conn: TLSConn, buf: int64, bufsize: int64): int64 {
-  if (conn.connected == 0) {
-    return -1;
-  }
-  return SSL_write(conn.ssl, buf, bufsize);
-}
-
-// Close TLS connection (performs shutdown handshake)
-pub fn TLSClose(conn: TLSConn) {
-  if (conn.ssl != 0) {
-    SSL_shutdown(conn.ssl);
-    SSL_free(conn.ssl);
-  }
-}
-
-// Free TLS context
-pub fn TLSFree(ctx: TLSContext) {
-  if (ctx.ctx != 0) {
-    SSL_CTX_free(ctx.ctx);
-  }
+// Zahl der geladenen Vertrauensanker — fuer Diagnose und Tests. Der Wrapper
+// hatte dafuer keine Entsprechung, weil OpenSSL den Store verwaltete.
+pub fn TLSTrustAnzahl(ctx: TLSContext): int64 {
+  return ctx.trustN;
 }
