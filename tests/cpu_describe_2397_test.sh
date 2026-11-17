@@ -129,6 +129,8 @@ TJP_VOR="$(hol threads_je_paket)"
 # Sieht der Gast die GANZE Maschine? Dann muessen CPUID und lscpu dieselbe
 # Antwort geben. Sieht er nur einen Teil (Sockel * Threads je Paket != CPUs),
 # beschreibt CPUID den WIRT und lscpu den Gast — zwei verschiedene Fragen.
+# Dieselbe Bedingung steht in tests/lyx_cpu_cli_2402_test.sh (threads_per_core)
+# — die beiden muessen uebereinstimmen.
 # Dieselbe Unterscheidung macht der Abgleich fuer `kerne` weiter unten schon;
 # fuer threads_je_kern fehlte sie, und auf einem CI-Laeufer mit beschnittener
 # Topologie wurde der Test dadurch rot (gemessen 2026-11-17: Bibliothek 1,
