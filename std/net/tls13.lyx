@@ -57,6 +57,19 @@
 //                    uebergangen. rsa_pkcs1_* ist in CertificateVerify nach
 //                    RFC 8446 §4.2.3 verboten und wird darum auch abgewiesen.
 
+// CAPABILITIES (#2096): diese Unit macht KEINE Ein-/Ausgabe. Sie bekommt
+// Byte gefuettert und gibt Byte heraus; Socket, Datei und Uhr gehoeren der
+// Anwendung. Gebraucht werden nur der Speicher fuer den Verbindungsblock
+// (memory.mmap) und Zufall fuer Schluessel und Nonces (system.rand, auf
+// LyXOS ein implizites Recht).
+//
+// Was ein TLS-SERVER darueber hinaus fuehren muss, ist damit abschliessend:
+// network.tcp.bind und io.wait fuer den Listener, system.time, wenn er die
+// Uhr fuer TlsConfigZeit selbst liest. KEIN fs.read und KEIN fs.meta — den
+// Trust-Store bekommt die Unit als Puffer uebergeben, ein CA-Store wird
+// nicht abgestattet. Belegt in tests/tls_capabilities_test.sh.
+@capabilities([memory.mmap, system.rand])
+
 unit std.net.tls13;
 
 import std.alloc;
@@ -108,6 +121,11 @@ con E_WARNUNG:       int64 := -13;   // Alert der Gegenseite
 con E_GESCHLOSSEN:   int64 := -14;   // close_notify
 con E_WIDERRUFEN:    int64 := -15;   // Widerruf-Hook der Anwendung lehnt ab
 con E_HRR:           int64 := -16;   // HelloRetryRequest unzulaessig
+// Ein Feld mit einem Wert, den das Protokoll nicht kennt (RFC 8446 §4.6.3:
+// request_update ausser 0 und 1 MUSS illegal_parameter geben). Getrennt von
+// E_FORMAT, weil die Gegenseite an der Alertnummer erkennen soll, ob die
+// Nachricht verstuemmelt oder der WERT falsch war.
+con E_PARAM:         int64 := -19;
 
 pub fn TlsFehlerText(rc: int64): pchar {
     if (rc == 0)  { return "ok"c; }
@@ -129,6 +147,7 @@ pub fn TlsFehlerText(rc: int64): pchar {
     if (rc == -14) { return "Verbindung geschlossen (close_notify)"c; }
     if (rc == -15) { return "Zertifikat vom Widerruf-Hook abgelehnt"c; }
     if (rc == -16) { return "HelloRetryRequest unzulaessig (zweites HRR oder unbekannte Gruppe)"c; }
+    if (rc == -19) { return "unzulaessiger Wert in einem Protokollfeld"c; }
     return "unbekannter Fehler"c;
 }
 
@@ -253,22 +272,41 @@ con V_HRRGRP:     int64 := 1856;
 // delegiert JEDE oeffentliche Funktion dieser Unit dorthin — diese Unit ist
 // dann nur noch das Tor (siehe "Verteiler" weiter unten).
 con V_12:         int64 := 1864;
+// Das Signaturverfahren, auf das sich beide Seiten einigen. Es muss aus der
+// Liste des Clients kommen (RFC 8446 §4.4.2.2) und zu unserem Schluessel
+// passen; 0 heisst "noch nicht gewaehlt".
+con V_SIGALG:     int64 := 1872;
+// Ort und Laenge der signature_algorithms-Liste im ClientHello. Sie zeigt in
+// den Empfangspuffer und ist nur SO LANGE gueltig, wie das ClientHello dort
+// liegt — gewaehlt wird darum im selben Schritt, nicht spaeter.
+con V_SIGLISTE:    int64 := 1880;
+con V_SIGLISTELEN: int64 := 1888;
+// Haben wir schon ein close_notify gesendet? RFC 8446 §6.1 verlangt, dass
+// auf ein empfangenes close_notify EIN eigenes folgt — aber nur eines.
+con V_CLOSEGESENDET: int64 := 1896;
 con V_KOPF:       int64 := 1920;   // Ende des Kopfteils
 
+// Ein Record traegt bis zu 2^14 Byte Klartext (RFC 8446 §5.2), und was
+// davon nicht sofort abgeholt wird, bleibt im Puffer liegen. Mit B_HS =
+// 16384 (genau 2^14) wies diese Unit darum eine ZULAESSIGE Nachricht ab,
+// sobald vorher ein Byte im Puffer lag — tlsfuzzer
+// (test-tls13-record-layer-limits, #2096) hat das an Finished-Nachrichten
+// maximaler Groesse gezeigt. 24576 laesst einen vollen Record und einen
+// angefangenen zweiten zu.
 con B_IN:   int64 := 20480;
 con B_OUT:  int64 := 20480;
-con B_APP:  int64 := 17408;
-con B_HS:   int64 := 16384;
+con B_APP:  int64 := 24576;
+con B_HS:   int64 := 24576;
 
 // Die Puffer liegen hinter dem Kopf, auf 64 ausgerichtet angefuegt.
 con O_IN:   int64 := 1920;
 con O_OUT:  int64 := 22400;
 con O_APP:  int64 := 42880;
-con O_HS:   int64 := 60288;
+con O_HS:   int64 := 67456;
 // Der Client muss sein ClientHello aufbewahren: der Transkript-Hash haengt an
 // der Cipher-Suite, und die kennt er erst mit dem ServerHello. Darum wird das
 // ClientHello hier abgelegt und erst danach in den Hash gegeben.
-con O_CH:   int64 := 76672;
+con O_CH:   int64 := 92032;
 con B_CH:   int64 := 2048;
 
 // Kratzspeicher der Verbindung. Nach TlsNeu wird NICHTS mehr belegt: jede
@@ -278,7 +316,7 @@ con B_CH:   int64 := 2048;
 // Eintraegen je Funktion und in verschachtelten Rahmen gemessen zu frueh
 // freigab — zwei alloc(8) bekamen dieselbe Adresse, und der Schaden fiel erst
 // im zweiten Handschlag auf.
-con O_SCR:  int64 := 78720;      // 2560 Byte kleine Puffer
+con O_SCR:  int64 := 94080;      // 2560 Byte kleine Puffer
 con S_TP:    int64 := 0;         // Typ/Position/Laenge beim Nachrichtenlesen
 con S_PP:    int64 := 8;
 con S_LP:    int64 := 16;
@@ -314,8 +352,8 @@ con S_KU:    int64 := 2312;      // 64 Byte neues Verkehrsgeheimnis (KeyUpdate)
 con S_HRRC:  int64 := 2376;      // 32 Byte erwarteter HRR-Zufallswert
 // 2408 belegt, Bereich ist 2560 gross.
 
-con O_REC:  int64 := 81280;      // 17408 Byte Recordzusammenbau
-con O_MSG:  int64 := 98688;      // 8192 Byte Nachrichtenzusammenbau
+con O_REC:  int64 := 96640;      // 17408 Byte Recordzusammenbau
+con O_MSG:  int64 := 114048;      // 8192 Byte Nachrichtenzusammenbau
 con B_MSG:  int64 := 8192;
 // Das Zertifikat der Gegenseite wird HIERHER kopiert, bevor es gelesen wird.
 // Der X509-Satz haelt nur Positionen in seinem DER-Puffer; stand dieser
@@ -323,12 +361,12 @@ con B_MSG:  int64 := 8192;
 // fremde Byte. Gemessen: mit ECDSA und Ed25519 fiel es nicht auf (die
 // folgende CertificateVerify-Nachricht ist kurz), mit RSA wurde der Modulus
 // ueberschrieben und die Pruefung lehnte den eigenen Partner ab.
-con O_CERT:   int64 := 106880;      // 8192 Byte Blattzertifikat
+con O_CERT:   int64 := 122240;      // 8192 Byte Blattzertifikat
 con B_CERT:   int64 := 8192;
 // Dahinter der RSA-Schluessel der eigenen Seite; seine Groesse kommt aus der
 // Unit, darum als Summe in TlsSpeicherBedarf.
-con O_RSAKEY: int64 := 115072;
-con V_SIZE: int64 := 115072;
+con O_RSAKEY: int64 := 130432;
+con V_SIZE: int64 := 130432;
 
 pub fn TlsSpeicherBedarf(): int64 {
     return V_SIZE + RsaSchluesselGroesse() + X509Groesse();
@@ -703,7 +741,15 @@ fn recordVerarbeiten(c: int64): int64 {
     var ver1: int64 := peek8(b + 1) & 0xFF;
     var len: int64 := ((peek8(b + 3) & 0xFF) << 8) | (peek8(b + 4) & 0xFF);
     if (ver1 != 3) { return E_VERSION; }
-    if (len > 16640) { return E_FORMAT; }           // §5.2: 2^14 + 256
+    // §5.2: ein verschluesselter Record traegt hoechstens 2^14 + 256 Byte,
+    // ein unverschluesselter 2^14. Zu gross ist KEIN Formatfehler, sondern
+    // record_overflow — tlsfuzzer prueft die Alertnummer, und mit
+    // decode_error fielen 52 Faelle (#2096).
+    if (peek64(c + V_KRYPT_LESE) != 0) {
+        if (len > 16640) { return E_PUFFER; }
+    } else {
+        if (len > 16384) { return E_PUFFER; }
+    }
     if (vorhanden < 5 + len) { return 1; }
 
     var inhalt: int64 := b + 5;
@@ -719,6 +765,12 @@ fn recordVerarbeiten(c: int64): int64 {
             return E_ENTSCHLUESS;
         }
         poke64(c + V_SEQ_LESE, peek64(c + V_SEQ_LESE) + 1);
+        // Der INNERE Klartext darf 2^14 + 1 Byte nicht ueberschreiten
+        // (§5.2: Inhalt plus Polsterung plus das Typbyte). Der Deckel auf
+        // dem Chiffrat (2^14 + 256) laesst mehr durch, als innen erlaubt
+        // ist; ohne diese Pruefung meldete die Unit decrypt_error, wo
+        // record_overflow hingehoert (tlsfuzzer, #2096).
+        if (ctLen > 16385) { return E_PUFFER; }
         // Polsterung abschneiden und den echten Typ lesen (§5.4).
         var p: int64 := ctLen - 1;
         while (p >= 0 && (peek8(inhalt + p) & 0xFF) == 0) { p -= 1; }
@@ -730,6 +782,13 @@ fn recordVerarbeiten(c: int64): int64 {
     }
 
     var rc: int64 := 0;
+    // RFC 8446 §5.1: nulllange Fragmente von Handschlag und Alert sind
+    // verboten, und wer eines empfaengt, MUSS mit unexpected_message
+    // abbrechen. Vorher gab es dafuer decode_error (tlsfuzzer
+    // test-tls13-empty-alert, #2096).
+    if (nutzLen == 0 && (echterTyp == RT_HANDSHAKE || echterTyp == RT_ALERT)) {
+        return E_ABLAUF;
+    }
     if (echterTyp == RT_HANDSHAKE) {
         var hp: int64 := peek64(c + V_HSPOS);
         if (hp + nutzLen > B_HS) { rc := E_PUFFER; }
@@ -740,6 +799,10 @@ fn recordVerarbeiten(c: int64): int64 {
         }
     } else {
         if (echterTyp == RT_APPDATA) {
+            // Anwendungsdaten gibt es erst nach dem Handschlag. Vorher sind
+            // sie ein Ablauffehler (RFC 8446 §5.1) — tls12 hat diese
+            // Pruefung von Anfang an, hier fehlte sie.
+            if (peek64(c + V_ZUSTAND) != Z_FERTIG) { return E_ABLAUF; }
             var ap: int64 := peek64(c + V_APPPOS);
             if (ap + nutzLen > B_APP) { rc := E_PUFFER; }
             else {
@@ -757,9 +820,24 @@ fn recordVerarbeiten(c: int64): int64 {
                         if (stufe == 1) { rc := E_WARNUNG; } else { rc := E_WARNUNG; }
                     }
                 } else { rc := E_FORMAT; }
+            } else {
+                if (echterTyp == RT_CCS) {
+                    // change_cipher_spec wird verworfen (Anhang D.4,
+                    // Middlebox-Kompatibilitaet) — aber nur, wenn es
+                    // RICHTIG aussieht. RFC 8446 §5: ein anderer Wert als
+                    // 0x01 oder ein CCS mit anderer Laenge MUSS mit
+                    // unexpected_message abgewiesen werden. Vorher wurde
+                    // alles verworfen, was als CCS kam; tlsfuzzer
+                    // (test-tls13-ccs, #2096) prueft genau das.
+                    if (nutzLen != 1 || (peek8(inhalt) & 0xFF) != 1) {
+                        rc := E_ABLAUF;
+                    }
+                } else {
+                    // Ein unbekannter Recordtyp ist kein Grund
+                    // weiterzumachen.
+                    rc := E_FORMAT;
+                }
             }
-            // change_cipher_spec wird verworfen (§5 Anhang D.4,
-            // Middlebox-Kompatibilitaet) — aber nur unverschluesselt.
         }
     }
 
@@ -927,10 +1005,28 @@ fn gruppenGeheimnis(c: int64): bool {
         var px: int64 := c + V_EC_PEER + 1;
         var py: int64 := c + V_EC_PEER + 33;
         if (!EcValidatePublicKey(EC_P256, px, py)) { return false; }
-        return EcdhSharedSecret(EC_P256, c + V_EC_SK, px, py, c + V_SHARED);
+        if (!EcdhSharedSecret(EC_P256, c + V_EC_SK, px, py, c + V_SHARED)) {
+            return false;
+        }
+        return !nullGeheimnis(c + V_SHARED, 32);
     }
     X25519SharedSecret(c + V_EPH_SK, c + V_PEER_PK, c + V_SHARED);
-    return true;
+    // RFC 8446 §7.4.2: ergibt der Austausch das NULL-Geheimnis, MUSS
+    // abgebrochen werden. Das passiert bei Punkten kleiner Ordnung — die
+    // Wycheproof-Vektoren (x25519_test, #2096) enthalten 31 solche Faelle,
+    // und ohne diese Pruefung lief der Handschlag damit durch: beide Seiten
+    // haetten ihre Schluessel aus einem Geheimnis abgeleitet, das der
+    // Angreifer kennt, weil es fest ist.
+    return !nullGeheimnis(c + V_SHARED, 32);
+}
+
+// Alle Byte null? Ueber ALLE Byte, ohne fruehen Ausstieg: das Ergebnis ist
+// oeffentlich (es beendet die Verbindung), die Eingabe ist ein Geheimnis.
+fn nullGeheimnis(p: int64, n: int64): bool {
+    var acc: int64 := 0;
+    var i: int64 := 0;
+    while (i < n) { acc := acc | (peek8(p + i) & 0xFF); i := i + 1; }
+    return acc == 0;
 }
 
 // Eigenes Schluesselpaar und Zufall erzeugen.
@@ -1393,6 +1489,61 @@ fn eigeneSchluesselart(c: int64): int64 {
     return 0;
 }
 
+// Welche Signaturverfahren koennen wir mit unserem Schluessel leisten, in
+// unserer Vorliebe? Die Liste ist kurz und ausdruecklich: ein Verfahren, das
+// hier nicht steht, wird auch nicht gesendet.
+//   EC P-256     ecdsa_secp256r1_sha256
+//   RSA          rsa_pss_rsae_sha256, dann sha384, dann sha512
+//   Ed25519      ed25519
+fn eigeneSchemata(art: int64, out: int64): int64 {
+    if (art == 1) { poke64(out, 0x0403); return 1; }
+    if (art == 3) {
+        poke64(out, 0x0804); poke64(out + 8, 0x0805); poke64(out + 16, 0x0806);
+        return 3;
+    }
+    if (art == 4) { poke64(out, 0x0807); return 1; }
+    return 0;
+}
+
+// Steht `schema` in der signature_algorithms-Liste des ClientHello?
+fn clientBietetSchema(liste: int64, listeLen: int64, schema: int64): bool {
+    var i: int64 := 0;
+    while (i + 1 < listeLen) {
+        if (r16(liste, i) == schema) { return true; }
+        i += 2;
+    }
+    return false;
+}
+
+// Waehlt das Signaturverfahren fuer CertificateVerify. Bietet der Client
+// keines an, das wir mit unserem Schluessel leisten koennen, wird
+// ABGEBROCHEN — ein Verfahren zu senden, das der Client nicht genannt hat,
+// waere ein Protokollfehler (und genau den hat tlsfuzzer gefunden: mit einem
+// EC-Schluessel und einem Client, der nur RSA-PSS anbietet, signierte diese
+// Unit trotzdem mit ecdsa_secp256r1_sha256).
+fn schemaWaehlen(c: int64, liste: int64, listeLen: int64): int64 {
+    var art: int64 := eigeneSchluesselart(c);
+    if (art == 0) { return E_KONFIG; }
+    var kand: int64 := pScr(c) + S_WUNSCH;
+    var n: int64 := eigeneSchemata(art, kand);
+    var i: int64 := 0;
+    while (i < n) {
+        var sch: int64 := peek64(kand + i * 8);
+        if (listeLen <= 0) {
+            // Ohne die Erweiterung gibt es in TLS 1.3 keinen Handschlag
+            // (RFC 8446 §9.2: signature_algorithms ist Pflicht, wenn der
+            // Server ein Zertifikat sendet).
+            return E_UNTERSTUETZT;
+        }
+        if (clientBietetSchema(liste, listeLen, sch)) {
+            poke64(c + V_SIGALG, sch);
+            return 0;
+        }
+        i += 1;
+    }
+    return E_UNTERSTUETZT;
+}
+
 fn certVerifySenden(c: int64, serverRolle: bool): int64 {
     var scr: int64 := pScr(c);
     var art: int64 := eigeneSchluesselart(c);
@@ -1402,6 +1553,17 @@ fn certVerifySenden(c: int64, serverRolle: bool): int64 {
     var len: int64 := signaturInhalt(c, serverRolle, inhalt);
     var buf: int64 := scr + S_CVBUF;
     var sigBuf: int64 := scr + S_SIGBUF;
+
+    // Das gewaehlte Verfahren steht in V_SIGALG (Server: aus der Liste des
+    // Clients; Client: unsere Vorliebe, der Server hat sie in
+    // CertificateRequest genannt).
+    var schema: int64 := peek64(c + V_SIGALG);
+    if (schema == 0) {
+        var kand0: int64 := pScr(c) + S_WUNSCH;
+        if (eigeneSchemata(art, kand0) <= 0) { return E_KONFIG; }
+        schema := peek64(kand0);
+        poke64(c + V_SIGALG, schema);
+    }
 
     if (art == 1) {
         // ecdsa_secp256r1_sha256
@@ -1421,19 +1583,25 @@ fn certVerifySenden(c: int64, serverRolle: bool): int64 {
     }
 
     if (art == 3) {
-        // rsa_pss_rsae_sha256 (RFC 8446 §4.2.3: PSS ist fuer TLS 1.3 Pflicht,
-        // PKCS#1 v1.5 ist dort NICHT erlaubt)
+        // RSASSA-PSS (RFC 8446 §4.2.3: PSS ist fuer TLS 1.3 Pflicht,
+        // PKCS#1 v1.5 ist dort NICHT erlaubt). Die Hashlaenge kommt aus dem
+        // gewaehlten Schema: 0x0804 sha256, 0x0805 sha384, 0x0806 sha512.
+        var hl2: int64 := 32;
+        if (schema == 0x0805) { hl2 := 48; }
+        if (schema == 0x0806) { hl2 := 64; }
         var hash2: int64 := scr + S_HASH;
-        SHA256(inhalt, len, hash2);
-        var sl: int64 := RsaSignPss(pRsa(c), 32, hash2, sigBuf);
+        if (hl2 == 32) { SHA256(inhalt, len, hash2); }
+        if (hl2 == 48) { Sha384(inhalt, len, hash2); }
+        if (hl2 == 64) { Sha512(inhalt, len, hash2); }
+        var sl: int64 := RsaSignPss(pRsa(c), hl2, hash2, sigBuf);
         if (sl <= 0) { return E_SIGNATUR; }
         if (sl > 480) { return E_PUFFER; }
-        var p2: int64 := w16(buf, 0, 0x0804);
+        var p2: int64 := w16(buf, 0, schema);
         p2 := w16(buf, p2, sl);
         // Der Rumpf passt nicht in S_CVBUF (128 Byte) — darum direkt in den
         // Nachrichtenpuffer schreiben.
         var mb: int64 := pMsg(c) + 4096;
-        var p3: int64 := w16(mb, 0, 0x0804);
+        var p3: int64 := w16(mb, 0, schema);
         p3 := w16(mb, p3, sl);
         p3 := wBytes(mb, p3, sigBuf, sl);
         return hsSenden(c, HS_CERT_VERIFY, mb, p3);
@@ -1468,6 +1636,29 @@ fn finishedSenden(c: int64, secret: int64): int64 {
     var vd: int64 := pScr(c) + S_VD;
     if (!finishedWert(c, secret, vd)) { return E_FINISHED; }
     return hsSenden(c, HS_FINISHED, vd, hl);
+}
+
+// Ein Dummy-ChangeCipherSpec im KLARTEXT (RFC 8446 Anhang D.4,
+// "middlebox compatibility mode"). Es gehoert NICHT in den Transkript-Hash
+// und wird von der Gegenseite verworfen; sein Zweck ist allein, dass der
+// Handschlag auf der Leitung wie TLS 1.2 aussieht.
+//
+// Der Record muss unverschluesselt hinausgehen, auch wenn die Schreibstufe
+// schon steht — darum nicht ueber recordSenden, das ab dann verschluesselt.
+// Dass es noetig ist, hat tlsfuzzer gezeigt (#2096): dessen
+// Grundgespraechstest erwartet das CCS, weil praktisch jeder Server es
+// sendet, und ohne es verwerfen Mittelboxen den Handschlag.
+fn ccsDummySenden(c: int64): int64 {
+    var pos: int64 := peek64(c + V_OUTPOS);
+    if (pos + 6 > B_OUT) { return E_PUFFER; }
+    poke8(pOut(c) + pos, RT_CCS);
+    poke8(pOut(c) + pos + 1, 3);
+    poke8(pOut(c) + pos + 2, 3);
+    poke8(pOut(c) + pos + 3, 0);
+    poke8(pOut(c) + pos + 4, 1);
+    poke8(pOut(c) + pos + 5, 1);
+    poke64(c + V_OUTPOS, pos + 6);
+    return 0;
 }
 
 fn alertSenden(c: int64, stufe: int64, grund: int64): void {
@@ -1597,7 +1788,13 @@ fn serverHelloLesen(c: int64, pos: int64, len: int64): int64 {
 // ClientHello (Server-Seite): Suite waehlen, key_share und SNI/ALPN lesen.
 fn clientHelloLesen(c: int64, pos: int64, len: int64): int64 {
     if (len < 38) { return E_FORMAT; }
-    if (r16(pos, 0) != 0x0303) { return E_VERSION; }
+    // legacy_version wird NICHT geprueft. RFC 8446 §4.2.1: wer ueber
+    // supported_versions verhandelt, muss legacy_version ignorieren — dort
+    // darf 0x0301 (TLS 1.0) stehen, und der Handschlag ist trotzdem
+    // gueltig. Die alte Pruefung auf 0x0303 wies 193 von 202 Faellen in
+    // tlsfuzzers test-tls13-version-negotiation ab (#2096), alle mit
+    // protocol_version — und alle zu Unrecht. Die VERSION entscheidet
+    // allein supported_versions, weiter unten.
     var i: int64 := 0;
     while (i < 32) { poke8(c + V_PEER_RAND + i, peek8(pos + 2 + i)); i := i + 1; }
     var sidLen: int64 := peek8(pos + 34) & 0xFF;
@@ -1706,6 +1903,20 @@ fn clientHelloLesen(c: int64, pos: int64, len: int64): int64 {
         if (peek64(c + V_HRR) != 0) { return E_HRR; }   // zweites HRR ist verboten
         poke64(c + V_GRUPPE, gWahl);
         poke64(c + V_HRR, 2);                            // HRR faellig
+    }
+
+    // signature_algorithms des Clients merken. Gewaehlt wird erst nach der
+    // Kettenwahl (die Schluesselart kann vom SNI abhaengen), darum hier nur
+    // Ort und Laenge der Liste.
+    poke64(c + V_SIGLISTE, 0);
+    poke64(c + V_SIGLISTELEN, 0);
+    var sa: int64 := extSuchen(pos, p, len - p, 13, el);
+    if (sa >= 0 && peek64(el) >= 2) {
+        var saLen: int64 := r16(sa, 0);
+        if (saLen > 0 && saLen + 2 <= peek64(el)) {
+            poke64(c + V_SIGLISTE, sa + 2);
+            poke64(c + V_SIGLISTELEN, saLen);
+        }
     }
 
     // SNI aufbewahren: der Zeiger in den Empfangspuffer ueberlebt den
@@ -1890,7 +2101,11 @@ fn certVerifyLesen(c: int64, pos: int64, len: int64, gegenseiteIstServer: bool):
 
 fn finishedLesen(c: int64, pos: int64, len: int64, secret: int64): int64 {
     var hl: int64 := peek64(c + V_HASHLEN);
-    if (len != hl) { return E_FINISHED; }
+    // Eine falsche LAENGE ist ein Dekodierfehler, kein falscher Abschluss:
+    // verify_data hat eine feste Groesse, eine andere Nachricht ist
+    // verstuemmelt. Der Unterschied steht im Alert (decode_error gegen
+    // decrypt_error) und wird von tlsfuzzer geprueft (#2096).
+    if (len != hl) { return E_FORMAT; }
     var vd: int64 := pScr(c) + S_VD;
     if (!finishedWert(c, secret, vd)) { return E_FINISHED; }
     var gleich: int64 := CTMemEqual(vd, pos, hl);
@@ -2041,7 +2256,39 @@ fn verteilerClient(c: int64): int64 {
     return 1;
 }
 
+// Welcher Alert gehoert zu welchem Fehler (RFC 8446 §6.2, RFC 5246 §7.2)?
+// 0 heisst "keiner" — das gilt fuer die Faelle, in denen die GEGENSEITE
+// einen Alert geschickt hat.
+fn alertFuer(rc: int64): int64 {
+    if (rc == E_FORMAT)       { return 50; }   // decode_error
+    if (rc == E_VERSION)      { return 70; }   // protocol_version
+    if (rc == E_SUITE)        { return 40; }   // handshake_failure
+    if (rc == E_GRUPPE)       { return 40; }
+    if (rc == E_ENTSCHLUESS)  { return 20; }   // bad_record_mac
+    if (rc == E_ZERTIFIKAT)   { return 42; }   // bad_certificate
+    if (rc == E_SIGNATUR)     { return 51; }   // decrypt_error
+    if (rc == E_FINISHED)     { return 51; }
+    if (rc == E_ABLAUF)       { return 10; }   // unexpected_message
+    if (rc == E_PUFFER)       { return 22; }   // record_overflow
+    if (rc == E_KONFIG)       { return 80; }   // internal_error
+    if (rc == E_UNTERSTUETZT) { return 40; }
+    if (rc == E_WIDERRUFEN)   { return 44; }   // certificate_revoked
+    if (rc == E_HRR)          { return 47; }   // illegal_parameter
+    if (rc == E_PARAM)        { return 47; }
+    return 0;
+}
+
 fn fehlerSetzen(c: int64, rc: int64): int64 {
+    // Ein fataler Fehler MUSS der Gegenseite als Alert gesagt werden, sonst
+    // sieht sie nur eine abgeschnittene Verbindung und raet. tlsfuzzer
+    // (#2096) wartet an vielen Stellen genau darauf; ohne Alert lief es dort
+    // in sein Zeitlimit.
+    //
+    // Nur einmal: ist der Zustand schon Z_FEHLER, ist der Alert heraus.
+    if (peek64(c + V_ZUSTAND) != Z_FEHLER) {
+        var a: int64 := alertFuer(rc);
+        if (a != 0) { alertSenden(c, 2, a); }
+    }
     poke64(c + V_ZUSTAND, Z_FEHLER);
     poke64(c + V_FEHLER, rc);
     return rc;
@@ -2142,6 +2389,11 @@ fn clientHandschlag(c: int64): int64 {
             // Server-Finished (§7.1) — darum hier, vor dem eigenen Finished.
             if (!planAnwendung(c)) { return fehlerSetzen(c, E_KONFIG); }
 
+            // Dummy-CCS unmittelbar vor dem zweiten Flug (Anhang D.4). Es
+            // geht im Klartext hinaus, obwohl die Schreibstufe schon steht.
+            var rcc: int64 := ccsDummySenden(c);
+            if (rcc != 0) { return fehlerSetzen(c, rcc); }
+
             if (peek64(c + V_CERTREQ) != 0) {
                 if (TlsCfgCert(cfg) != 0 && TlsCfgCertN(cfg) > 0) {
                     var rc4: int64 := certSenden(c);
@@ -2193,6 +2445,15 @@ fn serverClientHello(c: int64): int64 {
     rc := ketteWaehlen(c);
     if (rc != 0) { return fehlerSetzen(c, rc); }
     if (eigeneSchluesselart(c) == 0) { return fehlerSetzen(c, E_KONFIG); }
+    // Signaturverfahren aus der Liste des Clients waehlen, passend zum
+    // Schluessel der gewaehlten Kette. Ohne gemeinsames Verfahren gibt es
+    // keinen Handschlag — mit Alert, damit die Gegenseite den Grund erfaehrt
+    // statt eine abgeschnittene Verbindung zu sehen.
+    rc := schemaWaehlen(c, peek64(c + V_SIGLISTE), peek64(c + V_SIGLISTELEN));
+    if (rc != 0) {
+        alertSenden(c, 2, 40);                   // fatal handshake_failure
+        return fehlerSetzen(c, rc);
+    }
 
     // HelloRetryRequest faellig (§4.1.4): Transkript auf message_hash
     // umstellen, HRR senden, auf ClientHello2 warten.
@@ -2218,6 +2479,9 @@ fn serverClientHello(c: int64): int64 {
     hsVerbrauchen(c, peek64(lp), true);
 
     rc := serverHelloSenden(c);
+    if (rc != 0) { return fehlerSetzen(c, rc); }
+    // Dummy-CCS zwischen ServerHello und verschluesseltem Flug (D.4).
+    rc := ccsDummySenden(c);
     if (rc != 0) { return fehlerSetzen(c, rc); }
 
     if (!gruppenGeheimnis(c)) { return fehlerSetzen(c, E_GRUPPE); }
@@ -2404,7 +2668,16 @@ pub fn TlsLese(c: int64, buf: int64, cap: int64): int64 {
     if (z == Z_FEHLER) { return peek64(c + V_FEHLER); }
     var rc: int64 := pumpe(c);
     if (rc != 0 && rc != E_GESCHLOSSEN) { return fehlerSetzen(c, rc); }
-    if (rc == E_GESCHLOSSEN) { poke64(c + V_ZUSTAND, Z_ZU); }
+    if (rc == E_GESCHLOSSEN) {
+        // Auf ein close_notify gehoert ein eigenes close_notify (§6.1).
+        // Ohne das wartet die Gegenseite auf einen Abschluss, den es nie
+        // gibt — tlsfuzzer lief dort in sein Zeitlimit (#2096).
+        if (peek64(c + V_CLOSEGESENDET) == 0) {
+            alertSenden(c, 1, 0);
+            poke64(c + V_CLOSEGESENDET, 1);
+        }
+        poke64(c + V_ZUSTAND, Z_ZU);
+    }
 
     // Nach dem Handschlag koennen Handschlagnachrichten kommen (KeyUpdate,
     // NewSessionTicket). Wer sie liegen laesst, liest nach einem KeyUpdate
@@ -2497,7 +2770,10 @@ fn nachHandschlag(c: int64): int64 {
         if (typ == HS_KEY_UPDATE) {
             if (len != 1) { return E_FORMAT; }
             var anf: int64 := peek8(pos) & 0xFF;
-            if (anf > 1) { return E_FORMAT; }
+            // §4.6.3: ein anderer Wert als 0 oder 1 MUSS illegal_parameter
+            // geben. Mit decode_error fielen 56 Faelle in tlsfuzzers
+            // test-tls13-keyupdate (#2096).
+            if (anf > 1) { return E_PARAM; }
             hsVerbrauchen(c, len, false);
             if (!secretFortschreiben(c, fremdesSecret(c))) { return E_KONFIG; }
             if (!leseSchluessel(c, fremdesSecret(c), 2)) { return E_KONFIG; }
@@ -2522,6 +2798,9 @@ fn nachHandschlag(c: int64): int64 {
 // close_notify senden (§6.1).
 pub fn TlsSchliessen(c: int64): void {
     if (peek64(c + V_12) != 0) { Tls12Schliessen(peek64(c + V_12)); return; }
-    if (peek64(c + V_ZUSTAND) == Z_FERTIG) { alertSenden(c, 1, 0); }
+    if (peek64(c + V_ZUSTAND) == Z_FERTIG && peek64(c + V_CLOSEGESENDET) == 0) {
+        alertSenden(c, 1, 0);
+        poke64(c + V_CLOSEGESENDET, 1);
+    }
     poke64(c + V_ZUSTAND, Z_ZU);
 }

@@ -50,6 +50,19 @@
 // Hash in die Signatur geht.
 // ---------------------------------------------------------------------------
 
+// CAPABILITIES (#2096): diese Unit macht KEINE Ein-/Ausgabe. Sie bekommt
+// Byte gefuettert und gibt Byte heraus; Socket, Datei und Uhr gehoeren der
+// Anwendung. Gebraucht werden nur der Speicher fuer den Verbindungsblock
+// (memory.mmap) und Zufall fuer Schluessel und Nonces (system.rand, auf
+// LyXOS ein implizites Recht).
+//
+// Was ein TLS-SERVER darueber hinaus fuehren muss, ist damit abschliessend:
+// network.tcp.bind und io.wait fuer den Listener, system.time, wenn er die
+// Uhr fuer TlsConfigZeit selbst liest. KEIN fs.read und KEIN fs.meta — den
+// Trust-Store bekommt die Unit als Puffer uebergeben, ein CA-Store wird
+// nicht abgestattet. Belegt in tests/tls_capabilities_test.sh.
+@capabilities([memory.mmap, system.rand])
+
 unit std.net.tls12;
 
 import std.alloc;
@@ -217,21 +230,26 @@ con V_PEER_PK:    int64 := 1024;   // 65 Punkt der Gegenseite
 con V_PMS:        int64 := 1096;   // 32 pre_master_secret
 con V_SNIBUF:     int64 := 1128;   // 256
 con V_ALPNBUF:    int64 := 1384;   // 32
+// Haben wir schon ein close_notify gesendet? Auf ein empfangenes gehoert
+// genau eines (RFC 5246 §7.2.1).
+con V_CLOSEGESENDET: int64 := 1416;
 con V_KOPF:       int64 := 1472;
 
+// Wie in tls13: ein Record traegt bis zu 2^14 Byte Klartext, und der Rest
+// bleibt liegen. Zu kleine Puffer weisen zulaessige Nachrichten ab.
 con B_IN:   int64 := 20480;
 con B_OUT:  int64 := 20480;
-con B_APP:  int64 := 17408;
-con B_HS:   int64 := 16384;
+con B_APP:  int64 := 24576;
+con B_HS:   int64 := 24576;
 
 con O_IN:   int64 := 1472;
 con O_OUT:  int64 := 21952;
 con O_APP:  int64 := 42432;
-con O_HS:   int64 := 59840;
+con O_HS:   int64 := 67008;
 
 // Kratzbereich. Ein Bereich gehoert genau EINER Rolle; Ueberlappung zweier
 // Rollen war in dieser Arbeit (#2096) der haeufigste Fehler.
-con O_SCR:   int64 := 76224;
+con O_SCR:   int64 := 91584;
 con S_TP:     int64 := 0;        // Typ/Position/Laenge beim Nachrichtenlesen
 con S_PP:     int64 := 8;
 con S_LP:     int64 := 16;
@@ -263,17 +281,17 @@ con S_PRFB:   int64 := 2448;     // 64 Byte ein Block der PRF-Ausgabe
 con S_AAD:    int64 := 2512;     // 13 Byte AAD des Records
 con S_SCR_SIZE: int64 := 2560;
 
-con O_REC:    int64 := 78784;    // 17408 Byte Recordzusammenbau
-con O_MSG:    int64 := 96192;    // 8192 Byte Nachrichtenzusammenbau
+con O_REC:    int64 := 94144;    // 17408 Byte Recordzusammenbau
+con O_MSG:    int64 := 111552;    // 8192 Byte Nachrichtenzusammenbau
 con B_MSG:    int64 := 8192;
 // Das Blattzertifikat der Gegenseite wird HIERHER kopiert, bevor es gelesen
 // wird: der X509-Satz haelt nur Positionen in seinem DER-Puffer, und der
 // Empfangspuffer wird gleich wieder benutzt (in tls13 war genau das der
 // Fehler, der mit RSA den eigenen Partner ablehnte).
-con O_CERT:   int64 := 104384;   // 8192
+con O_CERT:   int64 := 119744;   // 8192
 con B_CERT:   int64 := 8192;
-con O_RSAKEY: int64 := 112576;
-con V_SIZE:   int64 := 112576;
+con O_RSAKEY: int64 := 127936;
+con V_SIZE:   int64 := 127936;
 
 pub fn Tls12SpeicherBedarf(): int64 {
     return V_SIZE + RsaSchluesselGroesse() + X509Groesse();
@@ -1047,10 +1065,27 @@ fn gruppenGeheimnis(c: int64): bool {
         var px: int64 := c + V_PEER_PK + 1;
         var py: int64 := c + V_PEER_PK + 33;
         if (!EcValidatePublicKey(EC_P256, px, py)) { return false; }
-        return EcdhSharedSecret(EC_P256, c + V_EPH_SK, px, py, c + V_PMS);
+        if (!EcdhSharedSecret(EC_P256, c + V_EPH_SK, px, py, c + V_PMS)) {
+            return false;
+        }
+        return !nullGeheimnis(c + V_PMS, 32);
     }
     X25519SharedSecret(c + V_EPH_SK, c + V_PEER_PK, c + V_PMS);
-    return true;
+    // RFC 8422 Paragraph 5.11 und RFC 8446 Paragraph 7.4.2: ergibt der
+    // Austausch das NULL-Geheimnis, MUSS abgebrochen werden. Bei Punkten
+    // kleiner Ordnung passiert genau das; die Wycheproof-Vektoren
+    // (x25519_test, #2096) enthalten 31 solche Faelle, und ohne diese
+    // Pruefung lief der Handschlag damit durch.
+    return !nullGeheimnis(c + V_PMS, 32);
+}
+
+// Alle Byte null? Ueber ALLE Byte, ohne fruehen Ausstieg: das Ergebnis ist
+// oeffentlich (es beendet die Verbindung), die Eingabe ist ein Geheimnis.
+fn nullGeheimnis(p: int64, n: int64): bool {
+    var acc: int64 := 0;
+    var i: int64 := 0;
+    while (i < n) { acc := acc | (peek8(p + i) & 0xFF); i := i + 1; }
+    return acc == 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -1506,10 +1541,17 @@ fn clientHelloLesen(c: int64, pos: int64, len: int64): int64 {
     // "Renegotiation einer bestehenden Verbindung" — die machen wir nicht.
     var ri: int64 := extSuchen(pos, p, len - p, 0xFF01, el);
     if (ri >= 0) {
+        // Nicht leer heisst "Renegotiation einer bestehenden Verbindung" —
+        // die machen wir nicht.
         if (peek64(el) != 1 || (peek8(ri) & 0xFF) != 0) { return E_RENEG; }
         poke64(c + V_RENEGOK, 1);
     }
-    if (peek64(c + V_RENEGOK) == 0) { return E_RENEG; }
+    // Fehlt die Erweiterung UND das SCSV, wird der ERSTE Handschlag trotzdem
+    // gefuehrt: RFC 5746 §4.3 verlangt nur, dass dann keine Renegotiation
+    // zustande kommt — und die lehnt diese Unit ohnehin immer ab. Hier stand
+    // vorher ein Abbruch; tlsfuzzer hat damit 194 von 202 zulaessigen
+    // Handschlaegen abgewiesen bekommen (#2096), denn seine Skripte senden
+    // keinen der beiden Hinweise.
 
     // supported_groups
     var sg: int64 := extSuchen(pos, p, len - p, 10, el);
@@ -1837,7 +1879,9 @@ fn certVerifyPruefen(c: int64, schema: int64, sig: int64, sigLen: int64,
 }
 
 fn finishedLesen(c: int64, pos: int64, len: int64, clientSeite: bool): int64 {
-    if (len != 12) { return E_FINISHED; }
+    // Falsche Laenge = Dekodierfehler (verify_data ist in TLS 1.2 immer
+    // zwoelf Byte lang), nicht falscher Abschluss.
+    if (len != 12) { return E_FORMAT; }
     var vd: int64 := pScr(c) + S_VD;
     if (!finishedWert(c, clientSeite, vd)) { return E_FINISHED; }
     if (CTMemEqual(vd, pos, 12) != -1) { return E_FINISHED; }
@@ -1859,7 +1903,39 @@ fn finishedLesen(c: int64, pos: int64, len: int64, clientSeite: bool): int64 {
 // Richtung um, in der es steht, und es gehoert NICHT in den Transkript-Hash.
 // ---------------------------------------------------------------------------
 
+// Welcher Alert gehoert zu welchem Fehler (RFC 8446 §6.2, RFC 5246 §7.2)?
+// 0 heisst "keiner" — das gilt fuer die Faelle, in denen die GEGENSEITE
+// einen Alert geschickt hat.
+fn alertFuer(rc: int64): int64 {
+    if (rc == E_FORMAT)       { return 50; }   // decode_error
+    if (rc == E_VERSION)      { return 70; }   // protocol_version
+    if (rc == E_SUITE)        { return 40; }   // handshake_failure
+    if (rc == E_GRUPPE)       { return 40; }
+    if (rc == E_ENTSCHLUESS)  { return 20; }   // bad_record_mac
+    if (rc == E_ZERTIFIKAT)   { return 42; }   // bad_certificate
+    if (rc == E_SIGNATUR)     { return 51; }   // decrypt_error
+    if (rc == E_FINISHED)     { return 51; }
+    if (rc == E_ABLAUF)       { return 10; }   // unexpected_message
+    if (rc == E_PUFFER)       { return 22; }   // record_overflow
+    if (rc == E_KONFIG)       { return 80; }   // internal_error
+    if (rc == E_UNTERSTUETZT) { return 40; }
+    if (rc == E_WIDERRUFEN)   { return 44; }   // certificate_revoked
+    if (rc == E_EMS)          { return 40; }
+    if (rc == E_RENEG)        { return 40; }
+    return 0;
+}
+
 fn fehlerSetzen(c: int64, rc: int64): int64 {
+    // Ein fataler Fehler MUSS der Gegenseite als Alert gesagt werden, sonst
+    // sieht sie nur eine abgeschnittene Verbindung und raet. tlsfuzzer
+    // (#2096) wartet an vielen Stellen genau darauf; ohne Alert lief es dort
+    // in sein Zeitlimit.
+    //
+    // Nur einmal: ist der Zustand schon Z_FEHLER, ist der Alert heraus.
+    if (peek64(c + V_ZUSTAND) != Z_FEHLER) {
+        var a: int64 := alertFuer(rc);
+        if (a != 0) { alertSenden(c, 2, a); }
+    }
     poke64(c + V_ZUSTAND, Z_FEHLER);
     poke64(c + V_FEHLER, rc);
     return rc;
@@ -2174,7 +2250,13 @@ pub fn Tls12Lese(c: int64, buf: int64, cap: int64): int64 {
     if (z == Z_FEHLER) { return peek64(c + V_FEHLER); }
     var rc: int64 := pumpe(c);
     if (rc != 0 && rc != E_GESCHLOSSEN) { return fehlerSetzen(c, rc); }
-    if (rc == E_GESCHLOSSEN) { poke64(c + V_ZUSTAND, Z_ZU); }
+    if (rc == E_GESCHLOSSEN) {
+        if (peek64(c + V_CLOSEGESENDET) == 0) {
+            alertSenden(c, 1, 0);
+            poke64(c + V_CLOSEGESENDET, 1);
+        }
+        poke64(c + V_ZUSTAND, Z_ZU);
+    }
 
     // Nach dem Handschlag darf keine Handschlagnachricht mehr kommen: TLS 1.2
     // kennt dafuer nur Renegotiation, und die wird abgewiesen (RFC 5746).
@@ -2205,6 +2287,9 @@ pub fn Tls12Lese(c: int64, buf: int64, cap: int64): int64 {
 }
 
 pub fn Tls12Schliessen(c: int64): void {
-    if (peek64(c + V_ZUSTAND) == Z_FERTIG) { alertSenden(c, 1, 0); }
+    if (peek64(c + V_ZUSTAND) == Z_FERTIG && peek64(c + V_CLOSEGESENDET) == 0) {
+        alertSenden(c, 1, 0);
+        poke64(c + V_CLOSEGESENDET, 1);
+    }
     poke64(c + V_ZUSTAND, Z_ZU);
 }
