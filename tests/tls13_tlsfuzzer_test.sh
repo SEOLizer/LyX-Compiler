@@ -47,6 +47,11 @@
 #   test-tls13-*brainpool*, -obsolete-curves, -mlkem, -mldsa, -eddsa-in-*
 #                           diese Kurven und Verfahren fuehrt std.crypto
 #                           nicht
+# test-tls13-ecdhe-curves laeuft MIT, aber nur mit 14 von 33: die restlichen
+# 19 sind secp384r1 (6, kommt mit der P-384-Arbeit), secp521r1 (6) und x448
+# (4) — Kurven, die std.crypto nicht fuehrt, plus die drei sanity-Faelle
+# dazu. Die 14 sind die P-256-Faelle, und die pruefen genau das, was der
+# Befund unten betraf.
 #   test-tls13-certificate-compression  RFC 8879 ist nicht umgesetzt
 #   test-tls13-post-handshake-auth      §4.6.2 ist nicht umgesetzt
 set -uo pipefail
@@ -99,6 +104,7 @@ test-tls13-empty-alert 10
 test-tls13-legacy-version 10
 test-tls13-nociphers 3
 test-tls13-keyupdate 59
+test-tls13-ecdhe-curves 14
 "
 
 while read -r skript soll; do
