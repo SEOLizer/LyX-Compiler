@@ -1,0 +1,413 @@
+// src/cg_erreichbar.lyx — #2551: Erreichbarkeit auf Funktionsebene.
+//
+// WARUM ES DAS GIBT. Eine importierte Unit landet vollstaendig im Erzeugnis,
+// egal wie viel von ihr gebraucht wird. Gemessen (1.2.42A, x86-64):
+//
+//   fn main(): int64 { return 0; }                        4 313 Byte
+//   dasselbe plus `import std.hash`, nichts davon benutzt  190 176 Byte
+//
+// 185 863 Byte fuer Code, der nie gerufen wird. Im Befund waren es +406 903
+// Byte ueber `import vui`.
+//
+// Die Analyse selbst fehlte NICHT: src/ir_call_graph.lyx bildet die
+// Erreichbarkeit von `main` aus und MELDET unerreichbare Funktionen -- benutzt
+// wird sie aber nur vom Berichtsschalter --call-graph. Die Luecke sitzt
+// zwischen Analyse und Ausgabe, nicht in der Analyse.
+//
+// ── Warum ein VORPASS und nicht eine Entscheidung beim Emittieren ──────────
+//
+// Der Codegen verarbeitet jede Unit genau einmal (cg_processImportAsKern
+// beginnt mit cg_hasImported) und emittiert sie dabei sofort. Beim Emittieren
+// einer importierten Unit sind die Namen der SPAETER verarbeiteten Units also
+// noch unbekannt -- eine Entscheidung an dieser Stelle waere eine Entscheidung
+// mit halbem Wissen und wuerde Funktionen verwerfen, die eine andere Unit
+// noch braucht.
+//
+// Deshalb laeuft die Analyse vollstaendig VOR der Ausgabe, und sie braucht
+// dafuer keine zweite Importaufloesung: sema hat jede Unit schon geparst und
+// im Zwischenspeicher abgelegt (src/parse_cache.lyx, pcEintragen in
+// sema.lyx). pcAnz/pcNodes/pcNodeCount/pcHead reichen aus. Eine eigene
+// Aufloesung hier waere die fuenfte Stelle derselben Sache -- genau der
+// Fehler, den die Kommentare in parse_cache.lyx ausdruecklich benennen.
+//
+// ── Warum der Baumlauf jeden Index PRUEFT ──────────────────────────────────
+//
+// AST-Kanten sind nicht immer Knoten. `extern fn` legt in c3 eine GEPACKTE
+// SPANNE ab ((len << 32) | off), NK_AT_DIRECTIVE haelt in c0 einen Wert,
+// FOR_C den Rumpf in c3. Ein blinder Lauf ueber c0..c3 liest solche
+// Nutzlasten als Knotenindex.
+//
+// Darum wird jeder Index gegen nodeCount geprueft. Ein gepackter Wert, der
+// zufaellig im Bereich liegt, fuehrt dann auf einen fremden Knoten und
+// sammelt dessen Bezeichner mit -- es werden also MEHR Funktionen behalten,
+// nie weniger. Die Richtung des Irrtums ist hier die ganze Sicherheit.
+//
+// ── Konservativ, und zwar an welchen Stellen ───────────────────────────────
+//
+//   * Kandidat ist nur eine FREIE Funktion. Methoden bleiben immer erhalten,
+//     damit kein VMT-Eintrag ins Leere zeigt; virtueller Dispatch nennt den
+//     Namen nirgends im Baum.
+//   * Ein Name, den die Tabelle nicht kennt, gilt als erreichbar. Wer fragt,
+//     bekommt bei Unwissen "behalten" -- nicht "verwerfen".
+//   * Gesammelt wird JEDER Bezeichner eines behaltenen Rumpfes, nicht nur das
+//     Ziel eines Aufrufs. Damit ist ein Funktionszeiger (`var f := Name;`)
+//     mitgezaehlt, ohne dass die Form erkannt werden muss.
+//   * Eine Funktion mit Annotation (@export, @jni, @flight_crit, ...) ist
+//     Wurzel. Wer so etwas hinschreibt, haengt daran eine Erwartung von
+//     aussen, die im Baum nicht sichtbar ist.
+
+import src.std.alloc;
+import src.parser;
+import src.parse_cache;
+
+// Eintrag: {namePtr:8, nameLen:8, unitIdx:8, rumpf:8, flags:8, erreichbar:8,
+//           ausgewertet:8, frei:8} = 64 Byte
+con ER_SZ: int64 := 64;
+con ER_OFF_NAMELEN: int64 := 8;
+con ER_OFF_UNIT:    int64 := 16;
+con ER_OFF_RUMPF:   int64 := 24;
+con ER_OFF_FLAGS:   int64 := 32;
+con ER_OFF_ERR:     int64 := 40;
+con ER_OFF_AUSG:    int64 := 48;
+
+// flags
+con ER_F_PUB:   int64 := 1;
+con ER_F_ANNO:  int64 := 2;
+
+// Tiefendeckel. Ein Rumpf mit tausend geschachtelten Ausdruecken kommt im
+// Bestand nicht vor; wird der Deckel erreicht, gilt der Teilbaum als
+// unbekannt und es werden MEHR Namen behalten (siehe Kopfkommentar).
+con ER_MAXTIEFE: int64 := 256;
+
+pub var erTab:   int64 := 0;
+pub var erAnz:   int64 := 0;
+pub var erCap:   int64 := 0;
+pub var erAktiv: int64 := 0;   // 0 = Analyse aus, Verhalten unveraendert
+pub var erFertig: int64 := 0;  // Fixpunkt gelaufen?
+pub var erBericht: int64 := 0; // 1 = jede weggelassene Funktion nennen
+// Messung fuer --gc-functions-bericht
+pub var erVerworfen: int64 := 0;
+pub var erBehalten:  int64 := 0;
+// Die WURZEL-Unit steht NICHT im Zwischenspeicher: pcEintragen laeuft in
+// sema._sema_processImportKern, also nur fuer IMPORTIERTE Units. Ohne sie
+// fehlt `main`, es gibt keine Wurzel, und alles gilt als unerreichbar -- der
+// erste Lauf hat genau das getan und ein Programm von 8409 auf 4313 Byte
+// "gespart", also auf die Groesse des leeren Programms. Sie wird deshalb von
+// aussen hereingegeben und unter dem Index -1 gefuehrt.
+pub var erWNodes: int64 := 0;
+pub var erWSrc:   int64 := 0;
+pub var erWNc:    int64 := 0;
+
+fn _erInit() {
+  if (erCap != 0) { return; }
+  erCap := 512;
+  erTab := alloc(erCap * ER_SZ);
+  erAnz := 0;
+}
+
+fn _erWachsen() {
+  if (erAnz < erCap) { return; }
+  var nc: int64 := erCap * 2;
+  var nb: int64 := alloc(nc * ER_SZ);
+  memcpy(nb, erTab, erAnz * ER_SZ);
+  erTab := nb;
+  erCap := nc;
+}
+
+fn _erNameGleich(e: int64, nm: int64, nl: int64): int64 {
+  if (peek64(e + ER_OFF_NAMELEN) != nl) { return 0; }
+  var p: int64 := peek64(e);
+  var i: int64 := 0;
+  while (i < nl) {
+    if (peek8(p + i) != peek8(nm + i)) { return 0; }
+    i := i + 1;
+  }
+  return 1;
+}
+
+// Index des Eintrags zu diesem Namen, sonst -1.
+fn _erFinden(nm: int64, nl: int64): int64 {
+  var i: int64 := 0;
+  while (i < erAnz) {
+    if (_erNameGleich(erTab + i * ER_SZ, nm, nl) != 0) { return i; }
+    i := i + 1;
+  }
+  return 0 - 1;
+}
+
+// ── Knotenzugriff auf einem Parserbaum ────────────────────────────────────
+// Eigene Zugriffe, weil der Vorpass auf den Baeumen des Zwischenspeichers
+// laeuft (reine Parserknoten) und nicht auf der Codegen-Ablage mit ihrer
+// CG_INL_BASIS-Teilung.
+fn _nk(nodes: int64, i: int64): int64 { return peek64(nodes + i * PARSER_NODE_SIZE); }
+fn _nc(nodes: int64, i: int64, c: int64): int64 {
+  return peek64(nodes + i * PARSER_NODE_SIZE + NODE_OFF_C0 + c * 8);
+}
+fn _nnext(nodes: int64, i: int64): int64 {
+  return peek64(nodes + i * PARSER_NODE_SIZE + NODE_OFF_NEXT);
+}
+// ACHTUNG: SVAL ist ein OFFSET in den Quelltext der Unit, kein Zeiger.
+// Dieselbe Rechnung wie lyu_writer._nsp (dort `dkSrc + sval`). Der erste Wurf
+// hier las den Offset als Adresse -- SIGSEGV beim ersten Namensvergleich.
+// Deshalb traegt jede Stelle, die einen Namen braucht, die Quellbasis mit.
+fn _nsval(nodes: int64, i: int64): int64 {
+  return peek64(nodes + i * PARSER_NODE_SIZE + NODE_OFF_SVAL);
+}
+fn _nslen(nodes: int64, i: int64): int64 {
+  return peek64(nodes + i * PARSER_NODE_SIZE + NODE_OFF_SLEN);
+}
+fn _nispub(nodes: int64, i: int64): int64 {
+  return peek64(nodes + i * PARSER_NODE_SIZE + NODE_OFF_ISPUB);
+}
+
+fn _nival(nodes: int64, i: int64): int64 {
+  return peek64(nodes + i * PARSER_NODE_SIZE + NODE_OFF_IVAL);
+}
+
+// Traegt diese Funktion eine Annotation?
+//
+// Annotationen stehen als BITFELD in iVal des NK_FUNC_DECL (parser.lyx:
+// ANNO_EXPORT 1, ANNO_JNI 2, ANNO_PACKED 4, ANNO_REDUNDANT 8,
+// ANNO_CAPABILITIES 16, ANNO_USES_CAP 32, ANNO_CAP_EXTERN 64,
+// ANNO_LIFECYCLE 128, @energy Bits 8-10, ANNO_FLIGHTCRIT 2048,
+// @stack_limit ab 16, @wcet ab 40) -- NICHT als eigener Knoten.
+//
+// Der erste Wurf dieser Funktion fragte die KNOTENART des Rumpfes nach
+// NK_AT_* ab und haette damit @export und @jni uebersehen: genau die zwei
+// Annotationen, die eine Erwartung von AUSSEN ausdruecken, wo im Baum
+// niemand den Namen nennt. Geraten statt gelesen; die Darstellung steht in
+// parser.lyx ab "Annotation flags".
+//
+// Jedes gesetzte Bit macht zur Wurzel. Nicht nur @export und @jni: wer
+// @capabilities oder @flight_crit hinschreibt, erwartet, dass die Funktion
+// im Erzeugnis steht und geprueft wird.
+fn _erHatAnno(nodes: int64, i: int64): int64 {
+  if (_nival(nodes, i) != 0) { return 1; }
+  return 0;
+}
+
+pub var erGeaendert: int64 := 0;
+
+// ── Baumlauf ───────────────────────────────────────────────────────────────
+//
+// Sammelt jeden Bezeichner des Teilbaums und markiert die gleichnamige
+// Funktion als erreichbar.
+//
+// `stamp` ist ein Feld mit einem int64 je Knoten und `gen` die Nummer dieses
+// Laufs -- so braucht es kein Loeschen zwischen zwei Rumpfen, und ein Zyklus
+// im Baum laeuft nicht endlos.
+//
+// WICHTIG: dem `next`-Zeiger wird auf TIEFE 0 nicht gefolgt. Der Rumpfknoten
+// einer Funktion haengt in derselben Kette wie die naechste Deklaration der
+// obersten Ebene; wer ihm dort folgt, laeuft in den restlichen Baum und
+// sammelt damit JEDEN Namen der Unit ein. Die Analyse waere dann formal
+// korrekt (sie behaelt zu viel) und praktisch wertlos -- es wuerde nichts
+// mehr verworfen. Tiefer drinnen ist `next` die Anweisungskette eines Blocks
+// und gehoert dazu.
+fn _erWalk(nodes: int64, src: int64, nc: int64, ni: int64, tiefe: int64, stamp: int64, gen: int64) {
+  if (ni < 0) { return; }
+  if (ni >= nc) { return; }                 // gepackte Nutzlast statt Knoten
+  if (tiefe >= ER_MAXTIEFE) { return; }
+  if (peek64(stamp + ni * 8) == gen) { return; }
+  poke64(stamp + ni * 8, gen);
+
+  // JEDER namenstragende Knoten zaehlt, nicht nur NK_IDENT.
+  //
+  // Der erste Wurf fragte ausschliesslich NK_IDENT ab und hat damit jedes
+  // AUFRUFZIEL uebersehen: ein Aufruf traegt den Namen am NK_CALL-Knoten
+  // SELBST (parser.lyx: `_ssv(call, _tokOff(nameTok), _tokLen(nameTok))`),
+  // es gibt kein NK_IDENT-Kind dafuer. Folge war kein zu grosses Erzeugnis,
+  // sondern ein KAPUTTES: 8409 -> 4313 Byte, also genau die Groesse des
+  // leeren Programms, und das Erzeugnis lief in eine Endlosschleife (rc 124).
+  // Eine Messung nur der GROESSE haette das als "49 % gespart" gefeiert.
+  //
+  // Deshalb wird nicht nach Knotenarten gefragt. Wer einen Namen traegt,
+  // nennt ihn -- Aufruf, Bezeichner, Methodenname, Typname. Das behaelt im
+  // Zweifel mehr, und mehr ist hier die sichere Richtung.
+  var nl: int64 := _nslen(nodes, ni);
+  if (nl > 0) {
+    var nm: int64 := src + _nsval(nodes, ni);
+    var fi: int64 := _erFinden(nm, nl);
+    if (fi >= 0) {
+      var e: int64 := erTab + fi * ER_SZ;
+      if (peek64(e + ER_OFF_ERR) == 0) {
+        poke64(e + ER_OFF_ERR, 1);
+        erGeaendert := 1;
+      }
+    }
+  }
+
+  var c: int64 := 0;
+  while (c < 4) {
+    _erWalk(nodes, src, nc, _nc(nodes, ni, c), tiefe + 1, stamp, gen);
+    c := c + 1;
+  }
+  if (tiefe > 0) {
+    _erWalk(nodes, src, nc, _nnext(nodes, ni), tiefe + 1, stamp, gen);
+  }
+}
+
+// ── Sammeln ────────────────────────────────────────────────────────────────
+//
+// Jede freie Funktion MIT Rumpf aus jeder Unit des Zwischenspeichers.
+// `istCompileUnit`: bei --compile-unit ist jede `pub fn` ein Einstiegspunkt
+// von aussen und damit Wurzel.
+fn _erSammelnRoh(nodes: int64, src: int64, nc: int64, head: int64,
+                 u: int64, istCompileUnit: int64) {
+  var cur: int64 := head;
+  if (nodes == 0) { return; }
+  if (src == 0) { return; }
+  if (nc <= 0) { return; }
+  var gesehen: int64 := 0;
+  while (cur >= 0 && cur < nc && gesehen < 100000) {
+    gesehen := gesehen + 1;
+    var k: int64 := _nk(nodes, cur);
+    if (k == NK_FUNC_DECL) {
+      var rumpf: int64 := _nc(nodes, cur, 2);
+      var nm: int64 := src + _nsval(nodes, cur);
+      var nl: int64 := _nslen(nodes, cur);
+      // Ohne gueltigen Rumpfknoten ist nichts zu verwerfen: `extern fn` legt
+      // dort eine gepackte Spanne ab, eine Vorwaertsdeklaration gar nichts.
+      var hatRumpf: int64 := 0;
+      if (rumpf >= 0 && rumpf < nc) { hatRumpf := 1; }
+      if (hatRumpf != 0 && nl > 0) {
+        _erWachsen();
+        var e: int64 := erTab + erAnz * ER_SZ;
+        poke64(e,                 nm);
+        poke64(e + ER_OFF_NAMELEN, nl);
+        poke64(e + ER_OFF_UNIT,    u);
+        poke64(e + ER_OFF_RUMPF,   rumpf);
+        var fl: int64 := 0;
+        if (_nispub(nodes, cur) != 0) { fl := fl | ER_F_PUB; }
+        if (_erHatAnno(nodes, cur) != 0) { fl := fl | ER_F_ANNO; }
+        poke64(e + ER_OFF_FLAGS, fl);
+        // Wurzeln: `main`, jede Annotation, und bei --compile-unit jede
+        // oeffentliche Funktion.
+        var wurzel: int64 := 0;
+        if (nl == 4) {
+          if (peek8(nm) == 109 && peek8(nm + 1) == 97
+              && peek8(nm + 2) == 105 && peek8(nm + 3) == 110) { wurzel := 1; }
+        }
+        if ((fl & ER_F_ANNO) != 0) { wurzel := 1; }
+        if (istCompileUnit != 0 && (fl & ER_F_PUB) != 0) { wurzel := 1; }
+        poke64(e + ER_OFF_ERR,  wurzel);
+        poke64(e + ER_OFF_AUSG, 0);
+        erAnz := erAnz + 1;
+      }
+    }
+    cur := _nnext(nodes, cur);
+  }
+}
+
+// ── Fixpunkt ───────────────────────────────────────────────────────────────
+//
+// Solange noch eine erreichbare, aber nicht ausgewertete Funktion existiert,
+// wird ihr Rumpf abgelaufen. Das muss ueber UNITS HINWEG wiederholt werden:
+// Unit A kann ueber B eine Funktion in A brauchen, und B wird spaeter
+// gelesen als A.
+fn _erFixpunkt() {
+  var runden: int64 := 0;
+  erGeaendert := 1;
+  while (erGeaendert != 0 && runden < 64) {
+    erGeaendert := 0;
+    runden := runden + 1;
+    // Bei -1 beginnen: das ist die Wurzel-Unit, und dort sitzt `main`.
+    var u: int64 := 0 - 1;
+    while (u < pcAnz) {
+      // Gibt es in dieser Unit ueberhaupt etwas abzulaufen?
+      var offen: int64 := 0;
+      var i: int64 := 0;
+      while (i < erAnz) {
+        var e: int64 := erTab + i * ER_SZ;
+        if (peek64(e + ER_OFF_UNIT) == u) {
+          if (peek64(e + ER_OFF_ERR) != 0 && peek64(e + ER_OFF_AUSG) == 0) { offen := 1; }
+        }
+        i := i + 1;
+      }
+      if (offen != 0) {
+        var nodes: int64 := erWNodes;
+        var nc:    int64 := erWNc;
+        var src:   int64 := erWSrc;
+        if (u >= 0) {
+          nodes := pcNodes(u);
+          nc    := pcNodeCount(u);
+          src   := pcSrc(u) as int64;
+        }
+        var stamp: int64 := alloc(nc * 8);
+        var gen:   int64 := 0;
+        i := 0;
+        while (i < erAnz) {
+          var e2: int64 := erTab + i * ER_SZ;
+          if (peek64(e2 + ER_OFF_UNIT) == u) {
+            if (peek64(e2 + ER_OFF_ERR) != 0 && peek64(e2 + ER_OFF_AUSG) == 0) {
+              poke64(e2 + ER_OFF_AUSG, 1);
+              gen := gen + 1;
+              _erWalk(nodes, src, nc, peek64(e2 + ER_OFF_RUMPF), 0, stamp, gen);
+            }
+          }
+          i := i + 1;
+        }
+        free(stamp, nc * 8);
+      }
+      u := u + 1;
+    }
+  }
+}
+
+// ── Schnittstelle ──────────────────────────────────────────────────────────
+
+// Analyse vorbereiten. Ruft der Compiler NUR, wenn --gc-functions gesetzt ist.
+pub fn ErVorpass(istCompileUnit: int64, wNodes: int64, wSrc: int64,
+                 wNc: int64, wHead: int64) {
+  _erInit();
+  erAnz := 0;
+  erVerworfen := 0;
+  erBehalten  := 0;
+  erWNodes := wNodes;
+  erWSrc   := wSrc;
+  erWNc    := wNc;
+  // Erst die Wurzel (Index -1): ohne sie gibt es kein `main`.
+  _erSammelnRoh(wNodes, wSrc, wNc, wHead, 0 - 1, istCompileUnit);
+  var u: int64 := 0;
+  while (u < pcAnz) {
+    _erSammelnRoh(pcNodes(u), pcSrc(u) as int64, pcNodeCount(u), pcHead(u),
+                  u, istCompileUnit);
+    u := u + 1;
+  }
+  _erFixpunkt();
+  erFertig := 1;
+}
+
+// Darf der Rumpf dieser Funktion wegbleiben?
+//
+// 1 = erreichbar oder UNBEKANNT, also emittieren.
+// 0 = nachweislich unerreichbar.
+//
+// Unbekannt heisst behalten, nicht verwerfen: wer hier nicht in der Tabelle
+// steht, wurde vom Vorpass nicht gesehen (Unit nicht im Zwischenspeicher,
+// Name aus einer .lyu, generische Ausformung), und darueber faellt keine
+// Entscheidung.
+pub fn ErErreichbar(nm: pchar, nl: int64): int64 {
+  if (erAktiv == 0)  { return 1; }
+  if (erFertig == 0) { return 1; }
+  var fi: int64 := _erFinden(nm as int64, nl);
+  if (fi < 0) { return 1; }
+  if (peek64(erTab + fi * ER_SZ + ER_OFF_ERR) != 0) { return 1; }
+  return 0;
+}
+
+// Wie viele der erfassten Funktionen gelten als unerreichbar? Ohne diese
+// Zahl sind "nichts zu verwerfen" und "Analyse greift nicht" derselbe
+// Befund -- beide zeigen dieselbe Dateigroesse.
+pub fn ErUnerreichbarZahl(): int64 {
+  var n: int64 := 0;
+  var i: int64 := 0;
+  while (i < erAnz) {
+    if (peek64(erTab + i * ER_SZ + ER_OFF_ERR) == 0) { n := n + 1; }
+    i := i + 1;
+  }
+  return n;
+}
+
+pub fn ErZaehleBehalten()  { erBehalten  := erBehalten + 1; }
+pub fn ErZaehleVerworfen() { erVerworfen := erVerworfen + 1; }

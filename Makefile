@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.42A
+VERSION   := 1.2.42B
 VERSION_DATE := 2026-11-17
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -340,6 +340,7 @@ test: lyxc
 	@bash tests/lyu_ir_varint_2538_test.sh
 	@bash tests/lyu_dim_utype_2514_test.sh
 	@bash tests/lyu_con_verweis_2566_test.sh
+	@bash tests/gc_functions_2551_test.sh
 	@bash tests/laute_fehler_tanz1_test.sh
 	@bash tests/paket_lyu_frisch_2557_test.sh
 	@bash tests/tanz3_abi_scrub_test.sh
