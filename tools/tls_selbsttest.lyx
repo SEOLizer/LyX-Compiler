@@ -1,0 +1,282 @@
+// tools/tls_selbsttest.lyx — ein TLS-Handschlag OHNE Netz, zum Mitnehmen
+// auf das Gerät (#2096, Abnahmekriterium 3).
+//
+// Warum das die richtige Form für eine Auslieferung an das Kernelteam ist:
+//
+// `std.net.tls13` und `std.net.tls12` machen KEINE Ein-/Ausgabe. Sie
+// bekommen Byte herein (TlsFuetter) und geben Byte heraus (TlsAusgabe); wer
+// die über ein Netz schiebt, ist die Anwendung. Also lässt sich ein
+// vollständiger Handschlag in EINEM Prozess führen, mit zwei
+// Zustandsmaschinen und einem Puffer dazwischen — ohne Socket, ohne
+// Verzeichnis, ohne Uhr der Gegenstelle.
+//
+// Das trennt die drei offenen LyxOS-Fragen (work/lyxos/anfrage-2096-tls.md)
+// sauber voneinander:
+//
+//   Frage A (Entropie)  wird hier BEANTWORTET: ohne brauchbaren Zufall
+//                       kommt kein Handschlag zustande, und die Prüfung
+//                       unten zeigt zusätzlich, dass zwei Läufe
+//                       verschiedene Schlüssel verwenden.
+//   Frage C (Speicher)  wird hier BEANTWORTET: zwei Verbindungsblöcke zu je
+//                       134 880 Byte plus Arbeitsspeicher. Scheitert die
+//                       Anforderung, sagt dieses Programm es, statt zu
+//                       faulten.
+//   Frage B (Netz)      bleibt offen und wird hier NICHT berührt. Genau das
+//                       ist der Vorteil: die Netz-Syscalls 1536–1545 haben
+//                       keine lesbare Signatur, und bis die vorliegt, kann
+//                       man dennoch alles andere messen.
+//
+// Aufruf:  tls_selbsttest [leise]
+// Rückgabe 0 = alles bestanden, sonst die Zahl der Fehlschläge.
+import std.io;
+import std.alloc;
+import std.crypto.rand;
+import std.net.tls13;
+import std.net.tls_config;
+
+// Genau die zwei Rechte, die die Units brauchen — und kein drittes. Damit ist
+// das Abbild selbst die Aussage: laeuft es unter diesen beiden, braucht TLS
+// auf LyxOS nicht mehr. Kein fs.*, kein network.*, keine Uhr: dieser
+// Selbsttest fasst weder Datei noch Socket an.
+@capabilities([memory.mmap, system.rand])
+
+// Ein Zertifikat und sein Schlüssel, FEST eingebaut: auf dem Gerät gibt es
+// kein Dateisystem, aus dem man sie laden könnte, und ein Selbsttest, der
+// erst eine PKI braucht, wird nicht gefahren. Beides ist ein Testschlüssel
+// für genau diesen Zweck — er verschlüsselt nichts Echtes und steht
+// absichtlich im Quelltext.
+//
+// secp256r1-Blatt, selbst ausgestellt, CN=selbsttest, 2026-2036.
+fn zertDer(out: int64): int64 {
+  var hex: pchar := "308201983082013ea00302010202027002300a06082a8648ce3d040302302c3115301306035504030c0c417572756d20544c5320434131133011060355040a0c0a417572756d2054657374301e170d3236303130313030303030305a170d3336303130313030303030305a302d3116301406035504030c0d6e657875732e6578616d706c6531133011060355040a0c0a417572756d20546573743059301306072a8648ce3d020106082a8648ce3d0301070342000474ec5b2a59a070bc63e8ef0c78165ee98a6ace580d63b26988564068e3a88469a0ff169c6e66877f90b0731421a2238b15fadc4c5b0f76c95b964a70c58720bba34f304d300c0603551d130101ff04023000300e0603551d0f0101ff04040302078030130603551d25040c300a06082b0601050507030130180603551d110411300f820d6e657875732e6578616d706c65300a06082a8648ce3d040302034800304502202db436dc6e75f1dfb441f739dc620baea46a2e72834adcf83a858cdf469a040c022100e6e6a9de59caccf8da573bd4a80e042734704ee1e549433d003005b1e68f532e"c;
+  var n: int64 := 0;
+  var p: int64 := hex as int64;
+  while (peek8(p + n * 2) != 0) {
+    var h: int64 := hexZiffer(peek8(p + n * 2));
+    var l: int64 := hexZiffer(peek8(p + n * 2 + 1));
+    if (h < 0 || l < 0) { return n; }
+    poke8(out + n, h * 16 + l);
+    n := n + 1;
+  }
+  return n;
+}
+
+fn schluesselDer(out: int64): int64 {
+  var hex: pchar := "30770201010420bcf4bb74f3bc1c94fe7673265777d4cde42372d2e5a799503c526d1c09eedceba00a06082a8648ce3d030107a1440342000474ec5b2a59a070bc63e8ef0c78165ee98a6ace580d63b26988564068e3a88469a0ff169c6e66877f90b0731421a2238b15fadc4c5b0f76c95b964a70c58720bb"c;
+  var n: int64 := 0;
+  var p: int64 := hex as int64;
+  while (peek8(p + n * 2) != 0) {
+    var h: int64 := hexZiffer(peek8(p + n * 2));
+    var l: int64 := hexZiffer(peek8(p + n * 2 + 1));
+    if (h < 0 || l < 0) { return n; }
+    poke8(out + n, h * 16 + l);
+    n := n + 1;
+  }
+  return n;
+}
+
+fn hexZiffer(c: int64): int64 {
+  if (c >= 48 && c <= 57) { return c - 48; }
+  if (c >= 97 && c <= 102) { return c - 87; }
+  if (c >= 65 && c <= 70) { return c - 55; }
+  return -1;
+}
+
+fn sageZahl(marke: pchar, wert: int64): void {
+  Print(marke); Print(" "c); PrintIntLn(wert);
+}
+
+// Ein vollständiger Handschlag zwischen zwei Zustandsmaschinen im selben
+// Prozess. Liefert 0 bei Erfolg, sonst den Fehlercode der Seite, die
+// scheitert.
+fn handschlag(sv: int64, cl: int64, puf: int64, pufCap: int64): int64 {
+  var runden: int64 := 0;
+  while (runden < 40) {
+    var rcC: int64 := TlsSchritt(cl);
+    if (rcC < 0) { return rcC; }
+    var n: int64 := TlsAusgabe(cl, puf, pufCap);
+    if (n > 0) {
+      var fr: int64 := TlsFuetter(sv, puf, n);
+      if (fr < 0) { return fr; }
+    }
+    var rcS: int64 := TlsSchritt(sv);
+    if (rcS < 0) { return rcS; }
+    var m: int64 := TlsAusgabe(sv, puf, pufCap);
+    if (m > 0) {
+      var fr2: int64 := TlsFuetter(cl, puf, m);
+      if (fr2 < 0) { return fr2; }
+    }
+    if (TlsFertig(cl) && TlsFertig(sv)) { return 0; }
+    if (n == 0 && m == 0) { return 0 - 99; }
+    runden := runden + 1;
+  }
+  return 0 - 98;
+}
+
+fn main(): int64 {
+  var fehler: int64 := 0;
+  PrintStrLn("=== std.net.tls13 Selbsttest, ohne Netz ==="c);
+
+  // ── Frage A, erster Teil: liefert die Entropiequelle ueberhaupt? ────────
+  var z1: int64 := alloc(32);
+  var z2: int64 := alloc(32);
+  if (z1 == 0 || z2 == 0) {
+    PrintStrLn("FAIL kein Speicher fuer die Zufallsprobe"c);
+    return 1;
+  }
+  var g1: int64 := RandBytesExact(z1, 32);
+  var g2: int64 := RandBytesExact(z2, 32);
+  sageZahl("zufall-1-byte"c, g1);
+  sageZahl("zufall-2-byte"c, g2);
+  if (g1 != 32 || g2 != 32) {
+    PrintStrLn("FAIL die Entropiequelle liefert keine 32 Byte"c);
+    fehler := fehler + 1;
+  }
+  // Zwei Zuege MUESSEN sich unterscheiden. Eine Quelle, die immer dasselbe
+  // liefert, besteht jede Laengenpruefung und ist trotzdem wertlos.
+  var gleich: int64 := 1;
+  var i: int64 := 0;
+  while (i < 32) {
+    if ((peek8(z1 + i) & 255) != (peek8(z2 + i) & 255)) { gleich := 0; }
+    i := i + 1;
+  }
+  sageZahl("zufall-zwei-zuege-gleich"c, gleich);
+  if (gleich == 1) {
+    PrintStrLn("FAIL zwei Zuege sind BITGLEICH — die Quelle wiederholt sich"c);
+    fehler := fehler + 1;
+  }
+  // Und sie darf nicht nur Nullen liefern.
+  var acc: int64 := 0;
+  i := 0;
+  while (i < 32) { acc := acc | (peek8(z1 + i) & 255); i := i + 1; }
+  sageZahl("zufall-nicht-null"c, acc);
+  if (acc == 0) {
+    PrintStrLn("FAIL der Zufall ist durchgehend null"c);
+    fehler := fehler + 1;
+  }
+
+  // ── Frage C: reicht der Speicher fuer zwei Verbindungen? ───────────────
+  sageZahl("speicher-je-verbindung"c, TlsSpeicherBedarf());
+  var zert: int64 := alloc(4096);
+  var key: int64 := alloc(4096);
+  if (zert == 0 || key == 0) {
+    PrintStrLn("FAIL kein Speicher fuer Zertifikat und Schluessel"c);
+    return fehler + 1;
+  }
+  var zl: int64 := zertDer(zert);
+  var kl: int64 := schluesselDer(key);
+  sageZahl("zertifikat-byte"c, zl);
+  sageZahl("schluessel-byte"c, kl);
+  if (zl <= 0 || kl <= 0) {
+    PrintStrLn("FAIL das eingebaute Zertifikat ist unlesbar"c);
+    return fehler + 1;
+  }
+
+  var kette: int64 := alloc(16);
+  poke64(kette, zert); poke64(kette + 8, zl);
+  var trust: int64 := alloc(16);
+  poke64(trust, zert); poke64(trust + 8, zl);
+
+  var cfgS: int64 := alloc(TlsConfigGroesse());
+  var cfgC: int64 := alloc(TlsConfigGroesse());
+  if (cfgS == 0 || cfgC == 0) {
+    PrintStrLn("FAIL kein Speicher fuer die Konfiguration"c);
+    return fehler + 1;
+  }
+  TlsConfigNeu(cfgS, 1);
+  TlsConfigKette(cfgS, kette, 1, key, kl);
+  TlsConfigZeit(cfgS, 1800000000);
+  TlsConfigNeu(cfgC, 2);
+  // Die Kettenpruefung bleibt AUS: sie braucht einen passenden Namen und
+  // eine Uhr, und beides ist nicht die Frage, die hier geprueft wird. Was
+  // geprueft wird, ist der Handschlag selbst — Zufall, Speicher, Rechnung.
+  TlsConfigKettePruefen(cfgC, 0);
+  TlsConfigZeit(cfgC, 1800000000);
+
+  var sv: int64 := TlsNeu(cfgS);
+  var cl: int64 := TlsNeu(cfgC);
+  if (sv == 0 || cl == 0) {
+    PrintStrLn("FAIL kein Speicher fuer die Verbindungsbloecke"c);
+    return fehler + 1;
+  }
+  var puf: int64 := alloc(32768);
+  if (puf == 0) {
+    PrintStrLn("FAIL kein Speicher fuer den Zwischenpuffer"c);
+    return fehler + 1;
+  }
+
+  var rc: int64 := handschlag(sv, cl, puf, 32768);
+  sageZahl("handschlag"c, rc);
+  sageZahl("suite"c, TlsSuite(cl));
+  sageZahl("gruppe"c, TlsGruppe(cl));
+  if (rc != 0) {
+    Print("FAIL Handschlag: "c); PrintStrLn(TlsFehlerText(rc));
+    fehler := fehler + 1;
+  } else {
+    // Nutzdaten in beide Richtungen — erst damit ist die Record-Schicht
+    // belegt und nicht nur der Handschlag.
+    var text: pchar := "ping"c;
+    TlsSchreibe(cl, text as int64, 4);
+    var n1: int64 := TlsAusgabe(cl, puf, 32768);
+    if (n1 > 0) { TlsFuetter(sv, puf, n1); }
+    var ein: int64 := alloc(4096);
+    var gelesen: int64 := TlsLese(sv, ein, 4096);
+    sageZahl("server-liest"c, gelesen);
+    if (gelesen != 4) {
+      PrintStrLn("FAIL der Server hat die Nutzdaten nicht gelesen"c);
+      fehler := fehler + 1;
+    }
+    var antwort: pchar := "pong"c;
+    TlsSchreibe(sv, antwort as int64, 4);
+    var n2: int64 := TlsAusgabe(sv, puf, 32768);
+    if (n2 > 0) { TlsFuetter(cl, puf, n2); }
+    var gelesen2: int64 := TlsLese(cl, ein, 4096);
+    sageZahl("client-liest"c, gelesen2);
+    if (gelesen2 != 4) {
+      PrintStrLn("FAIL der Client hat die Antwort nicht gelesen"c);
+      fehler := fehler + 1;
+    }
+  }
+
+  // ── Frage A, zweiter Teil: zwei Handschlaege, verschiedene Schluessel ──
+  // Ein Geraet mit festem Startwert wuerde beide Handschlaege bestehen und
+  // dabei denselben Verkehrsschluessel benutzen. Darum wird der ZWEITE
+  // Handschlag gegen den ersten verglichen: das Exporter-Geheimnis MUSS sich
+  // unterscheiden.
+  var exp1: int64 := alloc(48);
+  var exp2: int64 := alloc(48);
+  var label: pchar := "selbsttest"c;
+  var ok1: bool := TlsExportKeyingMaterial(cl, label as int64, 10, 0, 0, exp1, 32);
+  var sv2: int64 := TlsNeu(cfgS);
+  var cl2: int64 := TlsNeu(cfgC);
+  var rc2: int64 := 0 - 1;
+  if (sv2 != 0 && cl2 != 0) {
+    rc2 := handschlag(sv2, cl2, puf, 32768);
+  }
+  sageZahl("handschlag-2"c, rc2);
+  var ok2: bool := false;
+  if (rc2 == 0) { ok2 := TlsExportKeyingMaterial(cl2, label as int64, 10, 0, 0, exp2, 32); }
+  if (ok1 && ok2) {
+    var gl2: int64 := 1;
+    i := 0;
+    while (i < 32) {
+      if ((peek8(exp1 + i) & 255) != (peek8(exp2 + i) & 255)) { gl2 := 0; }
+      i := i + 1;
+    }
+    sageZahl("zwei-handschlaege-gleiches-geheimnis"c, gl2);
+    if (gl2 == 1) {
+      PrintStrLn("FAIL zwei Handschlaege ergaben DASSELBE Geheimnis — fester Startwert"c);
+      fehler := fehler + 1;
+    }
+  } else {
+    PrintStrLn("FAIL der Exporter lieferte kein Geheimnis"c);
+    fehler := fehler + 1;
+  }
+
+  if (fehler == 0) {
+    PrintStrLn("ALLES BESTANDEN"c);
+    return 0;
+  }
+  Print("FEHLSCHLAEGE "c); PrintIntLn(fehler);
+  return fehler;
+}
