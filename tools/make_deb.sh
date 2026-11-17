@@ -319,10 +319,33 @@ if [ "$VERIFY" -eq 1 ]; then
   # bestätigt statt gemeldet.
   n_quellen="$(find "$tmp/usr/include/lyx/units" \( -name '*.lyx' -o -name '*.pas' \) | wc -l)"
   [ "$n_quellen" -eq 0 ] || fehler "$n_quellen Quelldatei(en) im fertigen Paket — seit #2447 liefert es keine aus."
-  n_units="$(find "$tmp/usr/include/lyx/units" -name '*.lyu' | wc -l)"
+  # #2514: JE BAUM zaehlen, nicht ueber alle. Seit #2536 kann das Paket mehrere
+  # Vorkompilatbaeume tragen (`make deb LYU_BAEUME="x86_64 lyxos"`), und diese
+  # Pruefung kannte nur einen: sie addierte 503 + 495 und meldete gegen 503
+  # Quell-Units "Paket enthaelt 998 .lyu". Damit konnte die im Makefile selbst
+  # beworbene Form NIE durchlaufen -- die zweite Stelle war nicht nachgezogen.
+  #
+  # Das Soll je Baum ist die Zahl der Quell-Units MINUS der erklaerten Luecken
+  # dieses Ziels. Die Liste dafuer ist dieselbe, die tools/lyu_baum_pruefen.sh
+  # liest; hier wird sie nur gezaehlt, nicht ein zweites Mal ausgelegt.
   n_soll="$(find std data -name '*.lyx' | wc -l)"
-  [ "$n_units" -eq "$n_soll" ] \
-    || fehler "Paket enthält $n_units .lyu, die Quelle hat $n_soll Units — 'make precompile-units' fahren."
+  n_baeume=0
+  n_units=0        # Summe ueber alle Baeume, fuer die Abschlussmeldung
+  for baum in "$tmp/usr/include/lyx/units"/*/; do
+    [ -d "$baum" ] || continue
+    a="$(basename "$baum")"
+    ausn="tools/dist_units_ausnahmen_$a.txt"
+    n_ausn=0
+    [ -f "$ausn" ] && n_ausn="$(grep -cE '^[^#[:space:]].*#' "$ausn")"
+    soll=$(( n_soll - n_ausn ))
+    ist="$(find "$baum" -name '*.lyu' | wc -l)"
+    [ "$ist" -eq "$soll" ] \
+      || fehler "Baum '$a' im Paket hat $ist .lyu, erwartet $soll ($n_soll Units minus $n_ausn erklaerte Luecken) — 'make units-baeume' fahren."
+    echo "  Baum $a: $ist .lyu (Soll $soll)"
+    n_units=$(( n_units + ist ))
+    n_baeume=$(( n_baeume + 1 ))
+  done
+  [ "$n_baeume" -gt 0 ] || fehler "kein einziger Vorkompilatbaum im Paket."
 
   # Handbuchseite: liegt sie richtig, ist sie gepackt, und findet mandb sie?
   mp="$tmp/usr/share/man/man1/lyxc.1.gz"
@@ -344,7 +367,7 @@ if [ "$VERIFY" -eq 1 ]; then
   fi
 
   [ -f "$tmp/usr/share/doc/lyx-compiler/copyright" ] || fehler "copyright fehlt im Paket (Policy 12.5)."
-  echo "  $PKGNAME $VERSION/$ARCH stimmen, lyxc identisch, $n_units Vorkompilate, 0 Quelldateien."
+  echo "  $PKGNAME $VERSION/$ARCH stimmen, lyxc identisch, $n_units Vorkompilate in $n_baeume Baum/Baeumen, 0 Quelldateien."
 fi
 
 echo ""
