@@ -122,17 +122,44 @@ REF_CPS="$(LC_ALL=C lscpu | sed -n 's/^Core(s) per socket: *//p' | head -1)"
 # STATUS:unsupported, und das ist die richtige Antwort und keine erfundene
 # Zahl. Geprueft wird deshalb: entweder die Zahl stimmt mit lscpu, oder es
 # steht ein STATUS da. Eine 0 oder ein leerer Wert faellt weiterhin durch.
+REF_SOCK="$(LC_ALL=C lscpu | sed -n 's/^Socket(s): *//p' | head -1)"
+REF_LOG="$(LC_ALL=C lscpu | sed -n 's/^CPU(s): *//p' | head -1)"
 TPC_IST="$(hol threads_je_kern)"
+TJP_VOR="$(hol threads_je_paket)"
+# Sieht der Gast die GANZE Maschine? Dann muessen CPUID und lscpu dieselbe
+# Antwort geben. Sieht er nur einen Teil (Sockel * Threads je Paket != CPUs),
+# beschreibt CPUID den WIRT und lscpu den Gast — zwei verschiedene Fragen.
+# Dieselbe Unterscheidung macht der Abgleich fuer `kerne` weiter unten schon;
+# fuer threads_je_kern fehlte sie, und auf einem CI-Laeufer mit beschnittener
+# Topologie wurde der Test dadurch rot (gemessen 2026-11-17: Bibliothek 1,
+# lscpu 2, waehrend derselbe Stand auf einem anderen Laeufer gruen war).
+ganze_maschine=0
+case "$REF_SOCK$REF_LOG$TJP_VOR" in
+  ''|*[!0-9]*) ;;
+  *) [ $(( REF_SOCK * TJP_VOR )) = "$REF_LOG" ] && ganze_maschine=1 ;;
+esac
 case "$TPC_IST" in
   STATUS:*)
     echo "HINWEIS: threads_je_kern = $TPC_IST — CPUID.0xB fehlt (VM);"
     echo "         lscpu sagt ${REF_TPC:-?}. Siehe #2413 (AMD-Herkunft 0x8000001E fehlt)."
     ok "threads_je_kern meldet einen Status statt einer erfundenen Zahl" ;;
   *)
-    if [ -n "$REF_TPC" ]; then
+    if [ -n "$REF_TPC" ] && [ "$ganze_maschine" = 1 ]; then
       [ "$TPC_IST" = "$REF_TPC" ] && ok "threads_je_kern = $REF_TPC" \
         || no "threads_je_kern" "'$TPC_IST' statt $REF_TPC"
+    else
+      if [ -n "$REF_TPC" ]; then
+        echo "HINWEIS: CPUID sagt $TPC_IST Threads je Kern, lscpu $REF_TPC —"
+        echo "         der Gast sieht $REF_LOG CPUs bei $REF_SOCK Sockel und"
+        echo "         $TJP_VOR Threads je Paket, also eine beschnittene"
+        echo "         Topologie. Der Abgleich entfaellt (#2413)."
+      fi
+      ok "threads_je_kern = $TPC_IST (Zahl, keine erfundene 0)"
     fi ;;
+esac
+# Eine 0 oder ein leerer Wert faellt weiterhin durch:
+case "$TPC_IST" in
+  0|'') no "threads_je_kern" "'$TPC_IST' — weder Zahl noch Status" ;;
 esac
 # Kerne je Paket: die Zahl kommt aus der x2APIC-Topologie (CPUID.0xB) und ist
 # die HARDWARE-Sicht. In einer VM beschreibt CPUID die Topologie des WIRTS,
@@ -154,8 +181,6 @@ if ist_zahl "$TJP" && ist_zahl "$TJK" && ist_zahl "$KER" && [ "$TJK" -gt 0 ]; th
     no "Topologie" "$KER x $TJK != $TJP — die drei Zahlen passen nicht zueinander"
   fi
 fi
-REF_SOCK="$(LC_ALL=C lscpu | sed -n 's/^Socket(s): *//p' | head -1)"
-REF_LOG="$(LC_ALL=C lscpu | sed -n 's/^CPU(s): *//p' | head -1)"
 if [ -n "$REF_CPS" ] && [ -n "$REF_SOCK" ] && [ -n "$REF_LOG" ] && ist_zahl "$TJP"; then
   if [ $(( REF_SOCK * TJP )) = "$REF_LOG" ]; then
     [ "$KER" = "$REF_CPS" ] && ok "kerne_je_paket = $REF_CPS (gegen lscpu)" \
