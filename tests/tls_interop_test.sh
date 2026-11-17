@@ -9,7 +9,7 @@
 #   1. **Unser Server, fremder Client** (`openssl s_client`): TLS 1.3 und
 #      TLS 1.2, je mit Prüfung der ausgehandelten Version UND Suite.
 #   2. **Unser Client, fremder Server** (`openssl s_server`): derselbe
-#      Durchgang, über den Adapter std.net.tlsc.
+#      Durchgang, über die native std.net.tls.
 #
 # Geprüft wird jeweils die WIRKUNG: nicht "der Handschlag lief", sondern
 # welche Version und welche Suite dabei herauskam, und dass Nutzdaten in
@@ -143,13 +143,13 @@ else
 fi
 pkill -x io_srv 2>/dev/null
 
-# ── Richtung 2: unser Client (std.net.tlsc), openssl s_server ──────────────
+# ── Richtung 2: unser Client (std.net.tls), openssl s_server ───────────────
 cat > "$TMP/klient.lyx" <<'LYXEOF'
 import std.io;
 import std.fs;
 import std.alloc;
 import std.crypto.der;
-import std.net.tlsc;
+import std.net.tls;
 import std.net.socket;
 
 fn ladeDer(pfad: pchar, etikett: pchar, out: int64): int64 {
