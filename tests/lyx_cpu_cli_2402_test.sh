@@ -44,36 +44,41 @@ REF_TPC="$(LC_ALL=C lscpu | sed -n 's/^Thread(s) per core: *//p' | head -1)"
 # Prueffrage wie in tests/cpu_describe_2397_test.sh; die beiden muessen
 # uebereinstimmen.
 #
-# Der Abgleich mit lscpu gilt nur, wenn der Gast die GANZE Maschine sieht:
-# Sockel * Threads je Paket == CPUs. Sonst beschreibt CPUID den Wirt und
-# lscpu den Gast, und das sind zwei verschiedene Fragen. Ohne diese
-# Unterscheidung war der Test auf einem CI-Laeufer mit beschnittener
-# Topologie rot (gemessen 2026-11-17: CLI 1, lscpu 2), waehrend derselbe
-# Stand auf einem anderen Laeufer gruen war.
+# Sieht der Gast die GANZE Maschine? Dann muessen CPUID und lscpu dieselbe
+# Antwort geben. Sieht er nur einen Teil (Sockel * Threads je Paket != CPUs),
+# beschreibt CPUID den WIRT und lscpu den Gast — zwei verschiedene Fragen.
+#
+# Dieselbe Unterscheidung hat cpu_describe_2397_test.sh seit 20b308b7; HIER
+# fehlte sie, obwohl der Kommentar darueber Gleichstand behauptet. Der Lauf zu
+# PR #2581 wurde dadurch rot (CPUID 1, lscpu 2), waehrend derselbe Stand auf
+# einem anderen Laeufer gruen war. Wer eine der beiden Stellen aendert, aendert
+# beide.
 REF_SOCK="$(LC_ALL=C lscpu | sed -n 's/^Socket(s): *//p' | head -1)"
 REF_LOG="$(LC_ALL=C lscpu | sed -n 's/^CPU(s): *//p' | head -1)"
-TPC_FELD="$(feld threads_per_core)"
-TJP_FELD="$(feld threads_per_package)"
+TJP="$(feld threads_per_package)"
 ganze_maschine=0
-case "$REF_SOCK$REF_LOG$TJP_FELD" in
+case "$REF_SOCK$REF_LOG$TJP" in
   ''|*[!0-9]*) ;;
-  *) [ $(( REF_SOCK * TJP_FELD )) = "$REF_LOG" ] && ganze_maschine=1 ;;
+  *) [ $(( REF_SOCK * TJP )) = "$REF_LOG" ] && ganze_maschine=1 ;;
 esac
+TPC_FELD="$(feld threads_per_core)"
 case "$TPC_FELD" in
   unsupported|permission_denied|not_implemented)
     echo "HINWEIS: threads_per_core = $TPC_FELD (CPUID.0xB fehlt, lscpu sagt ${REF_TPC:-?}) — #2413"
     ok "info: threads_per_core meldet einen Status statt einer erfundenen Zahl" ;;
-  ''|0)
+  0|'')
     no "threads_per_core" "'$TPC_FELD' — weder Zahl noch Status" ;;
   *)
     if [ -n "$REF_TPC" ] && [ "$ganze_maschine" = 1 ]; then
-      [ "$TPC_FELD" = "$REF_TPC" ] && ok "info: threads_per_core = $REF_TPC (gegen lscpu)" \
-        || no "threads_per_core" "'$TPC_FELD' statt $REF_TPC"
+      [ "$TPC_FELD" = "$REF_TPC" ] && ok "info: threads_per_core = $REF_TPC" \
+        || no "threads_per_core" "'$TPC_FELD'"
     else
-      echo "HINWEIS: CPUID sagt $TPC_FELD Threads je Kern, lscpu ${REF_TPC:-?} —"
-      echo "         der Gast sieht ${REF_LOG:-?} CPUs bei ${REF_SOCK:-?} Sockel und"
-      echo "         ${TJP_FELD:-?} Threads je Paket, also eine beschnittene Topologie."
-      echo "         Der Abgleich entfaellt (#2413)."
+      if [ -n "$REF_TPC" ]; then
+        echo "HINWEIS: CPUID sagt $TPC_FELD Threads je Kern, lscpu $REF_TPC —"
+        echo "         der Gast sieht $REF_LOG CPUs bei $REF_SOCK Sockel und"
+        echo "         $TJP Threads je Paket, also eine beschnittene Topologie."
+        echo "         Der Abgleich entfaellt (#2413)."
+      fi
       ok "info: threads_per_core = $TPC_FELD (Zahl, keine erfundene 0)"
     fi ;;
 esac

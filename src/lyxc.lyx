@@ -15,6 +15,7 @@
 import src.lexer;
 import src.tools.disasm.x86;   // #1370: --dump-asm/--emit-asm/--asm-listing
 import src.parser;
+import src.cg_erreichbar;   // #2551
 import src.sema;
 import src.herkunft;   // #2202
 import src.frontend.linter;
@@ -482,8 +483,9 @@ pub type CompilerConfig = class {
   paketPfade: int64;          // Projektdatei: "name=pfad:name=pfad" (0 = keine)
 
   stdPath: int64;
-  insWurzel: int64;
-  win64SyscallsWarnen: int64;   // #2519: 1 = rohe Syscalls im PE nur melden   // #2518: Wurzel der vierten Aufloesestufe (pchar), 0 = eingebaute
+  insWurzel: int64;             // #2518: Wurzel der vierten Aufloesestufe (pchar), 0 = eingebaute
+  win64SyscallsWarnen: int64;   // #2519: 1 = rohe Syscalls im PE nur melden
+  gcFunctions: int64;           // #2551: 1 = unerreichbare Funktionen weglassen
   arch: int64;
   defineMacros: int64;
   emitRelocs: bool;
@@ -750,6 +752,7 @@ pub type CompilerConfig = class {
     self.stdPath := 0;
     self.insWurzel := 0;   // #2518
     self.win64SyscallsWarnen := 0;   // #2519: Vorgabe = abweisen
+    self.gcFunctions := 0;           // #2551: Vorgabe = alles emittieren
     self.arch := 0;
     self.defineMacros := 0;
     self.emitRelocs := false;
@@ -1551,6 +1554,22 @@ pub type CompilerConfig = class {
       self.dumpSema := true;
       return;
     }
+    // #2551: Erreichbarkeitsanalyse auf Funktionsebene. BEWUSST ein Schalter
+    // und nicht die Vorgabe: so ist der Gewinn messbar, bevor er fuer alle
+    // gilt, und ein Fehlschlag trifft niemanden, der ihn nicht setzt.
+    if StrCmp(arg, "--gc-functions"c) == 0 {
+      self.gcFunctions := 1;
+      return;
+    }
+    // #2551: dieselbe Analyse, dazu jede weggelassene Funktion namentlich.
+    // Gebraucht beim Messen: die Dateigroesse ist SEITENGRANULAR (ein
+    // Erzeugnis sprang um genau 4096 Byte), zwei kleine weggelassene
+    // Funktionen sind daran also nicht zu erkennen.
+    if StrCmp(arg, "--gc-functions-bericht"c) == 0 {
+      self.gcFunctions := 1;
+      erBericht := 1;
+      return;
+    }
     if StrCmp(arg, "--dump-ir"c) == 0 {
       self.dumpIR := true;
       return;
@@ -1910,7 +1929,7 @@ pub type CompilerConfig = class {
     if StrCmp(arg, "--version"c) == 0 {
       PrintStr("lyxc"c);
       PrintStr(" "c);
-      PrintStrLn("1.2.42A"c);
+      PrintStrLn("1.2.42B"c);
       PrintStr("Build: "c);
       PrintStrLn("bootstrap"c);
       self.exitCode := 0;
@@ -1932,7 +1951,7 @@ pub type CompilerConfig = class {
       PrintStr("  Name: "c);
       PrintStrLn("lyxc"c);
       PrintStr("  Version: "c);
-      PrintStrLn("1.2.42A"c);
+      PrintStrLn("1.2.42B"c);
       PrintStr("  Build: "c);
       PrintStrLn("bootstrap"c);
       PrintStr("  Target: "c);
@@ -2188,7 +2207,7 @@ pub type CompilerConfig = class {
   }
 
   fn printHelp(): void {
-    PrintStrLn("lyxc 1.2.42A (bootstrap)");
+    PrintStrLn("lyxc 1.2.42B (bootstrap)");
     PrintStrLn("Copyright (c) 2026 Andreas Roene. All rights reserved.");
     PrintStrLn("");
     PrintStrLn("Verwendung: lyxc <datei.lyx> [-o <ausgabe>] [--target=TARGET] [--arch=ARCH]");
@@ -2228,6 +2247,8 @@ pub type CompilerConfig = class {
     PrintStrLn("  --mcdc-report          MC/DC-Coverage-Bericht nach Kompilierung");
     PrintStrLn("  --static-analysis      Statische Analyse (Data-Flow, Live-Vars, Stack, ...)");
     PrintStrLn("  --call-graph           Statischer Aufrufgraph (WCET, Rekursions-Erkennung)");
+    PrintStrLn("  --gc-functions         Unerreichbare Funktionen importierter Units weglassen (#2551)");
+    PrintStrLn("  --gc-functions-bericht dasselbe, nennt jede weggelassene Funktion");
     PrintStrLn("  --map-file             Symbol-/Sektionskarte als <ausgabe>.map");
     PrintStrLn("  --runtime-checks       Runtime-Assertions (bounds, null, zero) fuer DO-178C");
     PrintStrLn("  --verify-tmr           Bilanz der @redundant-Zugriffe; Fehler, wenn einer am Voter vorbeigeht");
@@ -2523,6 +2544,25 @@ pub type CompilerConfig = class {
     if self._cpZaehlerAn() { sema.zlAktiv := 1; }   // #2174, #2343
     var semaResult: int64 := sema.Check(astRoot);
     self._passEnd("sema"c, _t3);
+    // #2551: Erreichbarkeit JETZT bestimmen, nicht beim Emittieren. sema hat
+    // gerade jede Unit geparst und im Zwischenspeicher abgelegt; der Codegen
+    // verarbeitet jede Unit nur einmal und emittiert sie dabei sofort, waere
+    // also beim Entscheiden auf halbem Wissen. Siehe Kopf von
+    // src/cg_erreichbar.lyx.
+    if self.gcFunctions != 0 {
+      erAktiv := 1;
+      var cuFlag: int64 := 0;
+      if self.compileUnit { cuFlag := 1; }
+      ErVorpass(cuFlag, parser.nodes, source as int64, parser.nodeCount, astRoot);
+      // #2551: was die Analyse gefunden hat, als Zahl. Ohne diese Zeile ist
+      // nicht unterscheidbar, ob nichts zu verwerfen war oder die Analyse
+      // nicht gegriffen hat -- zwei Faelle mit derselben Dateigroesse.
+      PrintStr("gc-functions: "c);
+      PrintInt(erAnz);
+      PrintStr(" Funktionen erfasst, "c);
+      PrintInt(ErUnerreichbarZahl());
+      PrintStrLn(" davon unerreichbar"c);
+    }
     if self.timeTrace != 0 as pchar {
       var zs: pchar := StrConcat(self._zlKv("importe_us"c, sema.zlImpNs / 1000), ","c);
       zs := StrConcat(StrConcat(zs, self._zlKv("importe_units"c, sema.zlImpN)), ","c);
@@ -6868,7 +6908,7 @@ pub type CompilerConfig = class {
     j := StrConcat(j, ",\"compiler\":{"c);
     // tools/next_version.sh ersetzt jedes Literal "x.y.zS"c in dieser Datei
     // global; diese Stelle wird also mitgezogen und driftet nicht weg.
-    j := StrConcat(j, self._cpTxt("version"c, "1.2.42A"c));
+    j := StrConcat(j, self._cpTxt("version"c, "1.2.42B"c));
     j := StrConcat(j, ","c);
     j := StrConcat(j, self._cpFehlt("commit"c, "NO_COMMIT_IN_BINARY"c));
     j := StrConcat(j, ","c);
@@ -7908,7 +7948,7 @@ pub fn main(argc: int64, argv: pchar): int64 {
 
   // Print version banner unless suppressed with --quiet
   if not cfg.quiet {
-    PrintStr("lyxc 1.2.42A -- Copyright (c) 2026 Andreas Roene. All rights reserved.\n"c);
+    PrintStr("lyxc 1.2.42B -- Copyright (c) 2026 Andreas Roene. All rights reserved.\n"c);
   }
 
   // WP-BC-50: --unit-info <file> — read .lyu file, print metadata, exit
