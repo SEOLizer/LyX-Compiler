@@ -1,0 +1,2210 @@
+// std/net/tls12.lyx — TLS 1.2 (RFC 5246) in Lyx, ohne OpenSSL, ohne FFI
+//
+// Stufe 2 aus #2096. Der Grund fuer diese Unit ist nicht Vollstaendigkeit,
+// sondern ein gemessener Bedarf: Windows 10 und Windows Server bis 2019
+// sprechen LDAPS und RADIUS-EAP nur bis TLS 1.2. Ohne diese Fassung gibt es
+// keine Windows-Interop fuer NEXUS Directory.
+//
+// Die Unit ist die ZWEITE Zustandsmaschine neben std.net.tls13 und teilt mit
+// ihr die Konfiguration (std.net.tls_config) und die Krypto-Bausteine. Sie
+// macht keine Ein-/Ausgabe: gefuetterte Byte herein, zu sendende Byte heraus,
+// genau wie tls13 — damit bleibt sie mit epoll und nicht blockierenden
+// Sockets benutzbar.
+//
+// Was enthalten ist:
+//   Rollen           Server und Client
+//   Cipher-Suites    NUR ECDHE mit AEAD:
+//                    ECDHE_ECDSA/RSA_WITH_AES_128_GCM_SHA256 (0xC02B/0xC02F)
+//                    ECDHE_ECDSA/RSA_WITH_AES_256_GCM_SHA384 (0xC02C/0xC030)
+//                    ECDHE_ECDSA/RSA_WITH_CHACHA20_POLY1305  (0xCCA9/0xCCA8)
+//   Schluesseltausch X25519 und secp256r1
+//   Signaturen       ecdsa_secp256r1_sha256/384, rsa_pkcs1_sha256/384,
+//                    rsa_pss_rsae_sha256/384
+//   Pflicht          Extended Master Secret (RFC 7627). Fehlt die
+//                    Erweiterung, wird der Handschlag ABGEBROCHEN, nicht
+//                    stillschweigend ohne sie gefuehrt — #2096 verlangt sie,
+//                    und ohne sie ist der Triple-Handshake-Angriff offen.
+//   Renegotiation    wird abgewiesen (RFC 5746): renegotiation_info geht
+//                    leer mit, und jedes ClientHello NACH dem Handschlag
+//                    beendet die Verbindung mit handshake_failure.
+//
+// Was absichtlich NICHT enthalten ist, und was beim Lesen eines fremden
+// Angebots laut abgewiesen wird: RSA-Schluesseltausch (kein Forward Secrecy),
+// CBC-Suiten samt MAC-then-Encrypt (Lucky-13-Klasse), RC4, statisches DH,
+// Kompression, SSLv3/TLS 1.0/1.1, Session-Resumption ueber Session-ID oder
+// Tickets.
+//
+// ---------------------------------------------------------------------------
+// Zwei Transkript-Hashes
+//
+// TLS 1.2 braucht den Transkript-Hash mit ZWEI verschiedenen Verfahren:
+// Finished und Extended Master Secret rechnen mit dem Hash der Cipher-Suite
+// (SHA-256 oder SHA-384), CertificateVerify und ServerKeyExchange dagegen mit
+// dem Hash, der in der SIGNATUR steht — und der darf ein anderer sein
+// (ecdsa_secp256r1_sha256 unter TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 ist
+// eine zulaessige Kombination).
+//
+// Darum laufen hier IMMER beide Zustaende mit, SHA-256 und SHA-384. Das
+// kostet einen zweiten Hashdurchlauf ueber den Handschlag (ein paar
+// Kilobyte) und erspart die ganze Klasse von Fehlern, in der der falsche
+// Hash in die Signatur geht.
+// ---------------------------------------------------------------------------
+
+unit std.net.tls12;
+
+import std.alloc;
+import std.crypto.sha256;
+import std.crypto.sha512;
+import std.crypto.hkdf;
+import std.crypto.aesgcm;
+import std.crypto.chacha20poly1305;
+import std.crypto.x25519;
+import std.crypto.ec;
+import std.crypto.rand;
+import std.crypto.ct;
+import std.crypto.der;
+import std.crypto.x509;
+import std.crypto.pkey;
+import std.crypto.rsa_native;
+import std.crypto.ed25519;
+import std.net.tls_config;
+
+// ---------------------------------------------------------------------------
+// Rueckgabewerte. Dieselben Zahlen wie in std.net.tls13, damit die Anwendung
+// nicht zwei Fehlertabellen fuehren muss.
+// ---------------------------------------------------------------------------
+
+con E_FORMAT:        int64 := -1;
+con E_VERSION:       int64 := -2;
+con E_SUITE:         int64 := -3;
+con E_GRUPPE:        int64 := -4;
+con E_ENTSCHLUESS:   int64 := -5;
+con E_ZERTIFIKAT:    int64 := -6;
+con E_SIGNATUR:      int64 := -7;
+con E_FINISHED:      int64 := -8;
+con E_ABLAUF:        int64 := -9;
+con E_PUFFER:        int64 := -10;
+con E_KONFIG:        int64 := -11;
+con E_UNTERSTUETZT:  int64 := -12;
+con E_WARNUNG:       int64 := -13;
+con E_GESCHLOSSEN:   int64 := -14;
+con E_WIDERRUFEN:    int64 := -15;
+// eigener Code fuer die beiden Pflichten dieser Fassung
+con E_EMS:           int64 := -17;   // Extended Master Secret fehlt
+con E_RENEG:         int64 := -18;   // Renegotiation versucht
+
+pub fn Tls12FehlerText(rc: int64): pchar {
+    if (rc == 0)  { return "ok"c; }
+    if (rc == 1)  { return "want-read"c; }
+    if (rc == 2)  { return "want-write"c; }
+    if (rc == -1) { return "Record oder Handschlagnachricht nicht lesbar"c; }
+    if (rc == -2) { return "Gegenseite bietet TLS 1.2 nicht an"c; }
+    if (rc == -3) { return "keine gemeinsame Cipher-Suite (nur ECDHE mit AEAD)"c; }
+    if (rc == -4) { return "keine gemeinsame Schluesselgruppe"c; }
+    if (rc == -5) { return "Entschluesselung fehlgeschlagen (Tag falsch)"c; }
+    if (rc == -6) { return "Zertifikatskette nicht gueltig"c; }
+    if (rc == -7) { return "Signatur falsch"c; }
+    if (rc == -8) { return "Finished falsch"c; }
+    if (rc == -9) { return "Nachricht an dieser Stelle unerwartet"c; }
+    if (rc == -10) { return "Puffer zu klein"c; }
+    if (rc == -11) { return "Konfiguration unvollstaendig"c; }
+    if (rc == -12) { return "Verfahren nicht unterstuetzt"c; }
+    if (rc == -13) { return "Alert der Gegenseite"c; }
+    if (rc == -14) { return "Verbindung geschlossen (close_notify)"c; }
+    if (rc == -15) { return "Zertifikat vom Widerruf-Hook abgelehnt"c; }
+    if (rc == -17) { return "Extended Master Secret fehlt (RFC 7627, Pflicht)"c; }
+    if (rc == -18) { return "Renegotiation wird abgewiesen (RFC 5746)"c; }
+    return "unbekannter Fehler"c;
+}
+
+pub fn Tls12Ok(): int64 { return 0; }
+pub fn Tls12WantRead(): int64 { return 1; }
+pub fn Tls12WantWrite(): int64 { return 2; }
+
+// Cipher-Suites
+con CS_ECDHE_ECDSA_AES128_GCM: int64 := 0xC02B;
+con CS_ECDHE_ECDSA_AES256_GCM: int64 := 0xC02C;
+con CS_ECDHE_RSA_AES128_GCM:   int64 := 0xC02F;
+con CS_ECDHE_RSA_AES256_GCM:   int64 := 0xC030;
+con CS_ECDHE_ECDSA_CHACHA20:   int64 := 0xCCA9;
+con CS_ECDHE_RSA_CHACHA20:     int64 := 0xCCA8;
+// Signalisierung, dass der Client keine Renegotiation macht (RFC 5746 §3.3)
+con SCSV_RENEG:                int64 := 0x00FF;
+
+// Gruppen
+con GRP_X25519:    int64 := 0x001d;
+con GRP_SECP256R1: int64 := 0x0017;
+
+// Record-Typen
+con RT_CCS:        int64 := 20;
+con RT_ALERT:      int64 := 21;
+con RT_HANDSHAKE:  int64 := 22;
+con RT_APPDATA:    int64 := 23;
+
+// Handschlagnachrichten
+con HS_CLIENT_HELLO: int64 := 1;
+con HS_SERVER_HELLO: int64 := 2;
+con HS_CERT:         int64 := 11;
+con HS_SKE:          int64 := 12;   // ServerKeyExchange
+con HS_CERT_REQUEST: int64 := 13;
+con HS_SHD:          int64 := 14;   // ServerHelloDone
+con HS_CERT_VERIFY:  int64 := 15;
+con HS_CKE:          int64 := 16;   // ClientKeyExchange
+con HS_FINISHED:     int64 := 20;
+
+// Zustaende
+con Z_START:      int64 := 0;
+con Z_WARTE_SH:   int64 := 1;    // Client wartet auf ServerHello..ServerHelloDone
+con Z_WARTE_CCS:  int64 := 2;    // Client wartet auf CCS + Finished des Servers
+con Z_WARTE_CH:   int64 := 3;    // Server wartet auf ClientHello
+con Z_WARTE_CKE:  int64 := 4;    // Server wartet auf Cert/CKE/CertVerify
+con Z_WARTE_CF:   int64 := 5;    // Server wartet auf CCS + Finished des Clients
+con Z_FERTIG:     int64 := 6;
+con Z_FEHLER:     int64 := 7;
+con Z_ZU:         int64 := 8;
+
+// ---------------------------------------------------------------------------
+// Verbindungszustand. Wie in tls13: EINE Allokation je Verbindung, feste
+// Unterbereiche, danach wird nichts mehr belegt.
+// ---------------------------------------------------------------------------
+
+con V_CFG:        int64 := 0;
+con V_ROLLE:      int64 := 8;
+con V_ZUSTAND:    int64 := 16;
+con V_SUITE:      int64 := 24;
+con V_HASHLEN:    int64 := 32;     // Hash der Suite: 32 oder 48
+con V_KEYLEN:     int64 := 40;     // 16 oder 32
+con V_AEAD:       int64 := 48;     // 1 AES-GCM, 2 ChaCha20-Poly1305
+con V_IVFIX:      int64 := 56;     // 4 (GCM) oder 12 (ChaCha)
+con V_INPOS:      int64 := 64;
+con V_OUTPOS:     int64 := 72;
+con V_OUTGELESEN: int64 := 80;
+con V_APPPOS:     int64 := 88;
+con V_APPGELESEN: int64 := 96;
+con V_HSPOS:      int64 := 104;
+con V_HSGELESEN:  int64 := 112;
+con V_SEQ_LESE:   int64 := 120;
+con V_SEQ_SCHR:   int64 := 128;
+con V_KRYPT_LESE: int64 := 136;
+con V_KRYPT_SCHR: int64 := 144;
+con V_FEHLER:     int64 := 152;
+con V_GRUPPE:     int64 := 160;
+con V_SIGALG:     int64 := 168;    // gewaehltes Signaturverfahren
+con V_CERTREQ:    int64 := 176;
+con V_PEERCERTOK: int64 := 184;
+con V_PEERCERT:   int64 := 192;    // Zeiger auf den X509-Satz
+con V_EMS:        int64 := 200;    // 1 = beide Seiten haben EMS angeboten
+con V_RENEGOK:    int64 := 208;    // 1 = renegotiation_info gesehen
+con V_ALPNSEL:    int64 := 216;
+con V_ALPNSELLEN: int64 := 224;
+con V_KETTE:      int64 := 232;    // gewaehlter Eintrag der SNI-Tabelle
+con V_SNILEN:     int64 := 240;
+// Transkript: zwei Zustaende (siehe Kopf)
+con V_HS256:      int64 := 256;    // 208 Byte
+con V_HS384:      int64 := 464;    // 208 Byte
+con V_MASTER:     int64 := 672;    // 48 Byte master_secret
+con V_CRAND:      int64 := 720;    // 32 client_random
+con V_SRAND:      int64 := 752;    // 32 server_random
+con V_SESSID:     int64 := 784;    // 32 session_id (gespiegelt, nie benutzt)
+con V_SESSIDLEN:  int64 := 816;
+con V_KEY_LESE:   int64 := 824;    // 32
+con V_KEY_SCHR:   int64 := 856;    // 32
+con V_IV_LESE:    int64 := 888;    // 12
+con V_IV_SCHR:    int64 := 904;    // 12
+con V_EPH_SK:     int64 := 920;    // 32 eigener Skalar
+con V_EPH_PK:     int64 := 952;    // 65 eigener Punkt (0x04||X||Y) oder 32
+con V_PEER_PK:    int64 := 1024;   // 65 Punkt der Gegenseite
+con V_PMS:        int64 := 1096;   // 32 pre_master_secret
+con V_SNIBUF:     int64 := 1128;   // 256
+con V_ALPNBUF:    int64 := 1384;   // 32
+con V_KOPF:       int64 := 1472;
+
+con B_IN:   int64 := 20480;
+con B_OUT:  int64 := 20480;
+con B_APP:  int64 := 17408;
+con B_HS:   int64 := 16384;
+
+con O_IN:   int64 := 1472;
+con O_OUT:  int64 := 21952;
+con O_APP:  int64 := 42432;
+con O_HS:   int64 := 59840;
+
+// Kratzbereich. Ein Bereich gehoert genau EINER Rolle; Ueberlappung zweier
+// Rollen war in dieser Arbeit (#2096) der haeufigste Fehler.
+con O_SCR:   int64 := 76224;
+con S_TP:     int64 := 0;        // Typ/Position/Laenge beim Nachrichtenlesen
+con S_PP:     int64 := 8;
+con S_LP:     int64 := 16;
+con S_EL:     int64 := 24;       // Laenge einer gefundenen Erweiterung
+con S_KOPF:   int64 := 32;       // 13 Byte AAD bzw. 5 Byte Recordkopf
+con S_NONCE:  int64 := 48;       // 12 Byte AEAD-Nonce
+con S_TAG:    int64 := 64;       // 16 Byte AEAD-Tag
+con S_TH:     int64 := 96;       // 64 Byte Transkript-Hash (Suite-Hash)
+con S_TH2:    int64 := 160;      // 64 Byte Transkript-Hash (Signatur-Hash)
+con S_VD:     int64 := 224;      // 16 Byte verify_data (12 benutzt)
+con S_HCTX:   int64 := 240;      // 208 Byte Kopie eines Hashzustands
+con S_PRF:    int64 := 448;      // 256 Byte PRF-Ausgabe (Schluesselblock)
+con S_PRFA:   int64 := 704;      // 64 Byte A(i)
+con S_PRFIN:  int64 := 768;      // 256 Byte HMAC-Eingabe A(i) || seed
+con S_SEED:   int64 := 1024;     // 128 Byte label || seed
+con S_SIG:    int64 := 1152;     // 512 Byte Signatur
+con S_SIGIN:  int64 := 1664;     // 256 Byte zu signierender Block
+con S_DER:    int64 := 1920;     // 80 Byte DER-Signatur (ECDSA)
+con S_R:      int64 := 2000;     // 32
+con S_S:      int64 := 2032;     // 32
+con S_HASH:   int64 := 2064;     // 64 Signaturhash
+con S_PRIV:   int64 := 2128;     // 48 eigener EC-Skalar
+con S_EDSEED: int64 := 2176;     // 32 Ed25519-Seed (nur Kettenpruefung)
+con S_KETTE:  int64 := 2208;     // 8 Eintraege (Zeiger, Laenge)
+con S_ECX:    int64 := 2336;     // 32
+con S_ECY:    int64 := 2368;     // 32
+con S_WUNSCH: int64 := 2400;     // 6 Suites in Server-Vorliebe
+con S_PRFB:   int64 := 2448;     // 64 Byte ein Block der PRF-Ausgabe
+con S_AAD:    int64 := 2512;     // 13 Byte AAD des Records
+con S_SCR_SIZE: int64 := 2560;
+
+con O_REC:    int64 := 78784;    // 17408 Byte Recordzusammenbau
+con O_MSG:    int64 := 96192;    // 8192 Byte Nachrichtenzusammenbau
+con B_MSG:    int64 := 8192;
+// Das Blattzertifikat der Gegenseite wird HIERHER kopiert, bevor es gelesen
+// wird: der X509-Satz haelt nur Positionen in seinem DER-Puffer, und der
+// Empfangspuffer wird gleich wieder benutzt (in tls13 war genau das der
+// Fehler, der mit RSA den eigenen Partner ablehnte).
+con O_CERT:   int64 := 104384;   // 8192
+con B_CERT:   int64 := 8192;
+con O_RSAKEY: int64 := 112576;
+con V_SIZE:   int64 := 112576;
+
+pub fn Tls12SpeicherBedarf(): int64 {
+    return V_SIZE + RsaSchluesselGroesse() + X509Groesse();
+}
+
+fn pIn(c: int64): int64   { return c + O_IN; }
+fn pOut(c: int64): int64  { return c + O_OUT; }
+fn pApp(c: int64): int64  { return c + O_APP; }
+fn pHs(c: int64): int64   { return c + O_HS; }
+fn pScr(c: int64): int64  { return c + O_SCR; }
+fn pRec(c: int64): int64  { return c + O_REC; }
+fn pMsg(c: int64): int64  { return c + O_MSG; }
+fn pCert(c: int64): int64 { return c + O_CERT; }
+fn pRsa(c: int64): int64  { return c + O_RSAKEY; }
+fn pAad(c: int64): int64  { return pScr(c) + S_AAD; }
+
+pub fn Tls12Neu(cfg: int64): int64 {
+    var c: int64 := alloc(Tls12SpeicherBedarf());
+    if (c == 0) { return 0; }
+    var i: int64 := 0;
+    while (i < V_KOPF) { poke8(c + i, 0); i := i + 1; }
+    poke64(c + V_CFG, cfg);
+    poke64(c + V_ROLLE, TlsCfgRolle(cfg));
+    poke64(c + V_PEERCERT, c + V_SIZE + RsaSchluesselGroesse());
+    if (TlsCfgRolle(cfg) == 1) { poke64(c + V_ZUSTAND, Z_WARTE_CH); }
+    else { poke64(c + V_ZUSTAND, Z_START); }
+    return c;
+}
+
+pub fn Tls12Frei(c: int64): void {
+    if (c == 0) { return; }
+    SecureZero(c + V_MASTER, V_KOPF - V_MASTER);
+    free(c, Tls12SpeicherBedarf());
+}
+
+// ---------------------------------------------------------------------------
+// Uebernahme aus dem gemeinsamen Tor (std.net.tls13)
+//
+// Der Verteiler in std.net.tls13 baut EIN ClientHello, das beide Versionen
+// anbietet. Antwortet die Gegenseite mit TLS 1.2, uebernimmt diese Unit den
+// angefangenen Handschlag: sie braucht dafuer das Zufallswort, die Gruppe
+// samt eigenem Schluesselpaar und die GESENDETEN Byte des ClientHello, damit
+// ihr Transkript mit dem der Gegenseite uebereinstimmt.
+//
+// Ohne diesen Weg muesste das ClientHello zweimal gebaut werden — einmal je
+// Version — und die beiden Fassungen waeren verschieden. Das Transkript
+// haengt an den gesendeten Byte, nicht an deren Bedeutung.
+// ---------------------------------------------------------------------------
+
+pub fn Tls12UebernehmenClient(c: int64, crand: int64, grp: int64,
+                              sk: int64, pk: int64,
+                              ch: int64, chLen: int64): bool {
+    if (peek64(c + V_ROLLE) != 2) { return false; }
+    var rohLen: int64 := gruppenRohLen(grp);
+    if (rohLen == 0) { return false; }
+    var i: int64 := 0;
+    while (i < 32) { poke8(c + V_CRAND + i, peek8(crand + i)); i := i + 1; }
+    poke64(c + V_GRUPPE, grp);
+    i := 0;
+    while (i < 32) { poke8(c + V_EPH_SK + i, peek8(sk + i)); i := i + 1; }
+    i := 0;
+    while (i < rohLen) { poke8(c + V_EPH_PK + i, peek8(pk + i)); i := i + 1; }
+    hashInit(c);
+    hashUpdate(c, ch, chLen);
+    poke64(c + V_ZUSTAND, Z_WARTE_SH);
+    return true;
+}
+
+// Handschlagbyte direkt in den Nachrichtenpuffer legen. Beim Uebergeben hat
+// der Verteiler die Records schon aufgebrochen; nur die rohen
+// Handschlagnachrichten sind noch da.
+pub fn Tls12FuetterHandschlag(c: int64, buf: int64, len: int64): int64 {
+    var hp: int64 := peek64(c + V_HSPOS);
+    if (hp + len > B_HS) { return E_PUFFER; }
+    var i: int64 := 0;
+    while (i < len) { poke8(pHs(c) + hp + i, peek8(buf + i)); i := i + 1; }
+    poke64(c + V_HSPOS, hp + len);
+    return 0;
+}
+
+pub fn Tls12Zustand(c: int64): int64 { return peek64(c + V_ZUSTAND); }
+pub fn Tls12Fertig(c: int64): bool { return peek64(c + V_ZUSTAND) == Z_FERTIG; }
+pub fn Tls12Suite(c: int64): int64 { return peek64(c + V_SUITE); }
+pub fn Tls12Gruppe(c: int64): int64 { return peek64(c + V_GRUPPE); }
+pub fn Tls12EMS(c: int64): bool { return peek64(c + V_EMS) != 0; }
+pub fn Tls12AlpnPos(c: int64): int64 { return peek64(c + V_ALPNSEL); }
+pub fn Tls12AlpnLen(c: int64): int64 { return peek64(c + V_ALPNSELLEN); }
+pub fn Tls12SniLen(c: int64): int64 { return peek64(c + V_SNILEN); }
+pub fn Tls12SniPos(c: int64): int64 {
+    if (peek64(c + V_SNILEN) == 0) { return 0; }
+    return c + V_SNIBUF;
+}
+
+pub fn Tls12PeerZertifikat(c: int64): int64 {
+    if (peek64(c + V_PEERCERTOK) == 0) { return 0; }
+    return peek64(c + V_PEERCERT);
+}
+
+// ---------------------------------------------------------------------------
+// Ein- und Ausgabe (gleiche Form wie in tls13)
+// ---------------------------------------------------------------------------
+
+pub fn Tls12Fuetter(c: int64, buf: int64, len: int64): int64 {
+    var pos: int64 := peek64(c + V_INPOS);
+    var platz: int64 := B_IN - pos;
+    var n: int64 := len;
+    if (n > platz) { n := platz; }
+    var i: int64 := 0;
+    while (i < n) { poke8(pIn(c) + pos + i, peek8(buf + i)); i := i + 1; }
+    poke64(c + V_INPOS, pos + n);
+    return n;
+}
+
+pub fn Tls12Ausgabe(c: int64, buf: int64, cap: int64): int64 {
+    var gelesen: int64 := peek64(c + V_OUTGELESEN);
+    var vorhanden: int64 := peek64(c + V_OUTPOS) - gelesen;
+    if (vorhanden <= 0) { return 0; }
+    var n: int64 := vorhanden;
+    if (n > cap) { n := cap; }
+    var i: int64 := 0;
+    while (i < n) { poke8(buf + i, peek8(pOut(c) + gelesen + i)); i := i + 1; }
+    gelesen += n;
+    if (gelesen == peek64(c + V_OUTPOS)) {
+        poke64(c + V_OUTPOS, 0);
+        poke64(c + V_OUTGELESEN, 0);
+    } else {
+        poke64(c + V_OUTGELESEN, gelesen);
+    }
+    return n;
+}
+
+pub fn Tls12AusgabeOffen(c: int64): int64 {
+    return peek64(c + V_OUTPOS) - peek64(c + V_OUTGELESEN);
+}
+
+fn outAnhaengen(c: int64, daten: int64, len: int64): int64 {
+    var pos: int64 := peek64(c + V_OUTPOS);
+    if (pos + len > B_OUT) { return E_PUFFER; }
+    var i: int64 := 0;
+    while (i < len) { poke8(pOut(c) + pos + i, peek8(daten + i)); i := i + 1; }
+    poke64(c + V_OUTPOS, pos + len);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Schreib- und Lesehilfen auf Puffern
+// ---------------------------------------------------------------------------
+
+fn wByte(buf: int64, pos: int64, v: int64): int64 {
+    poke8(buf + pos, v & 0xFF);
+    return pos + 1;
+}
+
+fn w16(buf: int64, pos: int64, v: int64): int64 {
+    poke8(buf + pos, (v >> 8) & 0xFF);
+    poke8(buf + pos + 1, v & 0xFF);
+    return pos + 2;
+}
+
+fn w24(buf: int64, pos: int64, v: int64): int64 {
+    poke8(buf + pos, (v >> 16) & 0xFF);
+    poke8(buf + pos + 1, (v >> 8) & 0xFF);
+    poke8(buf + pos + 2, v & 0xFF);
+    return pos + 3;
+}
+
+fn wBytes(buf: int64, pos: int64, src: int64, len: int64): int64 {
+    var i: int64 := 0;
+    while (i < len) { poke8(buf + pos + i, peek8(src + i)); i := i + 1; }
+    return pos + len;
+}
+
+fn r16(buf: int64, pos: int64): int64 {
+    return ((peek8(buf + pos) & 0xFF) << 8) | (peek8(buf + pos + 1) & 0xFF);
+}
+
+fn r24(buf: int64, pos: int64): int64 {
+    return ((peek8(buf + pos) & 0xFF) << 16) | ((peek8(buf + pos + 1) & 0xFF) << 8)
+         |  (peek8(buf + pos + 2) & 0xFF);
+}
+
+// ---------------------------------------------------------------------------
+// Transkript: beide Hashes laufen immer mit (siehe Kopf der Datei)
+// ---------------------------------------------------------------------------
+
+fn hashInit(c: int64): void {
+    Sha256Init(c + V_HS256);
+    Sha384Init(c + V_HS384);
+}
+
+fn hashUpdate(c: int64, daten: int64, len: int64): void {
+    Sha256Update(c + V_HS256, daten, len);
+    Sha512Update(c + V_HS384, daten, len);
+}
+
+// Transkript-Hash OHNE den laufenden Zustand zu verbrauchen: der Zustand
+// wird kopiert und die Kopie abgeschlossen. `hl` waehlt das Verfahren
+// (32 = SHA-256, 48 = SHA-384).
+fn hashJetzt(c: int64, hl: int64, out: int64): void {
+    var gr: int64 := Sha512CtxSize();
+    var k: int64 := pScr(c) + S_HCTX;
+    var quelle: int64 := c + V_HS256;
+    if (hl == 48) { quelle := c + V_HS384; }
+    var i: int64 := 0;
+    while (i < gr) { poke8(k + i, peek8(quelle + i)); i := i + 1; }
+    if (hl == 48) { Sha384Final(k, out); } else { Sha256Final(k, out); }
+}
+
+// ---------------------------------------------------------------------------
+// PRF (RFC 5246 §5): PRF(secret, label, seed) = P_hash(secret, label + seed)
+//
+//   A(0) = label + seed
+//   A(i) = HMAC(secret, A(i-1))
+//   P_hash = HMAC(secret, A(1) + label + seed) ||
+//            HMAC(secret, A(2) + label + seed) || ...
+//
+// Die Laufzeit haengt nur an den Laengen, nicht an den Werten.
+// ---------------------------------------------------------------------------
+
+fn prf(c: int64, hl: int64, secret: int64, secretLen: int64,
+       label: int64, labelLen: int64, seed: int64, seedLen: int64,
+       out: int64, outLen: int64): bool {
+    if (labelLen + seedLen > 128) { return false; }
+    if (outLen > 256) { return false; }
+    var scr: int64 := pScr(c);
+    var sd: int64 := scr + S_SEED;          // label || seed
+    var a: int64 := scr + S_PRFA;           // A(i)
+    var ein: int64 := scr + S_PRFIN;        // A(i) || label || seed
+    var i: int64 := 0;
+    while (i < labelLen) { poke8(sd + i, peek8(label + i)); i := i + 1; }
+    i := 0;
+    while (i < seedLen) { poke8(sd + labelLen + i, peek8(seed + i)); i := i + 1; }
+    var sdLen: int64 := labelLen + seedLen;
+
+    // A(1) = HMAC(secret, A(0))
+    HmacHash(hl, secret, secretLen, sd, sdLen, a);
+
+    var geschrieben: int64 := 0;
+    while (geschrieben < outLen) {
+        // ein := A(i) || label || seed
+        i := 0;
+        while (i < hl) { poke8(ein + i, peek8(a + i)); i := i + 1; }
+        i := 0;
+        while (i < sdLen) { poke8(ein + hl + i, peek8(sd + i)); i := i + 1; }
+        var blk: int64 := scr + S_PRFB;
+        HmacHash(hl, secret, secretLen, ein, hl + sdLen, blk);
+        var n: int64 := outLen - geschrieben;
+        if (n > hl) { n := hl; }
+        i := 0;
+        while (i < n) { poke8(out + geschrieben + i, peek8(blk + i)); i := i + 1; }
+        geschrieben += n;
+        // A(i+1) = HMAC(secret, A(i))
+        HmacHash(hl, secret, secretLen, a, hl, a);
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Suite und Schluesselplan
+// ---------------------------------------------------------------------------
+
+// Setzt Hash, Schluessellaenge, AEAD-Art und die Laenge des festen
+// IV-Anteils. Eine unbekannte Suite wird abgewiesen, nicht geraten.
+fn suiteSetzen(c: int64, suite: int64): bool {
+    if (suite == CS_ECDHE_ECDSA_AES128_GCM || suite == CS_ECDHE_RSA_AES128_GCM) {
+        poke64(c + V_SUITE, suite); poke64(c + V_HASHLEN, 32);
+        poke64(c + V_KEYLEN, 16); poke64(c + V_AEAD, 1); poke64(c + V_IVFIX, 4);
+        return true;
+    }
+    if (suite == CS_ECDHE_ECDSA_AES256_GCM || suite == CS_ECDHE_RSA_AES256_GCM) {
+        poke64(c + V_SUITE, suite); poke64(c + V_HASHLEN, 48);
+        poke64(c + V_KEYLEN, 32); poke64(c + V_AEAD, 1); poke64(c + V_IVFIX, 4);
+        return true;
+    }
+    if (suite == CS_ECDHE_ECDSA_CHACHA20 || suite == CS_ECDHE_RSA_CHACHA20) {
+        poke64(c + V_SUITE, suite); poke64(c + V_HASHLEN, 32);
+        poke64(c + V_KEYLEN, 32); poke64(c + V_AEAD, 2); poke64(c + V_IVFIX, 12);
+        return true;
+    }
+    return false;
+}
+
+// Braucht die Suite ein ECDSA- oder ein RSA-Zertifikat?
+// 1 = ECDSA, 3 = RSA (gleiche Zahlen wie X509KeyAlg).
+fn suiteSchluesselart(suite: int64): int64 {
+    if (suite == CS_ECDHE_ECDSA_AES128_GCM || suite == CS_ECDHE_ECDSA_AES256_GCM
+        || suite == CS_ECDHE_ECDSA_CHACHA20) { return 1; }
+    return 3;
+}
+
+// master_secret nach RFC 7627 (Extended Master Secret):
+//   master_secret = PRF(pms, "extended master secret", session_hash)
+// Das klassische Verfahren mit client_random || server_random ist hier NICHT
+// umgesetzt: #2096 verlangt EMS, und eine Fassung, die beides kann, waere
+// eine Einladung, versehentlich die schwache zu nehmen.
+fn planMaster(c: int64): bool {
+    var hl: int64 := peek64(c + V_HASHLEN);
+    var th: int64 := pScr(c) + S_TH;
+    hashJetzt(c, hl, th);
+    var lab: pchar := "extended master secret"c;
+    return prf(c, hl, c + V_PMS, 32, lab as int64, 22, th, hl,
+               c + V_MASTER, 48);
+}
+
+// key_block = PRF(master_secret, "key expansion",
+//                 server_random || client_random)
+// Reihenfolge der Teile: client_write_key, server_write_key,
+// client_write_IV, server_write_IV (RFC 5246 Paragraph 6.3).
+fn planSchluessel(c: int64): bool {
+    var hl: int64 := peek64(c + V_HASHLEN);
+    var kl: int64 := peek64(c + V_KEYLEN);
+    var ivl: int64 := peek64(c + V_IVFIX);
+    var scr: int64 := pScr(c);
+    var seed: int64 := scr + S_SIGIN;             // eigener Platz, 64 Byte
+    var i: int64 := 0;
+    while (i < 32) { poke8(seed + i, peek8(c + V_SRAND + i)); i := i + 1; }
+    i := 0;
+    while (i < 32) { poke8(seed + 32 + i, peek8(c + V_CRAND + i)); i := i + 1; }
+
+    var block: int64 := scr + S_PRF;
+    var gesamt: int64 := 2 * kl + 2 * ivl;
+    var lab: pchar := "key expansion"c;
+    if (!prf(c, hl, c + V_MASTER, 48, lab as int64, 13, seed, 64, block, gesamt)) {
+        return false;
+    }
+
+    var clientKey: int64 := block;
+    var serverKey: int64 := block + kl;
+    var clientIv: int64 := block + 2 * kl;
+    var serverIv: int64 := block + 2 * kl + ivl;
+
+    var eigenerKey: int64 := clientKey;
+    var fremderKey: int64 := serverKey;
+    var eigenerIv: int64 := clientIv;
+    var fremderIv: int64 := serverIv;
+    if (peek64(c + V_ROLLE) == 1) {              // Server schreibt mit server_*
+        eigenerKey := serverKey; fremderKey := clientKey;
+        eigenerIv := serverIv;   fremderIv := clientIv;
+    }
+    i := 0;
+    while (i < kl) {
+        poke8(c + V_KEY_SCHR + i, peek8(eigenerKey + i));
+        poke8(c + V_KEY_LESE + i, peek8(fremderKey + i));
+        i := i + 1;
+    }
+    i := 0;
+    while (i < ivl) {
+        poke8(c + V_IV_SCHR + i, peek8(eigenerIv + i));
+        poke8(c + V_IV_LESE + i, peek8(fremderIv + i));
+        i := i + 1;
+    }
+    SecureZero(block, gesamt);
+    return true;
+}
+
+// Die Schluessel stehen, sobald das pre_master_secret und beide Zufallswerte
+// da sind; ChangeCipherSpec schaltet nur um. Diese Funktion ist der eine
+// Ort, der das sicherstellt — sie wird aus dem CCS-Zweig und vor dem eigenen
+// CCS gerufen, und rechnet genau einmal.
+fn schluesselFaellig(c: int64): bool {
+    if (peek64(c + V_MASTER) == 0 && peek64(c + V_MASTER + 8) == 0) {
+        return false;                            // master_secret fehlt noch
+    }
+    if (peek64(c + V_IVFIX) <= 0) { return false; }
+    if (peek64(c + V_KEY_SCHR) != 0 || peek64(c + V_KEY_SCHR + 8) != 0) {
+        return true;                             // schon gerechnet
+    }
+    return planSchluessel(c);
+}
+
+// ---------------------------------------------------------------------------
+// Record-Schicht (RFC 5246 Paragraph 6.2, RFC 5288 fuer GCM, RFC 7905 fuer
+// ChaCha20-Poly1305)
+//
+// Zwei Unterschiede zu TLS 1.3, und beide waren dort schon einmal
+// Fehlerquelle:
+//  * Der aeussere Typ ist der ECHTE Typ (kein verstecktes Typbyte am Ende
+//    des Klartexts), und die Version steht als 0x0303 im Kopf.
+//  * GCM traegt ein EXPLIZITES Nonce von acht Byte VOR dem Chiffrat; das
+//    feste IV ist nur vier Byte lang. ChaCha20-Poly1305 macht es nach
+//    RFC 7905 wie TLS 1.3: zwoelf Byte festes IV, mit der Sequenznummer
+//    verxort, kein explizites Nonce.
+//
+// AAD ist in beiden Faellen seq(8) || typ(1) || version(2) || laenge(2),
+// wobei die Laenge die des KLARTEXTS ist.
+// ---------------------------------------------------------------------------
+
+fn aadBauen(c: int64, typ: int64, seq: int64, ptLen: int64, out: int64): void {
+    var i: int64 := 0;
+    while (i < 8) {
+        poke8(out + i, ((seq as uint64) >> ((7 - i) * 8)) & 0xFF);
+        i := i + 1;
+    }
+    poke8(out + 8, typ & 0xFF);
+    poke8(out + 9, 3); poke8(out + 10, 3);
+    poke8(out + 11, (ptLen >> 8) & 0xFF);
+    poke8(out + 12, ptLen & 0xFF);
+}
+
+// GCM: nonce = festes IV (4) || explizites Nonce (8, hier die Sequenznummer).
+// ChaCha: nonce = festes IV (12) xor Sequenznummer rechtsbuendig.
+fn nonceBauen(c: int64, iv: int64, seq: int64, out: int64): void {
+    if (peek64(c + V_AEAD) == 2) {
+        var i: int64 := 0;
+        while (i < 12) { poke8(out + i, peek8(iv + i)); i := i + 1; }
+        i := 0;
+        while (i < 8) {
+            var b: int64 := ((seq as uint64) >> ((7 - i) * 8)) & 0xFF;
+            poke8(out + 4 + i, peek8(out + 4 + i) ^ b);
+            i := i + 1;
+        }
+        return;
+    }
+    var j: int64 := 0;
+    while (j < 4) { poke8(out + j, peek8(iv + j)); j := j + 1; }
+    j := 0;
+    while (j < 8) {
+        poke8(out + 4 + j, ((seq as uint64) >> ((7 - j) * 8)) & 0xFF);
+        j := j + 1;
+    }
+}
+
+fn aeadSiegeln(c: int64, nonce: int64, aad: int64, daten: int64, len: int64,
+               ct: int64, tag: int64): bool {
+    if (peek64(c + V_AEAD) == 2) {
+        return ChaChaPolySeal(c + V_KEY_SCHR, nonce, aad, 13, daten, len, ct, tag);
+    }
+    return AesGcmSeal(c + V_KEY_SCHR, peek64(c + V_KEYLEN), nonce, 12,
+                      aad, 13, daten, len, ct, tag, 16);
+}
+
+fn aeadOeffnen(c: int64, nonce: int64, aad: int64, ct: int64, len: int64,
+               tag: int64, pt: int64): bool {
+    if (peek64(c + V_AEAD) == 2) {
+        return ChaChaPolyOpen(c + V_KEY_LESE, nonce, aad, 13, ct, len, tag, pt);
+    }
+    return AesGcmOpen(c + V_KEY_LESE, peek64(c + V_KEYLEN), nonce, 12,
+                      aad, 13, ct, len, tag, 16, pt);
+}
+
+fn recordSenden(c: int64, typ: int64, daten: int64, len: int64): int64 {
+    var kopf: int64 := pScr(c) + S_KOPF;
+    if (peek64(c + V_KRYPT_SCHR) == 0) {
+        if (peek64(c + V_OUTPOS) + 5 + len > B_OUT) { return E_PUFFER; }
+        poke8(kopf, typ); poke8(kopf + 1, 3); poke8(kopf + 2, 3);
+        poke8(kopf + 3, (len >> 8) & 0xFF); poke8(kopf + 4, len & 0xFF);
+        var rc: int64 := outAnhaengen(c, kopf, 5);
+        if (rc != 0) { return rc; }
+        return outAnhaengen(c, daten, len);
+    }
+
+    var explizit: int64 := 0;
+    if (peek64(c + V_AEAD) == 1) { explizit := 8; }
+    var gesamt: int64 := explizit + len + 16;
+    if (peek64(c + V_OUTPOS) + 5 + gesamt > B_OUT) { return E_PUFFER; }
+    if (len > 16384) { return E_PUFFER; }
+
+    var seq: int64 := peek64(c + V_SEQ_SCHR);
+    var aad: int64 := pAad(c);
+    aadBauen(c, typ, seq, len, aad);
+    var nonce: int64 := pScr(c) + S_NONCE;
+    nonceBauen(c, c + V_IV_SCHR, seq, nonce);
+    var tag: int64 := pScr(c) + S_TAG;
+    var innen: int64 := pRec(c);
+    var i: int64 := 0;
+    while (i < len) { poke8(innen + i, peek8(daten + i)); i := i + 1; }
+    if (!aeadSiegeln(c, nonce, aad, innen, len, innen, tag)) { return E_FORMAT; }
+    poke64(c + V_SEQ_SCHR, seq + 1);
+
+    poke8(kopf, typ); poke8(kopf + 1, 3); poke8(kopf + 2, 3);
+    poke8(kopf + 3, (gesamt >> 8) & 0xFF); poke8(kopf + 4, gesamt & 0xFF);
+    outAnhaengen(c, kopf, 5);
+    // Das explizite Nonce sind die letzten acht Byte des Nonces.
+    if (explizit == 8) { outAnhaengen(c, nonce + 4, 8); }
+    outAnhaengen(c, innen, len);
+    outAnhaengen(c, tag, 16);
+    SecureZero(innen, len);
+    return 0;
+}
+
+// Den naechsten vollstaendigen Record verarbeiten. Liefert 0 (einer
+// verarbeitet), 1 (noch nichts vollstaendig) oder einen Fehler.
+fn recordVerarbeiten(c: int64): int64 {
+    var vorhanden: int64 := peek64(c + V_INPOS);
+    if (vorhanden < 5) { return 1; }
+    var b: int64 := pIn(c);
+    var typ: int64 := peek8(b) & 0xFF;
+    var ver1: int64 := peek8(b + 1) & 0xFF;
+    var len: int64 := ((peek8(b + 3) & 0xFF) << 8) | (peek8(b + 4) & 0xFF);
+    if (ver1 != 3) { return E_VERSION; }
+    if (len > 18432) { return E_FORMAT; }
+    if (vorhanden < 5 + len) { return 1; }
+
+    var inhalt: int64 := b + 5;
+    var nutzLen: int64 := len;
+
+    if (peek64(c + V_KRYPT_LESE) != 0 && typ != RT_CCS) {
+        var explizit: int64 := 0;
+        if (peek64(c + V_AEAD) == 1) { explizit := 8; }
+        if (len < explizit + 16) { return E_FORMAT; }
+        var ctLen: int64 := len - explizit - 16;
+        var seq: int64 := peek64(c + V_SEQ_LESE);
+        var aad: int64 := pAad(c);
+        aadBauen(c, typ, seq, ctLen, aad);
+        var nonce: int64 := pScr(c) + S_NONCE;
+        if (explizit == 8) {
+            // festes IV (4) || explizites Nonce AUS DEM RECORD (8)
+            var i: int64 := 0;
+            while (i < 4) { poke8(nonce + i, peek8(c + V_IV_LESE + i)); i := i + 1; }
+            i := 0;
+            while (i < 8) { poke8(nonce + 4 + i, peek8(inhalt + i)); i := i + 1; }
+        } else {
+            nonceBauen(c, c + V_IV_LESE, seq, nonce);
+        }
+        var ct: int64 := inhalt + explizit;
+        if (!aeadOeffnen(c, nonce, aad, ct, ctLen, ct + ctLen, ct)) {
+            return E_ENTSCHLUESS;
+        }
+        poke64(c + V_SEQ_LESE, seq + 1);
+        inhalt := ct;
+        nutzLen := ctLen;
+    }
+
+    var rc: int64 := 0;
+    if (typ == RT_HANDSHAKE) {
+        var hp: int64 := peek64(c + V_HSPOS);
+        if (hp + nutzLen > B_HS) { rc := E_PUFFER; }
+        else {
+            var i2: int64 := 0;
+            while (i2 < nutzLen) { poke8(pHs(c) + hp + i2, peek8(inhalt + i2)); i2 += 1; }
+            poke64(c + V_HSPOS, hp + nutzLen);
+        }
+    } else {
+    if (typ == RT_APPDATA) {
+        // Anwendungsdaten vor dem Handschlagende gibt es nicht.
+        if (peek64(c + V_ZUSTAND) != Z_FERTIG) { rc := E_ABLAUF; }
+        else {
+            var ap: int64 := peek64(c + V_APPPOS);
+            if (ap + nutzLen > B_APP) { rc := E_PUFFER; }
+            else {
+                var i3: int64 := 0;
+                while (i3 < nutzLen) { poke8(pApp(c) + ap + i3, peek8(inhalt + i3)); i3 += 1; }
+                poke64(c + V_APPPOS, ap + nutzLen);
+            }
+        }
+    } else {
+    if (typ == RT_CCS) {
+        // ChangeCipherSpec: ab jetzt wird gelesen verschluesselt. Der Inhalt
+        // muss genau ein Byte mit dem Wert 1 sein; alles andere ist ein
+        // Formatfehler und kein Grund, trotzdem umzuschalten.
+        if (nutzLen != 1 || (peek8(inhalt) & 0xFF) != 1) { rc := E_FORMAT; }
+        else {
+            if (!schluesselFaellig(c)) { rc := E_ABLAUF; }
+            else {
+                poke64(c + V_KRYPT_LESE, 1);
+                poke64(c + V_SEQ_LESE, 0);
+            }
+        }
+    } else {
+    if (typ == RT_ALERT) {
+        if (nutzLen >= 2) {
+            var grund: int64 := peek8(inhalt + 1) & 0xFF;
+            if (grund == 0) { rc := E_GESCHLOSSEN; } else { rc := E_WARNUNG; }
+        } else { rc := E_FORMAT; }
+    } else {
+        rc := E_FORMAT;
+    } } } }
+
+    var rest: int64 := vorhanden - (5 + len);
+    var k: int64 := 0;
+    while (k < rest) { poke8(b + k, peek8(b + 5 + len + k)); k := k + 1; }
+    poke64(c + V_INPOS, rest);
+    if (rc != 0) { return rc; }
+    return 0;
+}
+
+fn pumpe(c: int64): int64 {
+    var rc: int64 := 0;
+    while (rc == 0) { rc := recordVerarbeiten(c); }
+    if (rc == 1) { return 0; }
+    return rc;
+}
+
+fn alertSenden(c: int64, stufe: int64, grund: int64): void {
+    var a: int64 := pScr(c) + S_VD;
+    poke8(a, stufe); poke8(a + 1, grund);
+    recordSenden(c, RT_ALERT, a, 2);
+}
+
+// ---------------------------------------------------------------------------
+// Eigene Kette: einzelne aus TlsConfigKette oder der nach SNI gewaehlte
+// Eintrag aus TlsConfigKetten (gleiche Regel wie in tls13)
+// ---------------------------------------------------------------------------
+
+fn aktKette(c: int64): int64 {
+    var e: int64 := peek64(c + V_KETTE);
+    if (e != 0) { return peek64(e + 16); }
+    return TlsCfgCert(peek64(c + V_CFG));
+}
+
+fn aktKetteN(c: int64): int64 {
+    var e: int64 := peek64(c + V_KETTE);
+    if (e != 0) { return peek64(e + 24); }
+    return TlsCfgCertN(peek64(c + V_CFG));
+}
+
+fn aktKey(c: int64): int64 {
+    var e: int64 := peek64(c + V_KETTE);
+    if (e != 0) { return peek64(e + 32); }
+    return TlsCfgKey(peek64(c + V_CFG));
+}
+
+fn aktKeyLen(c: int64): int64 {
+    var e: int64 := peek64(c + V_KETTE);
+    if (e != 0) { return peek64(e + 40); }
+    return TlsCfgKeyLen(peek64(c + V_CFG));
+}
+
+fn kleinbuchstabe(b: int64): int64 {
+    if (b >= 65 && b <= 90) { return b + 32; }
+    return b;
+}
+
+fn namenGleichKlein(a: int64, aLen: int64, b: int64, bLen: int64): bool {
+    if (aLen != bLen) { return false; }
+    var i: int64 := 0;
+    while (i < aLen) {
+        if (kleinbuchstabe(peek8(a + i) & 0xFF) != kleinbuchstabe(peek8(b + i) & 0xFF)) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+fn jokerPasst(muster: int64, musterLen: int64, host: int64, hostLen: int64): bool {
+    if (musterLen < 3) { return false; }
+    if ((peek8(muster) & 0xFF) != 42) { return false; }
+    if ((peek8(muster + 1) & 0xFF) != 46) { return false; }
+    var rest: int64 := muster + 2;
+    var restLen: int64 := musterLen - 2;
+    var punkte: int64 := 0;
+    var i: int64 := 0;
+    while (i < restLen) {
+        if ((peek8(rest + i) & 0xFF) == 46) { punkte += 1; }
+        i += 1;
+    }
+    if (punkte < 1) { return false; }
+    var ersterPunkt: int64 := -1;
+    i := 0;
+    while (i < hostLen) {
+        if ((peek8(host + i) & 0xFF) == 46 && ersterPunkt < 0) { ersterPunkt := i; }
+        i += 1;
+    }
+    if (ersterPunkt <= 0) { return false; }
+    return namenGleichKlein(rest, restLen,
+                            host + ersterPunkt + 1, hostLen - ersterPunkt - 1);
+}
+
+// Kette nach dem SNI waehlen. Passt nichts und fehlt der Standardeintrag,
+// wird abgewiesen — ein beliebiges anderes Zertifikat auszuliefern waere der
+// stille Default.
+fn ketteWaehlen(c: int64): int64 {
+    var cfg: int64 := peek64(c + V_CFG);
+    poke64(c + V_KETTE, 0);
+    var tab: int64 := TlsCfgKetten(cfg);
+    var n: int64 := TlsCfgKettenN(cfg);
+    if (tab != 0 && n > 0) {
+        var host: int64 := c + V_SNIBUF;
+        var hostLen: int64 := peek64(c + V_SNILEN);
+        var treffer: int64 := 0;
+        var standard: int64 := 0;
+        var joker: int64 := 0;
+        var i: int64 := 0;
+        while (i < n) {
+            var e: int64 := tab + i * 48;
+            var nl: int64 := peek64(e + 8);
+            if (nl == 0) {
+                if (standard == 0) { standard := e; }
+            } else {
+                if (hostLen > 0 && treffer == 0) {
+                    if (namenGleichKlein(peek64(e), nl, host, hostLen)) { treffer := e; }
+                    else {
+                        if (joker == 0 && jokerPasst(peek64(e), nl, host, hostLen)) {
+                            joker := e;
+                        }
+                    }
+                }
+            }
+            i += 1;
+        }
+        if (treffer == 0) { treffer := joker; }
+        if (treffer == 0) { treffer := standard; }
+        if (treffer == 0) { return E_KONFIG; }
+        if (peek64(treffer + 16) == 0 || peek64(treffer + 24) <= 0
+            || peek64(treffer + 32) == 0) { return E_KONFIG; }
+        poke64(c + V_KETTE, treffer);
+        return 0;
+    }
+    if (TlsCfgCert(cfg) == 0 || TlsCfgCertN(cfg) <= 0 || TlsCfgKey(cfg) == 0) {
+        return E_KONFIG;
+    }
+    return 0;
+}
+
+// Eigene Schluesselart: 1 EC secp256r1, 3 RSA, 0 nicht lesbar.
+// Ed25519 ist in TLS 1.2 fuer ServerKeyExchange nicht vorgesehen und wird
+// darum hier nicht angeboten.
+fn eigeneSchluesselart(c: int64): int64 {
+    var der: int64 := aktKey(c);
+    var len: int64 := aktKeyLen(c);
+    if (der == 0 || len <= 0) { return 0; }
+    var priv: int64 := pScr(c) + S_PRIV;
+    if (PkeyLiesEcPrivat(der, len, priv) == 1) { return 1; }
+    if (RsaPrivAusPkcs8(der, len, pRsa(c))) { return 3; }
+    if (RsaPrivAusPkcs1(der, len, pRsa(c))) { return 3; }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Gruppen und Schluesselpaare
+// ---------------------------------------------------------------------------
+
+fn gruppenMaske(c: int64): int64 {
+    var m: int64 := TlsCfgGruppen(peek64(c + V_CFG));
+    if (m == 0) { return 3; }
+    return m;
+}
+
+fn gruppeErlaubt(c: int64, grp: int64): bool {
+    var m: int64 := gruppenMaske(c);
+    if (grp == GRP_X25519) { return (m & 1) != 0; }
+    if (grp == GRP_SECP256R1) { return (m & 2) != 0; }
+    return false;
+}
+
+fn gruppenRohLen(grp: int64): int64 {
+    if (grp == GRP_SECP256R1) { return 65; }
+    if (grp == GRP_X25519) { return 32; }
+    return 0;
+}
+
+fn gruppenPaar(c: int64): bool {
+    var grp: int64 := peek64(c + V_GRUPPE);
+    if (grp == GRP_SECP256R1) {
+        var x: int64 := pScr(c) + S_ECX;
+        var y: int64 := pScr(c) + S_ECY;
+        if (!EcGenerateKey(EC_P256, c + V_EPH_SK, x, y)) { return false; }
+        poke8(c + V_EPH_PK, 4);
+        var i: int64 := 0;
+        while (i < 32) {
+            poke8(c + V_EPH_PK + 1 + i, peek8(x + i));
+            poke8(c + V_EPH_PK + 33 + i, peek8(y + i));
+            i += 1;
+        }
+        return true;
+    }
+    if (grp != GRP_X25519) { return false; }
+    var seed: int64 := pScr(c) + S_ECX;
+    if (RandBytesExact(seed, 32) != 32) { return false; }
+    X25519KeyGen(seed, c + V_EPH_PK, c + V_EPH_SK);
+    SecureZero(seed, 32);
+    return true;
+}
+
+// pre_master_secret aus dem Punkt der Gegenseite. Der Punkt wird geprueft,
+// nicht geglaubt.
+fn gruppenGeheimnis(c: int64): bool {
+    if (peek64(c + V_GRUPPE) == GRP_SECP256R1) {
+        if ((peek8(c + V_PEER_PK) & 0xFF) != 4) { return false; }
+        var px: int64 := c + V_PEER_PK + 1;
+        var py: int64 := c + V_PEER_PK + 33;
+        if (!EcValidatePublicKey(EC_P256, px, py)) { return false; }
+        return EcdhSharedSecret(EC_P256, c + V_EPH_SK, px, py, c + V_PMS);
+    }
+    X25519SharedSecret(c + V_EPH_SK, c + V_PEER_PK, c + V_PMS);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Handschlagnachrichten schreiben
+// ---------------------------------------------------------------------------
+
+// Kopf anlegen, in BEIDE Transkript-Hashes geben, als Record hinausschreiben.
+fn hsSenden(c: int64, typ: int64, rumpf: int64, len: int64): int64 {
+    if (len + 4 > B_MSG) { return E_PUFFER; }
+    var n: int64 := pMsg(c);
+    var p: int64 := wByte(n, 0, typ);
+    p := w24(n, p, len);
+    p := wBytes(n, p, rumpf, len);
+    hashUpdate(c, n, p);
+    return recordSenden(c, RT_HANDSHAKE, n, p);
+}
+
+fn ccsSenden(c: int64): int64 {
+    var a: int64 := pScr(c) + S_VD + 8;
+    poke8(a, 1);
+    var rc: int64 := recordSenden(c, RT_CCS, a, 1);
+    if (rc != 0) { return rc; }
+    if (!schluesselFaellig(c)) { return E_ABLAUF; }
+    poke64(c + V_KRYPT_SCHR, 1);
+    poke64(c + V_SEQ_SCHR, 0);
+    return 0;
+}
+
+// ALPN-Liste "h2,http/1.1" in das Protokollformat schreiben.
+fn alpnSchreiben(buf: int64, pos: int64, liste: int64, len: int64): int64 {
+    var p: int64 := pos;
+    var start: int64 := 0;
+    var i: int64 := 0;
+    while (i <= len) {
+        if (i == len || (peek8(liste + i) & 0xFF) == 44) {
+            var l: int64 := i - start;
+            if (l > 0) {
+                p := wByte(buf, p, l);
+                p := wBytes(buf, p, liste + start, l);
+            }
+            start := i + 1;
+        }
+        i += 1;
+    }
+    return p;
+}
+
+// Die Signaturverfahren, die diese Fassung anbietet und annimmt.
+// rsa_pkcs1_* ist in TLS 1.2 ausdruecklich erlaubt (anders als in 1.3).
+fn sigAlgSchreiben(buf: int64, pos: int64): int64 {
+    var p: int64 := w16(buf, pos, 13);           // signature_algorithms
+    p := w16(buf, p, 16);
+    p := w16(buf, p, 14);
+    p := w16(buf, p, 0x0403);                    // ecdsa_secp256r1_sha256
+    p := w16(buf, p, 0x0503);                    // ecdsa_secp384r1_sha384
+    p := w16(buf, p, 0x0804);                    // rsa_pss_rsae_sha256
+    p := w16(buf, p, 0x0805);                    // rsa_pss_rsae_sha384
+    p := w16(buf, p, 0x0401);                    // rsa_pkcs1_sha256
+    p := w16(buf, p, 0x0501);                    // rsa_pkcs1_sha384
+    p := w16(buf, p, 0x0601);                    // rsa_pkcs1_sha512
+    return p;
+}
+
+fn clientHelloSenden(c: int64): int64 {
+    var cfg: int64 := peek64(c + V_CFG);
+    var buf: int64 := pMsg(c) + 4096;
+    var p: int64 := w16(buf, 0, 0x0303);
+    p := wBytes(buf, p, c + V_CRAND, 32);
+    p := wByte(buf, p, 0);                       // leere session_id
+    // Cipher-Suites in unserer Vorliebe, dazu das Renegotiation-SCSV
+    p := w16(buf, p, 14);
+    p := w16(buf, p, CS_ECDHE_ECDSA_AES128_GCM);
+    p := w16(buf, p, CS_ECDHE_RSA_AES128_GCM);
+    p := w16(buf, p, CS_ECDHE_ECDSA_CHACHA20);
+    p := w16(buf, p, CS_ECDHE_RSA_CHACHA20);
+    p := w16(buf, p, CS_ECDHE_ECDSA_AES256_GCM);
+    p := w16(buf, p, CS_ECDHE_RSA_AES256_GCM);
+    p := w16(buf, p, SCSV_RENEG);
+    p := wByte(buf, p, 1); p := wByte(buf, p, 0); // keine Kompression
+
+    var extLenPos: int64 := p;
+    p += 2;
+    var extStart: int64 := p;
+
+    // supported_groups
+    var maske: int64 := gruppenMaske(c);
+    var anz: int64 := 0;
+    if ((maske & 1) != 0) { anz += 1; }
+    if ((maske & 2) != 0) { anz += 1; }
+    p := w16(buf, p, 10); p := w16(buf, p, 2 + anz * 2);
+    p := w16(buf, p, anz * 2);
+    if ((maske & 1) != 0) { p := w16(buf, p, GRP_X25519); }
+    if ((maske & 2) != 0) { p := w16(buf, p, GRP_SECP256R1); }
+    // ec_point_formats: nur uncompressed
+    p := w16(buf, p, 11); p := w16(buf, p, 2);
+    p := wByte(buf, p, 1); p := wByte(buf, p, 0);
+    // signature_algorithms
+    p := sigAlgSchreiben(buf, p);
+    // extended_master_secret (RFC 7627), leer
+    p := w16(buf, p, 23); p := w16(buf, p, 0);
+    // renegotiation_info (RFC 5746), leer
+    p := w16(buf, p, 0xFF01); p := w16(buf, p, 1); p := wByte(buf, p, 0);
+    // server_name
+    var hostLen: int64 := TlsCfgHostLen(cfg);
+    if (TlsCfgHost(cfg) != 0 && hostLen > 0) {
+        p := w16(buf, p, 0); p := w16(buf, p, hostLen + 5);
+        p := w16(buf, p, hostLen + 3);
+        p := wByte(buf, p, 0); p := w16(buf, p, hostLen);
+        p := wBytes(buf, p, TlsCfgHost(cfg), hostLen);
+    }
+    // ALPN
+    var alpnLen: int64 := TlsCfgAlpnLen(cfg);
+    if (TlsCfgAlpn(cfg) != 0 && alpnLen > 0) {
+        var merk: int64 := p;
+        p := w16(buf, p, 16); p += 4;
+        var listenStart: int64 := p;
+        p := alpnSchreiben(buf, p, TlsCfgAlpn(cfg), alpnLen);
+        var listenLen: int64 := p - listenStart;
+        w16(buf, merk + 2, listenLen + 2);
+        w16(buf, merk + 4, listenLen);
+    }
+    w16(buf, extLenPos, p - extStart);
+    return hsSenden(c, HS_CLIENT_HELLO, buf, p);
+}
+
+fn serverHelloSenden(c: int64): int64 {
+    var buf: int64 := pMsg(c) + 4096;
+    var p: int64 := w16(buf, 0, 0x0303);
+    p := wBytes(buf, p, c + V_SRAND, 32);
+    p := wByte(buf, p, 0);                       // keine Session-Resumption
+    p := w16(buf, p, peek64(c + V_SUITE));
+    p := wByte(buf, p, 0);
+    var extLenPos: int64 := p;
+    p += 2;
+    var extStart: int64 := p;
+    // extended_master_secret bestaetigen
+    p := w16(buf, p, 23); p := w16(buf, p, 0);
+    // renegotiation_info leer zurueck (RFC 5746 Paragraph 3.6)
+    p := w16(buf, p, 0xFF01); p := w16(buf, p, 1); p := wByte(buf, p, 0);
+    // ec_point_formats
+    p := w16(buf, p, 11); p := w16(buf, p, 2);
+    p := wByte(buf, p, 1); p := wByte(buf, p, 0);
+    // ALPN, wenn eines ausgehandelt wurde
+    if (peek64(c + V_ALPNSELLEN) > 0) {
+        var l: int64 := peek64(c + V_ALPNSELLEN);
+        p := w16(buf, p, 16); p := w16(buf, p, l + 3);
+        p := w16(buf, p, l + 1);
+        p := wByte(buf, p, l);
+        p := wBytes(buf, p, peek64(c + V_ALPNSEL), l);
+    }
+    w16(buf, extLenPos, p - extStart);
+    return hsSenden(c, HS_SERVER_HELLO, buf, p);
+}
+
+fn certSenden(c: int64): int64 {
+    var n: int64 := aktKetteN(c);
+    var liste: int64 := aktKette(c);
+    var gesamt: int64 := 0;
+    var i: int64 := 0;
+    while (i < n) { gesamt += 3 + peek64(liste + i * 16 + 8); i += 1; }
+    if (gesamt + 8 > 4000) { return E_PUFFER; }
+    var buf: int64 := pMsg(c) + 4096;
+    var p: int64 := w24(buf, 0, gesamt);
+    i := 0;
+    while (i < n) {
+        var l: int64 := peek64(liste + i * 16 + 8);
+        p := w24(buf, p, l);
+        p := wBytes(buf, p, peek64(liste + i * 16), l);
+        i += 1;
+    }
+    return hsSenden(c, HS_CERT, buf, p);
+}
+
+// Der zu signierende Block von ServerKeyExchange (RFC 4492 Paragraph 5.4):
+//   client_random || server_random || ECParameters || ECPoint
+fn skeSignaturblock(c: int64, params: int64, paramsLen: int64, out: int64): int64 {
+    var p: int64 := wBytes(out, 0, c + V_CRAND, 32);
+    p := wBytes(out, p, c + V_SRAND, 32);
+    p := wBytes(out, p, params, paramsLen);
+    return p;
+}
+
+// Signiert `len` Byte ab `daten` mit dem eigenen Schluessel und schreibt
+// SignatureAndHashAlgorithm + Signatur nach buf/pos. Liefert die neue
+// Position oder einen Fehler als negative Zahl.
+fn signaturSchreiben(c: int64, buf: int64, pos: int64,
+                     daten: int64, len: int64): int64 {
+    var scr: int64 := pScr(c);
+    var art: int64 := eigeneSchluesselart(c);
+    var hash: int64 := scr + S_HASH;
+    var sig: int64 := scr + S_SIG;
+
+    if (art == 1) {
+        // ecdsa_secp256r1_sha256
+        SHA256(daten, len, hash);
+        var priv: int64 := scr + S_PRIV;
+        var r: int64 := scr + S_R;
+        var s: int64 := scr + S_S;
+        var der: int64 := scr + S_DER;
+        if (!EcdsaSign(EC_P256, hash, priv, r, s)) {
+            SecureZero(priv, 48); return E_SIGNATUR;
+        }
+        var derLen: int64 := EcdsaSigToDer(r, s, der);
+        SecureZero(priv, 48);
+        var p1: int64 := w16(buf, pos, 0x0403);
+        p1 := w16(buf, p1, derLen);
+        return wBytes(buf, p1, der, derLen);
+    }
+
+    if (art == 3) {
+        // rsa_pss_rsae_sha256 — PSS auch in TLS 1.2, weil beide Seiten es
+        // anbieten; PKCS#1 v1.5 bleibt fuer die Gegenrichtung erlaubt.
+        SHA256(daten, len, hash);
+        var sl: int64 := RsaSignPss(pRsa(c), 32, hash, sig);
+        if (sl <= 0) { return E_SIGNATUR; }
+        var p2: int64 := w16(buf, pos, 0x0804);
+        p2 := w16(buf, p2, sl);
+        return wBytes(buf, p2, sig, sl);
+    }
+
+    return E_KONFIG;
+}
+
+fn skeSenden(c: int64): int64 {
+    var buf: int64 := pMsg(c) + 4096;
+    var grp: int64 := peek64(c + V_GRUPPE);
+    var rohLen: int64 := gruppenRohLen(grp);
+    // ECParameters: curve_type named_curve (3) || named_curve || Punkt
+    var p: int64 := wByte(buf, 0, 3);
+    p := w16(buf, p, grp);
+    p := wByte(buf, p, rohLen);
+    p := wBytes(buf, p, c + V_EPH_PK, rohLen);
+    var paramsLen: int64 := p;
+
+    var sigIn: int64 := pScr(c) + S_SIGIN;
+    var sigInLen: int64 := skeSignaturblock(c, buf, paramsLen, sigIn);
+    var p2: int64 := signaturSchreiben(c, buf, p, sigIn, sigInLen);
+    if (p2 < 0) { return p2; }
+    return hsSenden(c, HS_SKE, buf, p2);
+}
+
+fn certRequestSenden(c: int64): int64 {
+    var buf: int64 := pMsg(c) + 4096;
+    // certificate_types: ecdsa_sign (64), rsa_sign (1)
+    var p: int64 := wByte(buf, 0, 2);
+    p := wByte(buf, p, 64);
+    p := wByte(buf, p, 1);
+    // supported_signature_algorithms (ohne Erweiterungskopf)
+    p := w16(buf, p, 14);
+    p := w16(buf, p, 0x0403);
+    p := w16(buf, p, 0x0503);
+    p := w16(buf, p, 0x0804);
+    p := w16(buf, p, 0x0805);
+    p := w16(buf, p, 0x0401);
+    p := w16(buf, p, 0x0501);
+    p := w16(buf, p, 0x0601);
+    // certificate_authorities: leer
+    p := w16(buf, p, 0);
+    return hsSenden(c, HS_CERT_REQUEST, buf, p);
+}
+
+fn shdSenden(c: int64): int64 {
+    var buf: int64 := pMsg(c) + 4096;
+    return hsSenden(c, HS_SHD, buf, 0);
+}
+
+fn ckeSenden(c: int64): int64 {
+    var buf: int64 := pMsg(c) + 4096;
+    var rohLen: int64 := gruppenRohLen(peek64(c + V_GRUPPE));
+    var p: int64 := wByte(buf, 0, rohLen);
+    p := wBytes(buf, p, c + V_EPH_PK, rohLen);
+    return hsSenden(c, HS_CKE, buf, p);
+}
+
+// CertificateVerify des Clients: Signatur ueber ALLE Handschlagnachrichten
+// bis hierher. Der Hash ist der des Signaturverfahrens, nicht der der Suite
+// — darum laufen beide Transkripte mit.
+fn certVerifySenden(c: int64): int64 {
+    var scr: int64 := pScr(c);
+    var art: int64 := eigeneSchluesselart(c);
+    var buf: int64 := pMsg(c) + 4096;
+    var th: int64 := scr + S_TH2;
+    var sig: int64 := scr + S_SIG;
+
+    if (art == 1) {
+        hashJetzt(c, 32, th);
+        var priv: int64 := scr + S_PRIV;
+        var r: int64 := scr + S_R;
+        var s: int64 := scr + S_S;
+        var der: int64 := scr + S_DER;
+        if (!EcdsaSign(EC_P256, th, priv, r, s)) {
+            SecureZero(priv, 48); return E_SIGNATUR;
+        }
+        var derLen: int64 := EcdsaSigToDer(r, s, der);
+        SecureZero(priv, 48);
+        var p1: int64 := w16(buf, 0, 0x0403);
+        p1 := w16(buf, p1, derLen);
+        p1 := wBytes(buf, p1, der, derLen);
+        return hsSenden(c, HS_CERT_VERIFY, buf, p1);
+    }
+    if (art == 3) {
+        hashJetzt(c, 32, th);
+        var sl: int64 := RsaSignPss(pRsa(c), 32, th, sig);
+        if (sl <= 0) { return E_SIGNATUR; }
+        var p2: int64 := w16(buf, 0, 0x0804);
+        p2 := w16(buf, p2, sl);
+        p2 := wBytes(buf, p2, sig, sl);
+        return hsSenden(c, HS_CERT_VERIFY, buf, p2);
+    }
+    return E_KONFIG;
+}
+
+// verify_data = PRF(master_secret, "client finished"|"server finished",
+//                   Hash(handshake_messages))[0..11]
+fn finishedWert(c: int64, clientSeite: bool, out: int64): bool {
+    var hl: int64 := peek64(c + V_HASHLEN);
+    var th: int64 := pScr(c) + S_TH;
+    hashJetzt(c, hl, th);
+    var lab: pchar := "server finished"c;
+    var labLen: int64 := 15;
+    if (clientSeite) { lab := "client finished"c; labLen := 15; }
+    return prf(c, hl, c + V_MASTER, 48, lab as int64, labLen, th, hl, out, 12);
+}
+
+fn finishedSenden(c: int64, clientSeite: bool): int64 {
+    var vd: int64 := pScr(c) + S_VD;
+    if (!finishedWert(c, clientSeite, vd)) { return E_FINISHED; }
+    return hsSenden(c, HS_FINISHED, vd, 12);
+}
+
+// ---------------------------------------------------------------------------
+// Handschlagnachrichten lesen
+// ---------------------------------------------------------------------------
+
+fn hsAnsehen(c: int64, typPtr: int64, posPtr: int64, lenPtr: int64): bool {
+    var gelesen: int64 := peek64(c + V_HSGELESEN);
+    var vorhanden: int64 := peek64(c + V_HSPOS) - gelesen;
+    if (vorhanden < 4) { return false; }
+    var b: int64 := pHs(c) + gelesen;
+    var len: int64 := r24(b, 1);
+    if (len < 0 || len > B_HS) { return false; }
+    if (vorhanden < 4 + len) { return false; }
+    poke64(typPtr, peek8(b) & 0xFF);
+    poke64(posPtr, b + 4);
+    poke64(lenPtr, len);
+    return true;
+}
+
+fn hsVerbrauchen(c: int64, len: int64, hashen: bool): void {
+    var gelesen: int64 := peek64(c + V_HSGELESEN);
+    if (hashen) { hashUpdate(c, pHs(c) + gelesen, 4 + len); }
+    gelesen += 4 + len;
+    if (gelesen == peek64(c + V_HSPOS)) {
+        poke64(c + V_HSPOS, 0);
+        poke64(c + V_HSGELESEN, 0);
+    } else {
+        poke64(c + V_HSGELESEN, gelesen);
+    }
+}
+
+// Erweiterungsblock durchsuchen; Rueckgabe ist die ABSOLUTE Adresse des
+// Inhalts oder -1.
+fn extSuchen(buf: int64, pos: int64, len: int64, typ: int64, lenPtr: int64): int64 {
+    if (len < 2) { return -1; }
+    var gesamt: int64 := r16(buf, pos);
+    if (gesamt + 2 > len) { return -1; }
+    var p: int64 := pos + 2;
+    var ende: int64 := pos + 2 + gesamt;
+    while (p + 4 <= ende) {
+        var t: int64 := r16(buf, p);
+        var l: int64 := r16(buf, p + 2);
+        if (p + 4 + l > ende) { return -1; }
+        if (t == typ) { poke64(lenPtr, l); return buf + p + 4; }
+        p := p + 4 + l;
+    }
+    return -1;
+}
+
+// ClientHello (Server-Seite)
+fn clientHelloLesen(c: int64, pos: int64, len: int64): int64 {
+    if (len < 38) { return E_FORMAT; }
+    // legacy_version muss mindestens 1.2 sein; 1.0/1.1 werden abgewiesen.
+    if (r16(pos, 0) < 0x0303) { return E_VERSION; }
+    var i: int64 := 0;
+    while (i < 32) { poke8(c + V_CRAND + i, peek8(pos + 2 + i)); i := i + 1; }
+    var sidLen: int64 := peek8(pos + 34) & 0xFF;
+    if (sidLen > 32) { return E_FORMAT; }
+    var p: int64 := 35 + sidLen;
+    if (len < p + 2) { return E_FORMAT; }
+    var csLen: int64 := r16(pos, p);
+    p += 2;
+    if (p + csLen > len) { return E_FORMAT; }
+
+    // Welche Zertifikatsart haben wir? Danach richtet sich, welche Suiten
+    // ueberhaupt in Frage kommen — eine ECDSA-Suite mit RSA-Schluessel waere
+    // ein Handschlag, der erst bei der Signatur scheitert.
+    var art: int64 := eigeneSchluesselart(c);
+    if (art == 0) { return E_KONFIG; }
+
+    var wunsch: int64 := pScr(c) + S_WUNSCH;
+    if (art == 1) {
+        poke64(wunsch, CS_ECDHE_ECDSA_AES128_GCM);
+        poke64(wunsch + 8, CS_ECDHE_ECDSA_CHACHA20);
+        poke64(wunsch + 16, CS_ECDHE_ECDSA_AES256_GCM);
+    } else {
+        poke64(wunsch, CS_ECDHE_RSA_AES128_GCM);
+        poke64(wunsch + 8, CS_ECDHE_RSA_CHACHA20);
+        poke64(wunsch + 16, CS_ECDHE_RSA_AES256_GCM);
+    }
+
+    var gewaehlt: int64 := 0;
+    var w: int64 := 0;
+    while (w < 3 && gewaehlt == 0) {
+        var k: int64 := 0;
+        while (k + 1 < csLen) {
+            if (r16(pos, p + k) == peek64(wunsch + w * 8)) {
+                gewaehlt := peek64(wunsch + w * 8);
+            }
+            k += 2;
+        }
+        w += 1;
+    }
+    // Das Renegotiation-SCSV zaehlt als "Client kann RFC 5746".
+    var k2: int64 := 0;
+    while (k2 + 1 < csLen) {
+        if (r16(pos, p + k2) == SCSV_RENEG) { poke64(c + V_RENEGOK, 1); }
+        k2 += 2;
+    }
+    if (gewaehlt == 0) { return E_SUITE; }
+    if (!suiteSetzen(c, gewaehlt)) { return E_SUITE; }
+    p += csLen;
+
+    if (p + 1 > len) { return E_FORMAT; }
+    var compLen: int64 := peek8(pos + p) & 0xFF;
+    // Kompression gibt es nicht; der Client MUSS die Null anbieten.
+    var compNull: bool := false;
+    var ci: int64 := 0;
+    while (ci < compLen) {
+        if ((peek8(pos + p + 1 + ci) & 0xFF) == 0) { compNull := true; }
+        ci += 1;
+    }
+    if (!compNull) { return E_UNTERSTUETZT; }
+    p := p + 1 + compLen;
+    if (p + 2 > len) { return E_FORMAT; }
+
+    var el: int64 := pScr(c) + S_EL;
+
+    // Extended Master Secret ist Pflicht (RFC 7627, #2096).
+    if (extSuchen(pos, p, len - p, 23, el) < 0) { return E_EMS; }
+    poke64(c + V_EMS, 1);
+
+    // renegotiation_info: leer erwartet. Ein nicht leeres Feld hiesse
+    // "Renegotiation einer bestehenden Verbindung" — die machen wir nicht.
+    var ri: int64 := extSuchen(pos, p, len - p, 0xFF01, el);
+    if (ri >= 0) {
+        if (peek64(el) != 1 || (peek8(ri) & 0xFF) != 0) { return E_RENEG; }
+        poke64(c + V_RENEGOK, 1);
+    }
+    if (peek64(c + V_RENEGOK) == 0) { return E_RENEG; }
+
+    // supported_groups
+    var sg: int64 := extSuchen(pos, p, len - p, 10, el);
+    if (sg < 0) { return E_GRUPPE; }
+    var sgLen: int64 := r16(sg, 0);
+    var gWahl: int64 := 0;
+    var wg: int64 := 0;
+    while (wg < 2 && gWahl == 0) {
+        var kand: int64 := GRP_X25519;
+        if (wg == 1) { kand := GRP_SECP256R1; }
+        if (gruppeErlaubt(c, kand)) {
+            var t2: int64 := 2;
+            while (t2 + 1 < 2 + sgLen) {
+                if (r16(sg, t2) == kand) { gWahl := kand; }
+                t2 += 2;
+            }
+        }
+        wg += 1;
+    }
+    if (gWahl == 0) { return E_GRUPPE; }
+    poke64(c + V_GRUPPE, gWahl);
+
+    // SNI aufbewahren
+    poke64(c + V_SNILEN, 0);
+    var sn: int64 := extSuchen(pos, p, len - p, 0, el);
+    if (sn >= 0 && peek64(el) >= 5) {
+        var listeLen: int64 := r16(sn, 0);
+        if ((peek8(sn + 2) & 0xFF) == 0 && listeLen >= 3) {
+            var nl: int64 := r16(sn, 3);
+            if (nl > 0 && nl <= 256 && 5 + nl <= peek64(el)) {
+                var z: int64 := 0;
+                while (z < nl) { poke8(c + V_SNIBUF + z, peek8(sn + 5 + z)); z += 1; }
+                poke64(c + V_SNILEN, nl);
+            }
+        }
+    }
+
+    // ALPN: erste gemeinsame Kennung in der Reihenfolge des Servers
+    var cfg: int64 := peek64(c + V_CFG);
+    if (TlsCfgAlpn(cfg) != 0 && TlsCfgAlpnLen(cfg) > 0) {
+        var ap: int64 := extSuchen(pos, p, len - p, 16, el);
+        if (ap >= 0) {
+            var listeLen2: int64 := r16(ap, 0);
+            var eigene: int64 := TlsCfgAlpn(cfg);
+            var eigeneLen: int64 := TlsCfgAlpnLen(cfg);
+            var start: int64 := 0;
+            var idx: int64 := 0;
+            while (idx <= eigeneLen && peek64(c + V_ALPNSELLEN) == 0) {
+                if (idx == eigeneLen || (peek8(eigene + idx) & 0xFF) == 44) {
+                    var l2: int64 := idx - start;
+                    if (l2 > 0) {
+                        var t3: int64 := 2;
+                        while (t3 < 2 + listeLen2) {
+                            var pl: int64 := peek8(ap + t3) & 0xFF;
+                            if (pl == l2 && CTMemEqual(ap + t3 + 1, eigene + start, l2) == -1) {
+                                poke64(c + V_ALPNSEL, eigene + start);
+                                poke64(c + V_ALPNSELLEN, l2);
+                                t3 := 2 + listeLen2;
+                            } else {
+                                t3 := t3 + 1 + pl;
+                            }
+                        }
+                    }
+                    start := idx + 1;
+                }
+                idx += 1;
+            }
+        }
+    }
+    return 0;
+}
+
+// ServerHello (Client-Seite)
+fn serverHelloLesen(c: int64, pos: int64, len: int64): int64 {
+    if (len < 38) { return E_FORMAT; }
+    if (r16(pos, 0) != 0x0303) { return E_VERSION; }
+    var i: int64 := 0;
+    while (i < 32) { poke8(c + V_SRAND + i, peek8(pos + 2 + i)); i := i + 1; }
+    var sidLen: int64 := peek8(pos + 34) & 0xFF;
+    if (sidLen > 32) { return E_FORMAT; }
+    var p: int64 := 35 + sidLen;
+    if (len < p + 3) { return E_FORMAT; }
+    var suite: int64 := r16(pos, p);
+    if (!suiteSetzen(c, suite)) { return E_SUITE; }
+    p += 2;
+    if ((peek8(pos + p) & 0xFF) != 0) { return E_UNTERSTUETZT; }   // Kompression
+    p += 1;
+
+    var el: int64 := pScr(c) + S_EL;
+    if (len <= p) { return E_EMS; }                 // ohne Erweiterungen kein EMS
+    if (extSuchen(pos, p, len - p, 23, el) < 0) { return E_EMS; }
+    poke64(c + V_EMS, 1);
+    // renegotiation_info muss leer zurueckkommen
+    var ri: int64 := extSuchen(pos, p, len - p, 0xFF01, el);
+    if (ri >= 0) {
+        if (peek64(el) != 1 || (peek8(ri) & 0xFF) != 0) { return E_RENEG; }
+    }
+    // ALPN-Auswahl des Servers uebernehmen
+    var ap: int64 := extSuchen(pos, p, len - p, 16, el);
+    if (ap >= 0 && peek64(el) >= 4) {
+        var pl: int64 := peek8(ap + 2) & 0xFF;
+        if (pl > 32) { pl := 32; }
+        var z: int64 := 0;
+        while (z < pl) { poke8(c + V_ALPNBUF + z, peek8(ap + 3 + z)); z += 1; }
+        poke64(c + V_ALPNSEL, c + V_ALPNBUF);
+        poke64(c + V_ALPNSELLEN, pl);
+    }
+    return 0;
+}
+
+// Certificate: Kette lesen, Blatt kopieren, pruefen (wie in tls13)
+fn certLesen(c: int64, pos: int64, len: int64, serverSeite: bool): int64 {
+    if (len < 3) { return E_FORMAT; }
+    var listeLen: int64 := r24(pos, 0);
+    var p: int64 := 3;
+    if (p + listeLen > len) { return E_FORMAT; }
+    var cfg: int64 := peek64(c + V_CFG);
+    var kette: int64 := pScr(c) + S_KETTE;
+    var n: int64 := 0;
+    var ende: int64 := p + listeLen;
+    while (p + 3 <= ende && n < 8) {
+        var cl: int64 := r24(pos, p);
+        p += 3;
+        if (p + cl > ende) { return E_FORMAT; }
+        poke64(kette + n * 16, pos + p);
+        poke64(kette + n * 16 + 8, cl);
+        n += 1;
+        p += cl;
+    }
+    if (n == 0) { return E_FORMAT; }
+
+    var bl: int64 := peek64(kette + 8);
+    if (bl > B_CERT) { return E_PUFFER; }
+    var kop: int64 := 0;
+    while (kop < bl) { poke8(pCert(c) + kop, peek8(peek64(kette) + kop)); kop += 1; }
+    if (!X509Lies(pCert(c), bl, peek64(c + V_PEERCERT))) { return E_ZERTIFIKAT; }
+    poke64(c + V_PEERCERTOK, 1);
+    poke64(kette, pCert(c));              // Blatt aus der Kopie pruefen
+
+    if (TlsCfgPruefen(cfg) != 0) {
+        var host: int64 := 0;
+        var hostLen: int64 := 0;
+        var zweck: int64 := 2;
+        if (!serverSeite) {
+            host := TlsCfgHost(cfg);
+            hostLen := TlsCfgHostLen(cfg);
+            zweck := 1;
+        }
+        var rc: int64 := X509PruefeKette(kette, n, TlsCfgTrust(cfg),
+                                         TlsCfgTrustN(cfg), host, hostLen,
+                                         TlsCfgJetzt(cfg), zweck);
+        if (rc != 0) { return E_ZERTIFIKAT; }
+    }
+
+    var hook: int64 := TlsCfgWiderruf(cfg);
+    if (hook != 0) {
+        if (widerrufRufen(hook as Tls12WiderrufFn, peek64(c + V_PEERCERT)) != 0) {
+            return E_WIDERRUFEN;
+        }
+    }
+    return 0;
+}
+
+type Tls12WiderrufFn = fn(int64): int64;
+fn widerrufRufen(f: Tls12WiderrufFn, satz: int64): int64 { return f(satz); }
+
+// Eine Signatur der Gegenseite pruefen. `schema` ist der
+// SignatureAndHashAlgorithm-Wert, `daten` der signierte Block.
+fn signaturPruefen(c: int64, schema: int64, sig: int64, sigLen: int64,
+                   daten: int64, len: int64): int64 {
+    var satz: int64 := peek64(c + V_PEERCERT);
+    if (peek64(c + V_PEERCERTOK) == 0) { return E_ABLAUF; }
+    var der: int64 := X509DerPuffer(satz);
+    var kPos: int64 := der + X509PubKeyPos(satz);
+    var kLen: int64 := X509PubKeyLen(satz);
+    var keyAlg: int64 := X509KeyAlg(satz);
+    var scr: int64 := pScr(c);
+    var hash: int64 := scr + S_HASH;
+
+    // Hashlaenge aus dem Schema: 0x04xx SHA-256, 0x05xx SHA-384,
+    // 0x06xx SHA-512. Alles andere (SHA-1, MD5) wird abgewiesen.
+    var hl: int64 := 0;
+    var hoch: int64 := (schema >> 8) & 0xFF;
+    if (hoch == 4) { hl := 32; }
+    if (hoch == 5) { hl := 48; }
+    if (hoch == 6) { hl := 64; }
+    if (hoch == 8) {
+        // PSS-Schemata: 0x0804 sha256, 0x0805 sha384, 0x0806 sha512
+        var tief: int64 := schema & 0xFF;
+        if (tief == 4) { hl := 32; }
+        if (tief == 5) { hl := 48; }
+        if (tief == 6) { hl := 64; }
+    }
+    if (hl == 0) { return E_UNTERSTUETZT; }
+    if (hl == 32) { SHA256(daten, len, hash); }
+    if (hl == 48) { Sha384(daten, len, hash); }
+    if (hl == 64) { Sha512(daten, len, hash); }
+
+    var tiefByte: int64 := schema & 0xFF;
+    if (hoch != 8 && tiefByte == 3) {
+        // ECDSA
+        if (keyAlg != 1 || kLen != 65 || (peek8(kPos) & 0xFF) != 4) {
+            return E_UNTERSTUETZT;
+        }
+        var r: int64 := scr + S_R;
+        var s: int64 := scr + S_S;
+        if (!EcdsaSigFromDer(sig, sigLen, r, s)) { return E_SIGNATUR; }
+        // P-256 rechnet auf 32 Byte; ein SHA-384-Hash wird dafuer nach
+        // RFC 6979-Konvention links gekuerzt.
+        if (!EcdsaVerify(EC_P256, hash, kPos + 1, kPos + 33, r, s)) {
+            return E_SIGNATUR;
+        }
+        return 0;
+    }
+    if (hoch != 8 && tiefByte == 1) {
+        // RSA PKCS#1 v1.5 — in TLS 1.2 erlaubt
+        if (keyAlg != 3) { return E_UNTERSTUETZT; }
+        if (!RsaPubAusDer(kPos, kLen, pRsa(c))) { return E_UNTERSTUETZT; }
+        if (!RsaVerifyPkcs1(pRsa(c), hl, hash, sig, sigLen)) { return E_SIGNATUR; }
+        return 0;
+    }
+    if (hoch == 8) {
+        // RSASSA-PSS
+        if (keyAlg != 3) { return E_UNTERSTUETZT; }
+        if (!RsaPubAusDer(kPos, kLen, pRsa(c))) { return E_UNTERSTUETZT; }
+        if (!RsaVerifyPss(pRsa(c), hl, hash, sig, sigLen)) { return E_SIGNATUR; }
+        return 0;
+    }
+    return E_UNTERSTUETZT;
+}
+
+// ServerKeyExchange lesen und die Signatur pruefen.
+fn skeLesen(c: int64, pos: int64, len: int64): int64 {
+    if (len < 4) { return E_FORMAT; }
+    if ((peek8(pos) & 0xFF) != 3) { return E_UNTERSTUETZT; }   // named_curve
+    var grp: int64 := r16(pos, 1);
+    if (!gruppeErlaubt(c, grp)) { return E_GRUPPE; }
+    var rohLen: int64 := gruppenRohLen(grp);
+    if (rohLen == 0) { return E_GRUPPE; }
+    var pl: int64 := peek8(pos + 3) & 0xFF;
+    if (pl != rohLen || 4 + pl + 4 > len) { return E_FORMAT; }
+    poke64(c + V_GRUPPE, grp);
+    var i: int64 := 0;
+    while (i < pl) { poke8(c + V_PEER_PK + i, peek8(pos + 4 + i)); i := i + 1; }
+    var paramsLen: int64 := 4 + pl;
+
+    var schema: int64 := r16(pos, paramsLen);
+    var sigLen: int64 := r16(pos, paramsLen + 2);
+    if (paramsLen + 4 + sigLen > len) { return E_FORMAT; }
+    var sig: int64 := pos + paramsLen + 4;
+
+    var sigIn: int64 := pScr(c) + S_SIGIN;
+    var sigInLen: int64 := skeSignaturblock(c, pos, paramsLen, sigIn);
+    return signaturPruefen(c, schema, sig, sigLen, sigIn, sigInLen);
+}
+
+// ClientKeyExchange lesen (Server-Seite)
+fn ckeLesen(c: int64, pos: int64, len: int64): int64 {
+    if (len < 1) { return E_FORMAT; }
+    var rohLen: int64 := gruppenRohLen(peek64(c + V_GRUPPE));
+    var pl: int64 := peek8(pos) & 0xFF;
+    if (pl != rohLen || 1 + pl > len) { return E_FORMAT; }
+    var i: int64 := 0;
+    while (i < pl) { poke8(c + V_PEER_PK + i, peek8(pos + 1 + i)); i := i + 1; }
+    return 0;
+}
+
+// CertificateVerify des Clients pruefen. Der Hash laeuft ueber alle
+// Nachrichten BIS VOR diese; hsVerbrauchen wird darum erst danach gerufen.
+fn certVerifyLesen(c: int64, pos: int64, len: int64): int64 {
+    if (len < 4) { return E_FORMAT; }
+    var schema: int64 := r16(pos, 0);
+    var sigLen: int64 := r16(pos, 2);
+    if (4 + sigLen > len) { return E_FORMAT; }
+    var scr: int64 := pScr(c);
+    var th: int64 := scr + S_TH2;
+    // Hashlaenge aus dem Schema bestimmen und das Transkript damit bilden.
+    var hoch: int64 := (schema >> 8) & 0xFF;
+    var hl: int64 := 32;
+    if (hoch == 5) { hl := 48; }
+    if (hoch == 8 && (schema & 0xFF) == 5) { hl := 48; }
+    if (hl == 48) { hashJetzt(c, 48, th); } else { hashJetzt(c, 32, th); }
+    // signaturPruefen hasht selbst; hier wird der FERTIGE Hash gebraucht,
+    // darum der direkte Weg.
+    return certVerifyPruefen(c, schema, pos + 4, sigLen, th, hl);
+}
+
+fn certVerifyPruefen(c: int64, schema: int64, sig: int64, sigLen: int64,
+                     hash: int64, hl: int64): int64 {
+    var satz: int64 := peek64(c + V_PEERCERT);
+    if (peek64(c + V_PEERCERTOK) == 0) { return E_ABLAUF; }
+    var der: int64 := X509DerPuffer(satz);
+    var kPos: int64 := der + X509PubKeyPos(satz);
+    var kLen: int64 := X509PubKeyLen(satz);
+    var keyAlg: int64 := X509KeyAlg(satz);
+    var scr: int64 := pScr(c);
+    var hoch: int64 := (schema >> 8) & 0xFF;
+    var tief: int64 := schema & 0xFF;
+
+    if (hoch != 8 && tief == 3) {
+        if (keyAlg != 1 || kLen != 65 || (peek8(kPos) & 0xFF) != 4) {
+            return E_UNTERSTUETZT;
+        }
+        var r: int64 := scr + S_R;
+        var s: int64 := scr + S_S;
+        if (!EcdsaSigFromDer(sig, sigLen, r, s)) { return E_SIGNATUR; }
+        if (!EcdsaVerify(EC_P256, hash, kPos + 1, kPos + 33, r, s)) {
+            return E_SIGNATUR;
+        }
+        return 0;
+    }
+    if (hoch != 8 && tief == 1) {
+        if (keyAlg != 3) { return E_UNTERSTUETZT; }
+        if (!RsaPubAusDer(kPos, kLen, pRsa(c))) { return E_UNTERSTUETZT; }
+        if (!RsaVerifyPkcs1(pRsa(c), hl, hash, sig, sigLen)) { return E_SIGNATUR; }
+        return 0;
+    }
+    if (hoch == 8) {
+        if (keyAlg != 3) { return E_UNTERSTUETZT; }
+        if (!RsaPubAusDer(kPos, kLen, pRsa(c))) { return E_UNTERSTUETZT; }
+        if (!RsaVerifyPss(pRsa(c), hl, hash, sig, sigLen)) { return E_SIGNATUR; }
+        return 0;
+    }
+    return E_UNTERSTUETZT;
+}
+
+fn finishedLesen(c: int64, pos: int64, len: int64, clientSeite: bool): int64 {
+    if (len != 12) { return E_FINISHED; }
+    var vd: int64 := pScr(c) + S_VD;
+    if (!finishedWert(c, clientSeite, vd)) { return E_FINISHED; }
+    if (CTMemEqual(vd, pos, 12) != -1) { return E_FINISHED; }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Ablauf
+//
+// Der Flug ist in TLS 1.2 fest:
+//   Client: ClientHello
+//   Server: ServerHello, Certificate, ServerKeyExchange,
+//           [CertificateRequest,] ServerHelloDone
+//   Client: [Certificate,] ClientKeyExchange, [CertificateVerify],
+//           CCS, Finished
+//   Server: CCS, Finished
+//
+// Anders als in TLS 1.3 gibt es ChangeCipherSpec wirklich: es schaltet die
+// Richtung um, in der es steht, und es gehoert NICHT in den Transkript-Hash.
+// ---------------------------------------------------------------------------
+
+fn fehlerSetzen(c: int64, rc: int64): int64 {
+    poke64(c + V_ZUSTAND, Z_FEHLER);
+    poke64(c + V_FEHLER, rc);
+    return rc;
+}
+
+fn clientStart(c: int64): int64 {
+    if (RandBytesExact(c + V_CRAND, 32) != 32) { return fehlerSetzen(c, E_KONFIG); }
+    // Die Gruppe steht schon vor dem ClientHello fest, weil das
+    // ClientKeyExchange spaeter denselben Punkt braucht.
+    if ((gruppenMaske(c) & 1) != 0) { poke64(c + V_GRUPPE, GRP_X25519); }
+    else { poke64(c + V_GRUPPE, GRP_SECP256R1); }
+    if (!gruppenPaar(c)) { return fehlerSetzen(c, E_KONFIG); }
+    hashInit(c);
+    var rc: int64 := clientHelloSenden(c);
+    if (rc != 0) { return fehlerSetzen(c, rc); }
+    poke64(c + V_ZUSTAND, Z_WARTE_SH);
+    return Tls12WantRead();
+}
+
+// Client: ServerHello bis ServerHelloDone, danach der eigene Flug.
+fn clientServerFlug(c: int64): int64 {
+    var cfg: int64 := peek64(c + V_CFG);
+    var tp: int64 := pScr(c) + S_TP;
+    var pp: int64 := pScr(c) + S_PP;
+    var lp: int64 := pScr(c) + S_LP;
+
+    while (hsAnsehen(c, tp, pp, lp)) {
+        var typ: int64 := peek64(tp);
+        var pos: int64 := peek64(pp);
+        var len: int64 := peek64(lp);
+
+        if (typ == HS_SERVER_HELLO) {
+            var rc: int64 := serverHelloLesen(c, pos, len);
+            if (rc != 0) { return fehlerSetzen(c, rc); }
+            hsVerbrauchen(c, len, true);
+        } else {
+        if (typ == HS_CERT) {
+            var rc2: int64 := certLesen(c, pos, len, false);
+            if (rc2 != 0) { return fehlerSetzen(c, rc2); }
+            // Die Suite verlangt eine bestimmte Schluesselart; ein
+            // ECDSA-Zertifikat unter einer RSA-Suite waere ein Angriff.
+            if (X509KeyAlg(peek64(c + V_PEERCERT))
+                != suiteSchluesselart(peek64(c + V_SUITE))) {
+                return fehlerSetzen(c, E_ZERTIFIKAT);
+            }
+            hsVerbrauchen(c, len, true);
+        } else {
+        if (typ == HS_SKE) {
+            var rc3: int64 := skeLesen(c, pos, len);
+            if (rc3 != 0) { return fehlerSetzen(c, rc3); }
+            hsVerbrauchen(c, len, true);
+        } else {
+        if (typ == HS_CERT_REQUEST) {
+            poke64(c + V_CERTREQ, 1);
+            hsVerbrauchen(c, len, true);
+        } else {
+        if (typ == HS_SHD) {
+            hsVerbrauchen(c, len, true);
+            // eigener Flug
+            if (peek64(c + V_CERTREQ) != 0) {
+                if (TlsCfgCert(cfg) != 0 && TlsCfgCertN(cfg) > 0) {
+                    var rc4: int64 := certSenden(c);
+                    if (rc4 != 0) { return fehlerSetzen(c, rc4); }
+                } else {
+                    // leeres Certificate ist die vorgesehene Antwort
+                    var leer: int64 := pScr(c) + S_VD + 8;
+                    poke8(leer, 0); poke8(leer + 1, 0); poke8(leer + 2, 0);
+                    var rc5: int64 := hsSenden(c, HS_CERT, leer, 3);
+                    if (rc5 != 0) { return fehlerSetzen(c, rc5); }
+                }
+            }
+            var rc6: int64 := ckeSenden(c);
+            if (rc6 != 0) { return fehlerSetzen(c, rc6); }
+            if (!gruppenGeheimnis(c)) { return fehlerSetzen(c, E_GRUPPE); }
+            // master_secret haengt am Transkript BIS EINSCHLIESSLICH
+            // ClientKeyExchange (RFC 7627) — also genau hier.
+            if (!planMaster(c)) { return fehlerSetzen(c, E_KONFIG); }
+            if (peek64(c + V_CERTREQ) != 0
+                && TlsCfgCert(cfg) != 0 && TlsCfgCertN(cfg) > 0) {
+                var rc7: int64 := certVerifySenden(c);
+                if (rc7 != 0) { return fehlerSetzen(c, rc7); }
+            }
+            var rc8: int64 := ccsSenden(c);
+            if (rc8 != 0) { return fehlerSetzen(c, rc8); }
+            var rc9: int64 := finishedSenden(c, true);
+            if (rc9 != 0) { return fehlerSetzen(c, rc9); }
+            poke64(c + V_ZUSTAND, Z_WARTE_CCS);
+            return 0;
+        } else {
+            return fehlerSetzen(c, E_ABLAUF);
+        } } } } }
+    }
+    return Tls12WantRead();
+}
+
+// Client: Finished des Servers (CCS hat der Record-Layer schon verarbeitet)
+fn clientServerFinished(c: int64): int64 {
+    var tp: int64 := pScr(c) + S_TP;
+    var pp: int64 := pScr(c) + S_PP;
+    var lp: int64 := pScr(c) + S_LP;
+    if (!hsAnsehen(c, tp, pp, lp)) { return Tls12WantRead(); }
+    if (peek64(tp) != HS_FINISHED) { return fehlerSetzen(c, E_ABLAUF); }
+    if (peek64(c + V_KRYPT_LESE) == 0) {
+        // Finished vor ChangeCipherSpec ist ein Protokollfehler, nicht nur
+        // eine Reihenfolgefrage: es waere im Klartext gekommen.
+        return fehlerSetzen(c, E_ABLAUF);
+    }
+    var rc: int64 := finishedLesen(c, peek64(pp), peek64(lp), false);
+    if (rc != 0) { return fehlerSetzen(c, rc); }
+    hsVerbrauchen(c, peek64(lp), true);
+    poke64(c + V_ZUSTAND, Z_FERTIG);
+    return 0;
+}
+
+// Server: ClientHello lesen, eigenen Flug senden
+fn serverClientHello(c: int64): int64 {
+    var cfg: int64 := peek64(c + V_CFG);
+    var tp: int64 := pScr(c) + S_TP;
+    var pp: int64 := pScr(c) + S_PP;
+    var lp: int64 := pScr(c) + S_LP;
+    if (!hsAnsehen(c, tp, pp, lp)) { return Tls12WantRead(); }
+    if (peek64(tp) != HS_CLIENT_HELLO) { return fehlerSetzen(c, E_ABLAUF); }
+
+    hashInit(c);
+    var rc: int64 := clientHelloLesen(c, peek64(pp), peek64(lp));
+    if (rc != 0) { return fehlerSetzen(c, rc); }
+    rc := ketteWaehlen(c);
+    if (rc != 0) { return fehlerSetzen(c, rc); }
+    // Die Kette kann die Schluesselart geaendert haben (SNI-Wahl); die Suite
+    // muss dazu passen.
+    if (eigeneSchluesselart(c) != suiteSchluesselart(peek64(c + V_SUITE))) {
+        return fehlerSetzen(c, E_KONFIG);
+    }
+    hsVerbrauchen(c, peek64(lp), true);
+
+    if (RandBytesExact(c + V_SRAND, 32) != 32) { return fehlerSetzen(c, E_KONFIG); }
+    if (!gruppenPaar(c)) { return fehlerSetzen(c, E_KONFIG); }
+
+    rc := serverHelloSenden(c);
+    if (rc == 0) { rc := certSenden(c); }
+    if (rc == 0) { rc := skeSenden(c); }
+    if (rc == 0 && TlsCfgClientAuth(cfg) != 0) { rc := certRequestSenden(c); }
+    if (rc == 0) { rc := shdSenden(c); }
+    if (rc != 0) { return fehlerSetzen(c, rc); }
+    poke64(c + V_ZUSTAND, Z_WARTE_CKE);
+    return 0;
+}
+
+// Server: Certificate, ClientKeyExchange, CertificateVerify
+fn serverClientFlug(c: int64): int64 {
+    var cfg: int64 := peek64(c + V_CFG);
+    var tp: int64 := pScr(c) + S_TP;
+    var pp: int64 := pScr(c) + S_PP;
+    var lp: int64 := pScr(c) + S_LP;
+
+    while (hsAnsehen(c, tp, pp, lp)) {
+        var typ: int64 := peek64(tp);
+        var pos: int64 := peek64(pp);
+        var len: int64 := peek64(lp);
+
+        if (typ == HS_CERT) {
+            var leerKette: bool := false;
+            if (len >= 3) { if (r24(pos, 0) == 0) { leerKette := true; } }
+            if (leerKette) {
+                if (TlsCfgClientAuth(cfg) == 2) {
+                    return fehlerSetzen(c, E_ZERTIFIKAT);
+                }
+            } else {
+                var rc: int64 := certLesen(c, pos, len, true);
+                if (rc != 0) { return fehlerSetzen(c, rc); }
+            }
+            hsVerbrauchen(c, len, true);
+        } else {
+        if (typ == HS_CKE) {
+            var rc2: int64 := ckeLesen(c, pos, len);
+            if (rc2 != 0) { return fehlerSetzen(c, rc2); }
+            hsVerbrauchen(c, len, true);
+            if (!gruppenGeheimnis(c)) { return fehlerSetzen(c, E_GRUPPE); }
+            // EMS: Transkript bis einschliesslich ClientKeyExchange
+            if (!planMaster(c)) { return fehlerSetzen(c, E_KONFIG); }
+            if (TlsCfgClientAuth(cfg) == 2 && peek64(c + V_PEERCERTOK) == 0) {
+                return fehlerSetzen(c, E_ZERTIFIKAT);
+            }
+            // Ohne Client-Zertifikat kommt kein CertificateVerify; dann ist
+            // der naechste Schritt CCS.
+            poke64(c + V_ZUSTAND, Z_WARTE_CF);
+        } else {
+        if (typ == HS_CERT_VERIFY) {
+            var rc3: int64 := certVerifyLesen(c, pos, len);
+            if (rc3 != 0) { return fehlerSetzen(c, rc3); }
+            hsVerbrauchen(c, len, true);
+            poke64(c + V_ZUSTAND, Z_WARTE_CF);
+        } else {
+        if (typ == HS_FINISHED) {
+            // gehoert in den naechsten Zustand
+            return serverClientFinished(c);
+        } else {
+            return fehlerSetzen(c, E_ABLAUF);
+        } } } }
+    }
+    return Tls12WantRead();
+}
+
+// Server: Finished des Clients, dann eigenes CCS + Finished
+fn serverClientFinished(c: int64): int64 {
+    var tp: int64 := pScr(c) + S_TP;
+    var pp: int64 := pScr(c) + S_PP;
+    var lp: int64 := pScr(c) + S_LP;
+    if (!hsAnsehen(c, tp, pp, lp)) { return Tls12WantRead(); }
+    var typ: int64 := peek64(tp);
+    if (typ == HS_CERT_VERIFY) {
+        var rcv: int64 := certVerifyLesen(c, peek64(pp), peek64(lp));
+        if (rcv != 0) { return fehlerSetzen(c, rcv); }
+        hsVerbrauchen(c, peek64(lp), true);
+        return 0;
+    }
+    if (typ == HS_CLIENT_HELLO) {
+        // Renegotiation: wird abgewiesen (RFC 5746).
+        alertSenden(c, 2, 40);                   // fatal handshake_failure
+        return fehlerSetzen(c, E_RENEG);
+    }
+    if (typ != HS_FINISHED) { return fehlerSetzen(c, E_ABLAUF); }
+    if (peek64(c + V_KRYPT_LESE) == 0) { return fehlerSetzen(c, E_ABLAUF); }
+
+    var rc: int64 := finishedLesen(c, peek64(pp), peek64(lp), true);
+    if (rc != 0) { return fehlerSetzen(c, rc); }
+    hsVerbrauchen(c, peek64(lp), true);
+
+    rc := ccsSenden(c);
+    if (rc != 0) { return fehlerSetzen(c, rc); }
+    rc := finishedSenden(c, false);
+    if (rc != 0) { return fehlerSetzen(c, rc); }
+    poke64(c + V_ZUSTAND, Z_FERTIG);
+    return 0;
+}
+
+fn zustandSchritt(c: int64): int64 {
+    var z: int64 := peek64(c + V_ZUSTAND);
+    if (z == Z_WARTE_SH)  { return clientServerFlug(c); }
+    if (z == Z_WARTE_CCS) { return clientServerFinished(c); }
+    if (z == Z_WARTE_CH)  { return serverClientHello(c); }
+    if (z == Z_WARTE_CKE) { return serverClientFlug(c); }
+    if (z == Z_WARTE_CF)  { return serverClientFinished(c); }
+    return 0;
+}
+
+// Bringt den Handschlag so weit wie moeglich voran. Wie in tls13 wird immer
+// nur EIN Record verarbeitet und dann die Zustandsmaschine gefragt: der
+// ganze Flug des Servers kommt in einem TCP-Segment, und das CCS darin
+// schaltet die Schluessel um.
+pub fn Tls12Schritt(c: int64): int64 {
+    var z: int64 := peek64(c + V_ZUSTAND);
+    if (z == Z_FEHLER) { return peek64(c + V_FEHLER); }
+    if (z == Z_FERTIG) { return 0; }
+    if (z == Z_ZU) { return E_GESCHLOSSEN; }
+
+    if (z == Z_START) {
+        var rc0: int64 := clientStart(c);
+        if (rc0 < 0) { return rc0; }
+        if (Tls12AusgabeOffen(c) > 0) { return Tls12WantWrite(); }
+        return Tls12WantRead();
+    }
+
+    var weiter: bool := true;
+    while (weiter) {
+        weiter := false;
+        var vor: int64 := peek64(c + V_ZUSTAND);
+        var vorHs: int64 := peek64(c + V_HSGELESEN);
+        var r: int64 := zustandSchritt(c);
+        if (r < 0) { return r; }
+        if (peek64(c + V_ZUSTAND) != vor) { weiter := true; }
+        if (peek64(c + V_HSGELESEN) != vorHs) { weiter := true; }
+        if (peek64(c + V_ZUSTAND) == Z_FERTIG) { weiter := false; }
+        else {
+            var rr: int64 := recordVerarbeiten(c);
+            if (rr < 0) { return fehlerSetzen(c, rr); }
+            if (rr == 0) { weiter := true; }
+        }
+    }
+
+    if (peek64(c + V_ZUSTAND) == Z_FERTIG) {
+        if (Tls12AusgabeOffen(c) > 0) { return Tls12WantWrite(); }
+        return 0;
+    }
+    if (Tls12AusgabeOffen(c) > 0) { return Tls12WantWrite(); }
+    return Tls12WantRead();
+}
+
+// ---------------------------------------------------------------------------
+// Anwendungsdaten
+// ---------------------------------------------------------------------------
+
+pub fn Tls12Schreibe(c: int64, buf: int64, len: int64): int64 {
+    if (peek64(c + V_ZUSTAND) != Z_FERTIG) { return E_ABLAUF; }
+    var pos: int64 := 0;
+    while (pos < len) {
+        var n: int64 := len - pos;
+        if (n > 16384) { n := 16384; }
+        if (peek64(c + V_OUTPOS) + n + 30 > B_OUT) {
+            if (pos == 0) { return Tls12WantWrite(); }
+            return pos;
+        }
+        var rc: int64 := recordSenden(c, RT_APPDATA, buf + pos, n);
+        if (rc != 0) { return rc; }
+        pos += n;
+    }
+    return pos;
+}
+
+pub fn Tls12Lese(c: int64, buf: int64, cap: int64): int64 {
+    var z: int64 := peek64(c + V_ZUSTAND);
+    if (z == Z_FEHLER) { return peek64(c + V_FEHLER); }
+    var rc: int64 := pumpe(c);
+    if (rc != 0 && rc != E_GESCHLOSSEN) { return fehlerSetzen(c, rc); }
+    if (rc == E_GESCHLOSSEN) { poke64(c + V_ZUSTAND, Z_ZU); }
+
+    // Nach dem Handschlag darf keine Handschlagnachricht mehr kommen: TLS 1.2
+    // kennt dafuer nur Renegotiation, und die wird abgewiesen (RFC 5746).
+    if (peek64(c + V_ZUSTAND) == Z_FERTIG
+        && peek64(c + V_HSPOS) > peek64(c + V_HSGELESEN)) {
+        alertSenden(c, 2, 40);
+        return fehlerSetzen(c, E_RENEG);
+    }
+
+    var gelesen: int64 := peek64(c + V_APPGELESEN);
+    var da: int64 := peek64(c + V_APPPOS) - gelesen;
+    if (da <= 0) {
+        if (peek64(c + V_ZUSTAND) == Z_ZU) { return E_GESCHLOSSEN; }
+        return 0;
+    }
+    var n: int64 := da;
+    if (n > cap) { n := cap; }
+    var i: int64 := 0;
+    while (i < n) { poke8(buf + i, peek8(pApp(c) + gelesen + i)); i := i + 1; }
+    gelesen += n;
+    if (gelesen == peek64(c + V_APPPOS)) {
+        poke64(c + V_APPPOS, 0);
+        poke64(c + V_APPGELESEN, 0);
+    } else {
+        poke64(c + V_APPGELESEN, gelesen);
+    }
+    return n;
+}
+
+pub fn Tls12Schliessen(c: int64): void {
+    if (peek64(c + V_ZUSTAND) == Z_FERTIG) { alertSenden(c, 1, 0); }
+    poke64(c + V_ZUSTAND, Z_ZU);
+}

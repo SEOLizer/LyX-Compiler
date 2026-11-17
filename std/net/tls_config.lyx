@@ -1,0 +1,205 @@
+// std/net/tls_config.lyx — die Konfiguration fuer std.net.tls13 und
+// std.net.tls12 (#2096)
+//
+// Beide Fassungen lesen DENSELBEN Byteblock: die Anwendung stellt eine
+// Konfiguration auf, schaltet mit TlsConfigMinVersion frei, was sie erlauben
+// will, und bekommt eine Zustandsmaschine, die sich danach richtet. Der Block
+// lag bis 1.2.41 in tls13.lyx; er steht hier, damit es ihn nicht ZWEIMAL
+// gibt — zwei Aufzaehlungen derselben Sache sind in diesem Repo regelmaessig
+// auseinandergelaufen.
+//
+// Die Unit haelt keinen Zustand und belegt keinen Speicher: alle Felder sind
+// Zeiger und Laengen auf Puffer des Aufrufers.
+
+unit std.net.tls_config;
+
+// Protokollversionen (Zahlenwerte wie auf der Leitung)
+pub fn TlsVersion12(): int64 { return 0x0303; }
+pub fn TlsVersion13(): int64 { return 0x0304; }
+
+// Bitmaske fuer die erlaubten Schluesselgruppen (C_GRUPPEN)
+pub fn TlsGruppeX25519(): int64 { return 1; }
+pub fn TlsGruppeSecp256r1(): int64 { return 2; }
+
+// ---------------------------------------------------------------------------
+// Konfiguration
+//
+// Layout (alles Zeiger und Laengen auf Puffer des Aufrufers; die Unit kopiert
+// nichts und haelt keine Dateien offen):
+// ---------------------------------------------------------------------------
+
+con C_ROLLE:      int64 := 0;      // 1 Server, 2 Client
+con C_CERT:       int64 := 8;      // DER der eigenen Kette: Block aus
+con C_CERTN:      int64 := 16;     //   16-Byte-Eintraegen (Zeiger, Laenge)
+con C_KEY:        int64 := 24;     // eigener Privatschluessel (DER)
+con C_KEYLEN:     int64 := 32;
+con C_TRUST:      int64 := 40;     // Trust-Store, gleiches Format wie C_CERT
+con C_TRUSTN:     int64 := 48;
+con C_HOST:       int64 := 56;     // SNI/zu pruefender Name (Client)
+con C_HOSTLEN:    int64 := 64;
+con C_ALPN:       int64 := 72;     // ALPN-Liste "h2,http/1.1"
+con C_ALPNLEN:    int64 := 80;
+con C_CLIENTAUTH: int64 := 88;     // 0 keine, 1 optional, 2 verlangt
+con C_JETZT:      int64 := 96;     // Unix-Zeit fuer die Kettenpruefung
+con C_PRUEFEN:    int64 := 104;    // 1 = Kette pruefen (Standard), 0 = nicht
+// Mehrere Ketten nach SNI: Tabelle aus 48-Byte-Eintraegen des Aufrufers
+//   0 Name (Zeiger)    8 Namenslaenge   16 Kette (Zeiger)
+//  24 Kettenlaenge     32 Schluessel    40 Schluessellaenge
+// Ein Eintrag mit Namenslaenge 0 ist der Standard fuer Clients ohne SNI und
+// fuer Namen, die auf keinen Eintrag passen. Fehlt er, wird laut abgewiesen
+// (E_KONFIG) statt still ein fremdes Zertifikat ausgeliefert.
+// Hot-Reload: die Tabelle wird JE HANDSCHLAG gelesen und nichts davon
+// zwischengespeichert — die Anwendung tauscht Inhalt oder Zeiger im Betrieb.
+con C_KETTEN:     int64 := 112;
+con C_KETTENN:    int64 := 120;
+// Widerruf-Hook (OCSP/CRL in der Anwendung): fn(satz: int64): int64,
+// 0 = gueltig, alles andere lehnt die Verbindung mit E_WIDERRUFEN ab.
+// `satz` ist der X509-Satz des Blattzertifikats der Gegenseite.
+con C_WIDERRUF:   int64 := 128;
+// Erlaubte Schluesselgruppen als Bitmaske (1 x25519, 2 secp256r1).
+// 0 heisst "Standard": beide.
+con C_GRUPPEN:    int64 := 136;
+// Kleinste zugelassene Protokollversion. 0 heisst 0x0304 — TLS 1.3 und
+// nichts darunter. Wer TLS 1.2 braucht (Windows bis Server 2019 spricht
+// LDAPS nur bis dahin), setzt sie ausdruecklich auf 0x0303; #2096 verlangt
+// genau diesen Standard "aus".
+con C_MINVER:     int64 := 144;
+// Groesste zugelassene Version, 0 heisst 0x0304. Nur fuer Pruefstaende, die
+// einen Partner ohne TLS 1.3 nachstellen wollen.
+con C_MAXVER:     int64 := 152;
+con C_SIZE:       int64 := 160;
+
+pub fn TlsConfigGroesse(): int64 { return C_SIZE; }
+pub fn TlsKetteEintragGroesse(): int64 { return 48; }
+
+// rolle: 1 Server, 2 Client
+pub fn TlsConfigNeu(cfg: int64, rolle: int64): void {
+    var i: int64 := 0;
+    while (i < C_SIZE) { poke8(cfg + i, 0); i := i + 1; }
+    poke64(cfg + C_ROLLE, rolle);
+    poke64(cfg + C_PRUEFEN, 1);
+}
+
+// Eigene Kette (Blatt zuerst) und Privatschluessel, beide als DER.
+pub fn TlsConfigKette(cfg: int64, kette: int64, ketteN: int64,
+                      key: int64, keyLen: int64): void {
+    poke64(cfg + C_CERT, kette);
+    poke64(cfg + C_CERTN, ketteN);
+    poke64(cfg + C_KEY, key);
+    poke64(cfg + C_KEYLEN, keyLen);
+}
+
+// Mehrere Ketten nach SNI. `tabelle` zeigt auf n Eintraege von je 48 Byte
+// (Aufbau siehe C_KETTEN). Die Unit kopiert nichts.
+pub fn TlsConfigKetten(cfg: int64, tabelle: int64, n: int64): void {
+    poke64(cfg + C_KETTEN, tabelle);
+    poke64(cfg + C_KETTENN, n);
+}
+
+// Einen Eintrag der Tabelle fuellen. Namenslaenge 0 macht den Eintrag zum
+// Standard. Gibt die Adresse des Eintrags zurueck, damit der Aufrufer ihn im
+// Betrieb neu belegen kann (Hot-Reload).
+pub fn TlsKetteEintrag(tabelle: int64, idx: int64, name: int64, nameLen: int64,
+                       kette: int64, ketteN: int64,
+                       key: int64, keyLen: int64): int64 {
+    var e: int64 := tabelle + idx * 48;
+    poke64(e, name);      poke64(e + 8, nameLen);
+    poke64(e + 16, kette); poke64(e + 24, ketteN);
+    poke64(e + 32, key);  poke64(e + 40, keyLen);
+    return e;
+}
+
+// Widerruf-Hook: fn(satz: int64): int64, 0 = gueltig. Als int64 uebergeben
+// (`meinHook as int64`), weil die Konfiguration ein reiner Byteblock ist.
+pub fn TlsConfigWiderrufHook(cfg: int64, hook: int64): void {
+    poke64(cfg + C_WIDERRUF, hook);
+}
+
+// Erlaubte Schluesselgruppen (Bitmaske aus TlsGruppeX25519/TlsGruppeSecp256r1).
+pub fn TlsConfigGruppen(cfg: int64, maske: int64): void {
+    poke64(cfg + C_GRUPPEN, maske);
+}
+
+pub fn TlsConfigTrust(cfg: int64, trust: int64, trustN: int64): void {
+    poke64(cfg + C_TRUST, trust);
+    poke64(cfg + C_TRUSTN, trustN);
+}
+
+pub fn TlsConfigHost(cfg: int64, host: int64, hostLen: int64): void {
+    poke64(cfg + C_HOST, host);
+    poke64(cfg + C_HOSTLEN, hostLen);
+}
+
+pub fn TlsConfigAlpn(cfg: int64, alpn: int64, alpnLen: int64): void {
+    poke64(cfg + C_ALPN, alpn);
+    poke64(cfg + C_ALPNLEN, alpnLen);
+}
+
+// 0 keine, 1 optional, 2 verlangt (mTLS)
+pub fn TlsConfigClientAuth(cfg: int64, modus: int64): void {
+    poke64(cfg + C_CLIENTAUTH, modus);
+}
+
+pub fn TlsConfigZeit(cfg: int64, jetzt: int64): void {
+    poke64(cfg + C_JETZT, jetzt);
+}
+
+// Nur fuer Pruefstaende: schaltet die Kettenpruefung ab. In der Anwendung
+// bleibt sie an — darum ist der Standard 1 und nicht 0.
+pub fn TlsConfigKettePruefen(cfg: int64, an: int64): void {
+    poke64(cfg + C_PRUEFEN, an);
+}
+
+// Kleinste und groesste zugelassene Version. Der Standard ist TLS 1.3 in
+// beide Richtungen; TLS 1.2 muss ausdruecklich freigeschaltet werden
+// (#2096: "pro Listener abschaltbar; Standard aus").
+pub fn TlsConfigMinVersion(cfg: int64, ver: int64): void {
+    poke64(cfg + C_MINVER, ver);
+}
+
+pub fn TlsConfigMaxVersion(cfg: int64, ver: int64): void {
+    poke64(cfg + C_MAXVER, ver);
+}
+
+// Abfragen (auch fuer die beiden Protokoll-Units, die den Block lesen)
+pub fn TlsCfgMinVersion(cfg: int64): int64 {
+    var v: int64 := peek64(cfg + C_MINVER);
+    if (v == 0) { return 0x0304; }
+    return v;
+}
+
+pub fn TlsCfgMaxVersion(cfg: int64): int64 {
+    var v: int64 := peek64(cfg + C_MAXVER);
+    if (v == 0) { return 0x0304; }
+    return v;
+}
+
+pub fn TlsCfgErlaubt12(cfg: int64): bool {
+    return TlsCfgMinVersion(cfg) <= 0x0303 && TlsCfgMaxVersion(cfg) >= 0x0303;
+}
+
+pub fn TlsCfgErlaubt13(cfg: int64): bool {
+    return TlsCfgMaxVersion(cfg) >= 0x0304;
+}
+
+// Lesezugriffe auf die Felder. Die Protokoll-Units greifen ueber diese
+// Funktionen zu und nicht ueber eigene Offsets — sonst gibt es den Block
+// doch wieder zweimal.
+pub fn TlsCfgRolle(cfg: int64): int64      { return peek64(cfg + C_ROLLE); }
+pub fn TlsCfgCert(cfg: int64): int64       { return peek64(cfg + C_CERT); }
+pub fn TlsCfgCertN(cfg: int64): int64      { return peek64(cfg + C_CERTN); }
+pub fn TlsCfgKey(cfg: int64): int64        { return peek64(cfg + C_KEY); }
+pub fn TlsCfgKeyLen(cfg: int64): int64     { return peek64(cfg + C_KEYLEN); }
+pub fn TlsCfgTrust(cfg: int64): int64      { return peek64(cfg + C_TRUST); }
+pub fn TlsCfgTrustN(cfg: int64): int64     { return peek64(cfg + C_TRUSTN); }
+pub fn TlsCfgHost(cfg: int64): int64       { return peek64(cfg + C_HOST); }
+pub fn TlsCfgHostLen(cfg: int64): int64    { return peek64(cfg + C_HOSTLEN); }
+pub fn TlsCfgAlpn(cfg: int64): int64       { return peek64(cfg + C_ALPN); }
+pub fn TlsCfgAlpnLen(cfg: int64): int64    { return peek64(cfg + C_ALPNLEN); }
+pub fn TlsCfgClientAuth(cfg: int64): int64 { return peek64(cfg + C_CLIENTAUTH); }
+pub fn TlsCfgJetzt(cfg: int64): int64      { return peek64(cfg + C_JETZT); }
+pub fn TlsCfgPruefen(cfg: int64): int64    { return peek64(cfg + C_PRUEFEN); }
+pub fn TlsCfgKetten(cfg: int64): int64     { return peek64(cfg + C_KETTEN); }
+pub fn TlsCfgKettenN(cfg: int64): int64    { return peek64(cfg + C_KETTENN); }
+pub fn TlsCfgWiderruf(cfg: int64): int64   { return peek64(cfg + C_WIDERRUF); }
+pub fn TlsCfgGruppen(cfg: int64): int64    { return peek64(cfg + C_GRUPPEN); }

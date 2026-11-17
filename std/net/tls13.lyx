@@ -1,8 +1,16 @@
-// std/net/tls13.lyx — TLS 1.3 (RFC 8446) in Lyx, ohne OpenSSL, ohne FFI
+// std/net/tls13.lyx — TLS 1.3 (RFC 8446) in Lyx, ohne OpenSSL, ohne FFI,
+// und das gemeinsame Tor fuer TLS 1.2 (std.net.tls12)
 //
 // Teil von #2096. std/net/tls.lyx bleibt als OpenSSL-Wrapper daneben stehen;
 // diese Unit kommt ohne Fremdbibliothek aus und laeuft damit auch unter
 // --target=lyxos.
+//
+// Die Anwendung ruft IMMER die Funktionen dieser Unit. Ist TLS 1.2 ueber
+// TlsConfigMinVersion freigeschaltet und einigen sich beide Seiten darauf,
+// uebernimmt std.net.tls12 den Handschlag und jede Funktion hier delegiert
+// dorthin; TlsVersion(c) sagt, was ausgehandelt wurde. Ohne Zutun bleibt es
+// bei TLS 1.3, und der Flug ist dann byteweise derselbe wie vorher. Der
+// Abschnitt "Verteiler" weiter unten beschreibt die Uebergabe.
 //
 // Die Unit macht KEINE Ein-/Ausgabe. Sie bekommt empfangene Byte gefuettert
 // und gibt zu sendende Byte heraus:
@@ -39,7 +47,10 @@
 //                    (TlsConfigKetten) mit Jokernamen, Standardeintrag und
 //                    Austausch im Betrieb (Hot-Reload)
 //   Widerruf         Hook der Anwendung (OCSP/CRL), TlsConfigWiderrufHook
-//   Nicht enthalten  PSK/0-RTT, Tickets, TLS 1.2, secp384r1 als
+//   TLS 1.2          ueber die Weiche, siehe std.net.tls12 (nur ECDHE mit
+//                    AEAD, Extended Master Secret als Pflicht,
+//                    Renegotiation abgewiesen); Standard ist "aus"
+//   Nicht enthalten  PSK/0-RTT, Tickets, secp384r1 als
 //                    Schluesseltausch und ecdsa_secp384r1_sha384 (std.crypto.ec
 //                    rechnet bisher nur auf 256 Bit). Jeder dieser Faelle wird
 //                    mit einem benannten Fehler abgewiesen, nicht still
@@ -63,6 +74,8 @@ import std.crypto.x509;
 import std.crypto.pkey;
 import std.crypto.rsa_native;
 import std.crypto.ed25519;
+import std.net.tls_config;
+import std.net.tls12;
 
 // ---------------------------------------------------------------------------
 // Rueckgabewerte von TlsSchritt / TlsLese / TlsSchreibe
@@ -127,9 +140,7 @@ con CS_CHACHA20_SHA256:     int64 := 0x1303;
 // Schluesselgruppen (RFC 8446 §4.2.7, Zahlenwerte wie im Protokoll)
 con GRP_X25519:    int64 := 0x001d;
 con GRP_SECP256R1: int64 := 0x0017;
-// Bitmaske in der Konfiguration (C_GRUPPEN)
-pub fn TlsGruppeX25519(): int64 { return 1; }
-pub fn TlsGruppeSecp256r1(): int64 { return 2; }
+// Die Bitmaske dafuer (C_GRUPPEN) definiert std.net.tls_config.
 
 // Record-Typen
 con RT_CCS:        int64 := 20;
@@ -160,126 +171,6 @@ con Z_FEHLER:       int64 := 6;
 con Z_ZU:           int64 := 7;
 con Z_WARTE_CH2:    int64 := 8;    // Server wartet nach HRR auf ClientHello2
 
-// ---------------------------------------------------------------------------
-// Konfiguration
-//
-// Layout (alles Zeiger und Laengen auf Puffer des Aufrufers; die Unit kopiert
-// nichts und haelt keine Dateien offen):
-// ---------------------------------------------------------------------------
-
-con C_ROLLE:      int64 := 0;      // 1 Server, 2 Client
-con C_CERT:       int64 := 8;      // DER der eigenen Kette: Block aus
-con C_CERTN:      int64 := 16;     //   16-Byte-Eintraegen (Zeiger, Laenge)
-con C_KEY:        int64 := 24;     // eigener Privatschluessel (DER)
-con C_KEYLEN:     int64 := 32;
-con C_TRUST:      int64 := 40;     // Trust-Store, gleiches Format wie C_CERT
-con C_TRUSTN:     int64 := 48;
-con C_HOST:       int64 := 56;     // SNI/zu pruefender Name (Client)
-con C_HOSTLEN:    int64 := 64;
-con C_ALPN:       int64 := 72;     // ALPN-Liste "h2,http/1.1"
-con C_ALPNLEN:    int64 := 80;
-con C_CLIENTAUTH: int64 := 88;     // 0 keine, 1 optional, 2 verlangt
-con C_JETZT:      int64 := 96;     // Unix-Zeit fuer die Kettenpruefung
-con C_PRUEFEN:    int64 := 104;    // 1 = Kette pruefen (Standard), 0 = nicht
-// Mehrere Ketten nach SNI: Tabelle aus 48-Byte-Eintraegen des Aufrufers
-//   0 Name (Zeiger)    8 Namenslaenge   16 Kette (Zeiger)
-//  24 Kettenlaenge     32 Schluessel    40 Schluessellaenge
-// Ein Eintrag mit Namenslaenge 0 ist der Standard fuer Clients ohne SNI und
-// fuer Namen, die auf keinen Eintrag passen. Fehlt er, wird laut abgewiesen
-// (E_KONFIG) statt still ein fremdes Zertifikat ausgeliefert.
-// Hot-Reload: die Tabelle wird JE HANDSCHLAG gelesen und nichts davon
-// zwischengespeichert — die Anwendung tauscht Inhalt oder Zeiger im Betrieb.
-con C_KETTEN:     int64 := 112;
-con C_KETTENN:    int64 := 120;
-// Widerruf-Hook (OCSP/CRL in der Anwendung): fn(satz: int64): int64,
-// 0 = gueltig, alles andere lehnt die Verbindung mit E_WIDERRUFEN ab.
-// `satz` ist der X509-Satz des Blattzertifikats der Gegenseite.
-con C_WIDERRUF:   int64 := 128;
-// Erlaubte Schluesselgruppen als Bitmaske (1 x25519, 2 secp256r1).
-// 0 heisst "Standard": beide.
-con C_GRUPPEN:    int64 := 136;
-con C_SIZE:       int64 := 144;
-
-pub fn TlsConfigGroesse(): int64 { return C_SIZE; }
-pub fn TlsKetteEintragGroesse(): int64 { return 48; }
-
-// rolle: 1 Server, 2 Client
-pub fn TlsConfigNeu(cfg: int64, rolle: int64): void {
-    var i: int64 := 0;
-    while (i < C_SIZE) { poke8(cfg + i, 0); i := i + 1; }
-    poke64(cfg + C_ROLLE, rolle);
-    poke64(cfg + C_PRUEFEN, 1);
-}
-
-// Eigene Kette (Blatt zuerst) und Privatschluessel, beide als DER.
-pub fn TlsConfigKette(cfg: int64, kette: int64, ketteN: int64,
-                      key: int64, keyLen: int64): void {
-    poke64(cfg + C_CERT, kette);
-    poke64(cfg + C_CERTN, ketteN);
-    poke64(cfg + C_KEY, key);
-    poke64(cfg + C_KEYLEN, keyLen);
-}
-
-// Mehrere Ketten nach SNI. `tabelle` zeigt auf n Eintraege von je 48 Byte
-// (Aufbau siehe C_KETTEN). Die Unit kopiert nichts.
-pub fn TlsConfigKetten(cfg: int64, tabelle: int64, n: int64): void {
-    poke64(cfg + C_KETTEN, tabelle);
-    poke64(cfg + C_KETTENN, n);
-}
-
-// Einen Eintrag der Tabelle fuellen. Namenslaenge 0 macht den Eintrag zum
-// Standard. Gibt die Adresse des Eintrags zurueck, damit der Aufrufer ihn im
-// Betrieb neu belegen kann (Hot-Reload).
-pub fn TlsKetteEintrag(tabelle: int64, idx: int64, name: int64, nameLen: int64,
-                       kette: int64, ketteN: int64,
-                       key: int64, keyLen: int64): int64 {
-    var e: int64 := tabelle + idx * 48;
-    poke64(e, name);      poke64(e + 8, nameLen);
-    poke64(e + 16, kette); poke64(e + 24, ketteN);
-    poke64(e + 32, key);  poke64(e + 40, keyLen);
-    return e;
-}
-
-// Widerruf-Hook: fn(satz: int64): int64, 0 = gueltig. Als int64 uebergeben
-// (`meinHook as int64`), weil die Konfiguration ein reiner Byteblock ist.
-pub fn TlsConfigWiderrufHook(cfg: int64, hook: int64): void {
-    poke64(cfg + C_WIDERRUF, hook);
-}
-
-// Erlaubte Schluesselgruppen (Bitmaske aus TlsGruppeX25519/TlsGruppeSecp256r1).
-pub fn TlsConfigGruppen(cfg: int64, maske: int64): void {
-    poke64(cfg + C_GRUPPEN, maske);
-}
-
-pub fn TlsConfigTrust(cfg: int64, trust: int64, trustN: int64): void {
-    poke64(cfg + C_TRUST, trust);
-    poke64(cfg + C_TRUSTN, trustN);
-}
-
-pub fn TlsConfigHost(cfg: int64, host: int64, hostLen: int64): void {
-    poke64(cfg + C_HOST, host);
-    poke64(cfg + C_HOSTLEN, hostLen);
-}
-
-pub fn TlsConfigAlpn(cfg: int64, alpn: int64, alpnLen: int64): void {
-    poke64(cfg + C_ALPN, alpn);
-    poke64(cfg + C_ALPNLEN, alpnLen);
-}
-
-// 0 keine, 1 optional, 2 verlangt (mTLS)
-pub fn TlsConfigClientAuth(cfg: int64, modus: int64): void {
-    poke64(cfg + C_CLIENTAUTH, modus);
-}
-
-pub fn TlsConfigZeit(cfg: int64, jetzt: int64): void {
-    poke64(cfg + C_JETZT, jetzt);
-}
-
-// Nur fuer Pruefstaende: schaltet die Kettenpruefung ab. In der Anwendung
-// bleibt sie an — darum ist der Standard 1 und nicht 0.
-pub fn TlsConfigKettePruefen(cfg: int64, an: int64): void {
-    poke64(cfg + C_PRUEFEN, an);
-}
 
 // ---------------------------------------------------------------------------
 // Verbindungszustand
@@ -358,6 +249,10 @@ con V_COOKIE:     int64 := 1600;   // 256 Byte
 // Gruppe, die ein HelloRetryRequest verlangt hat — das ClientHello2 muss
 // genau diese bringen, sonst wird abgewiesen.
 con V_HRRGRP:     int64 := 1856;
+// Zeiger auf einen uebernommenen TLS-1.2-Zustand, oder 0. Ist er gesetzt,
+// delegiert JEDE oeffentliche Funktion dieser Unit dorthin — diese Unit ist
+// dann nur noch das Tor (siehe "Verteiler" weiter unten).
+con V_12:         int64 := 1864;
 con V_KOPF:       int64 := 1920;   // Ende des Kopfteils
 
 con B_IN:   int64 := 20480;
@@ -456,9 +351,9 @@ pub fn TlsNeu(cfg: int64): int64 {
     var i: int64 := 0;
     while (i < V_KOPF) { poke8(c + i, 0); i := i + 1; }
     poke64(c + V_CFG, cfg);
-    poke64(c + V_ROLLE, peek64(cfg + C_ROLLE));
+    poke64(c + V_ROLLE, TlsCfgRolle(cfg));
     poke64(c + V_PEERCERT, c + V_SIZE + RsaSchluesselGroesse());
-    if (peek64(cfg + C_ROLLE) == 1) {
+    if (TlsCfgRolle(cfg) == 1) {
         poke64(c + V_ZUSTAND, Z_WARTE_CH);
     } else {
         poke64(c + V_ZUSTAND, Z_START);
@@ -468,31 +363,62 @@ pub fn TlsNeu(cfg: int64): int64 {
 
 pub fn TlsFrei(c: int64): void {
     if (c == 0) { return; }
+    if (peek64(c + V_12) != 0) { Tls12Frei(peek64(c + V_12)); poke64(c + V_12, 0); }
     // Schluessel und Geheimnisse nicht im Speicher liegen lassen.
     SecureZero(c + V_SEC_HS, V_KOPF - V_SEC_HS);
     free(c, TlsSpeicherBedarf());
 }
 
-pub fn TlsZustand(c: int64): int64 { return peek64(c + V_ZUSTAND); }
-pub fn TlsFertig(c: int64): bool { return peek64(c + V_ZUSTAND) == Z_FERTIG; }
-pub fn TlsSuite(c: int64): int64 { return peek64(c + V_SUITE); }
+pub fn TlsZustand(c: int64): int64 {
+    if (peek64(c + V_12) != 0) { return Tls12Zustand(peek64(c + V_12)); }
+    return peek64(c + V_ZUSTAND);
+}
+pub fn TlsFertig(c: int64): bool {
+    if (peek64(c + V_12) != 0) { return Tls12Fertig(peek64(c + V_12)); }
+    return peek64(c + V_ZUSTAND) == Z_FERTIG;
+}
+pub fn TlsSuite(c: int64): int64 {
+    if (peek64(c + V_12) != 0) { return Tls12Suite(peek64(c + V_12)); }
+    return peek64(c + V_SUITE);
+}
+
+// Ausgehandelte Protokollversion: 0x0303 oder 0x0304. Erst nach dem
+// Handschlag verlaesslich.
+pub fn TlsVersion(c: int64): int64 {
+    if (peek64(c + V_12) != 0) { return 0x0303; }
+    return 0x0304;
+}
 
 // Ausgewaehltes ALPN-Protokoll (Ausschnitt im ALPN-Puffer der Konfiguration).
-pub fn TlsAlpnPos(c: int64): int64 { return peek64(c + V_ALPNSEL); }
-pub fn TlsAlpnLen(c: int64): int64 { return peek64(c + V_ALPNSELLEN); }
+pub fn TlsAlpnPos(c: int64): int64 {
+    if (peek64(c + V_12) != 0) { return Tls12AlpnPos(peek64(c + V_12)); }
+    return peek64(c + V_ALPNSEL);
+}
+pub fn TlsAlpnLen(c: int64): int64 {
+    if (peek64(c + V_12) != 0) { return Tls12AlpnLen(peek64(c + V_12)); }
+    return peek64(c + V_ALPNSELLEN);
+}
 
 // Ausgehandelte Schluesselgruppe (0x001d x25519, 0x0017 secp256r1).
-pub fn TlsGruppe(c: int64): int64 { return peek64(c + V_GRUPPE); }
+pub fn TlsGruppe(c: int64): int64 {
+    if (peek64(c + V_12) != 0) { return Tls12Gruppe(peek64(c + V_12)); }
+    return peek64(c + V_GRUPPE);
+}
 
 // SNI der Gegenseite (Server-Rolle): Zeiger und Laenge, 0 wenn keines kam.
 pub fn TlsSniPos(c: int64): int64 {
+    if (peek64(c + V_12) != 0) { return Tls12SniPos(peek64(c + V_12)); }
     if (peek64(c + V_SNILEN) == 0) { return 0; }
     return c + V_SNIBUF;
 }
-pub fn TlsSniLen(c: int64): int64 { return peek64(c + V_SNILEN); }
+pub fn TlsSniLen(c: int64): int64 {
+    if (peek64(c + V_12) != 0) { return Tls12SniLen(peek64(c + V_12)); }
+    return peek64(c + V_SNILEN);
+}
 
 // X509-Satz der Gegenseite, oder 0 wenn keines geprueft wurde.
 pub fn TlsPeerZertifikat(c: int64): int64 {
+    if (peek64(c + V_12) != 0) { return Tls12PeerZertifikat(peek64(c + V_12)); }
     if (peek64(c + V_PEERCERTOK) == 0) { return 0; }
     return peek64(c + V_PEERCERT);
 }
@@ -504,6 +430,7 @@ pub fn TlsPeerZertifikat(c: int64): int64 {
 // Empfangene Byte uebernehmen. Liefert die Anzahl uebernommener Byte; was
 // nicht passt, bleibt beim Aufrufer (kein stilles Verwerfen).
 pub fn TlsFuetter(c: int64, buf: int64, len: int64): int64 {
+    if (peek64(c + V_12) != 0) { return Tls12Fuetter(peek64(c + V_12), buf, len); }
     var pos: int64 := peek64(c + V_INPOS);
     var platz: int64 := B_IN - pos;
     var n: int64 := len;
@@ -516,6 +443,7 @@ pub fn TlsFuetter(c: int64, buf: int64, len: int64): int64 {
 
 // Zu sendende Byte abholen.
 pub fn TlsAusgabe(c: int64, buf: int64, cap: int64): int64 {
+    if (peek64(c + V_12) != 0) { return Tls12Ausgabe(peek64(c + V_12), buf, cap); }
     var gelesen: int64 := peek64(c + V_OUTGELESEN);
     var vorhanden: int64 := peek64(c + V_OUTPOS) - gelesen;
     if (vorhanden <= 0) { return 0; }
@@ -534,6 +462,7 @@ pub fn TlsAusgabe(c: int64, buf: int64, cap: int64): int64 {
 }
 
 pub fn TlsAusgabeOffen(c: int64): int64 {
+    if (peek64(c + V_12) != 0) { return Tls12AusgabeOffen(peek64(c + V_12)); }
     return peek64(c + V_OUTPOS) - peek64(c + V_OUTGELESEN);
 }
 
@@ -649,6 +578,9 @@ fn planAnwendung(c: int64): bool {
 pub fn TlsExportKeyingMaterial(c: int64, label: int64, labelLen: int64,
                                kontext: int64, kontextLen: int64,
                                out: int64, outLen: int64): bool {
+    // Der Exporter von RFC 5705 (TLS 1.2) ist nicht umgesetzt; wer ihn
+    // braucht, bekommt hier FALSE und nicht etwas Plausibles.
+    if (peek64(c + V_12) != 0) { return false; }
     if (peek64(c + V_ZUSTAND) != Z_FERTIG) { return false; }
     var hl: int64 := peek64(c + V_HASHLEN);
     var s: int64 := pScr(c) + S_EXP1;
@@ -931,7 +863,7 @@ fn suiteSetzen(c: int64, suite: int64): bool {
 
 // Erlaubte Gruppen der Konfiguration; 0 heisst beide.
 fn gruppenMaske(c: int64): int64 {
-    var m: int64 := peek64(peek64(c + V_CFG) + C_GRUPPEN);
+    var m: int64 := TlsCfgGruppen(peek64(c + V_CFG));
     if (m == 0) { return 3; }
     return m;
 }
@@ -1051,11 +983,29 @@ fn clientHelloBauen(c: int64, zweites: bool): int64 {
     p := wBytes(buf, p, c + V_RANDOM, 32);
     p := wByte(buf, p, 32);
     p := wBytes(buf, p, c + V_SESSID, 32);
-    // Cipher-Suites
-    p := w16(buf, p, 6);
-    p := w16(buf, p, CS_AES128_GCM_SHA256);
-    p := w16(buf, p, CS_AES256_GCM_SHA384);
-    p := w16(buf, p, CS_CHACHA20_SHA256);
+    // Cipher-Suites. Mit freigeschaltetem TLS 1.2 kommen dessen Suiten
+    // dahinter: ein 1.3-Server nimmt eine der ersten drei, ein Server ohne
+    // 1.3 eine der hinteren. EIN ClientHello fuer beide Versionen, weil das
+    // Transkript an den gesendeten Byte haengt und zwei verschiedene
+    // ClientHellos nicht zusammenpassen wuerden.
+    var mit12: bool := TlsCfgErlaubt12(cfg) && !zweites;
+    if (mit12) {
+        p := w16(buf, p, 18);
+        p := w16(buf, p, CS_AES128_GCM_SHA256);
+        p := w16(buf, p, CS_AES256_GCM_SHA384);
+        p := w16(buf, p, CS_CHACHA20_SHA256);
+        p := w16(buf, p, 0xC02B);                // ECDHE_ECDSA_AES128_GCM
+        p := w16(buf, p, 0xC02F);                // ECDHE_RSA_AES128_GCM
+        p := w16(buf, p, 0xCCA9);                // ECDHE_ECDSA_CHACHA20
+        p := w16(buf, p, 0xCCA8);                // ECDHE_RSA_CHACHA20
+        p := w16(buf, p, 0xC02C);                // ECDHE_ECDSA_AES256_GCM
+        p := w16(buf, p, 0xC030);                // ECDHE_RSA_AES256_GCM
+    } else {
+        p := w16(buf, p, 6);
+        p := w16(buf, p, CS_AES128_GCM_SHA256);
+        p := w16(buf, p, CS_AES256_GCM_SHA384);
+        p := w16(buf, p, CS_CHACHA20_SHA256);
+    }
     p := wByte(buf, p, 1); p := wByte(buf, p, 0);        // legacy_compression
 
     var extLenPos: int64 := p;
@@ -1063,8 +1013,13 @@ fn clientHelloBauen(c: int64, zweites: bool): int64 {
     var extStart: int64 := p;
 
     // supported_versions
-    p := w16(buf, p, 43); p := w16(buf, p, 3);
-    p := wByte(buf, p, 2); p := w16(buf, p, 0x0304);
+    if (mit12) {
+        p := w16(buf, p, 43); p := w16(buf, p, 5);
+        p := wByte(buf, p, 4); p := w16(buf, p, 0x0304); p := w16(buf, p, 0x0303);
+    } else {
+        p := w16(buf, p, 43); p := w16(buf, p, 3);
+        p := wByte(buf, p, 2); p := w16(buf, p, 0x0304);
+    }
     // supported_groups: alles, was die Konfiguration erlaubt
     var maske: int64 := gruppenMaske(c);
     var anz: int64 := 0;
@@ -1091,23 +1046,33 @@ fn clientHelloBauen(c: int64, zweites: bool): int64 {
     p := w16(buf, p, 0x0806);
     p := w16(buf, p, 0x0807);
     // server_name
-    var hostLen: int64 := peek64(cfg + C_HOSTLEN);
-    if (peek64(cfg + C_HOST) != 0 && hostLen > 0) {
+    var hostLen: int64 := TlsCfgHostLen(cfg);
+    if (TlsCfgHost(cfg) != 0 && hostLen > 0) {
         p := w16(buf, p, 0); p := w16(buf, p, hostLen + 5);
         p := w16(buf, p, hostLen + 3);
         p := wByte(buf, p, 0); p := w16(buf, p, hostLen);
-        p := wBytes(buf, p, peek64(cfg + C_HOST), hostLen);
+        p := wBytes(buf, p, TlsCfgHost(cfg), hostLen);
     }
     // ALPN
-    var alpnLen: int64 := peek64(cfg + C_ALPNLEN);
-    if (peek64(cfg + C_ALPN) != 0 && alpnLen > 0) {
+    var alpnLen: int64 := TlsCfgAlpnLen(cfg);
+    if (TlsCfgAlpn(cfg) != 0 && alpnLen > 0) {
         var merk: int64 := p;
         p := w16(buf, p, 16); p += 4;                     // Laengen spaeter
         var listenStart: int64 := p;
-        p := alpnSchreiben(buf, p, peek64(cfg + C_ALPN), alpnLen);
+        p := alpnSchreiben(buf, p, TlsCfgAlpn(cfg), alpnLen);
         var listenLen: int64 := p - listenStart;
         w16(buf, merk + 2, listenLen + 2);
         w16(buf, merk + 4, listenLen);
+    }
+
+    // Die Zutaten, die TLS 1.2 braucht: ohne sie lehnt die 1.2-Maschine den
+    // Handschlag ab (Extended Master Secret ist dort Pflicht).
+    if (mit12) {
+        p := w16(buf, p, 23); p := w16(buf, p, 0);        // extended_master_secret
+        p := w16(buf, p, 0xFF01); p := w16(buf, p, 1);    // renegotiation_info
+        p := wByte(buf, p, 0);
+        p := w16(buf, p, 11); p := w16(buf, p, 2);        // ec_point_formats
+        p := wByte(buf, p, 1); p := wByte(buf, p, 0);
     }
 
     // Cookie aus dem HelloRetryRequest unveraendert zurueckgeben (§4.2.2).
@@ -1298,25 +1263,25 @@ fn signaturInhalt(c: int64, serverRolle: bool, out: int64): int64 {
 fn aktKette(c: int64): int64 {
     var e: int64 := peek64(c + V_KETTE);
     if (e != 0) { return peek64(e + 16); }
-    return peek64(peek64(c + V_CFG) + C_CERT);
+    return TlsCfgCert(peek64(c + V_CFG));
 }
 
 fn aktKetteN(c: int64): int64 {
     var e: int64 := peek64(c + V_KETTE);
     if (e != 0) { return peek64(e + 24); }
-    return peek64(peek64(c + V_CFG) + C_CERTN);
+    return TlsCfgCertN(peek64(c + V_CFG));
 }
 
 fn aktKey(c: int64): int64 {
     var e: int64 := peek64(c + V_KETTE);
     if (e != 0) { return peek64(e + 32); }
-    return peek64(peek64(c + V_CFG) + C_KEY);
+    return TlsCfgKey(peek64(c + V_CFG));
 }
 
 fn aktKeyLen(c: int64): int64 {
     var e: int64 := peek64(c + V_KETTE);
     if (e != 0) { return peek64(e + 40); }
-    return peek64(peek64(c + V_CFG) + C_KEYLEN);
+    return TlsCfgKeyLen(peek64(c + V_CFG));
 }
 
 // Kette nach dem SNI des ClientHello waehlen. Die Tabelle wird JE
@@ -1330,8 +1295,8 @@ fn aktKeyLen(c: int64): int64 {
 fn ketteWaehlen(c: int64): int64 {
     var cfg: int64 := peek64(c + V_CFG);
     poke64(c + V_KETTE, 0);
-    var tab: int64 := peek64(cfg + C_KETTEN);
-    var n: int64 := peek64(cfg + C_KETTENN);
+    var tab: int64 := TlsCfgKetten(cfg);
+    var n: int64 := TlsCfgKettenN(cfg);
 
     if (tab != 0 && n > 0) {
         var host: int64 := c + V_SNIBUF;
@@ -1365,8 +1330,8 @@ fn ketteWaehlen(c: int64): int64 {
         return 0;
     }
 
-    if (peek64(cfg + C_CERT) == 0 || peek64(cfg + C_CERTN) <= 0
-        || peek64(cfg + C_KEY) == 0) { return E_KONFIG; }
+    if (TlsCfgCert(cfg) == 0 || TlsCfgCertN(cfg) <= 0
+        || TlsCfgKey(cfg) == 0) { return E_KONFIG; }
     return 0;
 }
 
@@ -1762,12 +1727,12 @@ fn clientHelloLesen(c: int64, pos: int64, len: int64): int64 {
 
     // ALPN: erste gemeinsame Kennung in der Reihenfolge des Servers
     var cfg: int64 := peek64(c + V_CFG);
-    if (peek64(cfg + C_ALPN) != 0 && peek64(cfg + C_ALPNLEN) > 0) {
+    if (TlsCfgAlpn(cfg) != 0 && TlsCfgAlpnLen(cfg) > 0) {
         var ap: int64 := extSuchen(pos, p, len - p, 16, el);
         if (ap >= 0) {
             var listeLen: int64 := r16(ap, 0);
-            var eigene: int64 := peek64(cfg + C_ALPN);
-            var eigeneLen: int64 := peek64(cfg + C_ALPNLEN);
+            var eigene: int64 := TlsCfgAlpn(cfg);
+            var eigeneLen: int64 := TlsCfgAlpnLen(cfg);
             var start: int64 := 0;
             var idx: int64 := 0;
             while (idx <= eigeneLen && peek64(c + V_ALPNSELLEN) == 0) {
@@ -1842,24 +1807,24 @@ fn certLesen(c: int64, pos: int64, len: int64, serverSeite: bool): int64 {
     }
     poke64(c + V_PEERCERTOK, 1);
 
-    if (peek64(cfg + C_PRUEFEN) != 0) {
+    if (TlsCfgPruefen(cfg) != 0) {
         var host: int64 := 0;
         var hostLen: int64 := 0;
         var zweck: int64 := 2;                      // clientAuth
         if (!serverSeite) {
-            host := peek64(cfg + C_HOST);
-            hostLen := peek64(cfg + C_HOSTLEN);
+            host := TlsCfgHost(cfg);
+            hostLen := TlsCfgHostLen(cfg);
             zweck := 1;                             // serverAuth
         }
-        var rc: int64 := X509PruefeKette(kette, n, peek64(cfg + C_TRUST),
-                                         peek64(cfg + C_TRUSTN), host, hostLen,
-                                         peek64(cfg + C_JETZT), zweck);
+        var rc: int64 := X509PruefeKette(kette, n, TlsCfgTrust(cfg),
+                                         TlsCfgTrustN(cfg), host, hostLen,
+                                         TlsCfgJetzt(cfg), zweck);
         if (rc != 0) { return E_ZERTIFIKAT; }
     }
 
     // Widerruf (OCSP/CRL) macht die Anwendung: sie bekommt den geprueften
     // Satz des Blattes und entscheidet. 0 = gueltig.
-    var hook: int64 := peek64(cfg + C_WIDERRUF);
+    var hook: int64 := TlsCfgWiderruf(cfg);
     if (hook != 0) {
         if (widerrufRufen(hook as TlsWiderrufFn, peek64(c + V_PEERCERT)) != 0) {
             return E_WIDERRUFEN;
@@ -1936,6 +1901,145 @@ fn finishedLesen(c: int64, pos: int64, len: int64, secret: int64): int64 {
 // ---------------------------------------------------------------------------
 // Ablauf
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Verteiler zwischen TLS 1.3 und TLS 1.2
+//
+// Diese Unit ist das gemeinsame Tor: die Anwendung stellt EINE Konfiguration
+// auf, ruft TlsNeu/TlsSchritt/TlsLese/TlsSchreibe und bekommt die Version,
+// auf die sich beide Seiten einigen. TLS 1.2 muss dafuer ausdruecklich
+// freigeschaltet sein (TlsConfigMinVersion), sonst gibt es nur 1.3 — so
+// verlangt es #2096.
+//
+// Uebergeben wird NICHT der Zustand, sondern der angefangene Handschlag:
+//   Server: das ClientHello liegt noch unausgepackt im Eingangspuffer. Steht
+//           darin kein supported_versions mit 0x0304, wird alles Rohmaterial
+//           an die 1.2-Maschine gefuettert und diese fuehrt den Handschlag
+//           von Anfang an.
+//   Client: das ClientHello ist schon gesendet und in O_CH aufbewahrt. Die
+//           1.2-Maschine uebernimmt Zufallswort, Gruppe, Schluesselpaar und
+//           die gesendeten Byte (Tls12UebernehmenClient) und bekommt dann die
+//           bereits ausgepackten Handschlagbyte (Tls12FuetterHandschlag)
+//           sowie den noch rohen Rest des Eingangspuffers.
+// ---------------------------------------------------------------------------
+
+// Sucht im Erweiterungsblock eines ClientHello nach supported_versions und
+// sagt, ob 0x0304 darin steht. Arbeitet auf den ROHEN Byte einer
+// Handschlagnachricht (ohne Recordkopf).
+fn chBietet13(ch: int64, len: int64, elPtr: int64): bool {
+    if (len < 38) { return false; }
+    var sidLen: int64 := peek8(ch + 34) & 0xFF;
+    if (sidLen > 32) { return false; }
+    var p: int64 := 35 + sidLen;
+    if (p + 2 > len) { return false; }
+    var csLen: int64 := r16(ch, p);
+    p := p + 2 + csLen;
+    if (p + 1 > len) { return false; }
+    var compLen: int64 := peek8(ch + p) & 0xFF;
+    p := p + 1 + compLen;
+    if (p + 2 > len) { return false; }
+    var sv: int64 := extSuchen(ch, p, len - p, 43, elPtr);
+    if (sv < 0) { return false; }
+    var svLen: int64 := peek8(sv) & 0xFF;
+    var q: int64 := 1;
+    var gefunden: bool := false;
+    while (q + 1 < 1 + svLen + 1) {
+        if (r16(sv, q) == 0x0304) { gefunden := true; }
+        q += 2;
+    }
+    return gefunden;
+}
+
+// Server: steht im Eingangspuffer ein vollstaendiges ClientHello, das kein
+// TLS 1.3 anbietet? Dann uebernimmt die 1.2-Maschine.
+// Rueckgabe: 1 uebergeben, 0 noch nichts zu entscheiden, <0 Fehler.
+fn verteilerServer(c: int64): int64 {
+    var cfg: int64 := peek64(c + V_CFG);
+    if (!TlsCfgErlaubt12(cfg)) { return 0; }
+    var vorhanden: int64 := peek64(c + V_INPOS);
+    if (vorhanden < 5) { return 0; }
+    var b: int64 := pIn(c);
+    if ((peek8(b) & 0xFF) != RT_HANDSHAKE) { return 0; }
+    var len: int64 := ((peek8(b + 3) & 0xFF) << 8) | (peek8(b + 4) & 0xFF);
+    if (vorhanden < 5 + len) { return 0; }          // noch nicht ganz da
+    if (len < 4) { return 0; }
+    if ((peek8(b + 5) & 0xFF) != HS_CLIENT_HELLO) { return 0; }
+    var chLen: int64 := r24(b + 5, 1);
+    if (chLen + 4 > len) { return 0; }
+    var el: int64 := pScr(c) + S_EL;
+    // Auf 1.2 wird umgeschaltet, wenn der Client KEIN 1.3 anbietet oder wenn
+    // WIR keines erlauben (TlsConfigMaxVersion). Beides einzeln geprueft: ein
+    // Server mit abgeschaltetem 1.3 darf nicht doch 1.3 sprechen, bloss weil
+    // der Client es anbietet.
+    if (TlsCfgErlaubt13(cfg) && chBietet13(b + 9, chLen, el)) { return 0; }
+    var c12: int64 := Tls12Neu(cfg);
+    if (c12 == 0) { return E_KONFIG; }
+    // ALLES Rohmaterial weitergeben; die 1.2-Maschine packt selbst aus.
+    if (Tls12Fuetter(c12, b, vorhanden) != vorhanden) {
+        Tls12Frei(c12);
+        return E_PUFFER;
+    }
+    poke64(c + V_INPOS, 0);
+    poke64(c + V_12, c12);
+    return 1;
+}
+
+// Client: das ServerHello liegt schon ausgepackt im Handschlagpuffer. Sagt
+// es nicht 0x0304, uebernimmt die 1.2-Maschine den angefangenen Handschlag.
+fn verteilerClient(c: int64): int64 {
+    var cfg: int64 := peek64(c + V_CFG);
+    if (!TlsCfgErlaubt12(cfg)) { return 0; }
+    var tp: int64 := pScr(c) + S_TP;
+    var pp: int64 := pScr(c) + S_PP;
+    var lp: int64 := pScr(c) + S_LP;
+    if (!hsAnsehen(c, tp, pp, lp)) { return 0; }
+    if (peek64(tp) != HS_SERVER_HELLO) { return 0; }
+    var pos: int64 := peek64(pp);
+    var len: int64 := peek64(lp);
+    if (len < 38) { return 0; }
+    var sidLen: int64 := peek8(pos + 34) & 0xFF;
+    if (sidLen > 32) { return 0; }
+    var q: int64 := 35 + sidLen + 3;
+    var el: int64 := pScr(c) + S_EL;
+    var ist13: bool := false;
+    if (len > q) {
+        var sv: int64 := extSuchen(pos, q, len - q, 43, el);
+        if (sv >= 0 && peek64(el) == 2 && r16(sv, 0) == 0x0304) { ist13 := true; }
+    }
+    if (ist13) { return 0; }
+
+    var c12: int64 := Tls12Neu(cfg);
+    if (c12 == 0) { return E_KONFIG; }
+    var grp: int64 := peek64(c + V_GRUPPE);
+    if (!Tls12UebernehmenClient(c12, c + V_RANDOM, grp, c + V_EPH_SK,
+                                gruppenPk(c), pCh(c), peek64(c + V_CHLEN))) {
+        Tls12Frei(c12);
+        return E_VERSION;
+    }
+    // die schon ausgepackten Handschlagbyte (ServerHello und was mit im
+    // Record stand) weitergeben ...
+    var hsOffen: int64 := peek64(c + V_HSPOS) - peek64(c + V_HSGELESEN);
+    if (hsOffen > 0) {
+        if (Tls12FuetterHandschlag(c12, pHs(c) + peek64(c + V_HSGELESEN),
+                                   hsOffen) != 0) {
+            Tls12Frei(c12);
+            return E_PUFFER;
+        }
+    }
+    poke64(c + V_HSPOS, 0);
+    poke64(c + V_HSGELESEN, 0);
+    // ... und den noch rohen Rest des Eingangspuffers.
+    var roh: int64 := peek64(c + V_INPOS);
+    if (roh > 0) {
+        if (Tls12Fuetter(c12, pIn(c), roh) != roh) {
+            Tls12Frei(c12);
+            return E_PUFFER;
+        }
+        poke64(c + V_INPOS, 0);
+    }
+    poke64(c + V_12, c12);
+    return 1;
+}
 
 fn fehlerSetzen(c: int64, rc: int64): int64 {
     poke64(c + V_ZUSTAND, Z_FEHLER);
@@ -2039,7 +2143,7 @@ fn clientHandschlag(c: int64): int64 {
             if (!planAnwendung(c)) { return fehlerSetzen(c, E_KONFIG); }
 
             if (peek64(c + V_CERTREQ) != 0) {
-                if (peek64(cfg + C_CERT) != 0 && peek64(cfg + C_CERTN) > 0) {
+                if (TlsCfgCert(cfg) != 0 && TlsCfgCertN(cfg) > 0) {
                     var rc4: int64 := certSenden(c);
                     if (rc4 == 0) { rc4 := certVerifySenden(c, false); }
                     if (rc4 != 0) { return fehlerSetzen(c, rc4); }
@@ -2122,7 +2226,7 @@ fn serverClientHello(c: int64): int64 {
     if (!leseSchluessel(c, c + V_SEC_CHS, 1)) { return fehlerSetzen(c, E_KONFIG); }
 
     rc := eeSenden(c);
-    if (rc == 0 && peek64(cfg + C_CLIENTAUTH) != 0) { rc := certRequestSenden(c); }
+    if (rc == 0 && TlsCfgClientAuth(cfg) != 0) { rc := certRequestSenden(c); }
     if (rc == 0) { rc := certSenden(c); }
     if (rc == 0) { rc := certVerifySenden(c, true); }
     if (rc == 0) { rc := finishedSenden(c, c + V_SEC_SHS); }
@@ -2154,7 +2258,7 @@ fn serverClientFinished(c: int64): int64 {
                 if (r24(pos, 1 + ctxLen) == 0) { leerKette := true; }
             }
             if (leerKette) {
-                if (peek64(cfg + C_CLIENTAUTH) == 2) {
+                if (TlsCfgClientAuth(cfg) == 2) {
                     return fehlerSetzen(c, E_ZERTIFIKAT);
                 }
             } else {
@@ -2172,7 +2276,7 @@ fn serverClientFinished(c: int64): int64 {
             var rc3: int64 := finishedLesen(c, pos, len, c + V_SEC_CHS);
             if (rc3 != 0) { return fehlerSetzen(c, rc3); }
             hsVerbrauchen(c, len, true);
-            if (peek64(cfg + C_CLIENTAUTH) == 2 && peek64(c + V_PEERCERTOK) == 0) {
+            if (TlsCfgClientAuth(cfg) == 2 && peek64(c + V_PEERCERTOK) == 0) {
                 return fehlerSetzen(c, E_ZERTIFIKAT);
             }
             if (!leseSchluessel(c, c + V_SEC_CAP, 2)) { return fehlerSetzen(c, E_KONFIG); }
@@ -2207,22 +2311,47 @@ fn zustandSchritt(c: int64): int64 {
 // Schluesselstand von vor dem ServerHello zu lesen — der ganze Flug des
 // Servers kommt in einem TCP-Segment.
 pub fn TlsSchritt(c: int64): int64 {
+    if (peek64(c + V_12) != 0) { return Tls12Schritt(peek64(c + V_12)); }
     var z: int64 := peek64(c + V_ZUSTAND);
     if (z == Z_FEHLER) { return peek64(c + V_FEHLER); }
     if (z == Z_FERTIG) { return 0; }
     if (z == Z_ZU) { return E_GESCHLOSSEN; }
 
     if (z == Z_START) {
+        // Ist 1.3 abgeschaltet, baut die 1.2-Maschine das ClientHello selbst
+        // — ein 1.3-ClientHello zu senden und danach umzusteigen waere
+        // Unsinn, weil die Gegenseite 1.3 annehmen koennte.
+        if (!TlsCfgErlaubt13(peek64(c + V_CFG))
+            && TlsCfgErlaubt12(peek64(c + V_CFG))) {
+            var c12n: int64 := Tls12Neu(peek64(c + V_CFG));
+            if (c12n == 0) { return fehlerSetzen(c, E_KONFIG); }
+            poke64(c + V_12, c12n);
+            return Tls12Schritt(c12n);
+        }
         var rc0: int64 := clientStart(c);
         if (rc0 < 0) { return rc0; }
         if (TlsAusgabeOffen(c) > 0) { return TlsWantWrite(); }
         return TlsWantRead();
     }
 
+    // Server: vor dem ersten Record entscheiden, welche Version laeuft.
+    if (z == Z_WARTE_CH) {
+        var rv: int64 := verteilerServer(c);
+        if (rv < 0) { return fehlerSetzen(c, rv); }
+        if (rv == 1) { return Tls12Schritt(peek64(c + V_12)); }
+    }
+
     var weiter: bool := true;
     while (weiter) {
         weiter := false;
         var vor: int64 := peek64(c + V_ZUSTAND);
+        // Client: antwortet die Gegenseite nicht mit 1.3, uebernimmt die
+        // 1.2-Maschine den angefangenen Handschlag.
+        if (vor == Z_WARTE_SH) {
+            var rv2: int64 := verteilerClient(c);
+            if (rv2 < 0) { return fehlerSetzen(c, rv2); }
+            if (rv2 == 1) { return Tls12Schritt(peek64(c + V_12)); }
+        }
         var r: int64 := zustandSchritt(c);
         if (r < 0) { return r; }
         if (peek64(c + V_ZUSTAND) != vor) { weiter := true; }
@@ -2249,6 +2378,7 @@ pub fn TlsSchritt(c: int64): int64 {
 // Anwendungsdaten senden. Records werden auf 16384 Byte Klartext begrenzt
 // (§5.2). Liefert die Anzahl verarbeiteter Byte oder einen Fehler.
 pub fn TlsSchreibe(c: int64, buf: int64, len: int64): int64 {
+    if (peek64(c + V_12) != 0) { return Tls12Schreibe(peek64(c + V_12), buf, len); }
     if (peek64(c + V_ZUSTAND) != Z_FERTIG) { return E_ABLAUF; }
     var pos: int64 := 0;
     while (pos < len) {
@@ -2269,6 +2399,7 @@ pub fn TlsSchreibe(c: int64, buf: int64, len: int64): int64 {
 
 // Empfangene Anwendungsdaten abholen. 0 heisst "noch nichts da".
 pub fn TlsLese(c: int64, buf: int64, cap: int64): int64 {
+    if (peek64(c + V_12) != 0) { return Tls12Lese(peek64(c + V_12), buf, cap); }
     var z: int64 := peek64(c + V_ZUSTAND);
     if (z == Z_FEHLER) { return peek64(c + V_FEHLER); }
     var rc: int64 := pumpe(c);
@@ -2339,6 +2470,9 @@ fn secretFortschreiben(c: int64, secret: int64): bool {
 // `anfordern` setzt request_update, verlangt also auch von der Gegenseite
 // ein KeyUpdate.
 pub fn TlsKeyUpdateSenden(c: int64, anfordern: bool): int64 {
+    // TLS 1.2 kennt kein KeyUpdate; dort gaebe es nur Renegotiation, und
+    // die wird abgewiesen.
+    if (peek64(c + V_12) != 0) { return E_UNTERSTUETZT; }
     if (peek64(c + V_ZUSTAND) != Z_FERTIG) { return E_ABLAUF; }
     var b: int64 := pScr(c) + S_KOPF;
     if (anfordern) { poke8(b, 1); } else { poke8(b, 0); }
@@ -2387,6 +2521,7 @@ fn nachHandschlag(c: int64): int64 {
 
 // close_notify senden (§6.1).
 pub fn TlsSchliessen(c: int64): void {
+    if (peek64(c + V_12) != 0) { Tls12Schliessen(peek64(c + V_12)); return; }
     if (peek64(c + V_ZUSTAND) == Z_FERTIG) { alertSenden(c, 1, 0); }
     poke64(c + V_ZUSTAND, Z_ZU);
 }
