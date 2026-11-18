@@ -1,0 +1,103 @@
+feat(tls): Wiederaufnahme ueber PSK und NewSessionTicket (#2577)
+
+Stufe 3 aus #2096, erster Vorgang. Ein zweiter Handschlag kostet damit keine
+Signatur und keine Skalarmultiplikation mehr — und das ist nicht behauptet,
+sondern gemessen: im Wiederaufnahmeflug steht KEIN Certificate und KEIN
+CertificateVerify.
+
+**Was gebaut ist**
+
+- Ticketschluessel in der Konfiguration, mit ZWEI Generationen:
+  ausgegeben wird mit der aktuellen, angenommen werden beide. Ohne die
+  vorige waeren beim Schluesselwechsel alle ausgegebenen Tickets im selben
+  Augenblick wertlos, und jede Wiederaufnahme fiele auf einen vollen
+  Handschlag zurueck — bei vielen Verbindungen ein Lastsprung, der wie ein
+  Ausfall aussieht.
+- Der Schluessel kommt vom BETREIBER (TlsConfigTicketSchluessel), nicht aus
+  einem Zufallsgenerator beim Start: mehrere Server hinter einem Verteiler
+  brauchen denselben, sonst nimmt nur der Prozess ein Ticket an, der es
+  ausgegeben hat. Das faellt im Betrieb als "Wiederaufnahme funktioniert
+  manchmal" auf und ist schwer zu finden.
+- resumption_master_secret (§7.1), auf BEIDEN Seiten an derselben
+  Transkriptstelle gebildet: unmittelbar nachdem das Client-Finished im Hash
+  steht. Eine Seite, die es frueher oder spaeter bildet, rechnet eine andere
+  Zahl — und merkt es erst am Binder einer SPAETEREN Verbindung.
+- Ticketformat: Fassung | Generation | Nonce(12) | AES-256-GCM | Tag(16).
+  Fassung und Generation stehen im Klartext UND in der AAD: der Leser
+  braucht die Generation, um den Schluessel zu waehlen, und ein gekipptes
+  Byte laesst trotzdem das Tag scheitern. Die GCM-Nonce ist ZUFAELLIG, nicht
+  gezaehlt — zwei Server mit demselben Ticketschluessel und je einem Zaehler
+  bei 0 benutzten sonst dieselbe Nonce zweimal, und eine wiederholte
+  GCM-Nonce gibt den Authentifizierungsschluessel her.
+- NewSessionTicket (§4.6.1) senden und lesen, mit zufaelligem
+  ticket_age_add (ohne ihn verraet das gemeldete Alter den
+  Ausstellzeitpunkt) und ticket_nonce fuer die PSK-Ableitung.
+- psk_key_exchange_modes: NUR psk_dhe_ke. Ohne frisches Diffie-Hellman
+  haette die wiederaufgenommene Sitzung keine Vorwaertssicherheit — wer den
+  Ticketschluessel spaeter erbeutet, liest alles mit. Kein Schalter.
+- pre_shared_key als LETZTE Erweiterung (§4.2.11) samt Binder, und auf der
+  Serverseite die Pruefung mit CTMemEqual.
+- Der Schluesselplan bekommt einen PARAMETER statt einer Kopie: voller
+  Handschlag und Wiederaufnahme unterscheiden sich in genau einer Zeile
+  (early_secret aus 0 oder aus dem PSK, §7.1).
+
+**Drei Befunde, die erst der LAUF gefunden hat**
+
+1. Der Server siegelte das resumption_master_secret statt des daraus
+   abgeleiteten PSK. Der Client rechnet
+   Expand(res_master, "resumption", nonce); mit dem Rohgeheimnis stimmt der
+   Binder nie. Gemeldet als E_SIGNATUR, eingegrenzt durch eine UNABHAENGIGE
+   Nachrechnung im Prueflaeufer — sie zeigte auf den Server, nicht auf den
+   Client.
+2. NAMENSUEBERSCHATTUNG, zum zweiten Mal in dieser Arbeit: der Parameter
+   `nonce` (ticket_nonce) wurde von der lokalen AES-GCM-Nonce verdeckt, und
+   der PSK entstand aus einem Zufallsbyte. Beides int64, der Compiler sagt
+   nichts. Jetzt `tnonce` und `gnonce`, mit Querverweis auf dieselbe Falle in
+   std/crypto/ec.lyx (dort `n` gegen die Kurvenordnung).
+3. Nachhandschlagnachrichten wurden NUR in TlsLese abgearbeitet. Damit
+   bekam ein Client, der nichts liest, sein Ticket nie — der Server schickt
+   es unmittelbar nach dem Client-Finished, also bevor Anwendungsdaten
+   anliegen. TlsSchritt heisst "bring den Zustand voran"; eine Nachricht
+   liegen zu lassen, bis die Anwendung zufaellig liest, widerspricht dem.
+
+Dass meine erste Sonde Punkt 3 NICHT zeigte, lag daran, dass sie
+Anwendungsdaten austauschte und damit TlsLese aufrief. Ein Test mit
+Sollwerten findet mehr als eine Sonde, die man nach dem Ergebnis liest.
+
+**Nachweis: tests/tls_wiederaufnahme_test.sh, 28 Pruefungen, ALL PASS**
+
+Die tragende Messung ist die Gegenueberstellung:
+
+                       Wiederaufnahme   voller Handschlag
+    Certificate                     0                   1
+    CertificateVerify               0                   1
+
+Ohne die zweite Spalte waere "0 Zertifikate" auch von einem Server erfuellt,
+der nie eines schickt. Dazu: res_master beidseitig bitgleich, PSK gegen eine
+UNABHAENGIGE Rechnung, Nutzdaten nach der Wiederaufnahme.
+
+Gegenproben, die greifen muessen:
+  gekipptes Ticket        -> VOLLER Handschlag mit Zertifikat, KEIN Abbruch
+                             (§4.2.11 erlaubt, ein unbrauchbares Ticket zu
+                             ignorieren; ein abgelaufenes ist Alltag)
+  falscher PSK, gueltiges
+  Ticket                  -> ABBRUCH, -7 (§4.2.11.2 "MUST abort": wer das
+                             Ticket hat und den PSK nicht kennt, greift an)
+  fremde Generation       -> abgewiesen, obwohl das Byte im Klartext steht
+  abgelaufen / Zukunft    -> abgewiesen, nach der Uhr des SERVERS
+  fremder Ticketschluessel-> abgewiesen
+  kein Ticketschluessel   -> Handschlag laeuft, KEIN Ticket geht hinaus
+
+Speicher je Verbindung 134880 -> 135752 Byte; die Zahl steht im
+Handschlagtest und faellt bei jeder weiteren Verschiebung auf.
+
+Alle TLS-Tests danach gruen: tls13_handschlag, tls12_handschlag,
+tls_version_weiche, tls13_rfc8448, tls_nullgeheimnis, tls_capabilities,
+tls13_hrr_gruppen, tls_p384, tls13_schluesselarten.
+
+Nicht enthalten: 0-RTT (#2578) — es setzt diese Arbeit voraus und braucht
+zusaetzlich den Wiederholungsschutz, ohne den ein Server SCHWAECHER waere
+als ohne 0-RTT.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_016wQpaEQcc4wj4aekzT615v
