@@ -19,6 +19,36 @@ FAIL=0
 _pass() { echo "PASS $1"; PASS=$((PASS+1)); }
 _fail() { echo "FAIL $1: $2"; FAIL=$((FAIL+1)); }
 
+# Ein Prüfling, der nicht entsteht, darf nicht still durchfallen: unter
+# `set -euo pipefail` beendete ein scheiterndes `dd` die ganze Suite nach dem
+# letzten PASS, ohne FAIL-Zeile und ohne Grund — der Lauf sah aus wie
+# abgeschnitten. Auslöser war eine /tmp-Quota, die `df` nicht zeigt.
+# Darum erzeugt alles Große über diese zwei Helfer, und sie melden laut.
+_fixture_fehlt() {
+  echo "FAIL $1: Pruefling nicht erzeugt — $2"
+  FAIL=$((FAIL+1))
+  echo ""
+  echo "Ergebnis: $PASS PASS, $FAIL FAIL"
+  exit 1
+}
+
+# _dd <testnr> <blockgroesse> <anzahl> <ziel> — echte Bytes aus /dev/urandom,
+# zählt voll gegen Platz und Quota.
+_dd() {
+  local nr="$1" bs="$2" anzahl="$3" ziel="$4" err
+  if ! err="$(dd if=/dev/urandom bs="$bs" count="$anzahl" of="$ziel" 2>&1)"; then
+    _fixture_fehlt "$nr" "dd $bs x $anzahl nach $ziel: $(printf '%s' "$err" | tail -1)"
+  fi
+}
+
+# _sparse <testnr> <bytes> <ziel> — Löcherdatei, belegt (fast) keinen Platz.
+_sparse() {
+  local nr="$1" bytes="$2" ziel="$3" err
+  if ! err="$(truncate -s "$bytes" "$ziel" 2>&1)"; then
+    _fixture_fehlt "$nr" "truncate $bytes nach $ziel: $(printf '%s' "$err" | tail -1)"
+  fi
+}
+
 # ── Hilfsfunktionen ──────────────────────────────────────────────────────────
 
 # Baut ein Lyx-Programm, das FileReadAll(argv[1]) aufruft.
@@ -68,7 +98,7 @@ else
 fi
 
 # Test 3: 1 KB Datei → OK
-dd if=/dev/urandom bs=1024 count=1 of="$TMP/1k.bin" 2>/dev/null
+_dd 3 1024 1 "$TMP/1k.bin"
 if "$READER_BIN" "$TMP/1k.bin" > /dev/null 2>&1; then
   _pass 3
 else
@@ -76,7 +106,7 @@ else
 fi
 
 # Test 4: 1 MB Datei → OK
-dd if=/dev/urandom bs=1048576 count=1 of="$TMP/1m.bin" 2>/dev/null
+_dd 4 1048576 1 "$TMP/1m.bin"
 if "$READER_BIN" "$TMP/1m.bin" > /dev/null 2>&1; then
   _pass 4
 else
@@ -84,7 +114,7 @@ else
 fi
 
 # Test 5: 16 MB Datei → OK
-dd if=/dev/urandom bs=1048576 count=16 of="$TMP/16m.bin" 2>/dev/null
+_dd 5 1048576 16 "$TMP/16m.bin"
 if "$READER_BIN" "$TMP/16m.bin" > /dev/null 2>&1; then
   _pass 5
 else
@@ -92,7 +122,7 @@ else
 fi
 
 # Test 6: 64 MB Datei → OK
-dd if=/dev/urandom bs=1048576 count=64 of="$TMP/64m.bin" 2>/dev/null
+_dd 6 1048576 64 "$TMP/64m.bin"
 if "$READER_BIN" "$TMP/64m.bin" > /dev/null 2>&1; then
   _pass 6
 else
@@ -100,7 +130,7 @@ else
 fi
 
 # Test 7: 128 MB Datei → OK
-dd if=/dev/urandom bs=1048576 count=128 of="$TMP/128m.bin" 2>/dev/null
+_dd 7 1048576 128 "$TMP/128m.bin"
 if "$READER_BIN" "$TMP/128m.bin" > /dev/null 2>&1; then
   _pass 7
 else
@@ -111,7 +141,7 @@ fi
 
 # Test 8: genau 256 MB (= 268435456 Bytes) — exakt am Limit → OK
 # Sparse-Datei: kein echter Disk-Verbrauch
-truncate -s 268435456 "$TMP/exactly256m.bin"
+_sparse 8 268435456 "$TMP/exactly256m.bin"
 if "$READER_BIN" "$TMP/exactly256m.bin" > /dev/null 2>&1; then
   _pass 8
 else
@@ -119,7 +149,7 @@ else
 fi
 
 # Test 9: 256 MB + 1 Byte (268435457) → ÜBER dem Limit → FileReadAll gibt 0 zurück
-truncate -s 268435457 "$TMP/over256m.bin"
+_sparse 9 268435457 "$TMP/over256m.bin"
 if ! "$READER_BIN" "$TMP/over256m.bin" > /dev/null 2>&1; then
   _pass 9
 else
@@ -127,7 +157,7 @@ else
 fi
 
 # Test 10: 512 MB (sparse) → FileReadAll gibt 0 zurück
-truncate -s 536870912 "$TMP/512m.bin"
+_sparse 10 536870912 "$TMP/512m.bin"
 if ! "$READER_BIN" "$TMP/512m.bin" > /dev/null 2>&1; then
   _pass 10
 else
@@ -135,7 +165,7 @@ else
 fi
 
 # Test 11: 1 GB (sparse) → FileReadAll gibt 0 zurück
-truncate -s 1073741824 "$TMP/1g.bin"
+_sparse 11 1073741824 "$TMP/1g.bin"
 if ! "$READER_BIN" "$TMP/1g.bin" > /dev/null 2>&1; then
   _pass 11
 else
@@ -143,7 +173,7 @@ else
 fi
 
 # Test 12: 4 GB (sparse) → FileReadAll gibt 0 zurück (OOM-Angriff)
-truncate -s 4294967296 "$TMP/4g.bin"
+_sparse 12 4294967296 "$TMP/4g.bin"
 if ! "$READER_BIN" "$TMP/4g.bin" > /dev/null 2>&1; then
   _pass 12
 else
@@ -169,7 +199,7 @@ fi
 
 # Test 15: Überdimensionale Haupt-.lyx-Datei (sparse) → Compiler gibt Fehler aus
 # FileReadAll gibt null → lyxc: "Cannot read input file"
-truncate -s 268435457 "$TMP/huge.lyx"
+_sparse 15 268435457 "$TMP/huge.lyx"
 OUT15=$("$LYXC" "$TMP/huge.lyx" -o "$TMP/huge_bin" 2>&1) || true
 if [ $? -ne 0 ] || ! echo "$OUT15" | grep -qE "Cannot read|Cannot open|error"; then
   : # The command failed (expected) - $? will be non-zero from the || true
@@ -190,7 +220,7 @@ fi
 
 # Test 17: Import einer >256 MB .lyu-Datei → _sema_readFile Fehlermeldung mit "256-MB-Limit"
 # Simuliere ein zu großes precompiliertes Unit
-truncate -s 268435457 "$TMP/fatunit.lyu"
+_sparse 17 268435457 "$TMP/fatunit.lyu"
 cat > "$TMP/import_fat.lyx" << 'LYXEOF'
 import fatunit;
 fn main(): int64 { return 0; }
@@ -212,7 +242,7 @@ fi
 
 # Test 19: Grenzwert: 256 MB - 1 Byte (268435455) → noch lesbar
 # Diese sparse-Datei hat 268435455 Bytes = 256 MB - 1 → unter Limit
-truncate -s 268435455 "$TMP/just_under.bin"
+_sparse 19 268435455 "$TMP/just_under.bin"
 if "$READER_BIN" "$TMP/just_under.bin" > /dev/null 2>&1; then
   _pass 19
 else
@@ -220,7 +250,7 @@ else
 fi
 
 # Test 20: Mehrfachaufruf mit mix aus kleinen und großen Dateien → kein Zustandsproblem
-truncate -s 268435457 "$TMP/big_again.bin"
+_sparse 20 268435457 "$TMP/big_again.bin"
 echo -n "ok" > "$TMP/small_again.txt"
 if ! "$READER_BIN" "$TMP/big_again.bin" > /dev/null 2>&1; then
   if "$READER_BIN" "$TMP/small_again.txt" > /dev/null 2>&1; then
