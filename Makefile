@@ -871,6 +871,10 @@ test: lyxc
 	@bash tests/lyxos_argc_2482_test.sh
 	@echo "--- Kernelnummern kommen aus der erzeugten Tabelle an (#2549) ---"
 	@bash tests/lyxos_gen_builtins_2549_test.sh
+	@echo "--- mmap-Fehlerwert auf LyxOS ist 0, nicht -1 (#2594) ---"
+	@bash tests/lyxos_mmap_fehlerwert_2594_test.sh
+	@echo "--- annehmender Horcher auf LyxOS ueber sys_accept (#2593) ---"
+	@bash tests/lyxos_accept_2593_test.sh
 	@echo "--- Socket-Block 1536-1545: Gestalt am Aufruf und an der Emission (#2589) ---"
 	@bash tests/lyxos_socket_gestalt_2589_test.sh
 	@echo "--- faltbarer Zweig wird nicht gesenkt, Gates bleiben scharf (#2513) ---"
