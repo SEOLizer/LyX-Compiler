@@ -21,8 +21,8 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.43B
-VERSION_DATE := 2026-11-18
+VERSION   := 1.2.44C
+VERSION_DATE := 2026-11-20
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
 # #2499: Die Vorkompilate liegen je Architektur. Sobald eine .lyu Maschinencode
