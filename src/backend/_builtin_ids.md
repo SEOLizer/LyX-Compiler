@@ -505,13 +505,13 @@ alten Block frei.
 | 267 | 189 | `sys_iofs_select` | 1 (vol) | 0 oder −1; schaltet den aktiven IOFS-Datenträger um |
 | 268 | 190 | `sys_iofs_vol_active` | 0 | Nummer des aktiven Volumes |
 | 269 | 191 | `sys_iofs_vol_count` | 0 | Anzahl der IOFS-Volumes |
-| 270 | 196 | `sys_mount_part` | 3 (disk_id, part_no, name) | 0 oder Fehlercode |
+| 270 | 196 | `sys_mount_dev` | 3 (disk_id, part_no, name) | 0 oder Fehlercode |
 | 271 | 198 | `sys_mount_list` | 2 (idx, out) | 0 oder −1; füllt 48 Byte je Eintrag |
 | 272 | 199 | `sys_mount_count` | 0 | Anzahl der Einträge |
 | 273 | 359 | `sys_sig_post` | 2 (tid, code) | 0 zugestellt, -1 kein solcher Strang oder Code unzulaessig, -12 Schlange voll, -13 von der Maske blockiert; tid == 0 heisst an sich selbst; laeuft unter PLEDGE_PROC wie sys_kill (#2544) |
 | 274 | 360 | `sys_sig_poll` | 0 | aeltester wartender Code, 0 = nichts da; braucht kein Recht, betrifft nur den Aufrufer (#2544) |
 
-**`sys_mount_part` nimmt DREI Argumente, nicht vier.** Die Entwurfssignatur
+**`sys_mount_dev` nimmt DREI Argumente, nicht vier.** Die Entwurfssignatur
 nennt `(disk_id, part_no, name, flags)`; gebaut ist
 `VfsMountPart(name, disk_id, part_no, MOUNT_TEMP)` — der Kernel setzt die Flags
 selbst, ein vierter Parameter wäre ein Wert, den niemand liest.
@@ -521,6 +521,21 @@ selbst, ein vierter Parameter wäre ein Wert, den niemand liest.
 Nummer **196** hängt eine Partition unter `/devices/<name>/` ein — gleicher
 Name, andere Bedeutung, und damit nicht entscheidbar, welcher gemeint ist. Es
 sind zwei Builtins, nicht einer mit neuer Nummer.
+
+**Und der Name ist auch nicht `sys_mount_part` (#2590).** Bis 1.2.44F hieß ID
+270 so — aber diesen Namen führt der Kernel für Nummer **90**,
+`sys_mount_part(vol_id, disk_id, part_no)` (`VfsMountByPart`). Zwei
+Bedeutungen, dieselbe Stelligkeit, derselbe Name: wer die Kernelgestalt
+schrieb, landete auf 196, und `part_no` ging an die Stelle, die der Kernel
+per `VmmPhysFromUserVirt` als **Zeiger auf einen Namen** liest. Die Kollision
+war beim Vergeben nicht sichtbar, weil 90 aus Lyx gar nicht erreichbar war.
+Seit #2549 ist 90 aus der Kerneltabelle erzeugt und trägt den Namen wieder;
+ID 270 heißt `sys_mount_dev`, nach dem Ort `/devices/<name>/`.
+
+Lehre für die Vergabe: ein Builtinname gehört gegen die **Namensspalte der
+Kerneltabelle** geprüft, nicht nur gegen die schon vergebenen Lyx-Namen. Ein
+Name, den der Kernel für eine andere Nummer führt, ist belegt, auch wenn ihn
+in Lyx noch niemand benutzt.
 
 **`sys_umount` (ID 36) zeigte auf 0x0210 = 528** — eine Entwurfsnummer, die es
 im Kernel nicht gibt; jeder Aufruf scheiterte an der Nummernprüfung aus #1734.

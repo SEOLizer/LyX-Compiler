@@ -72,17 +72,27 @@ fi
 # 6) Stichproben gegen den Kernel, von Hand nachgelesen in ring3.lyx:
 #      323 sys_sendto(sock, buf_uva, len, dst_uva)        -> 4
 #      3   sys_close(fd)                                  -> 1
-#      1   sys_write(fd, buf, count)                       -> 3
+#      95  sys_write(fd, buf, count)                      -> 3   (ring3.lyx:2078)
+#      0   sys_read(fd, buf, count)                       -> 3
 #    Ein Test, der nur "Tabelle vorhanden" prueft, ist blind fuer die
 #    falsche Zahl darin (#1829) — deshalb WERTE.
+#
+#    HIER STAND `1 3` fuer sys_write. Nummer 1 trug die Signatur bis
+#    LyxOS c0d0382 und war eine Dublette zu 95; seit 2d5bddc fuehrt die
+#    Tabelle dort WP-S4 ("stdout dieses Strangs ist umgeleitet") OHNE
+#    Signatur, und die Stichprobe war ohne eigenes Verschulden rot.
+#    Lehre: eine Stichprobe gegen eine FREMDE, bewegte Tabelle gehoert auf
+#    die Nummer gesetzt, die die Umsetzung TRAEGT (95, mit Rumpf im
+#    Dispatcher), nicht auf die Kompatibilitaetsnummer daneben -- eine
+#    Bruecke darf verschwinden, der Rumpf nicht.
 fehler=""
-for paar in "323 4" "3 1" "1 3"; do
+for paar in "323 4" "3 1" "95 3" "0 3"; do
   set -- $paar
   ist=$(grep -P "^$1\t" "$STAND" | cut -f3)
   [ "$ist" = "$2" ] || fehler="$fehler nr$1(ist=${ist:-fehlt},soll=$2)"
 done
 if [ -z "$fehler" ]; then
-  ok "Stichproben stimmen: 323->4, 3->1, 1->3"
+  ok "Stichproben stimmen: 323->4, 3->1, 95->3, 0->3"
 else
   bad "Werte" "$fehler"
 fi
