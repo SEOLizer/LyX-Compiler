@@ -144,6 +144,10 @@ fn x509Scr(): int64 {
 
 pub fn X509Groesse(): int64 { return X_SIZE; }
 
+// #2579: der DER-Puffer, auf den sich alle Positionen dieses Satzes
+// beziehen. Ohne ihn kann ein anderer Leser (OCSP) die Felder nicht
+// adressieren -- die Positionen sind Offsets, keine Zeiger.
+pub fn X509Der(s: int64): int64 { return peek64(s + X_DER); }
 pub fn X509TbsPos(s: int64): int64 { return peek64(s + X_TBSPOS); }
 pub fn X509TbsLen(s: int64): int64 { return peek64(s + X_TBSLEN); }
 pub fn X509SigPos(s: int64): int64 { return peek64(s + X_SIGPOS); }
@@ -367,7 +371,10 @@ fn extEku(der: int64, derLen: int64, wertPos: int64, wertLen: int64,
 // Hauptparser
 // ---------------------------------------------------------------------------
 
-fn algKennung(der: int64, ende: int64, algFeld: int64): int64 {
+// #2579: oeffentlich, weil die OCSP-Antwort denselben AlgorithmIdentifier
+// traegt. Zwei Abbildungen OID -> Kennung waeren zwei Aufzaehlungen derselben
+// Sache; ein neues Verfahren muss in GENAU einer nachgezogen werden.
+pub fn X509AlgKennung(der: int64, ende: int64, algFeld: int64): int64 {
     var k: int64 := x509Scr() + XS_ALG;
     var ob: int64 := k + DerFeldGroesse();
     var erg: int64 := 0;
@@ -445,7 +452,7 @@ pub fn X509Lies(der: int64, derLen: int64, satz: int64): bool {
     // --- signature (AlgorithmIdentifier im TBS) ---
     if (!DerLies(der, tbsEnde, p, f)) { return false; }
     if (DerTag(f) != 0x30) { return false; }
-    var tbsSigAlg: int64 := algKennung(der, tbsEnde, f);
+    var tbsSigAlg: int64 := X509AlgKennung(der, tbsEnde, f);
     p := DerNaechste(f);
 
     // --- issuer ---
@@ -576,7 +583,7 @@ pub fn X509Lies(der: int64, derLen: int64, satz: int64): bool {
     // --- signatureAlgorithm und signatureValue ---
     if (!DerLies(der, certEnde, DerNaechste(tbs), f)) { return false; }
     if (DerTag(f) != 0x30) { return false; }
-    var sigAlg: int64 := algKennung(der, certEnde, f);
+    var sigAlg: int64 := X509AlgKennung(der, certEnde, f);
     // RFC 5280 §4.1.1.2: beide AlgorithmIdentifier muessen uebereinstimmen.
     if (sigAlg != tbsSigAlg) { return false; }
     if (sigAlg == 0) { return false; }
@@ -824,52 +831,53 @@ con X_MAX_TIEFE: int64 := 8;
 // Prueft die Signatur von `kind` mit dem Schluessel aus `aussteller`.
 // Liefert 0 bei gueltiger Signatur, 5 bei falscher, 10 bei nicht
 // unterstuetztem Verfahren.
-pub fn X509PruefeSignatur(kind: int64, aussteller: int64): int64 {
-    var alg: int64 := peek64(kind + X_SIGALG);
-    var keyAlg: int64 := peek64(aussteller + X_KEYALG);
-    var derK: int64 := peek64(kind + X_DER);
-    var derA: int64 := peek64(aussteller + X_DER);
-    var tbs: int64 := derK + peek64(kind + X_TBSPOS);
-    var tbsLen: int64 := peek64(kind + X_TBSLEN);
-    var sig: int64 := derK + peek64(kind + X_SIGPOS);
-    var sigLen: int64 := peek64(kind + X_SIGLEN);
+// #2579: Der KERN der Signaturpruefung, ueber einen BELIEBIGEN signierten
+// Block. Herausgezogen aus X509PruefeSignatur, weil die OCSP-Antwort
+// (RFC 6960) dieselbe Verfahrensaufzaehlung braucht: ecdsa P-256/P-384,
+// RSA PKCS#1 v1.5 mit SHA-256/384/512, RSA-PSS, Ed25519. Eine zweite Kopie
+// davon waere genau die Aufzaehlung, die hier schon mehrfach auseinander
+// gelaufen ist -- eine neue Kurve oder ein neues Verfahren muss in GENAU
+// einer Liste nachgezogen werden.
+//
+// `pssHl` ist die Hashlaenge fuer alg 6 (RSA-PSS); sie steht in den
+// Parametern des AlgorithmIdentifier und wird vom Aufrufer gelesen, weil sie
+// im Zertifikat und in der OCSP-Antwort an verschiedenen Stellen liegt. Fuer
+// alle anderen Verfahren wird sie nicht angesehen.
+//
+// Rueckgabe wie bisher: 0 gueltig, 5 Signatur falsch, 10 nicht unterstuetzt.
+pub fn X509SignaturRoh(alg: int64, tbs: int64, tbsLen: int64,
+                       sig: int64, sigLen: int64,
+                       keyAlg: int64, keyPos: int64, keyLen: int64,
+                       pssHl: int64): int64 {
     var scr: int64 := x509Scr();
     var hash: int64 := scr + XS_HASH;
 
     // ecdsa-with-SHA256 auf secp256r1
     if (alg == 1) {
         if (keyAlg != 1) { return 10; }
-        if (peek64(aussteller + X_KEYLEN) != 65) { return 10; }
-        var kPos: int64 := derA + peek64(aussteller + X_KEYPOS);
-        if ((peek8(kPos) & 0xFF) != 4) { return 10; }
+        if (keyLen != 65) { return 10; }
+        if ((peek8(keyPos) & 0xFF) != 4) { return 10; }
         var r: int64 := scr + XS_SIG;
         var sv: int64 := r + 32;
         SHA256(tbs, tbsLen, hash);
         if (!EcdsaSigFromDer(sig, sigLen, r, sv, 32)) { return 5; }
-        if (!EcdsaVerify(EC_P256, hash, kPos + 1, kPos + 33, r, sv)) { return 5; }
+        if (!EcdsaVerify(EC_P256, hash, keyPos + 1, keyPos + 33, r, sv)) { return 5; }
         return 0;
     }
 
-    // ecdsa-with-SHA384 auf secp384r1. Die Kurve rechnet std/crypto/ec.lyx
-    // seit #2096; vorher stand hier Code 10 ("nicht unterstuetzt"), und eine
-    // Kette mit P-384-CA war damit nicht pruefbar — abgewiesen, aber eben
-    // auch nicht benutzbar.
-    //
-    // Der Schluessel ist 1 + 2*48 = 97 Byte unkomprimiert, die Koordinaten
-    // liegen bei kPos+1 und kPos+49. keyAlg 2 ist die Kurvenkennung aus dem
+    // ecdsa-with-SHA384 auf secp384r1. keyAlg 2 ist die Kurvenkennung aus dem
     // AlgorithmIdentifier: ein secp256r1-Schluessel unter diesem
     // Signaturverfahren wird NICHT durchgelassen, sonst wuerde die Kurve aus
     // dem Verfahren geraten statt gelesen.
     if (alg == 2) {
         if (keyAlg != 2) { return 10; }
-        if (peek64(aussteller + X_KEYLEN) != 97) { return 10; }
-        var kPos2: int64 := derA + peek64(aussteller + X_KEYPOS);
-        if ((peek8(kPos2) & 0xFF) != 4) { return 10; }
+        if (keyLen != 97) { return 10; }
+        if ((peek8(keyPos) & 0xFF) != 4) { return 10; }
         var r2: int64 := scr + XS_SIG;
         var sv2: int64 := r2 + 48;
         Sha384(tbs, tbsLen, hash);
         if (!EcdsaSigFromDer(sig, sigLen, r2, sv2, 48)) { return 5; }
-        if (!EcdsaVerify(EC_P384, hash, kPos2 + 1, kPos2 + 49, r2, sv2)) {
+        if (!EcdsaVerify(EC_P384, hash, keyPos + 1, keyPos + 49, r2, sv2)) {
             return 5;
         }
         return 0;
@@ -879,8 +887,7 @@ pub fn X509PruefeSignatur(kind: int64, aussteller: int64): int64 {
     if (alg == 3 || alg == 4 || alg == 5 || alg == 6) {
         if (keyAlg != 3) { return 10; }
         var key: int64 := scr + XS_RSAKEY;
-        if (!RsaPubAusDer(derA + peek64(aussteller + X_KEYPOS),
-                          peek64(aussteller + X_KEYLEN), key)) { return 10; }
+        if (!RsaPubAusDer(keyPos, keyLen, key)) { return 10; }
         var hl: int64 := 32;
         if (alg == 4) { hl := 48; }
         if (alg == 5) { hl := 64; }
@@ -888,7 +895,7 @@ pub fn X509PruefeSignatur(kind: int64, aussteller: int64): int64 {
             // RSASSA-PSS: die Hashwahl steht in den Parametern des
             // AlgorithmIdentifier. Ohne lesbare Parameter wird abgewiesen,
             // nicht auf SHA-256 geraten.
-            hl := pssHashLaenge(kind);
+            hl := pssHl;
             if (hl == 0) { return 10; }
         }
         if (hl == 32) { SHA256(tbs, tbsLen, hash); }
@@ -904,16 +911,35 @@ pub fn X509PruefeSignatur(kind: int64, aussteller: int64): int64 {
     // Ed25519 (RFC 8410): signiert die Nachricht selbst, kein Vorhash.
     if (alg == 7) {
         if (keyAlg != 4) { return 10; }
-        if (peek64(aussteller + X_KEYLEN) != 32) { return 10; }
+        if (keyLen != 32) { return 10; }
         if (sigLen != 64) { return 5; }
-        if (!Ed25519Verify(sig, tbs, tbsLen,
-                           derA + peek64(aussteller + X_KEYPOS))) { return 5; }
+        if (!Ed25519Verify(sig, tbs, tbsLen, keyPos)) { return 5; }
         return 0;
     }
 
     // Alles andere (SHA-1, DSA, Brainpool, ...) wird abgewiesen, nicht
     // durchgelassen.
     return 10;
+}
+
+// Signatur eines Zertifikats gegen den Schluessel seines Ausstellers.
+// Seit #2579 nur noch das Einsammeln der Felder; gerechnet wird in
+// X509SignaturRoh, damit OCSP dieselbe Liste benutzt.
+pub fn X509PruefeSignatur(kind: int64, aussteller: int64): int64 {
+    var alg: int64 := peek64(kind + X_SIGALG);
+    var derK: int64 := peek64(kind + X_DER);
+    var derA: int64 := peek64(aussteller + X_DER);
+    var pssHl: int64 := 0;
+    if (alg == 6) { pssHl := pssHashLaenge(kind); }
+    return X509SignaturRoh(alg,
+                           derK + peek64(kind + X_TBSPOS),
+                           peek64(kind + X_TBSLEN),
+                           derK + peek64(kind + X_SIGPOS),
+                           peek64(kind + X_SIGLEN),
+                           peek64(aussteller + X_KEYALG),
+                           derA + peek64(aussteller + X_KEYPOS),
+                           peek64(aussteller + X_KEYLEN),
+                           pssHl);
 }
 
 // Hashlaenge aus den PSS-Parametern des signatureAlgorithm (RFC 4055 §3.1).
