@@ -198,5 +198,84 @@ else
   grep -m3 -iE "error" "$T/oop.log" | sed 's/^/    /'
 fi
 
+# ── #2588: Aufrufe AUS METHODENRUEMPFEN sind lebende Kanten ────────────────
+#
+# Der Vorpass lief nur die oberste Ebene ab und sammelte allein NK_FUNC_DECL.
+# Methoden haengen INNERHALB der Typdeklaration (nc1 des NK_TYPE_DECL), wurden
+# also nie abgelaufen -- eine freie Funktion, die AUSSCHLIESSLICH aus einem
+# Methodenrumpf gerufen wird, hatte keine eingehende Kante und galt als
+# unerreichbar. `lyxc` ist methodenlastig: 413 von 495 Funktionen fielen weg,
+# und der Selbstbau brach ab mit
+#   error: undefined function 'lyxc_zlCpuNs' -- no codegen implementation found
+#
+# WARUM DER RUMPF EINEN ECHTEN AUFRUF BRAUCHT: zwei erste Minimalfassungen mit
+# `fn freiHelfer(): int64 { return 42; }` liefen GRUEN durch und gaben 42 aus,
+# obwohl der Bericht die Funktion als weggelassen meldete -- die Konstante wird
+# gefaltet, der Aufruf verschwindet, der Fehler ist unsichtbar. Darum steht im
+# Rumpf ein `PrintLn` mit einer Marke, die im Erzeugnis nachweisbar ist.
+cat > "$T/m.lyx" <<'LYXM'
+unit main;
+
+// NUR aus einem Methodenrumpf gerufen. Mit dem Defekt aus #2588 fiel sie weg.
+fn nurAusMethode(): int64 {
+  PrintLn("MARKE-2588-AUS-METHODE"c);
+  return 11;
+}
+
+// Transitiv: nurAusMethode ruft diese nicht, aber die Methode ruft beide --
+// die zweite Kante darf nicht an einer Stufe haengen bleiben.
+fn tiefAusMethode(): int64 {
+  PrintLn("MARKE-2588-TIEF"c);
+  return 22;
+}
+
+// Nie gerufen, von nirgends. Muss WEGFALLEN -- sonst waere der Test auch von
+// einer Analyse erfuellt, die einfach alles behaelt.
+fn niemandRuftMich(): int64 {
+  PrintLn("MARKE-2588-TOT"c);
+  return 99;
+}
+
+type Rechner = class {
+  wert: int64;
+  pub fn Summe(): int64 {
+    return nurAusMethode() + tiefAusMethode();
+  }
+};
+
+fn main(): int64 {
+  var r: Rechner := new Rechner();
+  if (r.Summe() != 33) { return 1; }
+  return 0;
+}
+LYXM
+
+if "$LYXC" --std-path="$ROOT" --gc-functions "$T/m.lyx" -o "$T/m.bin" >"$T/m.log" 2>&1; then
+  ok "eine nur aus einem Methodenrumpf gerufene Funktion bleibt erhalten (#2588)"
+  # Die WIRKUNG, nicht das Uebersetzen: beide Marken muessen im Erzeugnis
+  # stehen und das Programm muss 0 liefern.
+  if grep -q "MARKE-2588-AUS-METHODE" "$T/m.bin" && grep -q "MARKE-2588-TIEF" "$T/m.bin"; then
+    ok "beide aus der Methode gerufenen Ruempfe stehen im Erzeugnis"
+  else
+    nok "ein aus der Methode gerufener Rumpf fehlt im Erzeugnis"
+  fi
+  "$T/m.bin" >"$T/m.out" 2>&1
+  mrc=$?
+  if [ "$mrc" = "0" ]; then
+    ok "das Programm rechnet 11+22=33 (die Ruempfe sind da und richtig)"
+  else
+    nok "Programm endete mit rc=$mrc -- fehlender Rumpf oder falsches Ergebnis"
+  fi
+  # Gegenprobe: die von nirgends gerufene Funktion MUSS weg sein.
+  if grep -q "MARKE-2588-TOT" "$T/m.bin"; then
+    nok "niemandRuftMich steht noch im Erzeugnis -- die Analyse verwirft nichts mehr"
+  else
+    ok "die von nirgends gerufene Funktion faellt weiter weg (die Analyse wirkt noch)"
+  fi
+else
+  nok "uebersetzt nicht mit --gc-functions (#2588)"
+  grep -m3 -iE "error" "$T/m.log" | sed 's/^/    /'
+fi
+
 echo "RESULT: $PASS PASS, $FAIL FAIL"
 [ "$FAIL" = "0" ] || exit 1

@@ -559,9 +559,21 @@ fn main(): int64 { return sys_iofs_vol_active(); }' "190" ""
 pruefe_bytes "sys_iofs_vol_count emittiert 191" \
     'unit main;
 fn main(): int64 { return sys_iofs_vol_count(); }' "191" ""
-pruefe_bytes "sys_mount_part emittiert 196, nicht 85" \
+# #2590: zwei Bedeutungen, zwei Namen, zwei Nummern -- und jede Zeile prueft
+# AUCH, dass die andere Nummer NICHT im Erzeugnis steht. Ohne diese Gegenseite
+# waere die Pruefung auch von der alten, falschen Zuordnung erfuellt: dort trug
+# `sys_mount_part` die 196, und "196 ist drin" allein sagt nichts darueber,
+# welcher Name sie getragen hat.
+#
+# 85  sys_mount(vol_id, disk_id, lba_start)  -- Platte als Volume (VfsMountDisk)
+# 90  sys_mount_part(vol_id, disk_id, part_no) -- Partition als Volume (VfsMountByPart)
+# 196 sys_mount_dev(disk_id, part_no, name)  -- unter /devices/<name>/ (VfsMountPart)
+pruefe_bytes "sys_mount_dev emittiert 196, nicht 85 oder 90" \
     'unit main;
-fn main(): int64 { return sys_mount_part(0, 1, "n"c); }' "196" "85"
+fn main(): int64 { return sys_mount_dev(0, 1, "n"c); }' "196" "85,90"
+pruefe_bytes "sys_mount_part emittiert 90, nicht 196 -- der Name traegt die Kernelbedeutung (#2590)" \
+    'unit main;
+fn main(): int64 { return sys_mount_part(0, 1, 2); }' "90" "196"
 pruefe_bytes "sys_mount_list emittiert 198" \
     'unit main;
 fn main(): int64 { return sys_mount_list(0, 0); }' "198" ""
