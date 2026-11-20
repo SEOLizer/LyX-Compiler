@@ -471,6 +471,41 @@ warteAufMuster() {   # datei, muster, max-sekunden
 
 # Wartet, bis der Server auf dem Port lauscht. `sleep 1.5` war eine Annahme
 # über die Startzeit; unter Last ist sie falsch, und zwar in beide Richtungen.
+# #2418: Auf ALLE Bedingungen warten, nicht auf eine.
+#
+# `warteAufMuster` wartete auf EIN Muster in EINER Datei -- danach wurden
+# openssl, der Zubringer und unser Server sofort getoetet. Geurteilt wird aber
+# ueber SECHS Bedingungen, verteilt auf ZWEI Dateien, darunter eine in der
+# Ausgabe unseres Servers. Welche davon beim Toeten schon geschrieben war,
+# entschied die Maschine: lokal alle, unter Last nicht. Genau so entsteht ein
+# FAIL, bei dem beide Seiten Erfolg melden -- die fehlende Zeile war nie ein
+# Fehlschlag, sie war noch nicht da.
+#
+# Darum: jede Bedingung, auf die geurteilt wird, ist auch eine Bedingung, auf
+# die gewartet wird. Steht alles, geht es sofort weiter; fehlt etwas, laeuft
+# die Obergrenze ab und der Test urteilt auf dem unvollstaendigen Stand -- dann
+# ist es ein echter Fehlschlag und die gefallenen Bedingungen stehen im Bericht.
+#
+# Aufruf: warteAufAlle <max-sekunden> <datei> <muster> [<datei> <muster> ...]
+warteAufAlle() {
+  local grenze="$1"; shift
+  local i=0
+  while [ "$i" -lt "$((grenze * 10))" ]; do
+    local fehlt=0
+    local -a rest=("$@")
+    local k=0
+    while [ "$k" -lt "${#rest[@]}" ]; do
+      local d="${rest[$k]}" m="${rest[$((k+1))]}"
+      if [ ! -f "$d" ] || ! grep -q "$m" "$d" 2>/dev/null; then fehlt=1; fi
+      k=$((k+2))
+    done
+    [ "$fehlt" = "0" ] && return 0
+    sleep 0.1
+    i=$((i+1))
+  done
+  return 1
+}
+
 warteAufPort() {     # port, max-sekunden
   local port="$1" grenze="$2" i=0
   while [ "$i" -lt "$((grenze * 10))" ]; do
@@ -515,7 +550,13 @@ for suite in TLS_AES_128_GCM_SHA256 TLS_AES_256_GCM_SHA384 TLS_CHACHA20_POLY1305
      -servername nexus.example -CAfile "$TMP/certs/tlsca.pem" -alpn h2,http/1.1 \
      -ciphersuites "$suite" -tls1_3 < "$TMP/fifo_$suite" > "$TMP/os_$suite.txt" 2>&1 &
   ospid=$!
-  warteAufMuster "$TMP/os_$suite.txt" "Lyx TLS 1.3" 30
+  # #2418: jede der VIER Bedingungen, auf die unten geurteilt wird -- eine
+  # davon steht in der Ausgabe UNSERES Servers, nicht bei openssl.
+  warteAufAlle 30 \
+    "$TMP/os_$suite.txt" "Cipher is $suite" \
+    "$TMP/os_$suite.txt" "Verify return code: 0 (ok)" \
+    "$TMP/os_$suite.txt" "Lyx TLS 1.3" \
+    "$TMP/srv_$suite.txt" "empfangen 18 GET / HTTP/1.0"
   antwortDa=$?
   kill "$ospid" "$feedpid" "$srvpid" 2>/dev/null
   wait "$ospid" "$feedpid" "$srvpid" 2>/dev/null
@@ -535,7 +576,7 @@ for suite in TLS_AES_128_GCM_SHA256 TLS_AES_256_GCM_SHA384 TLS_CHACHA20_POLY1305
   pruefe "Server gegen s_client, $suite" "$ok"
   if [ "$ok" != 1 ]; then
     echo "  gefallene Bedingungen:$fehlend"
-    [ "$antwortDa" != 0 ] && echo "  (die Antwort stand nach 30 s nicht in der openssl-Ausgabe)"
+    [ "$antwortDa" != 0 ] && echo "  (nach 30 s stand nicht alles da -- siehe gefallene Bedingungen)"
     echo "  openssl: $(grep -E 'Cipher is|Verify return code|Lyx TLS' "$TMP/os_$suite.txt" | tr '\n' ' ')"
     echo "  lyx:     $(tr '\n' ' ' < "$TMP/srv_$suite.txt")"
     echo "  openssl-Ausgabe, letzte Zeilen:"
@@ -695,7 +736,12 @@ timeout 40 openssl s_client -connect "127.0.0.1:$p" -ign_eof \
    -servername nexus.example -CAfile "$TMP/certs/tlsca.pem" \
    -groups X25519:P-256 -tls1_3 < "$TMP/fifo_p256" > "$TMP/os_p256.txt" 2>&1 &
 ospid=$!
-warteAufMuster "$TMP/os_p256.txt" "Lyx TLS 1.3" 30
+# #2418: alle vier Bedingungen, eine davon in der Serverdatei.
+warteAufAlle 30 \
+  "$TMP/os_p256.txt" "Peer Temp Key: ECDH" \
+  "$TMP/os_p256.txt" "Verify return code: 0 (ok)" \
+  "$TMP/os_p256.txt" "Lyx TLS 1.3" \
+  "$TMP/srv_p256.txt" "^gruppe 23"
 kill "$ospid" "$feedpid" "$srvpid" 2>/dev/null
 wait "$ospid" "$feedpid" "$srvpid" 2>/dev/null
 rm -f "$TMP/fifo_p256"
