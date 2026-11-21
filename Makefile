@@ -1622,6 +1622,25 @@ test-known-red: lyxc
 	echo "known-red (.sh): $$n geprueft, $$fail unerwartet gruen, $$nf flaky-gruen"; \
 	test $$fail -eq 0
 
+# ── Gerätelauf (#2599) ────────────────────────────────────────────────────
+# Laesst ein Lyx-Programm WIRKLICH auf LyxOS laufen und sammelt sein Urteil
+# ueber die serielle Leitung ein. Bis dahin wurde fuer lyxos nur UEBERSETZT,
+# und jede Aussage ueber das Ziel war eine Aussage ueber den Uebersetzer.
+#
+# NICHT in `make test`, mit Grund: der Lauf braucht ein gebautes LyxOS-Abbild
+# (aus dem lyx-os-Repo, das dieses Projekt nur liest), QEMU, mtools, OVMF und
+# rund 400 MB Platz, und er dauert zwei Bootvorgaenge lang. Fehlt etwas, sagt
+# der Test SKIP und benennt WAS fehlt. In der CI gibt es kein Abbild; dort
+# wuerde das Ziel nur ueberspringen.
+.PHONY: test-geraet
+test-geraet: lyxc
+	@echo "=== Geraetelauf auf LyxOS in QEMU (#2599) ==="
+	@# Die Nutzlast gehoert zum Ziel: fehlt sie, scheitert der Lauf sonst erst
+	@# nach zwei Bootvorgaengen an einer fehlenden Marke.
+	@test -f tests/lyxos_geraet/probe0.lyx || { \
+	  echo "FEHLT: tests/lyxos_geraet/probe0.lyx -- die Nutzlast des Geraetelaufs"; exit 1; }
+	@bash tests/lyxos_geraet_2599_test.sh
+
 # LyxOS-Tests aus tests/ (nicht tests/lyxos/ -- dafuer gibt es `test-lyxos`).
 # Nur uebersetzen, der erzeugte Code laeuft nicht auf dem Buildhost.
 .PHONY: test-lyxos-units
