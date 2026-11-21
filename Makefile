@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.45A
+VERSION   := 1.2.45B
 VERSION_DATE := 2026-11-21
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -871,6 +871,8 @@ test: lyxc
 	@bash tests/lyxos_argc_2482_test.sh
 	@echo "--- Kernelnummern kommen aus der erzeugten Tabelle an (#2549) ---"
 	@bash tests/lyxos_gen_builtins_2549_test.sh
+	@echo "--- Zeiger-Syscalls 407-410 einzeln am Erzeugnis (#2601) ---"
+	@bash tests/lyxos_cursor_syscalls_2601_test.sh
 	@echo "--- mmap-Fehlerwert auf LyxOS ist 0, nicht -1 (#2594) ---"
 	@bash tests/lyxos_mmap_fehlerwert_2594_test.sh
 	@echo "--- annehmender Horcher auf LyxOS ueber sys_accept (#2593) ---"
