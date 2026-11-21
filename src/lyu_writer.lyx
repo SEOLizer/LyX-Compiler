@@ -31,7 +31,9 @@
 //   u32  Anzahl Eintraege
 //   je Eintrag:
 //     u8   Art   (2 = Funktion, 3 = Struct, 4 = Klasse, 5 = Typalias,
-//                 6 = f64-Konstante, 7 = Import)
+//                 6 = f64-Konstante, 7 = Import, 8 = pub var,
+//                 9 = Objektabbild, 10 = extern fn, 11 = dim, 12 = utype,
+//                 13 = Interface)
 //     u32  Laenge des Rests in Byte — ein Leser UEBERSPRINGT unbekannte Arten
 //     str  Name  (Bindung ueber den NAMEN, nicht ueber den Symbolindex)
 //     ...  artabhaengiger Rumpf:
@@ -84,6 +86,12 @@
 //          geerbten Platz, sonst Nummer unter den NEUEN Plaetzen dieser Klasse
 //          (in Deklarationsreihenfolge). Zusammen mit der Basisklasse ergibt
 //          das die VMT-Ordnung.
+//
+//   Art 13 (Interface, #2604):
+//     u16  Anzahl Methoden, je: str Name, Signatur
+//     Kein Feld, keine Basisklasse, keine Groesse, kein VMT-Platz: ein
+//     Interface hat davon nichts. Jede Methode ist rumpflos und oeffentlich,
+//     also braucht es auch die Flags der Art 4 nicht.
 //
 //   Art 7 (Import der Unit): Name = Modulname, u8 Flags (bit0 `.*`),
 //          str Alias ("" = keiner) — die Typen der Schnittstelle koennen aus
@@ -229,6 +237,20 @@ con LYU_DK_EXTERNFN: int64 := 10;
 // bei TY_USER, 1.1.14F) braucht es dafuer nicht.
 con LYU_DK_DIM:    int64 := 11;  // pub dim X [= DimAusdruck]
 con LYU_DK_UTYPE:  int64 := 12;  // pub utype x: Dim = Faktor
+// #2604: `pub type X = interface { ... }`. Ohne eigene Art fiel die
+// Interface-Deklaration hier heraus (der Zweig unten schloss Bit 32
+// ausdruecklich aus) -- der TYPNAME stand trotzdem in der Symboltabelle, nur
+// ohne seine Interface-Eigenschaft. Der Verbraucher hielt ihn fuer eine
+// gewoehnliche Klasse, baute keinen Interface-Dispatch und loeste den Aufruf
+// STATISCH in die rumpflose Methode der Interface-Deklaration auf: kein
+// Aufruf, keine Meldung, Rueckgabe war, was im Rueckgaberegister stand.
+// Genau der Zustand, den #1133 im eigenen Modul und #1976/#1787 am Dispatch
+// abgeschafft haben -- er kam ueber die .lyu zurueck.
+//
+// Beschrieben wird nur, was ein Interface AUSMACHT: die Methodennamen mit
+// Signatur. Felder, Basisklasse, Layout und VMT-Platz gibt es hier nicht,
+// und es wird auch kein Layout angefordert (_layoutTyp kennt kein Interface).
+con LYU_DK_IFACE:  int64 := 13;  // pub type X = interface { fn ...; }
 
 // Magic 'LYU\0'
 con LYU_W_M0: int64 := 76;
@@ -1051,6 +1073,16 @@ pub type LyuWriter = class {
             && self._istGenerisch(cur) == 0 && self._nameHatSpitze(cur) == 0) {
           self._dkAdd(LYU_DK_ALIAS, cur);
         }
+        // #2604: das Interface, mit eigener Art. Oben als "nicht tauglich"
+        // fuer Struct und Klasse ausgeschlossen -- das war richtig, nur fehlte
+        // danach die eigene Beschreibung, und damit verlor die Unit die
+        // Interface-Eigenschaft ihres Typs. Generische und Instanzen
+        // generischer Typen bleiben draussen, wie beim Alias; ein Interface
+        // mit Typparametern lehnt der Parser ohnehin ab (#2134).
+        if ((iv & 32) != 0 && self._istGenerisch(cur) == 0
+            && self._nameHatSpitze(cur) == 0) {
+          self._dkAdd(LYU_DK_IFACE, cur);
+        }
       } else if (k == NK_VAR_DECL && self._npub(cur) != 0) {
         // #2488 Schritt 2: Modulvariable. Typ und Startwert muessen BEIDE
         // beschreibbar sein, sonst bleibt der Eintrag weg.
@@ -1523,6 +1555,28 @@ pub type LyuWriter = class {
           if (self._eSignatur(m) == 0) { return 0; }
         }
         m := self._nnx(m);
+      }
+    } else if (art == LYU_DK_IFACE) {
+      // #2604: nur die Methoden. Sie haengen an c1, wie bei der Klasse
+      // (parser.lyx, TK_IFACE-Zweig: `self._sc1(n, iMthHead)`).
+      //
+      // Eine generische Methode macht den ganzen Eintrag unbeschreibbar --
+      // dieselbe Haltung wie bei der Klasse. Ein halb beschriebenes Interface
+      // waere schlimmer als ein fehlendes: der Leser hielte den Typ fuer
+      // vollstaendig und liesse die uebrigen Methoden still verschwinden.
+      var inm: int64 := 0;
+      var im: int64 := self._nc(n, 1);
+      while (im >= 0) { if (self._nk(im) == NK_FUNC_DECL) { inm := inm + 1; } im := self._nnx(im); }
+      self._e16le(inm);
+      im := self._nc(n, 1);
+      while (im >= 0) {
+        if (self._nk(im) == NK_FUNC_DECL) {
+          var itp: int64 := self._nc(im, 3);
+          if (itp >= 0) { if (self._nk(itp) == NK_TYPE_PARAM) { return 0; } }
+          self._eStr(self._nsp(im), self._nsl(im));
+          if (self._eSignatur(im) == 0) { return 0; }
+        }
+        im := self._nnx(im);
       }
     }
     self._p32le(lenPos, self.len - rumpfStart);
