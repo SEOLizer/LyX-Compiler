@@ -924,6 +924,8 @@ test: lyxc
 	@bash tests/tls_version_weiche_test.sh
 	@bash tests/tls_capabilities_test.sh
 	@bash tests/tls13_rfc8448_test.sh
+	@echo "--- OCSP-Stapling: beilegen, pruefen, Vorgabe weich/hart (#2579) ---"
+	@bash tests/tls_ocsp_stapling_2579_test.sh
 	@bash tests/tls_nullgeheimnis_test.sh
 	@bash tests/crypto_wycheproof_test.sh
 	@bash tests/ec_p384_test.sh

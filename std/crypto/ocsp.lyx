@@ -1,0 +1,484 @@
+// std/crypto/ocsp.lyx — Leser und Pruefer fuer OCSP-Antworten (RFC 6960).
+//
+// #2579. Der Widerruf hing bisher an einem Hook der Anwendung
+// (TlsConfigWiderrufHook): die TLS-Unit ruft ihn mit dem Zertifikat der
+// Gegenseite auf, und was er tut, entscheidet die Anwendung. Tragfaehig, aber
+// ein Hook, den niemand einhaengt, prueft nichts. Diese Unit liest den Weg,
+// der ohne Netz auf der Pruefseite auskommt: der Server legt eine frische
+// OCSP-Antwort selbst bei (RFC 6066 status_request, in TLS 1.3 am
+// CertificateEntry), und der Client prueft sie.
+//
+// WAS HIER NICHT PASSIERT: ein Netzzugriff. Die Antwort kommt aus einer Datei,
+// die ein Dienst ausserhalb erneuert. Selbst beim OCSP-Dienst anzufragen waere
+// ein Netzzugriff mitten im Handschlag, eine neue Capability und ein neuer
+// Fehlerfall.
+//
+// WAS "KEINE ANTWORT" BEDEUTET: nichts. Weder Gueltigkeit noch Widerruf. Ein
+// unknown, eine abgelaufene oder eine fehlende Antwort ist KEIN Beweis -- das
+// Urteil darueber gehoert in die Konfiguration des Aufrufers (weich: melden
+// und verbinden, hart: abweisen). Diese Unit liefert darum einen BEFUND, nicht
+// ein Urteil: sie sagt, was in der Antwort steht und ob sie zum vorgelegten
+// Zertifikat gehoert, und ueberlaesst die Folge dem Aufrufer. Ein stiller
+// Default waere hier besonders teuer, weil er wie eine Pruefung aussieht.
+//
+// ── Die Struktur, die gelesen wird (RFC 6960 Anhang B) ────────────────────
+//
+//   OCSPResponse ::= SEQUENCE {
+//       responseStatus   OCSPResponseStatus,          -- ENUMERATED
+//       responseBytes    [0] EXPLICIT ResponseBytes OPTIONAL }
+//   ResponseBytes ::= SEQUENCE {
+//       responseType     OBJECT IDENTIFIER,           -- id-pkix-ocsp-basic
+//       response         OCTET STRING }               -- BasicOCSPResponse
+//   BasicOCSPResponse ::= SEQUENCE {
+//       tbsResponseData      ResponseData,
+//       signatureAlgorithm   AlgorithmIdentifier,
+//       signature            BIT STRING,
+//       certs            [0] EXPLICIT SEQUENCE OF Certificate OPTIONAL }
+//   ResponseData ::= SEQUENCE {
+//       version          [0] EXPLICIT Version DEFAULT v1,
+//       responderID          ResponderID,
+//       producedAt           GeneralizedTime,
+//       responses            SEQUENCE OF SingleResponse,
+//       responseExtensions [1] EXPLICIT Extensions OPTIONAL }
+//   SingleResponse ::= SEQUENCE {
+//       certID               CertID,
+//       certStatus           CertStatus,              -- [0] good, [1] revoked, [2] unknown
+//       thisUpdate           GeneralizedTime,
+//       nextUpdate       [0] EXPLICIT GeneralizedTime OPTIONAL,
+//       singleExtensions [1] EXPLICIT Extensions OPTIONAL }
+//   CertID ::= SEQUENCE {
+//       hashAlgorithm        AlgorithmIdentifier,
+//       issuerNameHash       OCTET STRING,
+//       issuerKeyHash        OCTET STRING,
+//       serialNumber         CertificateSerialNumber }
+//
+// GELESEN WIRD NUR DIE ERSTE SingleResponse. Eine Antwort traegt in der Praxis
+// genau eine; mehrere waeren eine Sammelantwort, und welche davon das
+// vorgelegte Zertifikat betrifft, entscheidet erst der CertID-Vergleich. Wer
+// Sammelantworten braucht, erweitert OcspLesen um eine Schleife -- dann aber
+// mit dem CertID als Auswahlkriterium, nicht mit "die erste".
+
+unit std.crypto.ocsp;
+
+import std.crypto.der;
+import std.crypto.x509;
+import std.crypto.sha1;
+import std.crypto.sha256;
+
+// ── Befund ────────────────────────────────────────────────────────────────
+con O_DER:        int64 := 0;     // Basis des DER-Puffers
+con O_DERLEN:     int64 := 8;
+con O_STATUS:     int64 := 16;    // OCSPResponseStatus (0 = successful)
+con O_CERTSTATUS: int64 := 24;    // 0 good, 1 revoked, 2 unknown, -1 unbekannt
+con O_THISUPD:    int64 := 32;    // Unixzeit
+con O_NEXTUPD:    int64 := 40;    // Unixzeit oder -1 (nicht angegeben)
+con O_PRODUCED:   int64 := 48;
+con O_REVOKEDAT:  int64 := 56;    // Unixzeit oder -1
+con O_HASHALG:    int64 := 64;    // 1 = SHA-1, 2 = SHA-256, 0 = unbekannt
+con O_NAMEHPOS:   int64 := 72;    // issuerNameHash
+con O_NAMEHLEN:   int64 := 80;
+con O_KEYHPOS:    int64 := 88;    // issuerKeyHash
+con O_KEYHLEN:    int64 := 96;
+con O_SERPOS:     int64 := 104;   // serialNumber, Inhalt
+con O_SERLEN:     int64 := 112;
+con O_TBSPOS:     int64 := 120;   // tbsResponseData, ganzes Feld
+con O_TBSLEN:     int64 := 128;
+con O_SIGPOS:     int64 := 136;   // signature, Bitketteninhalt ohne Fuellbyte
+con O_SIGLEN:     int64 := 144;
+con O_SIGALG:     int64 := 152;   // Kennung wie X509AlgKennung
+con O_RESPIDART:  int64 := 160;   // 1 byName, 2 byKey
+con O_RESPIDPOS:  int64 := 168;
+con O_RESPIDLEN:  int64 := 176;
+con O_CERTSPOS:   int64 := 184;   // eingebettete Zertifikate oder 0
+con O_CERTSLEN:   int64 := 192;
+con O_SIZE:       int64 := 256;
+
+// Fehlerwerte von OcspLesen. Ausserhalb des Wertebereichs eines Befundes,
+// damit kein gueltiger Zustand mit einem Fehler verwechselt wird.
+pub con OCSP_OK:        int64 := 0;
+pub con OCSP_E_FORMAT:  int64 := -1;    // nicht nach RFC 6960 kodiert
+pub con OCSP_E_STATUS:  int64 := -2;    // responseStatus != successful
+pub con OCSP_E_TYP:     int64 := -3;    // responseType ist nicht id-pkix-ocsp-basic
+pub con OCSP_E_LEER:    int64 := -4;    // keine SingleResponse enthalten
+
+// Zustaende einer SingleResponse.
+pub con OCSP_GOOD:    int64 := 0;
+pub con OCSP_REVOKED: int64 := 1;
+pub con OCSP_UNKNOWN: int64 := 2;
+
+pub fn OcspGroesse(): int64 { return O_SIZE; }
+
+pub fn OcspStatus(s: int64): int64      { return peek64(s + O_STATUS); }
+pub fn OcspCertStatus(s: int64): int64  { return peek64(s + O_CERTSTATUS); }
+pub fn OcspThisUpdate(s: int64): int64  { return peek64(s + O_THISUPD); }
+pub fn OcspNextUpdate(s: int64): int64  { return peek64(s + O_NEXTUPD); }
+pub fn OcspProducedAt(s: int64): int64  { return peek64(s + O_PRODUCED); }
+pub fn OcspRevokedAt(s: int64): int64   { return peek64(s + O_REVOKEDAT); }
+pub fn OcspHashAlg(s: int64): int64     { return peek64(s + O_HASHALG); }
+pub fn OcspSigAlg(s: int64): int64      { return peek64(s + O_SIGALG); }
+pub fn OcspResponderArt(s: int64): int64 { return peek64(s + O_RESPIDART); }
+pub fn OcspCertsPos(s: int64): int64    { return peek64(s + O_CERTSPOS); }
+pub fn OcspCertsLen(s: int64): int64    { return peek64(s + O_CERTSLEN); }
+
+// id-pkix-ocsp-basic: 1.3.6.1.5.5.7.48.1.1
+fn oidOcspBasic(p: int64): int64 {
+    poke8(p + 0, 0x2B); poke8(p + 1, 0x06); poke8(p + 2, 0x01);
+    poke8(p + 3, 0x05); poke8(p + 4, 0x05); poke8(p + 5, 0x07);
+    poke8(p + 6, 0x30); poke8(p + 7, 0x01); poke8(p + 8, 0x01);
+    return 9;
+}
+
+// id-sha1: 1.3.14.3.2.26
+fn oidSha1(p: int64): int64 {
+    poke8(p + 0, 0x2B); poke8(p + 1, 0x0E); poke8(p + 2, 0x03);
+    poke8(p + 3, 0x02); poke8(p + 4, 0x1A);
+    return 5;
+}
+
+// id-sha256: 2.16.840.1.101.3.4.2.1
+fn oidSha256(p: int64): int64 {
+    poke8(p + 0, 0x60); poke8(p + 1, 0x86); poke8(p + 2, 0x48);
+    poke8(p + 3, 0x01); poke8(p + 4, 0x65); poke8(p + 5, 0x03);
+    poke8(p + 6, 0x04); poke8(p + 7, 0x02); poke8(p + 8, 0x01);
+    return 9;
+}
+
+// Ein Kratzblock fuer die ganze Unit, in Rollen geteilt. EIN Bereich gehoert
+// GENAU EINER Rolle -- ueberlappende Rollen waren in der TLS-Arbeit (#2096)
+// der haeufigste Fehler, und `defer` je Feld hat dort zweimal zwei Namen
+// dieselbe Adresse gegeben.
+var ocspScrBuf: int64 := 0;
+con OS_F1:   int64 := 0;      // Feld A
+con OS_F2:   int64 := 64;     // Feld B
+con OS_F3:   int64 := 128;    // Feld C
+con OS_F4:   int64 := 192;    // Feld D
+con OS_OID:  int64 := 256;    // OID-Vergleichspuffer
+con OS_H1:   int64 := 320;    // Hash A (bis 32 Byte)
+con OS_H2:   int64 := 384;    // Hash B
+con OS_SIZE: int64 := 448;
+
+fn ocspScr(): int64 {
+    if (ocspScrBuf == 0) { ocspScrBuf := alloc(OS_SIZE); }
+    return ocspScrBuf;
+}
+
+// Liest die Antwort. Rueckgabe OCSP_OK oder ein OCSP_E_*.
+//
+// `der` muss gueltig bleiben, solange der Befund benutzt wird: alle Positionen
+// darin sind ABSOLUTE Adressen in diesen Puffer, keine Kopien. Dieselbe
+// Bedingung gilt fuer X509Lies, und in tls13 war genau das einmal der Fehler,
+// der mit RSA den eigenen Partner ablehnte -- der Empfangspuffer wurde
+// wiederbenutzt, bevor der Satz gelesen war.
+pub fn OcspLesen(der: int64, derLen: int64, satz: int64): int64 {
+    if (der == 0 || derLen <= 0 || satz == 0) { return OCSP_E_FORMAT; }
+    var i: int64 := 0;
+    while (i < O_SIZE) { poke8(satz + i, 0); i := i + 1; }
+    poke64(satz + O_DER, der);
+    poke64(satz + O_DERLEN, derLen);
+    poke64(satz + O_CERTSTATUS, 0 - 1);
+    poke64(satz + O_NEXTUPD, 0 - 1);
+    poke64(satz + O_REVOKEDAT, 0 - 1);
+
+    var scr: int64 := ocspScr();
+    var f1: int64 := scr + OS_F1;
+    var f2: int64 := scr + OS_F2;
+    var f3: int64 := scr + OS_F3;
+    var f4: int64 := scr + OS_F4;
+    var ob: int64 := scr + OS_OID;
+
+    // OCSPResponse
+    if (!DerLies(der, derLen, 0, f1)) { return OCSP_E_FORMAT; }
+    if (DerTag(f1) != 0x30) { return OCSP_E_FORMAT; }
+    var ende: int64 := DerInhalt(f1) + DerInhaltLen(f1);
+
+    // responseStatus: ENUMERATED
+    if (!DerErstesKind(der, ende, f1, f2)) { return OCSP_E_FORMAT; }
+    if (DerTag(f2) != 0x0A) { return OCSP_E_FORMAT; }
+    if (DerInhaltLen(f2) != 1) { return OCSP_E_FORMAT; }
+    var st: int64 := peek8(der + DerInhalt(f2)) & 0xFF;
+    poke64(satz + O_STATUS, st);
+    // 0 = successful. Jeder andere Wert ist eine Auskunft des Responders ueber
+    // SICH (malformedRequest, internalError, tryLater, sigRequired,
+    // unauthorized) und sagt NICHTS ueber das Zertifikat.
+    if (st != 0) { return OCSP_E_STATUS; }
+
+    // responseBytes [0] EXPLICIT
+    if (!DerLies(der, ende, DerNaechste(f2), f2)) { return OCSP_E_FORMAT; }
+    if (DerTag(f2) != 0xA0) { return OCSP_E_FORMAT; }
+    if (!DerErstesKind(der, ende, f2, f3)) { return OCSP_E_FORMAT; }
+    if (DerTag(f3) != 0x30) { return OCSP_E_FORMAT; }
+    var rbEnde: int64 := DerInhalt(f3) + DerInhaltLen(f3);
+
+    // responseType
+    if (!DerErstesKind(der, rbEnde, f3, f4)) { return OCSP_E_FORMAT; }
+    if (DerTag(f4) != 0x06) { return OCSP_E_FORMAT; }
+    if (!DerOidGleich(der, f4, ob, oidOcspBasic(ob))) { return OCSP_E_TYP; }
+
+    // response OCTET STRING -> BasicOCSPResponse
+    if (!DerLies(der, rbEnde, DerNaechste(f4), f4)) { return OCSP_E_FORMAT; }
+    if (DerTag(f4) != 0x04) { return OCSP_E_FORMAT; }
+    var basPos: int64 := DerInhalt(f4);
+    var basEnde: int64 := basPos + DerInhaltLen(f4);
+
+    // BasicOCSPResponse
+    if (!DerLies(der, basEnde, basPos, f1)) { return OCSP_E_FORMAT; }
+    if (DerTag(f1) != 0x30) { return OCSP_E_FORMAT; }
+    var brEnde: int64 := DerInhalt(f1) + DerInhaltLen(f1);
+
+    // tbsResponseData: das GANZE Feld wird signiert, nicht sein Inhalt.
+    if (!DerErstesKind(der, brEnde, f1, f2)) { return OCSP_E_FORMAT; }
+    if (DerTag(f2) != 0x30) { return OCSP_E_FORMAT; }
+    var tbsAnfang: int64 := DerInhalt(f2);
+    var tbsEnde: int64 := tbsAnfang + DerInhaltLen(f2);
+    // Das Feld beginnt beim Tag, nicht beim Inhalt. Der Kopf ist
+    // Inhaltsanfang minus Feldanfang -- DerLies hat ihn gelesen, also wird
+    // hier zurueckgerechnet statt die Laenge neu zu dekodieren.
+    poke64(satz + O_TBSPOS, 0);
+    var tbsFeldAnfang: int64 := 0;
+    // Position des Feldes: DerErstesKind hat bei DerInhalt(f1) begonnen.
+    tbsFeldAnfang := DerInhalt(f1);
+    poke64(satz + O_TBSPOS, tbsFeldAnfang);
+    poke64(satz + O_TBSLEN, tbsEnde - tbsFeldAnfang);
+
+    // signatureAlgorithm
+    if (!DerLies(der, brEnde, DerNaechste(f2), f3)) { return OCSP_E_FORMAT; }
+    if (DerTag(f3) != 0x30) { return OCSP_E_FORMAT; }
+    poke64(satz + O_SIGALG, X509AlgKennung(der, brEnde, f3));
+
+    // signature BIT STRING: das erste Byte zaehlt die ungenutzten Bits und
+    // gehoert NICHT zur Signatur.
+    if (!DerLies(der, brEnde, DerNaechste(f3), f4)) { return OCSP_E_FORMAT; }
+    if (DerTag(f4) != 0x03) { return OCSP_E_FORMAT; }
+    if (DerInhaltLen(f4) < 2) { return OCSP_E_FORMAT; }
+    poke64(satz + O_SIGPOS, DerInhalt(f4) + 1);
+    poke64(satz + O_SIGLEN, DerInhaltLen(f4) - 1);
+
+    // certs [0] EXPLICIT, optional
+    var nachSig: int64 := DerNaechste(f4);
+    if (nachSig < brEnde) {
+        if (DerLies(der, brEnde, nachSig, f3)) {
+            if (DerTag(f3) == 0xA0) {
+                poke64(satz + O_CERTSPOS, DerInhalt(f3));
+                poke64(satz + O_CERTSLEN, DerInhaltLen(f3));
+            }
+        }
+    }
+
+    // ── ResponseData ──────────────────────────────────────────────────────
+    if (!DerLies(der, tbsEnde, tbsAnfang, f1)) { return OCSP_E_FORMAT; }
+    var rdPos: int64 := tbsAnfang;
+    // version [0] EXPLICIT, optional -- ueberspringen, wenn vorhanden.
+    if (DerTag(f1) == 0xA0) { rdPos := DerNaechste(f1); }
+    else { rdPos := tbsAnfang; }
+
+    // responderID: [1] byName oder [2] byKey
+    if (!DerLies(der, tbsEnde, rdPos, f1)) { return OCSP_E_FORMAT; }
+    if (DerTag(f1) == 0xA1) { poke64(satz + O_RESPIDART, 1); }
+    else {
+        if (DerTag(f1) != 0xA2) { return OCSP_E_FORMAT; }
+        poke64(satz + O_RESPIDART, 2);
+    }
+    poke64(satz + O_RESPIDPOS, DerInhalt(f1));
+    poke64(satz + O_RESPIDLEN, DerInhaltLen(f1));
+
+    // producedAt
+    if (!DerLies(der, tbsEnde, DerNaechste(f1), f2)) { return OCSP_E_FORMAT; }
+    if (DerTag(f2) != 0x18 && DerTag(f2) != 0x17) { return OCSP_E_FORMAT; }
+    poke64(satz + O_PRODUCED, DerZeitUnix(der, f2));
+
+    // responses SEQUENCE OF SingleResponse
+    if (!DerLies(der, tbsEnde, DerNaechste(f2), f3)) { return OCSP_E_FORMAT; }
+    if (DerTag(f3) != 0x30) { return OCSP_E_FORMAT; }
+    var rsEnde: int64 := DerInhalt(f3) + DerInhaltLen(f3);
+    if (DerInhaltLen(f3) <= 0) { return OCSP_E_LEER; }
+
+    // Erste SingleResponse
+    if (!DerErstesKind(der, rsEnde, f3, f1)) { return OCSP_E_LEER; }
+    if (DerTag(f1) != 0x30) { return OCSP_E_FORMAT; }
+    var srEnde: int64 := DerInhalt(f1) + DerInhaltLen(f1);
+
+    // CertID
+    if (!DerErstesKind(der, srEnde, f1, f2)) { return OCSP_E_FORMAT; }
+    if (DerTag(f2) != 0x30) { return OCSP_E_FORMAT; }
+    var ciEnde: int64 := DerInhalt(f2) + DerInhaltLen(f2);
+
+    //   hashAlgorithm
+    if (!DerErstesKind(der, ciEnde, f2, f3)) { return OCSP_E_FORMAT; }
+    if (DerTag(f3) != 0x30) { return OCSP_E_FORMAT; }
+    if (DerErstesKind(der, ciEnde, f3, f4) && DerTag(f4) == 0x06) {
+        if (DerOidGleich(der, f4, ob, oidSha1(ob)))   { poke64(satz + O_HASHALG, 1); }
+        if (peek64(satz + O_HASHALG) == 0
+            && DerOidGleich(der, f4, ob, oidSha256(ob))) { poke64(satz + O_HASHALG, 2); }
+    }
+    //   issuerNameHash
+    if (!DerLies(der, ciEnde, DerNaechste(f3), f4)) { return OCSP_E_FORMAT; }
+    if (DerTag(f4) != 0x04) { return OCSP_E_FORMAT; }
+    poke64(satz + O_NAMEHPOS, DerInhalt(f4));
+    poke64(satz + O_NAMEHLEN, DerInhaltLen(f4));
+    //   issuerKeyHash
+    if (!DerLies(der, ciEnde, DerNaechste(f4), f3)) { return OCSP_E_FORMAT; }
+    if (DerTag(f3) != 0x04) { return OCSP_E_FORMAT; }
+    poke64(satz + O_KEYHPOS, DerInhalt(f3));
+    poke64(satz + O_KEYHLEN, DerInhaltLen(f3));
+    //   serialNumber
+    if (!DerLies(der, ciEnde, DerNaechste(f3), f4)) { return OCSP_E_FORMAT; }
+    if (DerTag(f4) != 0x02) { return OCSP_E_FORMAT; }
+    poke64(satz + O_SERPOS, DerInhalt(f4));
+    poke64(satz + O_SERLEN, DerInhaltLen(f4));
+
+    // certStatus: [0] good, [1] revoked, [2] unknown
+    if (!DerLies(der, srEnde, DerNaechste(f2), f3)) { return OCSP_E_FORMAT; }
+    var tagCS: int64 := DerTag(f3);
+    if (tagCS == 0x80) { poke64(satz + O_CERTSTATUS, OCSP_GOOD); }
+    else {
+        if (tagCS == 0xA1 || tagCS == 0x81) {
+            poke64(satz + O_CERTSTATUS, OCSP_REVOKED);
+            // RevokedInfo ::= SEQUENCE { revocationTime GeneralizedTime, ... }
+            // Die Zeit ist eine Auskunft, kein Teil des Urteils: revoked ist
+            // revoked, auch wenn die Zeit nicht lesbar ist.
+            if (DerErstesKind(der, srEnde, f3, f4)) {
+                if (DerTag(f4) == 0x18 || DerTag(f4) == 0x17) {
+                    poke64(satz + O_REVOKEDAT, DerZeitUnix(der, f4));
+                }
+            }
+        } else {
+            if (tagCS == 0x82 || tagCS == 0xA2) {
+                poke64(satz + O_CERTSTATUS, OCSP_UNKNOWN);
+            } else { return OCSP_E_FORMAT; }
+        }
+    }
+
+    // thisUpdate
+    if (!DerLies(der, srEnde, DerNaechste(f3), f4)) { return OCSP_E_FORMAT; }
+    if (DerTag(f4) != 0x18 && DerTag(f4) != 0x17) { return OCSP_E_FORMAT; }
+    poke64(satz + O_THISUPD, DerZeitUnix(der, f4));
+
+    // nextUpdate [0] EXPLICIT, optional
+    var nachThis: int64 := DerNaechste(f4);
+    if (nachThis < srEnde) {
+        if (DerLies(der, srEnde, nachThis, f3)) {
+            if (DerTag(f3) == 0xA0) {
+                if (DerErstesKind(der, srEnde, f3, f4)) {
+                    if (DerTag(f4) == 0x18 || DerTag(f4) == 0x17) {
+                        poke64(satz + O_NEXTUPD, DerZeitUnix(der, f4));
+                    }
+                }
+            }
+        }
+    }
+
+    return OCSP_OK;
+}
+
+fn gleicheBytes(a: int64, aLen: int64, b: int64, bLen: int64): bool {
+    if (aLen != bLen) { return false; }
+    var i: int64 := 0;
+    while (i < aLen) {
+        if ((peek8(a + i) & 0xFF) != (peek8(b + i) & 0xFF)) { return false; }
+        i := i + 1;
+    }
+    return true;
+}
+
+// Gehoert dieser Befund zu DIESEM Zertifikat?
+//
+// Ohne diese Pruefung waere eine gueltige Antwort fuer ein ANDERES Zertifikat
+// ein Freibrief: der Angreifer legt die good-Antwort seines eigenen,
+// nicht widerrufenen Zertifikats bei. Die Bindung ist der CertID (RFC 6960
+// Paragraph 4.1.1): Hash des Ausstellernamens, Hash des Ausstellerschluessels
+// und die Seriennummer des Blattes -- alle drei muessen stimmen.
+//
+// Gehasht wird mit dem Verfahren, das die Antwort NENNT (hashAlgorithm), nicht
+// mit einem geratenen. Ein unbekanntes Verfahren liefert false, nicht "passt
+// wohl".
+pub fn OcspPasstZu(satz: int64, blatt: int64, aussteller: int64): bool {
+    if (satz == 0 || blatt == 0 || aussteller == 0) { return false; }
+    var alg: int64 := peek64(satz + O_HASHALG);
+    if (alg != 1 && alg != 2) { return false; }
+    var scr: int64 := ocspScr();
+    var h1: int64 := scr + OS_H1;
+    var h2: int64 := scr + OS_H2;
+    var hLen: int64 := 20;
+    if (alg == 2) { hLen := 32; }
+
+    // issuerNameHash: ueber den DER-kodierten SUBJEKTNAMEN des Ausstellers --
+    // das ist derselbe Bytebereich wie der Ausstellername des Blattes, aber
+    // der Satz des Ausstellers ist die verlaessliche Quelle (beim Blatt kann
+    // der Bereich eine Kopie in einem anderen Puffer sein).
+    var derA: int64 := X509Der(aussteller);
+    var namePos: int64 := derA + X509SubjectPos(aussteller);
+    var nameLen: int64 := X509SubjectLen(aussteller);
+    if (alg == 1) { SHA1(namePos, nameLen, h1); }
+    else { SHA256(namePos, nameLen, h1); }
+    if (!gleicheBytes(h1, hLen,
+                      peek64(satz + O_DER) + peek64(satz + O_NAMEHPOS),
+                      peek64(satz + O_NAMEHLEN))) { return false; }
+
+    // issuerKeyHash: ueber den ROHEN Schluessel (BIT-STRING-Inhalt des
+    // SubjectPublicKey), NICHT ueber das ganze SubjectPublicKeyInfo. Diese
+    // Verwechslung ist die haeufigste Fehlerquelle an dieser Stelle, und sie
+    // faellt nur am Vergleich auf -- nie an der Struktur.
+    var keyPos: int64 := derA + X509PubKeyPos(aussteller);
+    var keyLen: int64 := X509PubKeyLen(aussteller);
+    if (alg == 1) { SHA1(keyPos, keyLen, h2); }
+    else { SHA256(keyPos, keyLen, h2); }
+    if (!gleicheBytes(h2, hLen,
+                      peek64(satz + O_DER) + peek64(satz + O_KEYHPOS),
+                      peek64(satz + O_KEYHLEN))) { return false; }
+
+    // serialNumber des BLATTES
+    var derB: int64 := X509Der(blatt);
+    if (!gleicheBytes(derB + X509SerienNrPos(blatt), X509SerienNrLen(blatt),
+                      peek64(satz + O_DER) + peek64(satz + O_SERPOS),
+                      peek64(satz + O_SERLEN))) { return false; }
+    return true;
+}
+
+// Prueft die Signatur der Antwort gegen den Schluessel des Ausstellers.
+//
+// RFC 6960 Paragraph 4.2.2.2 erlaubt DREI Signierer: den Aussteller selbst,
+// einen von ihm benannten Vertreter mit id-kp-OCSPSigning (EKU-Bit 32), oder
+// einen vom Pruefer vertrauten Responder. Hier wird der ERSTE Fall geprueft --
+// der haeufigste bei beigelegten Antworten, weil der Server die Antwort seiner
+// eigenen CA weitergibt.
+//
+// WAS HIER NICHT GEPRUEFT WIRD, und das ist eine Luecke mit Namen: ein
+// Vertreter aus dem certs-Feld der Antwort. Dafuer muesste dessen Zertifikat
+// gegen den Aussteller geprueft, sein EKU auf OCSPSigning gelesen und erst
+// dann seine Signatur genommen werden. Wer das ergaenzt, darf das certs-Feld
+// NICHT als Vertrauensanker nehmen -- es kommt von der Gegenseite.
+// Solange das fehlt, liefert diese Funktion fuer solche Antworten 10
+// ("nicht pruefbar"), nicht 0.
+pub fn OcspSignaturPruefen(satz: int64, aussteller: int64): int64 {
+    if (satz == 0 || aussteller == 0) { return 10; }
+    var der: int64 := peek64(satz + O_DER);
+    var derA: int64 := X509Der(aussteller);
+    return X509SignaturRoh(peek64(satz + O_SIGALG),
+                           der + peek64(satz + O_TBSPOS),
+                           peek64(satz + O_TBSLEN),
+                           der + peek64(satz + O_SIGPOS),
+                           peek64(satz + O_SIGLEN),
+                           X509KeyAlg(aussteller),
+                           derA + X509PubKeyPos(aussteller),
+                           X509PubKeyLen(aussteller),
+                           0);
+}
+
+// Ist der Befund zeitlich gueltig? `jetzt` ist Unixzeit.
+//
+// thisUpdate darf nicht in der Zukunft liegen und nextUpdate nicht in der
+// Vergangenheit. FEHLT nextUpdate, ist die Antwort nach RFC 6960
+// Paragraph 2.4 so zu behandeln, dass sie IMMER aktuell ist -- das wird hier
+// NICHT getan: eine Antwort ohne Ablauf ist ein Dauerfreibrief, und genau den
+// soll die Pruefung verhindern. Sie gilt dann als nicht frisch, und der
+// Aufrufer entscheidet nach seiner Vorgabe (weich/hart).
+pub fn OcspZeitlichGueltig(satz: int64, jetzt: int64, toleranz: int64): bool {
+    if (satz == 0) { return false; }
+    var t: int64 := peek64(satz + O_THISUPD);
+    var n: int64 := peek64(satz + O_NEXTUPD);
+    if (t <= 0) { return false; }
+    if (t > jetzt + toleranz) { return false; }
+    if (n < 0) { return false; }
+    if (n + toleranz < jetzt) { return false; }
+    return true;
+}

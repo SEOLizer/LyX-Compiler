@@ -233,6 +233,12 @@ con V_ALPNBUF:    int64 := 1384;   // 32
 // Haben wir schon ein close_notify gesendet? Auf ein empfangenes gehoert
 // genau eines (RFC 5246 §7.2.1).
 con V_CLOSEGESENDET: int64 := 1416;
+// #2582: die signature_algorithms-Liste des ClientHello, als Zeiger in den
+// Empfangspuffer plus Laenge. Sie wird beim Lesen des ClientHello gemerkt
+// und beim Signieren befragt; 0/0 heisst "Client hat die Erweiterung nicht
+// gesendet". Frei war hier 1424..1471 (zwischen V_CLOSEGESENDET und V_KOPF).
+con V_SIGLISTE:    int64 := 1424;
+con V_SIGLISTELEN: int64 := 1432;
 con V_KOPF:       int64 := 1472;
 
 // Wie in tls13: ein Record traegt bis zu 2^14 Byte Klartext, und der Rest
@@ -286,6 +292,12 @@ con S_R:      int64 := 2640;     // bis 48
 con S_S:      int64 := 2688;     // bis 48
 con S_ECX:    int64 := 2736;     // bis 48
 con S_ECY:    int64 := 2784;     // bis 48
+// #2582: die eigenen Signaturkandidaten, bis zu drei. EIGENER Bereich, nicht
+// S_WUNSCH: der traegt in dieser Unit die Suite-Vorliebe. In tls13 heisst der
+// Kandidatenplatz S_WUNSCH -- gleicher Name, andere Rolle, und genau das war
+// in dieser Arbeit der haeufigste Fehler (siehe Kopf des Kratzbereichs).
+con S_SIGKAND: int64 := 2832;   // 3 x 8 Byte, frei war 2832..3071
+
 con S_SCR_SIZE: int64 := 3072;
 
 con O_REC:    int64 := 94656;    // 17408 Byte Recordzusammenbau
@@ -1359,15 +1371,101 @@ fn skeSignaturblock(c: int64, params: int64, paramsLen: int64, out: int64): int6
     return p;
 }
 
+// #2582: WELCHE Signaturverfahren diese Unit mit der eigenen Schluesselart
+// LEISTEN KANN -- gelesen aus signaturSchreiben darunter, nicht aus dem
+// Entwurf. Dieselbe Aufzaehlung fuehrt tls13.lyx als `eigeneSchemata`; die
+// beiden muessen NICHT uebereinstimmen, und das ist Absicht: tls13 kann mit
+// RSA auch 0x0805/0x0806 (PSS mit SHA-384/512), hier ist nur 0x0804 gebaut.
+// Wer das hier erweitert, baut zuerst den Zweig in signaturSchreiben.
+fn eigeneSchemata12(art: int64, out: int64): int64 {
+    if (art == 1) { poke64(out, 0x0403); return 1; }   // ecdsa_secp256r1_sha256
+    if (art == 5) { poke64(out, 0x0503); return 1; }   // ecdsa_secp384r1_sha384
+    if (art == 3) { poke64(out, 0x0804); return 1; }   // rsa_pss_rsae_sha256
+    return 0;
+}
+
+// Steht `schema` in der signature_algorithms-Liste des ClientHello?
+// Dieselbe Rechnung wie `clientBietetSchema` in tls13.lyx -- die beiden
+// muessen uebereinstimmen.
+fn clientBietetSchema12(liste: int64, listeLen: int64, schema: int64): bool {
+    var i: int64 := 0;
+    while (i + 1 < listeLen) {
+        if (r16(liste, i) == schema) { return true; }
+        i += 2;
+    }
+    return false;
+}
+
+// Waehlt das Signaturverfahren fuer ServerKeyExchange und CertificateVerify
+// aus der Liste der Gegenseite (RFC 5246 Paragraph 7.4.1.4.1).
+//
+// WARUM ES DAS BRAUCHT. Diese Unit signierte mit einem FESTEN Verfahren je
+// Schluesselart, ohne die Liste anzusehen: art 1 immer 0x0403, art 5 immer
+// 0x0503, art 3 immer 0x0804. Ein Client, der nur RSA-PSS anbietet, bekam von
+// einem EC-Schluessel trotzdem eine ECDSA-Signatur -- ein Protokollfehler, den
+// die Gegenseite abweist. In tls13 hat tlsfuzzer genau das gefunden; dort
+// stand `test-tls13-finished` deswegen bei 0 von 42.
+//
+// OHNE DIE ERWEITERUNG gilt in TLS 1.2 nicht "beliebig", sondern die Vorgabe
+// aus Paragraph 7.4.1.4.1: der Server MUSS sich verhalten, als haette der
+// Client {sha1,rsa}, {sha1,dsa}, {sha1,ecdsa} gesendet. SHA-1 baut diese Unit
+// NICHT -- weder zum Signieren noch sonst -- also gibt es hier kein gueltiges
+// Verfahren und der Handschlag wird ABGEBROCHEN. Das ist der ehrliche Ausgang:
+// ein SHA-256-Verfahren zu senden, das der Client nach der Vorgabe nicht
+// genannt hat, waere derselbe Protokollfehler eine Ebene tiefer.
+fn schemaWaehlen12(c: int64): int64 {
+    var art: int64 := eigeneSchluesselart(c);
+    if (art == 0) { return E_KONFIG; }
+    var kand: int64 := pScr(c) + S_SIGKAND;
+    var n: int64 := eigeneSchemata12(art, kand);
+    if (n == 0) { return E_KONFIG; }
+    var liste: int64 := peek64(c + V_SIGLISTE);
+    var listeLen: int64 := peek64(c + V_SIGLISTELEN);
+    if (liste == 0 || listeLen <= 0) { return E_UNTERSTUETZT; }
+    var i: int64 := 0;
+    while (i < n) {
+        var sch: int64 := peek64(kand + i * 8);
+        if (clientBietetSchema12(liste, listeLen, sch)) {
+            poke64(c + V_SIGALG, sch);
+            return 0;
+        }
+        i += 1;
+    }
+    return E_UNTERSTUETZT;
+}
+
 // Signiert `len` Byte ab `daten` mit dem eigenen Schluessel und schreibt
 // SignatureAndHashAlgorithm + Signatur nach buf/pos. Liefert die neue
 // Position oder einen Fehler als negative Zahl.
+//
+// #2582: Das Verfahren steht in V_SIGALG und ist aus der Liste der Gegenseite
+// gewaehlt (Server: schemaWaehlen12; Client: unsere eigene Vorliebe, die der
+// Server in CertificateRequest bestaetigt hat). Ein leeres V_SIGALG ist ein
+// Ablauffehler, kein Anlass zu raten.
 fn signaturSchreiben(c: int64, buf: int64, pos: int64,
                      daten: int64, len: int64): int64 {
     var scr: int64 := pScr(c);
     var art: int64 := eigeneSchluesselart(c);
     var hash: int64 := scr + S_HASH;
     var sig: int64 := scr + S_SIG;
+    // #2582: Das Verfahren ist GEWAEHLT, nicht fest. Steht hier 0, hat
+    // niemand gewaehlt -- ein Ablauffehler. Fruehere Fassungen schrieben die
+    // Zahl je Schluesselart hin, ohne die Liste der Gegenseite anzusehen.
+    var schema: int64 := peek64(c + V_SIGALG);
+    if (schema == 0) { return E_ABLAUF; }
+    // Gegenprobe: das gewaehlte Verfahren muss zu DIESEM Schluessel passen.
+    // Ohne sie koennte eine kuenftige Erweiterung der Kandidatenliste ein
+    // Verfahren durchlassen, fuer das es unten keinen Zweig gibt -- und dann
+    // waere die emittierte Zahl eine andere als die geleistete Signatur.
+    var kandP: int64 := scr + S_SIGKAND;
+    var nP: int64 := eigeneSchemata12(art, kandP);
+    var passt: bool := false;
+    var iP: int64 := 0;
+    while (iP < nP) {
+        if (peek64(kandP + iP * 8) == schema) { passt := true; }
+        iP += 1;
+    }
+    if (!passt) { return E_KONFIG; }
 
     if (art == 1) {
         // ecdsa_secp256r1_sha256
@@ -1381,7 +1479,7 @@ fn signaturSchreiben(c: int64, buf: int64, pos: int64,
         }
         var derLen: int64 := EcdsaSigToDer(r, s, 32, der);
         SecureZero(priv, 48);
-        var p1: int64 := w16(buf, pos, 0x0403);
+        var p1: int64 := w16(buf, pos, schema);   // #2582: gewaehlt, nicht fest
         p1 := w16(buf, p1, derLen);
         return wBytes(buf, p1, der, derLen);
     }
@@ -1400,7 +1498,7 @@ fn signaturSchreiben(c: int64, buf: int64, pos: int64,
         }
         var derLen5: int64 := EcdsaSigToDer(r5, s5, 48, der5);
         SecureZero(priv5, 48);
-        var p5: int64 := w16(buf, pos, 0x0503);
+        var p5: int64 := w16(buf, pos, schema);   // #2582: gewaehlt, nicht fest
         p5 := w16(buf, p5, derLen5);
         return wBytes(buf, p5, der5, derLen5);
     }
@@ -1411,7 +1509,7 @@ fn signaturSchreiben(c: int64, buf: int64, pos: int64,
         SHA256(daten, len, hash);
         var sl: int64 := RsaSignPss(pRsa(c), 32, hash, sig);
         if (sl <= 0) { return E_SIGNATUR; }
-        var p2: int64 := w16(buf, pos, 0x0804);
+        var p2: int64 := w16(buf, pos, schema);   // #2582: gewaehlt, nicht fest
         p2 := w16(buf, p2, sl);
         return wBytes(buf, p2, sig, sl);
     }
@@ -1479,6 +1577,20 @@ fn certVerifySenden(c: int64): int64 {
     var buf: int64 := pMsg(c) + 4096;
     var th: int64 := scr + S_TH2;
     var sig: int64 := scr + S_SIG;
+    // #2582: dieselbe Pruefung wie in signaturSchreiben -- die beiden muessen
+    // uebereinstimmen. Server: aus der Liste des ClientHello; Client: aus der
+    // Liste des CertificateRequest.
+    var schema: int64 := peek64(c + V_SIGALG);
+    if (schema == 0) { return E_ABLAUF; }
+    var kandV: int64 := scr + S_SIGKAND;
+    var nV: int64 := eigeneSchemata12(art, kandV);
+    var passtV: bool := false;
+    var iV: int64 := 0;
+    while (iV < nV) {
+        if (peek64(kandV + iV * 8) == schema) { passtV := true; }
+        iV += 1;
+    }
+    if (!passtV) { return E_KONFIG; }
 
     if (art == 1) {
         hashJetzt(c, 32, th);
@@ -1491,7 +1603,7 @@ fn certVerifySenden(c: int64): int64 {
         }
         var derLen: int64 := EcdsaSigToDer(r, s, 32, der);
         SecureZero(priv, 48);
-        var p1: int64 := w16(buf, 0, 0x0403);
+        var p1: int64 := w16(buf, 0, schema);   // #2582: gewaehlt, nicht fest
         p1 := w16(buf, p1, derLen);
         p1 := wBytes(buf, p1, der, derLen);
         return hsSenden(c, HS_CERT_VERIFY, buf, p1);
@@ -1510,7 +1622,7 @@ fn certVerifySenden(c: int64): int64 {
         }
         var derLen5: int64 := EcdsaSigToDer(r5, s5, 48, der5);
         SecureZero(priv5, 48);
-        var p5: int64 := w16(buf, 0, 0x0503);
+        var p5: int64 := w16(buf, 0, schema);   // #2582: gewaehlt, nicht fest
         p5 := w16(buf, p5, derLen5);
         p5 := wBytes(buf, p5, der5, derLen5);
         return hsSenden(c, HS_CERT_VERIFY, buf, p5);
@@ -1519,7 +1631,7 @@ fn certVerifySenden(c: int64): int64 {
         hashJetzt(c, 32, th);
         var sl: int64 := RsaSignPss(pRsa(c), 32, th, sig);
         if (sl <= 0) { return E_SIGNATUR; }
-        var p2: int64 := w16(buf, 0, 0x0804);
+        var p2: int64 := w16(buf, 0, schema);   // #2582: gewaehlt, nicht fest
         p2 := w16(buf, p2, sl);
         p2 := wBytes(buf, p2, sig, sl);
         return hsSenden(c, HS_CERT_VERIFY, buf, p2);
@@ -1687,6 +1799,25 @@ fn clientHelloLesen(c: int64, pos: int64, len: int64): int64 {
     // vorher ein Abbruch; tlsfuzzer hat damit 194 von 202 zulaessigen
     // Handschlaegen abgewiesen bekommen (#2096), denn seine Skripte senden
     // keinen der beiden Hinweise.
+
+    // #2582: signature_algorithms merken. NICHT auswerten -- das geht erst,
+    // wenn die Zertifikatskette gewaehlt ist, denn SNI kann die Schluesselart
+    // aendern. Fehlt die Erweiterung, bleibt 0/0 stehen, und schemaWaehlen12
+    // entscheidet daraus (RFC 5246 Paragraph 7.4.1.4.1: dann gelten {sha1,*},
+    // die diese Unit nicht baut).
+    poke64(c + V_SIGLISTE, 0);
+    poke64(c + V_SIGLISTELEN, 0);
+    var sa: int64 := extSuchen(pos, p, len - p, 13, el);
+    if (sa >= 0) {
+        var saLen: int64 := r16(sa, 0);
+        // Die Laengenangabe muss zur Erweiterung passen und eine gerade Zahl
+        // von Bytes nennen: es sind Paare. Eine ungerade Laenge waere ein
+        // halbes Verfahren am Ende, und darueber faellt keine Entscheidung.
+        if (saLen >= 2 && saLen + 2 <= peek64(el) && (saLen % 2) == 0) {
+            poke64(c + V_SIGLISTE, sa + 2);
+            poke64(c + V_SIGLISTELEN, saLen);
+        }
+    }
 
     // supported_groups
     var sg: int64 := extSuchen(pos, p, len - p, 10, el);
@@ -2153,13 +2284,52 @@ fn clientServerFlug(c: int64): int64 {
         } else {
         if (typ == HS_CERT_REQUEST) {
             poke64(c + V_CERTREQ, 1);
+            // #2582: die SPIEGELBILDLICHE Haelfte. Bis 1.2.44G wurde der
+            // Inhalt dieser Nachricht ganz uebergangen, und
+            // certVerifySenden signierte mit einem festen Verfahren je
+            // Schluesselart -- derselbe Protokollfehler wie auf der
+            // Serverseite, nur in der anderen Richtung.
+            //
+            // CertificateRequest (RFC 5246 Paragraph 7.4.4):
+            //   certificate_types                1 Byte Laenge + Typen
+            //   supported_signature_algorithms   2 Byte Laenge + Paare
+            //   certificate_authorities          2 Byte Laenge + DNs
+            poke64(c + V_SIGLISTE, 0);
+            poke64(c + V_SIGLISTELEN, 0);
+            if (len >= 1) {
+                var ctLen: int64 := peek8(pos) & 0xFF;
+                var sq: int64 := 1 + ctLen;
+                if (sq + 2 <= len) {
+                    var sqLen: int64 := r16(pos, sq);
+                    if (sqLen >= 2 && sq + 2 + sqLen <= len && (sqLen % 2) == 0) {
+                        poke64(c + V_SIGLISTE, pos + sq + 2);
+                        poke64(c + V_SIGLISTELEN, sqLen);
+                    }
+                }
+            }
+            // Die Wahl JETZT treffen, solange die Nachricht noch im Puffer
+            // steht: V_SIGLISTE zeigt hinein, und hsVerbrauchen gibt ihn
+            // frei. Ein Fehler hier ist kein Abbruch des Handschlags -- ohne
+            // passendes Verfahren senden wir ein LEERES Zertifikat, was
+            // RFC 5246 Paragraph 7.4.6 ausdruecklich erlaubt; der Server
+            // entscheidet dann, ob er das annimmt.
+            if (schemaWaehlen12(c) != 0) { poke64(c + V_SIGALG, 0); }
+            poke64(c + V_SIGLISTE, 0);
+            poke64(c + V_SIGLISTELEN, 0);
             hsVerbrauchen(c, len, true);
         } else {
         if (typ == HS_SHD) {
             hsVerbrauchen(c, len, true);
             // eigener Flug
             if (peek64(c + V_CERTREQ) != 0) {
-                if (TlsCfgCert(cfg) != 0 && TlsCfgCertN(cfg) > 0) {
+                // #2582: Ein eigenes Zertifikat nur dann, wenn wir die
+                // Signatur dazu auch leisten koennen. V_SIGALG == 0 heisst
+                // "der Server bot kein Verfahren an, das zu unserem Schluessel
+                // passt" -- dann ist das LEERE Certificate die richtige
+                // Antwort (RFC 5246 Paragraph 7.4.6), nicht eine Kette ohne
+                // CertificateVerify.
+                if (TlsCfgCert(cfg) != 0 && TlsCfgCertN(cfg) > 0
+                    && peek64(c + V_SIGALG) != 0) {
                     var rc4: int64 := certSenden(c);
                     if (rc4 != 0) { return fehlerSetzen(c, rc4); }
                 } else {
@@ -2177,7 +2347,8 @@ fn clientServerFlug(c: int64): int64 {
             // ClientKeyExchange (RFC 7627) — also genau hier.
             if (!planMaster(c)) { return fehlerSetzen(c, E_KONFIG); }
             if (peek64(c + V_CERTREQ) != 0
-                && TlsCfgCert(cfg) != 0 && TlsCfgCertN(cfg) > 0) {
+                && TlsCfgCert(cfg) != 0 && TlsCfgCertN(cfg) > 0
+                && peek64(c + V_SIGALG) != 0) {
                 var rc7: int64 := certVerifySenden(c);
                 if (rc7 != 0) { return fehlerSetzen(c, rc7); }
             }
@@ -2233,6 +2404,13 @@ fn serverClientHello(c: int64): int64 {
         != suiteSchluesselart(peek64(c + V_SUITE))) {
         return fehlerSetzen(c, E_KONFIG);
     }
+    // #2582: Erst HIER, nach der Kettenwahl -- die Schluesselart steht erst
+    // jetzt fest. Bietet die Gegenseite kein Verfahren an, das wir mit diesem
+    // Schluessel leisten koennen, wird abgebrochen, BEVOR ein ServerHello
+    // hinausgeht: eine Signatur mit einem nicht angebotenen Verfahren weist
+    // die Gegenseite ohnehin ab, und der Abbruch nennt den Grund.
+    rc := schemaWaehlen12(c);
+    if (rc != 0) { return fehlerSetzen(c, rc); }
     hsVerbrauchen(c, peek64(lp), true);
 
     if (RandBytesExact(c + V_SRAND, 32) != 32) { return fehlerSetzen(c, E_KONFIG); }

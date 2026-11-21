@@ -454,6 +454,41 @@ warteAufMuster() {   # datei, muster, max-sekunden
 
 # Wartet, bis der Server auf dem Port lauscht. `sleep 1.5` war eine Annahme
 # über die Startzeit; unter Last ist sie falsch, und zwar in beide Richtungen.
+# #2418: Auf ALLE Bedingungen warten, nicht auf eine.
+#
+# `warteAufMuster` wartete auf EIN Muster in EINER Datei -- danach wurden
+# openssl, der Zubringer und unser Server sofort getoetet. Geurteilt wird aber
+# ueber SECHS Bedingungen, verteilt auf ZWEI Dateien, darunter eine in der
+# Ausgabe unseres Servers. Welche davon beim Toeten schon geschrieben war,
+# entschied die Maschine: lokal alle, unter Last nicht. Genau so entsteht ein
+# FAIL, bei dem beide Seiten Erfolg melden -- die fehlende Zeile war nie ein
+# Fehlschlag, sie war noch nicht da.
+#
+# Darum: jede Bedingung, auf die geurteilt wird, ist auch eine Bedingung, auf
+# die gewartet wird. Steht alles, geht es sofort weiter; fehlt etwas, laeuft
+# die Obergrenze ab und der Test urteilt auf dem unvollstaendigen Stand -- dann
+# ist es ein echter Fehlschlag und die gefallenen Bedingungen stehen im Bericht.
+#
+# Aufruf: warteAufAlle <max-sekunden> <datei> <muster> [<datei> <muster> ...]
+warteAufAlle() {
+  local grenze="$1"; shift
+  local i=0
+  while [ "$i" -lt "$((grenze * 10))" ]; do
+    local fehlt=0
+    local -a rest=("$@")
+    local k=0
+    while [ "$k" -lt "${#rest[@]}" ]; do
+      local d="${rest[$k]}" m="${rest[$((k+1))]}"
+      if [ ! -f "$d" ] || ! grep -q "$m" "$d" 2>/dev/null; then fehlt=1; fi
+      k=$((k+2))
+    done
+    [ "$fehlt" = "0" ] && return 0
+    sleep 0.1
+    i=$((i+1))
+  done
+  return 1
+}
+
 warteAufPort() {     # port, max-sekunden
   local port="$1" grenze="$2" i=0
   while [ "$i" -lt "$((grenze * 10))" ]; do
@@ -484,7 +519,14 @@ for suite in ECDHE-ECDSA-AES128-GCM-SHA256 ECDHE-ECDSA-AES256-GCM-SHA384 ECDHE-E
      -servername nexus.example -CAfile "$TMP/certs/tlsca.pem" \
      -cipher "$suite" < "$TMP/fifo_$suite" > "$TMP/os_$suite.txt" 2>&1 &
   ospid=$!
-  warteAufMuster "$TMP/os_$suite.txt" "Lyx TLS 1.2" 30
+  # #2418: jede Bedingung, auf die unten geurteilt wird.
+  warteAufAlle 30 \
+    "$TMP/os_$suite.txt" "Protocol *: TLSv1.2" \
+    "$TMP/os_$suite.txt" "Cipher *: $suite" \
+    "$TMP/os_$suite.txt" "Verify return code: 0 (ok)" \
+    "$TMP/os_$suite.txt" "Extended master secret: yes" \
+    "$TMP/os_$suite.txt" "Lyx TLS 1.2" \
+    "$TMP/srv_$suite.txt" "empfangen 18 GET / HTTP/1.0"
   kill "$ospid" "$feedpid" "$srvpid" 2>/dev/null
   wait "$ospid" "$feedpid" "$srvpid" 2>/dev/null
   rm -f "$TMP/fifo_$suite"
@@ -534,6 +576,60 @@ grep -q "Lyx TLS 1.2" "$TMP/os_cbc.txt" && ok=0
 pruefe "CBC-Suite abgewiesen (-3)" "$ok"
 [ "$ok" != 1 ] && echo "  lyx: $(tr '\n' ' ' < "$TMP/srv_cbc.txt")"
 
+# --- 3b. #2582: der Server MUSS die signature_algorithms des Clients lesen ---
+#
+# Bis 1.2.44G signierte diese Unit mit einem FESTEN Verfahren je Schluesselart,
+# ohne die Liste anzusehen: art 1 immer ecdsa_secp256r1_sha256. Ein Client, der
+# dieses Verfahren nicht anbietet, bekam es trotzdem -- ein Protokollfehler
+# (RFC 5246 Paragraph 7.4.1.4.1).
+#
+# ZWEISEITIG, denn eine Pruefung, die nur zeigt "mit passendem Verfahren geht
+# es", waere auch von der alten, blinden Fassung erfuellt gewesen:
+#   a) Client bietet NUR ecdsa_secp384r1_sha384, unser Schluessel ist P-256
+#      -> Handschlag MUSS scheitern, und zwar mit E_UNTERSTUETZT (-12).
+#   b) Client bietet ecdsa_secp256r1_sha256 -> Handschlag MUSS gelingen.
+# Der Server ist in beiden Faellen derselbe; nur die Liste des Clients wechselt.
+#
+# WARUM NICHT "nur RSA-PSS anbieten": dann bietet OpenSSL auch nur RSA-SUITES
+# an, und unser Server weist schon dort ab (FEHLER -3, keine gemeinsame Suite).
+# Die Signaturwahl kaeme nie dran, und die Probe haette etwas anderes gemessen
+# als sie behauptet. Mit ECDSA+SHA384 bleiben die EC-Suiten im Angebot, und
+# allein das VERFAHREN passt nicht zu unserem P-256-Schluessel.
+#
+# GEURTEILT WIRD UEBER DEN HANDSCHLAG, nicht ueber die Nutzdaten: diese
+# Aufrufform (`printf | s_client`) beendet den Client, sobald seine Eingabe
+# endet, und unsere Antwort kann dann noch unterwegs sein. Darum Cipher und
+# Verify-Code, nicht die Nutzdatenmarke.
+for fall in nur-p384 mit-p256; do
+  if [ "$fall" = nur-p384 ]; then sa="ECDSA+SHA384"; else sa="ECDSA+SHA256"; fi
+  p="$(freierPort)"; PORT=$((PORT+1))
+  ( ulimit -v 4000000 -c 0; "$TMP/srv" "$p" > "$TMP/srv_sa_$fall.txt" 2>&1 ) &
+  srvpid=$!
+  warteAufPort "$p" 20 || echo "  HINWEIS: Server lauscht nach 20 s nicht auf $p"
+  printf 'GET / HTTP/1.0\r\n\r\n' | timeout 25 openssl s_client -connect "127.0.0.1:$p" \
+     -tls1_2 -sigalgs "$sa" -servername nexus.example \
+     -CAfile "$TMP/certs/tlsca.pem" > "$TMP/os_sa_$fall.txt" 2>&1
+  wait "$srvpid" 2>/dev/null
+  if [ "$fall" = nur-p384 ]; then
+    ok=1
+    grep -q "FEHLER -12" "$TMP/srv_sa_$fall.txt" || ok=0
+    # Die Gegenseite darf den Handschlag NICHT abgeschlossen haben. Geprueft
+    # wird an der Suite-Zeile, nicht am Verify-Code: OpenSSL prueft die
+    # Zertifikatskette, BEVOR unser Abbruch bei ihm ankommt, und meldet dann
+    # voellig zu Recht "Verify return code: 0 (ok)". Mit dieser Bedingung war
+    # die Probe rot, obwohl der Server richtig abgewiesen hatte.
+    grep -qE "Cipher *: *ECDHE" "$TMP/os_sa_$fall.txt" && ok=0
+    pruefe "nur ecdsa_secp384r1_sha384 angeboten, P-256-Schluessel: abgewiesen (-12)" "$ok"
+    [ "$ok" != 1 ] && echo "  lyx: $(tr '\n' ' ' < "$TMP/srv_sa_$fall.txt")"
+  else
+    ok=1
+    grep -q "Cipher *: ECDHE-ECDSA" "$TMP/os_sa_$fall.txt" || ok=0
+    grep -q "Verify return code: 0 (ok)" "$TMP/os_sa_$fall.txt" || ok=0
+    pruefe "ecdsa_secp256r1_sha256 angeboten: Handschlag gelingt" "$ok"
+    [ "$ok" != 1 ] && echo "  openssl: $(grep -E 'Cipher *:|Verify return' "$TMP/os_sa_$fall.txt" | tr '\n' ' ')"
+  fi
+done
+
 # --- 4. unser Server mit verlangtem Client-Zertifikat ---
 p="$(freierPort)"; PORT=$((PORT+1))
 ( ulimit -v 4000000 -c 0; "$TMP/srv" "$p" ec mtls > "$TMP/srv_mtls.txt" 2>&1 ) &
@@ -547,7 +643,11 @@ timeout 40 openssl s_client -connect "127.0.0.1:$p" -ign_eof -tls1_2 \
    -cert "$TMP/certs/tlscli.pem" -key "$TMP/certs/tlsclikey.pem" \
    < "$TMP/fifo_m" > "$TMP/os_mtls.txt" 2>&1 &
 ospid=$!
-warteAufMuster "$TMP/os_mtls.txt" "Lyx TLS 1.2" 30
+# #2418: beide Bedingungen, und eine davon steht in der Serverdatei.
+warteAufAlle 30 \
+  "$TMP/os_mtls.txt" "Lyx TLS 1.2" \
+  "$TMP/os_mtls.txt" "Verify return code: 0 (ok)" \
+  "$TMP/srv_mtls.txt" "client-zertifikat-geprueft 1"
 kill "$ospid" "$feedpid" "$srvpid" 2>/dev/null
 wait "$ospid" "$feedpid" "$srvpid" 2>/dev/null
 rm -f "$TMP/fifo_m"
