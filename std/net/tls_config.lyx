@@ -100,7 +100,33 @@ con C_OCSPLEN:    int64 := 248;
 // Ein stiller Default waere hier besonders teuer, weil er wie eine Pruefung
 // aussieht: "wir pruefen OCSP" und in Wahrheit faellt jede Antwort durch.
 con C_OCSPMODUS:  int64 := 256;
-con C_SIZE:       int64 := 264;
+// ── 0-RTT (#2578) ─────────────────────────────────────────────────────────
+//
+// C_EDMAX ist die Obergrenze in Byte fuer frühe Anwendungsdaten.
+// 0 heisst AUS, und das ist die Vorgabe. 0-RTT ohne Wiederholungsschutz
+// waere schwaecher als kein 0-RTT: der Flug ist wiederholbar, und der
+// Server kann die Wiederholung nicht von der ersten Sendung
+// unterscheiden. Darum nimmt der Server fruehe Daten NUR an, wenn
+// zusaetzlich ein Wiederholungsschutz-Speicher gesetzt ist -- siehe
+// TlsCfgFruehAn weiter unten, die genau diese Verknuepfung herstellt und
+// nicht dem Aufrufer ueberlaesst.
+con C_EDMAX:      int64 := 264;
+// Der Wiederholungsschutz (RFC 8446 §8). Der Speicher kommt von der
+// ANWENDUNG: diese Unit belegt keinen Speicher, der ihr nicht gehoert, und
+// der Schutz muss ueber Verbindungen hinweg halten -- ein Feld im
+// Verbindungszustand koennte das nicht.
+//   C_ARPTR       Zeiger auf kapazitaet * AR_SLOT Byte, von der Anwendung
+//   C_ARKAP       Zahl der Plaetze
+//   C_ARPOS       naechster Platz (Ringschreibweise)
+//   C_ARFENSTER   Fenster in Sekunden; aelter wird nicht mehr angenommen
+con C_ARPTR:      int64 := 272;
+con C_ARKAP:      int64 := 280;
+con C_ARPOS:      int64 := 288;
+con C_ARFENSTER:  int64 := 296;
+con C_SIZE:       int64 := 304;
+
+// Ein Platz im Wiederholungsschutz: 16 Byte Kennung + 8 Byte Zeit.
+con AR_SLOT:      int64 := 24;
 
 pub fn TlsConfigGroesse(): int64 { return C_SIZE; }
 
@@ -313,3 +339,113 @@ pub fn TlsCfgGruppen(cfg: int64): int64    { return peek64(cfg + C_GRUPPEN); }
 pub fn TlsCfgOcsp(cfg: int64): int64       { return peek64(cfg + C_OCSP); }
 pub fn TlsCfgOcspLen(cfg: int64): int64    { return peek64(cfg + C_OCSPLEN); }
 pub fn TlsCfgOcspModus(cfg: int64): int64  { return peek64(cfg + C_OCSPMODUS); }
+
+// ── 0-RTT und Wiederholungsschutz (#2578) ─────────────────────────────────
+
+// Fruehe Daten erlauben, bis `maxBytes` Byte je Verbindung. 0 schaltet aus.
+//
+// Das allein schaltet 0-RTT NICHT ein: ohne Wiederholungsschutz nimmt der
+// Server keine fruehen Daten an (siehe TlsCfgFruehAn). Die Trennung ist
+// absichtlich -- wer nur diese Zeile setzt, bekommt kein 0-RTT und keinen
+// stillen Schutzverlust.
+pub fn TlsConfigFrueheDaten(cfg: int64, maxBytes: int64): void {
+    if (maxBytes < 0) { poke64(cfg + C_EDMAX, 0); return; }
+    poke64(cfg + C_EDMAX, maxBytes);
+}
+
+// Den Wiederholungsschutz einrichten. `speicher` zeigt auf
+// kapazitaet * TlsArSlotGroesse() Byte, die der Aufrufer bereitstellt und
+// die so lange leben muessen wie die Konfiguration.
+//
+// `fensterSek` ist das Fenster aus §8.2: ein Ticket, dessen Ausstellzeit
+// weiter zurueckliegt, wird fuer 0-RTT nicht mehr angenommen. Es muss klein
+// sein, weil der Speicher nur die Faelle IN diesem Fenster fuehren kann --
+// ein grosses Fenster mit kleinem Speicher heisst, dass alte Eintraege
+// herausfallen und eine Wiederholung durchkommt. Diese Verknuepfung ist der
+// Grund, warum beide Werte in EINEM Aufruf gesetzt werden.
+pub fn TlsConfigWiederholungsschutz(cfg: int64, speicher: int64,
+                                    kapazitaet: int64, fensterSek: int64): void {
+    if (speicher == 0 || kapazitaet <= 0 || fensterSek <= 0) {
+        poke64(cfg + C_ARPTR, 0);
+        poke64(cfg + C_ARKAP, 0);
+        poke64(cfg + C_ARPOS, 0);
+        poke64(cfg + C_ARFENSTER, 0);
+        return;
+    }
+    poke64(cfg + C_ARPTR, speicher);
+    poke64(cfg + C_ARKAP, kapazitaet);
+    poke64(cfg + C_ARPOS, 0);
+    poke64(cfg + C_ARFENSTER, fensterSek);
+    // Die Plaetze auf 0 setzen: ein Platz mit Zeit 0 gilt als frei.
+    var i: int64 := 0;
+    while (i < kapazitaet * AR_SLOT) { poke8(speicher + i, 0); i := i + 1; }
+}
+
+pub fn TlsArSlotGroesse(): int64 { return AR_SLOT; }
+
+pub fn TlsCfgFruehMax(cfg: int64): int64     { return peek64(cfg + C_EDMAX); }
+pub fn TlsCfgArPtr(cfg: int64): int64        { return peek64(cfg + C_ARPTR); }
+pub fn TlsCfgArKap(cfg: int64): int64        { return peek64(cfg + C_ARKAP); }
+pub fn TlsCfgArFenster(cfg: int64): int64    { return peek64(cfg + C_ARFENSTER); }
+
+// Ist 0-RTT ueberhaupt eingeschaltet? Beides muss stehen. Eine Funktion und
+// nicht zwei Abfragen an der Aufrufstelle: die Verknuepfung ist die
+// Sicherheitsaussage, und sie gehoert an EINE Stelle.
+pub fn TlsCfgFruehAn(cfg: int64): bool {
+    if (peek64(cfg + C_EDMAX) <= 0) { return false; }
+    if (peek64(cfg + C_ARPTR) == 0) { return false; }
+    if (peek64(cfg + C_ARKAP) <= 0) { return false; }
+    if (peek64(cfg + C_ARFENSTER) <= 0) { return false; }
+    return true;
+}
+
+// Eine Kennung vermerken. Rueckgabe 1 = war NEU (und ist jetzt vermerkt),
+// 0 = schon gesehen oder kein Speicher.
+//
+// `id` zeigt auf 16 Byte. Gesucht wird ueber alle Plaetze, deren Zeit im
+// Fenster liegt; aeltere gelten als frei. Die Suche ist linear und damit
+// O(kapazitaet) je Aufruf -- das ist der Preis dafuer, dass dieser Speicher
+// ohne Allokation und ohne Hashtabelle auskommt, und er ist beziffert statt
+// verschwiegen.
+//
+// Geschrieben wird im Ring. Laeuft der Ring in einem Fenster voll, fallen
+// die aeltesten Eintraege heraus -- dann KANN eine Wiederholung durchkommen.
+// Darum ist die Kapazitaet eine Betriebsentscheidung und keine Vorgabe
+// dieser Unit.
+pub fn TlsArVermerken(cfg: int64, id: int64, jetzt: int64): int64 {
+    var basis: int64 := peek64(cfg + C_ARPTR);
+    var kap: int64 := peek64(cfg + C_ARKAP);
+    var fenster: int64 := peek64(cfg + C_ARFENSTER);
+    if (basis == 0 || kap <= 0 || fenster <= 0) { return 0; }
+
+    var frei: int64 := 0 - 1;
+    var i: int64 := 0;
+    while (i < kap) {
+        var s: int64 := basis + i * AR_SLOT;
+        var t: int64 := peek64(s + 16);
+        if (t == 0 || jetzt - t > fenster) {
+            if (frei < 0) { frei := i; }
+        } else {
+            var gleich: int64 := 1;
+            var k: int64 := 0;
+            while (k < 16) {
+                if (peek8(s + k) != peek8(id + k)) { gleich := 0; }
+                k := k + 1;
+            }
+            if (gleich == 1) { return 0; }      // schon gesehen
+        }
+        i := i + 1;
+    }
+
+    var platz: int64 := frei;
+    if (platz < 0) {
+        // Kein freier Platz im Fenster: den naechsten im Ring ueberschreiben.
+        platz := peek64(cfg + C_ARPOS) % kap;
+        poke64(cfg + C_ARPOS, (platz + 1) % kap);
+    }
+    var z: int64 := basis + platz * AR_SLOT;
+    var j: int64 := 0;
+    while (j < 16) { poke8(z + j, peek8(id + j)); j := j + 1; }
+    poke64(z + 16, jetzt);
+    return 1;
+}

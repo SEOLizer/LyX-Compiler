@@ -48,8 +48,23 @@
 # Skripte, die Funktionen voraussetzen, die diese Umsetzung bewusst nicht
 # hat, koennen nicht bestehen. Sie stehen hier nicht drin, und zwar mit
 # Grund statt mit Schweigen:
-#   test-tls13-session-resumption, -psk_ke, -psk_dhe_ke, -0rtt-garbage,
-#   -count-tickets          PSK, Tickets und 0-RTT sind Stufe 3 (#2096)
+#   -psk_ke, -psk_dhe_ke, -count-tickets   diese Skripte verlangen
+#                           psk_ke (PSK OHNE frischen Schluesselaustausch)
+#                           bzw. mehrere Tickets je Verbindung; beides ist
+#                           bewusst nicht umgesetzt.
+#
+# test-tls13-0rtt-garbage und test-tls13-session-resumption laufen seit
+# #2578 MIT (Schalter `frueh,tls12`), aber nicht vollstaendig:
+#   0rtt-garbage        10 von 11. Der letzte Fall erwartet einen Rueckfall
+#                       auf TLS 1.2 mit AES-128-CBC-SHA; std.net.tls12 fuehrt
+#                       nur AEAD (CBC ist die Lucky-13-Klasse und absichtlich
+#                       nicht umgesetzt, siehe Kopf von tls12.lyx).
+#   session-resumption   4 von 7. Es fehlen dieselbe CBC-Suite ("sanity -
+#                       TLS 1.2"), psk_ke ("PSK_ONLY") und
+#                       Sitzungstickets in TLS 1.2 ("use TLS 1.2 ticket in
+#                       TLS 1.3").
+# Alle vier Faelle scheitern an BEKANNTEN Grenzen und nicht an einem Defekt;
+# wer eine davon aufhebt, zieht die Zahl hier mit.
 #   test-tls13-version-negotiation  erwartet Fallback auf TLS 1.1/SSL 3.0 und
 #                           bietet standardmaessig RSA-CBC an; wir fuehren
 #                           nur ECDHE mit AEAD und verlangen Extended Master
@@ -119,18 +134,21 @@ PASS=0; FAIL=0
 #                             Stelle, an der es den Alert erwartet)
 #
 # Beide Zahlen sind gemessen, in beiden Betriebsarten, nicht geschaetzt.
+# Die dritte Spalte sind die SCHALTER des Pruefservers, `-` fuer keine.
 faelle="
 test-tls13-conversation 3 echo
 test-tls13-finished 42 echo
 test-tls13-record-layer-limits 68 echo
 test-tls13-lengths 1002 echo
 test-tls13-invalid-ciphers 52 echo
-test-tls13-zero-length-data 11 kein_echo
+test-tls13-zero-length-data 11 -
 test-tls13-empty-alert 10 echo
 test-tls13-legacy-version 2 echo
 test-tls13-nociphers 3 echo
 test-tls13-keyupdate 59 echo
 test-tls13-ecdhe-curves 21 echo
+test-tls13-0rtt-garbage 10 frueh,tls12
+test-tls13-session-resumption 4 frueh,tls12
 "
 
 while read -r skript soll art; do
@@ -141,13 +159,14 @@ while read -r skript soll art; do
   fi
   pkill -x tls_server 2>/dev/null
   sleep 0.3
-  if [ "${art:-echo}" = echo ]; then
-    ( ulimit -v 6000000 -c 0; "$TMP/tls_server" "$PORT" "$TMP/certs/cert.pem" \
-        "$TMP/certs/key.pem" x N=0 still echo > "$TMP/srv_$skript.log" 2>&1 & )
-  else
-    ( ulimit -v 6000000 -c 0; "$TMP/tls_server" "$PORT" "$TMP/certs/cert.pem" \
-        "$TMP/certs/key.pem" x N=0 still > "$TMP/srv_$skript.log" 2>&1 & )
-  fi
+  # Schalter aus der dritten Spalte: `-` heisst keine, Komma trennt mehrere.
+  schalter=""
+  case "${art:-echo}" in
+    -) schalter="" ;;
+    *) schalter="$(printf '%s' "$art" | tr ',' ' ')" ;;
+  esac
+  ( ulimit -v 6000000 -c 0; "$TMP/tls_server" "$PORT" "$TMP/certs/cert.pem" \
+      "$TMP/certs/key.pem" x N=0 still $schalter > "$TMP/srv_$skript.log" 2>&1 & )
   bereit=0
   for i in $(seq 1 60); do
     if ss -ltn 2>/dev/null | grep -q ":$PORT "; then bereit=1; break; fi
