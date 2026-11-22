@@ -1,0 +1,254 @@
+// std/net/tls_kern.lyx — der gemeinsame Kern von TLS 1.3 und DTLS 1.3
+// (#2619, Voraussetzung fuer #2580 Stufe 5).
+//
+// ── Warum diese Unit ─────────────────────────────────────────────────────
+//
+// DTLS 1.3 (RFC 9147) hat eine eigene Record-Schicht und einen eigenen
+// Ablauf, teilt mit TLS 1.3 aber den Schluesselplan, die Kodierung der
+// Nachrichtenfelder, die Erweiterungssuche und die Gruppen. Diese Rechnungen
+// lagen bis 1.2.46A ausschliesslich in std/net/tls13.lyx und waren dort
+// privat. Fuer DTLS gab es damit drei Wege, und zwei davon sind falsch:
+//
+//   * eine ZWEITE Fassung in dtls13.lyx -- das ist die "zweite Stelle", fuer
+//     die die Arbeitsregeln dieses Repos eine eigene Ursachenrubrik fuehren
+//     ("Die zweite Stelle wurde nicht nachgezogen", belegt an cg_foldConst
+//     gegen cg_evalConExpr (#1799), an der f64-Sperre (#1803) und an
+//     _findLocalSlot (#1806)). Bei Krypto ist der Preis hoeher als bei
+//     Codegen: eine Erweiterung, die nur in einer der beiden Fassungen
+//     nachgezogen wird, ist eine Luecke in einer von zwei
+//     Protokollfamilien.
+//   * alles in tls13.lyx `pub` machen -- dann ist das Innenleben der Unit
+//     ihre Schnittstelle, und jede Umstellung im Schluesselplan waere eine
+//     API-Aenderung.
+//
+// Hier steht darum jede dieser Rechnungen EINMAL. tls13.lyx ruft sie auf
+// (seine privaten Funktionen sind seit #2619 duenne Weiterleitungen, damit
+// die Aufrufstellen unveraendert blieben und der Nachweis dieselben Zahlen
+// liefert), dtls13.lyx ebenso.
+//
+// ── Was hier NICHT steht ─────────────────────────────────────────────────
+//
+// Der Bau und das Lesen der Handschlagnachrichten (ClientHello,
+// ServerHello, Certificate, ...) haengen heute am Verbindungszustand von
+// tls13.lyx -- an V_RANDOM, V_SESSID, V_TKT, V_COOKIE und einem Dutzend
+// weiterer Felder. Sie herauszuziehen heisst, diesen Zustand als
+// uebergebenen Block zu fassen; das ist ein eigener Schritt mit eigenem
+// Nachweis und steht weiter in #2619. Diese Unit nimmt bewusst nur die
+// Rechnungen, die sich mit ihren Eingaben vollstaendig beschreiben lassen
+// -- dafuer ohne jede Verhaltensaenderung.
+unit std.net.tls_kern;
+
+import std.crypto.hkdf;
+import std.crypto.sha256;
+import std.crypto.sha512;
+import std.crypto.ec;
+import std.crypto.ct;
+
+// ── Schluesselgruppen ────────────────────────────────────────────────────
+//
+// Zahlenwerte wie im Protokoll (RFC 8446 §4.2.7). Sie stehen hier, weil die
+// Laengen daran haengen und beide Protokolle dieselben Gruppen fuehren.
+pub fn TkGrpX25519(): int64    { return 0x001d; }
+pub fn TkGrpSecp256r1(): int64 { return 0x0017; }
+pub fn TkGrpSecp384r1(): int64 { return 0x0018; }
+pub fn TkGruppenAnzahl(): int64 { return 3; }
+
+// Die Rangfolge der eigenen Vorliebe: X25519 zuerst, dann P-256, dann P-384.
+pub fn TkGruppeNachRang(i: int64): int64 {
+    if (i == 0) { return 0x001d; }
+    if (i == 1) { return 0x0017; }
+    return 0x0018;
+}
+
+// Laenge des ROHEN oeffentlichen Anteils auf der Leitung. Bei den
+// Weierstrass-Kurven ist es der unkomprimierte Punkt (0x04 || X || Y), bei
+// X25519 der nackte Schluessel.
+pub fn TkGruppenRohLen(grp: int64): int64 {
+    if (grp == 0x0017) { return 65; }
+    if (grp == 0x0018) { return 97; }
+    if (grp == 0x001d) { return 32; }
+    return 0;
+}
+
+// Laenge des gemeinsamen Geheimnisses. Sie ist NICHT gleich der Rohlaenge
+// und nicht fuer alle Gruppen 32: bei P-384 sind es 48. Wer hier 32 annimmt,
+// rechnet den Schluesselplan ueber zwei Drittel des Geheimnisses -- und das
+// faellt erst beim Finished der Gegenseite auf.
+pub fn TkGruppenGeheimLen(grp: int64): int64 {
+    if (grp == 0x0017) { return 32; }
+    if (grp == 0x0018) { return 48; }
+    if (grp == 0x001d) { return 32; }
+    return 0;
+}
+
+// Die Kurvennummer von std.crypto.ec, oder -1 fuer X25519 (das keine
+// Weierstrass-Kurve ist und einen eigenen Weg hat).
+pub fn TkGruppenKurve(grp: int64): int64 {
+    if (grp == 0x0017) { return EC_P256; }
+    if (grp == 0x0018) { return EC_P384; }
+    return 0 - 1;
+}
+
+// ── Kodierung von Feldern ────────────────────────────────────────────────
+//
+// Reine Pufferschreiber mit laufender Position. Sie sehen klein aus, und
+// genau deshalb gehoeren sie hierher: zwei Fassungen von w24 koennten
+// auseinanderlaufen, ohne dass es irgendwo auffaellt -- 24-Bit-Laengen
+// stehen in jeder Handschlagnachricht.
+pub fn TkByte(buf: int64, pos: int64, v: int64): int64 {
+    poke8(buf + pos, v & 0xFF);
+    return pos + 1;
+}
+
+pub fn TkW16(buf: int64, pos: int64, v: int64): int64 {
+    poke8(buf + pos, (v >> 8) & 0xFF);
+    poke8(buf + pos + 1, v & 0xFF);
+    return pos + 2;
+}
+
+pub fn TkW24(buf: int64, pos: int64, v: int64): int64 {
+    poke8(buf + pos, (v >> 16) & 0xFF);
+    poke8(buf + pos + 1, (v >> 8) & 0xFF);
+    poke8(buf + pos + 2, v & 0xFF);
+    return pos + 3;
+}
+
+pub fn TkBytes(buf: int64, pos: int64, src: int64, len: int64): int64 {
+    var i: int64 := 0;
+    while (i < len) { poke8(buf + pos + i, peek8(src + i)); i := i + 1; }
+    return pos + len;
+}
+
+pub fn TkR16(buf: int64, pos: int64): int64 {
+    return ((peek8(buf + pos) & 0xFF) << 8) | (peek8(buf + pos + 1) & 0xFF);
+}
+
+pub fn TkR24(buf: int64, pos: int64): int64 {
+    return ((peek8(buf + pos) & 0xFF) << 16) | ((peek8(buf + pos + 1) & 0xFF) << 8)
+         |  (peek8(buf + pos + 2) & 0xFF);
+}
+
+// Eine Erweiterung in einer Erweiterungsliste suchen. `pos` zeigt auf das
+// Laengenfeld der LISTE. Rueckgabe ist die Adresse des Rumpfes, oder -1;
+// die Laenge landet in `lenPtr`.
+//
+// Die Laengen werden gegen das Listenende geprueft und nicht gegen den
+// Puffer: eine Erweiterung, die ueber die Liste hinausragt, ist ein
+// Formatfehler und kein "fast passend". Ohne diese Pruefung liest der
+// naechste Schritt fremde Byte als Feldinhalt.
+pub fn TkExtSuchen(buf: int64, pos: int64, len: int64, typ: int64,
+                   lenPtr: int64): int64 {
+    if (len < 2) { return 0 - 1; }
+    var gesamt: int64 := TkR16(buf, pos);
+    if (gesamt + 2 > len) { return 0 - 1; }
+    var p: int64 := pos + 2;
+    var ende: int64 := pos + 2 + gesamt;
+    while (p + 4 <= ende) {
+        var t: int64 := TkR16(buf, p);
+        var l: int64 := TkR16(buf, p + 2);
+        if (p + 4 + l > ende) { return 0 - 1; }
+        if (t == typ) { poke64(lenPtr, l); return buf + p + 4; }
+        p := p + 4 + l;
+    }
+    return 0 - 1;
+}
+
+// ── Schluesselplan (RFC 8446 §7.1, RFC 9147 benutzt denselben) ───────────
+
+// Der leere Hash der gewaehlten Laenge. Er steht in mehreren Ableitungen als
+// Kontext und ist darum eine eigene Funktion -- `Sha384(out, 0, out)` liest
+// sich wie ein Fehler und ist genau richtig.
+pub fn TkHashLeer(hashLen: int64, out: int64): void {
+    if (hashLen == 48) { Sha384(out, 0, out); } else { SHA256(out, 0, out); }
+}
+
+// Hash ueber `len` Byte, in der gewaehlten Laenge.
+pub fn TkHash(hashLen: int64, daten: int64, len: int64, out: int64): void {
+    if (hashLen == 48) { Sha384(daten, len, out); } else { SHA256(daten, len, out); }
+}
+
+// Schluessel und IV eines Verkehrsgeheimnisses (§7.3).
+pub fn TkVerkehrsSchluessel(hashLen: int64, keyLen: int64, secret: int64,
+                            keyOut: int64, ivOut: int64): bool {
+    if (!HkdfExpandLabel(hashLen, secret, hashLen, "key"c as int64, 3,
+                         0, 0, keyOut, keyLen)) { return false; }
+    return HkdfExpandLabel(hashLen, secret, hashLen, "iv"c as int64, 2,
+                           0, 0, ivOut, 12);
+}
+
+// Das early_secret -- der einzige Unterschied zwischen vollem Handschlag und
+// Wiederaufnahme (§7.1):
+//
+//     voll:            early_secret = HKDF-Extract(0, 0)
+//     Wiederaufnahme:  early_secret = HKDF-Extract(0, PSK)
+//
+// `psk` == 0 heisst "kein PSK". EIN Parameter statt zweier Fassungen des
+// Plans: zwei Rechnungen derselben Art nebeneinander sind in diesem Repo
+// regelmaessig auseinandergelaufen.
+//
+// `null64` zeigt auf 64 Byte Kratzspeicher, die die Funktion nullt und als
+// Nullgeheimnis benutzt. Sie belegt selbst keinen Speicher -- der Aufrufer
+// weiss, wo sein Kratzbereich liegt, und ein Bereich gehoert genau EINER
+// Rolle.
+pub fn TkPlanEarly(hashLen: int64, psk: int64, pskLen: int64,
+                   null64: int64, early: int64): void {
+    var i: int64 := 0;
+    while (i < 64) { poke8(null64 + i, 0); i := i + 1; }
+    if (psk == 0 || pskLen <= 0) {
+        HkdfExtract(hashLen, 0, 0, null64, hashLen, early);
+    } else {
+        HkdfExtract(hashLen, 0, 0, psk, pskLen, early);
+    }
+}
+
+// finished_key aus einem Geheimnis (§4.4.4). Dieselbe Rechnung braucht das
+// Finished und der PSK-Binder -- der Binder IST ein Finished ueber das halbe
+// ClientHello, darum EINE Funktion fuer beide.
+pub fn TkFinishedKey(hashLen: int64, secret: int64, out: int64): bool {
+    return HkdfExpandLabel(hashLen, secret, hashLen, "finished"c as int64, 8,
+                           0, 0, out, hashLen);
+}
+
+// binder_key = Derive-Secret(early_secret, "res binder", "") (§7.1), danach
+// daraus der finished_key.
+//
+// Die drei Kratzplaetze werden EINZELN uebergeben (je 64 Byte) und nicht als
+// eine Grundadresse mit Abstaenden. Der Grund steht in den Arbeitsregeln
+// dieses Repos: ein Bereich gehoert genau EINER Rolle. Wer hier eine Basis
+// uebergibt, legt drei Rollen auf 192 Byte, die der Aufrufer anderweitig
+// belegt haben kann -- genau so ist in diesem Repo mehrfach "jeder zweite
+// Aufruf falsch" entstanden.
+//
+// Die HASHLAENGE ist die des TICKETS und nicht die der verhandelten Suite:
+// beim ClientHello steht die Suite noch nicht fest (§4.2.11.2). Genau das
+// hat beim Bauen von #2577 einen Panic aus HKDF gegeben ("unbekannte
+// Digestlaenge") -- also laut gescheitert statt still falsch gerechnet.
+pub fn TkBinderKey(hashLen: int64, psk: int64, pskLen: int64,
+                   leer64: int64, early64: int64, bk64: int64,
+                   out: int64): bool {
+    TkHashLeer(hashLen, leer64);
+    TkPlanEarly(hashLen, psk, pskLen, bk64, early64);   // bk64 zuerst als Null64
+    if (!HkdfExpandLabel(hashLen, early64, hashLen, "res binder"c as int64, 10,
+                         leer64, hashLen, bk64, hashLen)) {
+        SecureZero(early64, 64);
+        return false;
+    }
+    var ok: bool := TkFinishedKey(hashLen, bk64, out);
+    SecureZero(early64, 64);
+    SecureZero(bk64, 64);
+    return ok;
+}
+
+// Nonce = IV xor Sequenznummer, big endian in den letzten acht Byte
+// (RFC 8446 §5.3, RFC 9147 §4.2.2 -- dieselbe Rechnung, darum EINE
+// Funktion).
+pub fn TkNonce(iv: int64, seq: int64, out: int64): void {
+    var i: int64 := 0;
+    while (i < 12) { poke8(out + i, peek8(iv + i)); i := i + 1; }
+    i := 0;
+    while (i < 8) {
+        var b: int64 := ((seq as uint64) >> ((7 - i) * 8)) & 0xFF;
+        poke8(out + 4 + i, peek8(out + 4 + i) ^ b);
+        i := i + 1;
+    }
+}
