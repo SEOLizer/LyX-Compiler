@@ -1,0 +1,815 @@
+// std/net/dtls13.lyx — DTLS 1.3 (RFC 9147), Record-Schicht und
+// Nachrichtenzusammensetzung.
+//
+// EIGENE UNIT und kein Schalter in std.net.tls13 (#2580). DTLS 1.3 teilt mit
+// TLS 1.3 den Schluesselplan, die Erweiterungen und die
+// Handschlagnachrichten -- aber nicht die Record-Schicht und nicht den
+// Ablauf. Die Record-Schicht in tls13.lyx traegt inzwischen drei Lesestufen
+// und den Verwerfensweg fuer abgelehntes 0-RTT (#2578); eine vierte
+// Verzweigung "ist es DTLS" waere genau der Catch-all, der in diesem Repo
+// mehrfach stille Fehlfunktion erzeugt hat.
+//
+// ── Was diese Fassung kann, und was nicht ────────────────────────────────
+//
+// Gebaut sind die ersten zwei Stufen der Reihenfolge aus #2580:
+//   1. Record-Schicht: beide Kopfformen, AEAD, Sequenznummern-
+//      verschluesselung (§4.2.3) und das Wiederholungsfenster (§4.5.1).
+//   2. Fragmentierung und Zusammensetzung der Handschlagnachrichten
+//      (§5.5), einschliesslich Umordnung, Doppelung und Ueberlappung.
+//
+// NICHT gebaut, und darum hier auch nicht angedeutet: Cookie-Austausch
+// (§5.1), ACK und Wiederholung mit Fristen (§7, §5.8) und der Handschlag
+// selbst. Sie stehen weiter in #2580. Wer sie baut, findet hier die
+// Grundlage; wer sie VERMISST, soll nicht ueber eine halbe Umsetzung
+// stolpern -- diese Unit fuehrt deshalb keine leeren Funktionen dafuer.
+//
+// ── Die drei Dinge, die hier anders sind als in TLS ──────────────────────
+//
+// 1. ZWEI Kopfformen. Vor den Schluesseln der DTLSPlaintext-Kopf mit 13 Byte
+//    (Typ, legacy_version 0xFEFD, Epoche, 48-Bit-Sequenznummer, Laenge);
+//    danach der "unified header" (§4):
+//
+//        0 0 1 C S L E E
+//
+//    C = Connection ID dabei, S = 16-Bit-Sequenznummer statt 8-Bit,
+//    L = Laengenfeld dabei, EE = die unteren zwei Bit der Epoche.
+//
+// 2. Die Sequenznummer im Kopf ist VERSCHLUESSELT (§4.2.3). Die Maske kommt
+//    aus dem Chiffrat desselben Records -- bei AES als ECB-Block, bei
+//    ChaCha20 als Blockstrom mit Zaehler und Nonce aus dem Chiffrat. Der
+//    Schluessel dafuer ist ein eigener (`sn`), abgeleitet aus demselben
+//    Verkehrsgeheimnis.
+//
+// 3. Ein WIEDERHOLUNGSFENSTER (§4.5.1). UDP liefert doppelt und in anderer
+//    Reihenfolge; ohne Fenster waere jede Wiederholung ein gueltiger Record.
+//    Das Fenster ist hier 64 Bit breit, die hoechste gesehene Nummer sein
+//    rechter Rand.
+unit std.net.dtls13;
+
+import std.alloc;
+import std.crypto.hkdf;
+import std.crypto.aes;
+import std.crypto.aesgcm;
+import std.crypto.chacha20poly1305;
+import std.crypto.ct;
+
+// ── Rueckgabewerte ────────────────────────────────────────────────────────
+//
+// Negative Zahlen sind Fehler, und sie sind EINZELN benannt. Ein
+// Sammelfehler waere hier besonders teuer: "Record abgewiesen" sagt nicht,
+// ob die Gegenseite Muell schickt, ob eine Wiederholung ankam oder ob der
+// eigene Schluessel falsch ist -- und das sind drei verschiedene Lagen.
+con DE_FORMAT:     int64 := 0 - 1;    // Kopf oder Laengen nicht lesbar
+con DE_KURZ:       int64 := 0 - 2;    // Paket zu kurz fuer den Kopf
+con DE_EPOCHE:     int64 := 0 - 3;    // Record aus einer anderen Epoche
+con DE_TAG:        int64 := 0 - 4;    // AEAD-Tag falsch
+con DE_WIEDERHOLT: int64 := 0 - 5;    // Sequenznummer schon gesehen
+con DE_FENSTER:    int64 := 0 - 6;    // Sequenznummer zu alt (links vom Fenster)
+con DE_PUFFER:     int64 := 0 - 7;    // Ziel zu klein
+con DE_SCHLUESSEL: int64 := 0 - 8;    // Richtung ohne Schluessel benutzt
+con DE_UEBERLANG:  int64 := 0 - 9;    // Nachricht ueber der Obergrenze
+con DE_WIDERSPRUCH: int64 := 0 - 10;  // zwei Fragmente, zwei Angaben
+
+pub fn DtlsFehlerText(rc: int64): pchar {
+    if (rc == 0)  { return "ok"c; }
+    if (rc == 0 - 1) { return "Kopf oder Laengenangabe nicht lesbar"c; }
+    if (rc == 0 - 2) { return "Paket zu kurz fuer den Kopf"c; }
+    if (rc == 0 - 3) { return "Record aus einer anderen Epoche"c; }
+    if (rc == 0 - 4) { return "AEAD-Tag falsch"c; }
+    if (rc == 0 - 5) { return "Sequenznummer schon gesehen (Wiederholung)"c; }
+    if (rc == 0 - 6) { return "Sequenznummer zu alt fuer das Fenster"c; }
+    if (rc == 0 - 7) { return "Zielpuffer zu klein"c; }
+    if (rc == 0 - 8) { return "fuer diese Richtung ist kein Schluessel gesetzt"c; }
+    if (rc == 0 - 9) { return "Handschlagnachricht ueber der Obergrenze"c; }
+    if (rc == 0 - 10) { return "Fragmente widersprechen sich in Typ oder Laenge"c; }
+    return "unbekannter Fehler"c;
+}
+
+// Recordtypen wie im Protokoll
+pub fn DtlsTypAlert(): int64     { return 21; }
+pub fn DtlsTypHandschlag(): int64 { return 22; }
+pub fn DtlsTypDaten(): int64     { return 23; }
+pub fn DtlsTypAck(): int64       { return 26; }   // §7, hier nur die Nummer
+
+// Richtungen
+pub fn DtlsSchreiben(): int64 { return 1; }
+pub fn DtlsLesen(): int64     { return 2; }
+
+// AEAD-Arten (wie in std.net.tls13)
+pub fn DtlsAesGcm(): int64   { return 1; }
+pub fn DtlsChaCha(): int64   { return 2; }
+
+con D_CFG:        int64 := 0;
+con D_AEAD:       int64 := 8;
+con D_KEYLEN:     int64 := 16;
+con D_HASHLEN:    int64 := 24;
+// Schreibseite
+con D_W_DA:       int64 := 32;     // 1 = Schluessel gesetzt
+con D_W_EPOCHE:   int64 := 40;
+con D_W_KEY:      int64 := 48;     // bis 32 Byte
+con D_W_IV:       int64 := 80;     // 12 Byte
+con D_W_SNKEY:    int64 := 96;     // bis 32 Byte
+con D_W_SNEXP:    int64 := 128;    // 240 Byte expandierter AES-Schluessel
+con D_W_SNRUNDEN: int64 := 368;
+con D_W_SEQ:      int64 := 376;
+// Leseseite
+con D_R_DA:       int64 := 384;
+con D_R_EPOCHE:   int64 := 392;
+con D_R_KEY:      int64 := 400;
+con D_R_IV:       int64 := 432;
+con D_R_SNKEY:    int64 := 448;
+con D_R_SNEXP:    int64 := 480;
+con D_R_SNRUNDEN: int64 := 720;
+// Rechter Rand des Fensters und die Bitmaske der 64 Nummern links davon.
+// -1 heisst "noch nichts empfangen"; die 0 ist eine GUELTIGE Sequenznummer
+// und taugt deshalb nicht als Fehlwert.
+con D_R_HOCH:     int64 := 728;
+con D_R_MASKE:    int64 := 736;
+// Zaehler. Sie sind der Nachweis: ein Test, der nur prueft, dass eine
+// Wiederholung "abgewiesen" wird, koennte das nicht von "Paket kam nie an"
+// unterscheiden.
+con D_Z_WIEDERHOLT:   int64 := 744;
+con D_Z_AUSSERFENSTER: int64 := 752;
+con D_Z_FRAGMENTE:    int64 := 760;
+con D_Z_NACHRICHTEN:  int64 := 768;
+con D_Z_DOPPELT:      int64 := 776;   // Fragmentbyte, die schon lagen
+// Zusammensetzung (§5.5)
+con D_HS_SEQ_SCHR:    int64 := 784;   // naechste eigene message_seq
+con D_HS_AKTIV:       int64 := 792;   // 1 = eine Nachricht in Arbeit
+con D_HS_TYP:         int64 := 800;
+con D_HS_LEN:         int64 := 808;
+con D_HS_SEQ:         int64 := 816;   // message_seq der Nachricht in Arbeit
+con D_HS_DA:          int64 := 824;   // beisammen liegende Byte
+con D_KOPF:           int64 := 832;
+
+// Obergrenzen. B_HSM ist die groesste Handschlagnachricht, die
+// zusammengesetzt wird; die Bitmaske dazu braucht ein Bit je Byte.
+con B_OUT:   int64 := 20480;
+con B_HSM:   int64 := 16384;
+con B_BM:    int64 := 2048;           // B_HSM / 8
+con B_SCR:   int64 := 1024;
+
+con D_O_OUT: int64 := 832;
+con D_O_HSM: int64 := 21312;          // 832 + 20480
+con D_O_BM:  int64 := 37696;          // 21312 + 16384
+con D_O_SCR: int64 := 39744;          // 37696 + 2048
+con D_SIZE:  int64 := 40768;          // 39744 + 1024
+
+pub fn DtlsSpeicherBedarf(): int64 { return D_SIZE; }
+
+fn pOut(z: int64): int64 { return z + D_O_OUT; }
+fn pHsm(z: int64): int64 { return z + D_O_HSM; }
+fn pBm(z: int64): int64  { return z + D_O_BM; }
+fn pScr(z: int64): int64 { return z + D_O_SCR; }
+
+pub fn DtlsNeu(cfg: int64): int64 {
+    var z: int64 := alloc(D_SIZE);
+    if (z == 0) { return 0; }
+    // Der GANZE Block wird genullt, nicht nur der Kopf. In std.net.tls13 ist
+    // genau das einmal schiefgegangen: dort laeuft die Nullschleife bis zum
+    // Kopfende, und die Felder dahinter standen auf dem, was der Allokator
+    // gerade hergab (#2578). Hier ist der Block klein genug, dass die Frage
+    // sich nicht stellt.
+    var i: int64 := 0;
+    while (i < D_SIZE) { poke8(z + i, 0); i := i + 1; }
+    poke64(z + D_CFG, cfg);
+    poke64(z + D_R_HOCH, 0 - 1);
+    poke64(z + D_AEAD, 1);
+    poke64(z + D_KEYLEN, 16);
+    poke64(z + D_HASHLEN, 32);
+    return z;
+}
+
+pub fn DtlsFrei(z: int64): void {
+    if (z == 0) { return; }
+    SecureZero(z, D_SIZE);
+    free(z, D_SIZE);
+}
+
+// ── Schluessel einer Epoche setzen ───────────────────────────────────────
+//
+// `secret` ist das Verkehrsgeheimnis der Epoche (in TLS die
+// *_traffic_secret). Daraus entstehen drei Werte, und der dritte ist der,
+// den TLS nicht hat:
+//
+//     key = HKDF-Expand-Label(secret, "key", "", keyLen)
+//     iv  = HKDF-Expand-Label(secret, "iv",  "", 12)
+//     sn  = HKDF-Expand-Label(secret, "sn",  "", keyLen)     (§4.2.3)
+//
+// Der sn-Schluessel verschluesselt die Sequenznummer IM KOPF. Wer ihn
+// weglaesst, schickt die Nummer im Klartext -- das ist kein Fehler, den eine
+// Gegenstelle meldet, sondern eine Preisgabe: die Nummern verketten die
+// Pakete einer Verbindung ueber Adresswechsel hinweg.
+pub fn DtlsSchluesselSetzen(z: int64, richtung: int64, epoche: int64,
+                            secret: int64, hashLen: int64,
+                            keyLen: int64, aead: int64): bool {
+    if (z == 0 || secret == 0) { return false; }
+    if (hashLen != 32 && hashLen != 48) { return false; }
+    if (keyLen != 16 && keyLen != 32) { return false; }
+    if (aead != 1 && aead != 2) { return false; }
+    if (epoche < 0) { return false; }
+    poke64(z + D_AEAD, aead);
+    poke64(z + D_KEYLEN, keyLen);
+    poke64(z + D_HASHLEN, hashLen);
+
+    var key: int64 := z + D_W_KEY;
+    var iv: int64 := z + D_W_IV;
+    var snk: int64 := z + D_W_SNKEY;
+    var snexp: int64 := z + D_W_SNEXP;
+    if (richtung == 2) {
+        key := z + D_R_KEY; iv := z + D_R_IV;
+        snk := z + D_R_SNKEY; snexp := z + D_R_SNEXP;
+    }
+
+    if (!HkdfExpandLabel(hashLen, secret, hashLen, "key"c as int64, 3,
+                         0, 0, key, keyLen)) { return false; }
+    if (!HkdfExpandLabel(hashLen, secret, hashLen, "iv"c as int64, 2,
+                         0, 0, iv, 12)) { return false; }
+    if (!HkdfExpandLabel(hashLen, secret, hashLen, "sn"c as int64, 2,
+                         0, 0, snk, keyLen)) { return false; }
+
+    // Bei AES wird der sn-Schluessel EINMAL expandiert. Die Expansion je
+    // Record waere nicht falsch, aber sie ist der teuerste Teil des
+    // Maskenbaus und haengt nur am Schluessel.
+    var runden: int64 := 0;
+    if (aead == 1) {
+        if (keyLen == 16) { AES128KeyExpand(snk as pchar, snexp as pchar); runden := 10; }
+        else { AES256KeyExpand(snk as pchar, snexp as pchar); runden := 14; }
+    }
+
+    if (richtung == 2) {
+        poke64(z + D_R_SNRUNDEN, runden);
+        poke64(z + D_R_EPOCHE, epoche);
+        poke64(z + D_R_DA, 1);
+        // Neue Epoche, neues Fenster: die Nummern zaehlen je Epoche (§4.5.1).
+        poke64(z + D_R_HOCH, 0 - 1);
+        poke64(z + D_R_MASKE, 0);
+    } else {
+        poke64(z + D_W_SNRUNDEN, runden);
+        poke64(z + D_W_EPOCHE, epoche);
+        poke64(z + D_W_DA, 1);
+        poke64(z + D_W_SEQ, 0);
+    }
+    return true;
+}
+
+// ── Sequenznummern-Maske (§4.2.3) ────────────────────────────────────────
+//
+// `ct` zeigt auf das Chiffrat des Records, `ctLen` ist seine Laenge. Der RFC
+// verlangt mindestens 16 Byte Chiffrat; weil das Tag 16 Byte hat, ist das bei
+// jedem echten Record erfuellt -- aber ein Angreifer darf kuerzere Pakete
+// schicken, und dann wird nicht geraten, sondern abgewiesen.
+fn snMaske(z: int64, richtung: int64, ct: int64, ctLen: int64, out: int64): bool {
+    if (ctLen < 16) { return false; }
+    var aead: int64 := peek64(z + D_AEAD);
+    if (aead == 1) {
+        var snexp: int64 := z + D_W_SNEXP;
+        var runden: int64 := peek64(z + D_W_SNRUNDEN);
+        if (richtung == 2) { snexp := z + D_R_SNEXP; runden := peek64(z + D_R_SNRUNDEN); }
+        if (runden <= 0) { return false; }
+        // AES-ECB auf den ersten 16 Byte des Chiffrats. Der Block wird AN
+        // ORT UND STELLE verschluesselt, darum eine Kopie: `ct` ist das
+        // Chiffrat des Records und wird gleich noch gebraucht.
+        var blk: int64 := pScr(z);
+        var i: int64 := 0;
+        while (i < 16) { poke8(blk + i, peek8(ct + i)); i := i + 1; }
+        AESEncryptBlockWithKey(blk as pchar, snexp as pchar, runden);
+        i := 0;
+        while (i < 16) { poke8(out + i, peek8(blk + i)); i := i + 1; }
+        return true;
+    }
+    // ChaCha20: Zaehler sind die ersten vier Byte des Chiffrats (little
+    // endian), Nonce die zwoelf danach. Ein Block, 64 Byte; die ersten 16
+    // sind die Maske.
+    var snk: int64 := z + D_W_SNKEY;
+    if (richtung == 2) { snk := z + D_R_SNKEY; }
+    var zaehler: int64 := (peek8(ct) & 0xFF)
+                        | ((peek8(ct + 1) & 0xFF) << 8)
+                        | ((peek8(ct + 2) & 0xFF) << 16)
+                        | ((peek8(ct + 3) & 0xFF) << 24);
+    var blk2: int64 := pScr(z);
+    ChaCha20Block(snk, zaehler, ct + 4, blk2);
+    var k: int64 := 0;
+    while (k < 16) { poke8(out + k, peek8(blk2 + k)); k := k + 1; }
+    return true;
+}
+
+// Nonce = IV xor Sequenznummer, big endian in den letzten acht Byte
+// (§4.2.2, wie RFC 8446 §5.3).
+fn nonceBauen(iv: int64, seq: int64, out: int64): void {
+    var i: int64 := 0;
+    while (i < 12) { poke8(out + i, peek8(iv + i)); i := i + 1; }
+    i := 0;
+    while (i < 8) {
+        var b: int64 := ((seq as uint64) >> ((7 - i) * 8)) & 0xFF;
+        poke8(out + 4 + i, peek8(out + 4 + i) ^ b);
+        i := i + 1;
+    }
+}
+
+fn aeadSiegeln(z: int64, nonce: int64, aad: int64, aadLen: int64,
+               daten: int64, len: int64, ct: int64, tag: int64): bool {
+    if (peek64(z + D_AEAD) == 2) {
+        return ChaChaPolySeal(z + D_W_KEY, nonce, aad, aadLen, daten, len, ct, tag);
+    }
+    return AesGcmSeal(z + D_W_KEY, peek64(z + D_KEYLEN), nonce, 12,
+                      aad, aadLen, daten, len, ct, tag, 16);
+}
+
+fn aeadOeffnen(z: int64, nonce: int64, aad: int64, aadLen: int64,
+               ct: int64, len: int64, tag: int64, pt: int64): bool {
+    if (peek64(z + D_AEAD) == 2) {
+        return ChaChaPolyOpen(z + D_R_KEY, nonce, aad, aadLen, ct, len, tag, pt);
+    }
+    return AesGcmOpen(z + D_R_KEY, peek64(z + D_KEYLEN), nonce, 12,
+                      aad, aadLen, ct, len, tag, 16, pt);
+}
+
+// ── Fenster (§4.5.1) ─────────────────────────────────────────────────────
+//
+// `hoch` ist die hoechste akzeptierte Nummer, `maske` fuehrt die 64 Nummern
+// einschliesslich ihr: **Bit k steht fuer die Nummer hoch - k**. Bit 0 ist
+// also `hoch` selbst, und es wird gesetzt, sobald `hoch` wandert.
+//
+// Diese Festlegung ist beim Bauen einmal anders gemeint und anders gebaut
+// worden: der Kommentar sagte "hoch - 1 - k", die Pruefung rechnete mit
+// "hoch - k", und das Verschieben setzte das Bit des alten Randes an die
+// falsche Stelle. Die Folge war ein umgeordneter Record, der als
+// Wiederholung abgewiesen wurde -- also genau der Fall, den das Fenster
+// zulassen soll. Darum steht die Festlegung hier EINMAL und gilt fuer alle
+// drei Stellen.
+//
+// Warum ueberhaupt ein Fenster und nicht "nur groesser als die letzte": UDP
+// ordnet um. Mit der strengen Regel waere jedes umgeordnete Paket verloren,
+// und eine Umsetzung, die das tut, laeuft auf einer verlustfreien Schleife
+// fehlerfrei und im Netz katastrophal.
+fn fensterPruefen(z: int64, seq: int64): int64 {
+    var hoch: int64 := peek64(z + D_R_HOCH);
+    if (hoch < 0) { return 0; }                 // noch nichts empfangen
+    if (seq > hoch) { return 0; }
+    var abstand: int64 := hoch - seq;
+    if (abstand >= 64) {
+        poke64(z + D_Z_AUSSERFENSTER, peek64(z + D_Z_AUSSERFENSTER) + 1);
+        return DE_FENSTER;
+    }
+    var maske: int64 := peek64(z + D_R_MASKE);
+    if ((((maske as uint64) >> (abstand as uint64)) & 1) == 1) {
+        poke64(z + D_Z_WIEDERHOLT, peek64(z + D_Z_WIEDERHOLT) + 1);
+        return DE_WIEDERHOLT;
+    }
+    return 0;
+}
+
+fn fensterVermerken(z: int64, seq: int64): void {
+    var hoch: int64 := peek64(z + D_R_HOCH);
+    var maske: int64 := peek64(z + D_R_MASKE);
+    if (hoch < 0) {
+        poke64(z + D_R_HOCH, seq);
+        poke64(z + D_R_MASKE, 1);               // Bit 0 ist der neue Rand
+        return;
+    }
+    if (seq > hoch) {
+        var schub: int64 := seq - hoch;
+        if (schub >= 64) { maske := 0; }
+        else { maske := maske << schub; }
+        poke64(z + D_R_HOCH, seq);
+        poke64(z + D_R_MASKE, maske | 1);
+        return;
+    }
+    var abstand: int64 := hoch - seq;
+    if (abstand < 64) {
+        poke64(z + D_R_MASKE, maske | (1 << abstand));
+    }
+}
+
+// Zustand des Fensters nach aussen -- fuer Pruefstaende und Protokoll.
+pub fn DtlsFensterHoch(z: int64): int64  { return peek64(z + D_R_HOCH); }
+pub fn DtlsFensterMaske(z: int64): int64 { return peek64(z + D_R_MASKE); }
+
+// ── Record schreiben ─────────────────────────────────────────────────────
+//
+// Ohne gesetzten Schreibschluessel entsteht ein DTLSPlaintext-Record (13
+// Byte Kopf), mit Schluessel ein DTLSCiphertext mit "unified header".
+//
+// Der Kopf des verschluesselten Records sieht so aus:
+//   1 Byte  0 0 1 0 1 1 E E   (C=0 keine CID, S=1 16-Bit-Nummer,
+//                              L=1 Laenge dabei, EE = Epoche & 3)
+//   2 Byte  verschluesselte Sequenznummer
+//   2 Byte  Laenge des Chiffrats
+// Die 16-Bit-Form und das Laengenfeld sind absichtlich FEST: mehrere
+// Records in einem Datagramm brauchen die Laenge, und eine 8-Bit-Nummer
+// waere nach 256 Records ohne Not zweideutig. Wer die kuerzeren Formen
+// ergaenzt, aendert hier und im Leser -- und braucht fuer beide einen Test,
+// weil der Leser sie koennen muss, der Schreiber aber nicht.
+pub fn DtlsRecordSchreiben(z: int64, typ: int64, daten: int64, len: int64,
+                           out: int64, outCap: int64): int64 {
+    if (z == 0 || out == 0 || len < 0) { return DE_FORMAT; }
+
+    if (peek64(z + D_W_DA) != 1) {
+        // Klartextform: nur vor den Schluesseln (Epoche 0).
+        if (outCap < 13 + len) { return DE_PUFFER; }
+        var seq0: int64 := peek64(z + D_W_SEQ);
+        poke8(out, typ);
+        poke8(out + 1, 0xFE); poke8(out + 2, 0xFD);     // legacy_record_version
+        poke8(out + 3, 0); poke8(out + 4, 0);           // Epoche 0
+        var i0: int64 := 0;
+        while (i0 < 6) {
+            poke8(out + 5 + i0, ((seq0 as uint64) >> ((5 - i0) * 8)) & 0xFF);
+            i0 := i0 + 1;
+        }
+        poke8(out + 11, (len >> 8) & 0xFF);
+        poke8(out + 12, len & 0xFF);
+        var k0: int64 := 0;
+        while (k0 < len) { poke8(out + 13 + k0, peek8(daten + k0)); k0 := k0 + 1; }
+        poke64(z + D_W_SEQ, seq0 + 1);
+        return 13 + len;
+    }
+
+    // Verschluesselt: Klartext ist Inhalt + Typbyte (§4.1, wie TLS 1.3 §5.2).
+    var ctLen: int64 := len + 1 + 16;
+    if (outCap < 5 + ctLen) { return DE_PUFFER; }
+    if (len + 1 > 16384) { return DE_PUFFER; }
+
+    var seq: int64 := peek64(z + D_W_SEQ);
+    var epoche: int64 := peek64(z + D_W_EPOCHE);
+    poke8(out, 0x2C | (epoche & 3));                    // 001 0 1 1 EE
+    // Die Sequenznummer steht zunaechst im KLARTEXT im Kopf, weil sie Teil
+    // der AAD ist (§4.2.3: "the AAD is the header as it appears on the
+    // wire"). Verschluesselt wird sie erst, nachdem das Chiffrat vorliegt --
+    // die Maske haengt daran. Diese Reihenfolge ist der ganze Trick, und
+    // wer sie dreht, bekommt einen Record, den die Gegenseite nicht oeffnet.
+    poke8(out + 1, (seq >> 8) & 0xFF);
+    poke8(out + 2, seq & 0xFF);
+    poke8(out + 3, (ctLen >> 8) & 0xFF);
+    poke8(out + 4, ctLen & 0xFF);
+
+    var innen: int64 := out + 5;
+    var j: int64 := 0;
+    while (j < len) { poke8(innen + j, peek8(daten + j)); j := j + 1; }
+    poke8(innen + len, typ);
+
+    var nonce: int64 := pScr(z) + 256;
+    nonceBauen(z + D_W_IV, seq, nonce);
+    if (!aeadSiegeln(z, nonce, out, 5, innen, len + 1, innen, innen + len + 1)) {
+        return DE_FORMAT;
+    }
+
+    var maske: int64 := pScr(z) + 512;
+    if (!snMaske(z, 1, innen, ctLen, maske)) { return DE_FORMAT; }
+    poke8(out + 1, peek8(out + 1) ^ peek8(maske));
+    poke8(out + 2, peek8(out + 2) ^ peek8(maske + 1));
+
+    poke64(z + D_W_SEQ, seq + 1);
+    return 5 + ctLen;
+}
+
+// ── Record lesen ─────────────────────────────────────────────────────────
+//
+// Liest EINEN Record aus `paket`. Rueckgabe ist die Laenge des Klartexts,
+// der nach `rumpf` geschrieben wird; der Typ landet in `typOut`, die
+// verbrauchten Byte in `verbrauchtOut` (ein Datagramm kann mehrere Records
+// tragen, §4.3).
+//
+// Ein abgewiesener Record ist KEIN Grund, die Verbindung zu beenden
+// (§4.5.1: "silently discard") -- aber er wird gezaehlt. Der Aufrufer
+// entscheidet, ob er weiterliest; was er nicht tun darf, ist aus dem
+// Fehlerwert auf einen Angriff schliessen, denn ein verlorenes Paket sieht
+// genauso aus.
+pub fn DtlsRecordLesen(z: int64, paket: int64, len: int64,
+                       typOut: int64, rumpf: int64, rumpfCap: int64,
+                       verbrauchtOut: int64): int64 {
+    if (z == 0 || paket == 0 || len <= 0) { return DE_KURZ; }
+    var b0: int64 := peek8(paket) & 0xFF;
+
+    // Klartextform? Die drei oberen Bit sind dort der ContentType und damit
+    // nie 001xxxxx: 20..26 beginnen alle mit 000. Genau diese Unterscheidung
+    // nennt §4 ("the first byte ... distinguishes the two forms").
+    if ((b0 & 0xE0) != 0x20) {
+        if (len < 13) { return DE_KURZ; }
+        var rlen: int64 := ((peek8(paket + 11) & 0xFF) << 8) | (peek8(paket + 12) & 0xFF);
+        if (13 + rlen > len) { return DE_KURZ; }
+        if (rlen > rumpfCap) { return DE_PUFFER; }
+        // Epoche 0 ist die einzige Klartextepoche.
+        var ep: int64 := ((peek8(paket + 3) & 0xFF) << 8) | (peek8(paket + 4) & 0xFF);
+        if (ep != 0) { return DE_EPOCHE; }
+        var i: int64 := 0;
+        while (i < rlen) { poke8(rumpf + i, peek8(paket + 13 + i)); i := i + 1; }
+        poke64(typOut, peek8(paket) & 0xFF);
+        poke64(verbrauchtOut, 13 + rlen);
+        return rlen;
+    }
+
+    if (peek64(z + D_R_DA) != 1) { return DE_SCHLUESSEL; }
+
+    var hatCid: bool := (b0 & 0x10) != 0;
+    var seq16: bool := (b0 & 0x08) != 0;
+    var hatLen: bool := (b0 & 0x04) != 0;
+    var eeBits: int64 := b0 & 3;
+    // Connection IDs sind nicht umgesetzt (sie brauchen eine Zuordnung
+    // ausserhalb dieser Unit). Ein Record mit CID wird darum ABGEWIESEN und
+    // nicht "irgendwie" gelesen: wo die CID steht, stuende sonst die
+    // Sequenznummer.
+    if (hatCid) { return DE_FORMAT; }
+
+    var snLen: int64 := 1;
+    if (seq16) { snLen := 2; }
+    var kopfLen: int64 := 1 + snLen;
+    if (hatLen) { kopfLen := kopfLen + 2; }
+    if (len < kopfLen) { return DE_KURZ; }
+
+    var ctLen: int64 := len - kopfLen;
+    if (hatLen) {
+        ctLen := ((peek8(paket + 1 + snLen) & 0xFF) << 8)
+              | (peek8(paket + 1 + snLen + 1) & 0xFF);
+        if (kopfLen + ctLen > len) { return DE_KURZ; }
+    }
+    if (ctLen < 17) { return DE_KURZ; }             // Tag + mindestens ein Byte
+
+    // Die Epoche steht nur mit zwei Bit im Kopf. Verglichen wird darum
+    // ebenfalls mit zwei Bit -- und wer mehr Epochen fuehrt als vier, muss
+    // hier eine Zuordnung ergaenzen statt der Gleichheit zu glauben.
+    if ((peek64(z + D_R_EPOCHE) & 3) != eeBits) { return DE_EPOCHE; }
+
+    var ct: int64 := paket + kopfLen;
+    var maske: int64 := pScr(z) + 512;
+    if (!snMaske(z, 2, ct, ctLen, maske)) { return DE_KURZ; }
+
+    // Die Nummer im Kopf ist verkuerzt. Rekonstruiert wird die vollstaendige
+    // aus dem rechten Rand des Fensters: die naechstliegende Zahl, die in
+    // den unteren Bit uebereinstimmt (§4.2.2).
+    var teil: int64 := 0;
+    var s: int64 := 0;
+    while (s < snLen) {
+        teil := (teil << 8) | ((peek8(paket + 1 + s) & 0xFF) ^ (peek8(maske + s) & 0xFF));
+        s := s + 1;
+    }
+    var breite: int64 := snLen * 8;
+    var voll: int64 := teil;
+    var hoch: int64 := peek64(z + D_R_HOCH);
+    if (hoch >= 0) {
+        var erwartet: int64 := hoch + 1;
+        var basis: int64 := erwartet & (0 - (1 << breite));      // obere Bit
+        voll := basis | teil;
+        // Zwei Nachbarn pruefen: die Nummer kann in den naechsten oder in
+        // den vorigen Zyklus gehoeren. Genommen wird die, die `erwartet`
+        // am naechsten liegt.
+        var kand1: int64 := voll + (1 << breite);
+        var kand2: int64 := voll - (1 << breite);
+        var d0: int64 := voll - erwartet; if (d0 < 0) { d0 := 0 - d0; }
+        var d1: int64 := kand1 - erwartet; if (d1 < 0) { d1 := 0 - d1; }
+        var d2: int64 := kand2 - erwartet; if (d2 < 0) { d2 := 0 - d2; }
+        if (d1 < d0) { voll := kand1; d0 := d1; }
+        if (d2 < d0 && kand2 >= 0) { voll := kand2; }
+    }
+
+    var fw: int64 := fensterPruefen(z, voll);
+    if (fw != 0) { return fw; }
+
+    if (ctLen - 16 > rumpfCap) { return DE_PUFFER; }
+    // AAD ist der Kopf MIT DER KLARTEXTNUMMER. RFC 9147 §4.2.1 sagt es
+    // ausdruecklich: "The entire header value ... (but prior to record
+    // number encryption) is used as the additional data value".
+    //
+    // Das ist die eine Stelle, an der sich diese Record-Schicht nicht
+    // "natuerlich" verhaelt: auf der Leitung steht die verschluesselte
+    // Nummer, gerechnet wird mit der entschluesselten. Beim Bauen hat genau
+    // das hier ein falsches Tag gegeben (-4), und der Fehler sah wie ein
+    // Krypto- oder Schluesselproblem aus. Darum wird der Kopf fuer die AAD
+    // NEU zusammengesetzt und nicht der angekommene genommen.
+    var aad: int64 := pScr(z) + 768;
+    var ak: int64 := 0;
+    while (ak < kopfLen) { poke8(aad + ak, peek8(paket + ak)); ak := ak + 1; }
+    var sx: int64 := 0;
+    while (sx < snLen) {
+        poke8(aad + 1 + sx, ((teil as uint64) >> ((snLen - 1 - sx) * 8)) & 0xFF);
+        sx := sx + 1;
+    }
+
+    var nonce: int64 := pScr(z) + 256;
+    nonceBauen(z + D_R_IV, voll, nonce);
+    var ptLen: int64 := ctLen - 16;
+    if (!aeadOeffnen(z, nonce, aad, kopfLen, ct, ptLen, ct + ptLen, rumpf)) {
+        return DE_TAG;
+    }
+
+    // Polsterung abschneiden und den echten Typ lesen (§4.1, wie TLS §5.4).
+    var p: int64 := ptLen - 1;
+    while (p >= 0 && (peek8(rumpf + p) & 0xFF) == 0) { p := p - 1; }
+    if (p < 0) { return DE_FORMAT; }
+    poke64(typOut, peek8(rumpf + p) & 0xFF);
+    poke64(verbrauchtOut, kopfLen + ctLen);
+    fensterVermerken(z, voll);
+    return p;
+}
+
+pub fn DtlsZaehlerWiederholt(z: int64): int64    { return peek64(z + D_Z_WIEDERHOLT); }
+pub fn DtlsZaehlerAusserFenster(z: int64): int64 { return peek64(z + D_Z_AUSSERFENSTER); }
+pub fn DtlsZaehlerFragmente(z: int64): int64     { return peek64(z + D_Z_FRAGMENTE); }
+pub fn DtlsZaehlerNachrichten(z: int64): int64   { return peek64(z + D_Z_NACHRICHTEN); }
+pub fn DtlsZaehlerDoppelt(z: int64): int64       { return peek64(z + D_Z_DOPPELT); }
+
+// ── Handschlagnachrichten: fragmentieren (§5.5) ──────────────────────────
+//
+// Der DTLS-Handschlagkopf ist zwoelf Byte und nicht vier wie in TLS:
+//
+//     msg_type(1) length(3) message_seq(2) fragment_offset(3) fragment_length(3)
+//
+// `length` ist die Laenge der GANZEN Nachricht, `fragment_length` die dieses
+// Stuecks. Beide Angaben stehen in JEDEM Fragment -- daran setzt der
+// Empfaenger zusammen, ohne auf eine Reihenfolge zu vertrauen.
+//
+// `mtu` ist die Obergrenze eines Datagramms. Fragmentiert wird nach der
+// NUTZLAST, die dort hineinpasst: der Recordkopf, der Handschlagkopf, das
+// Typbyte und das Tag gehen ab. Wer nur die Nachricht durch die MTU teilt,
+// baut Pakete, die genau um diesen Mehrbedarf zu gross sind -- und bemerkt
+// es erst an einem Pfad, der nicht fragmentiert.
+con HS_KOPF: int64 := 12;
+
+pub fn DtlsHsSenden(z: int64, typ: int64, rumpf: int64, len: int64,
+                    mtu: int64, out: int64, outCap: int64): int64 {
+    if (z == 0 || out == 0 || len < 0) { return DE_FORMAT; }
+    if (len > B_HSM) { return DE_UEBERLANG; }
+
+    var mehr: int64 := 13 + HS_KOPF;                  // Klartextform
+    if (peek64(z + D_W_DA) == 1) { mehr := 5 + HS_KOPF + 1 + 16; }
+    if (mtu <= mehr) { return DE_PUFFER; }
+    var jeFragment: int64 := mtu - mehr;
+
+    var seq: int64 := peek64(z + D_HS_SEQ_SCHR);
+    var puf: int64 := pOut(z);                        // Zwischenpuffer: Kopf + Stueck
+    var geschrieben: int64 := 0;
+    var offset: int64 := 0;
+    var ersteRunde: bool := true;
+
+    // Eine Nachricht der Laenge 0 (etwa end_of_early_data) hat GENAU EIN
+    // Fragment, nicht keines. Ohne diese Unterscheidung faellt sie
+    // stillschweigend aus dem Flug heraus -- die Schleife unten lief bei
+    // len == 0 nie.
+    while (offset < len || ersteRunde) {
+        ersteRunde := false;
+        var stueck: int64 := len - offset;
+        if (stueck > jeFragment) { stueck := jeFragment; }
+
+        poke8(puf, typ);
+        poke8(puf + 1, (len >> 16) & 0xFF);
+        poke8(puf + 2, (len >> 8) & 0xFF);
+        poke8(puf + 3, len & 0xFF);
+        poke8(puf + 4, (seq >> 8) & 0xFF);
+        poke8(puf + 5, seq & 0xFF);
+        poke8(puf + 6, (offset >> 16) & 0xFF);
+        poke8(puf + 7, (offset >> 8) & 0xFF);
+        poke8(puf + 8, offset & 0xFF);
+        poke8(puf + 9, (stueck >> 16) & 0xFF);
+        poke8(puf + 10, (stueck >> 8) & 0xFF);
+        poke8(puf + 11, stueck & 0xFF);
+        var i: int64 := 0;
+        while (i < stueck) { poke8(puf + HS_KOPF + i, peek8(rumpf + offset + i)); i := i + 1; }
+
+        var rc: int64 := DtlsRecordSchreiben(z, 22, puf, HS_KOPF + stueck,
+                                             out + geschrieben, outCap - geschrieben);
+        if (rc < 0) { return rc; }
+        geschrieben := geschrieben + rc;
+        offset := offset + stueck;
+    }
+    poke64(z + D_HS_SEQ_SCHR, seq + 1);
+    return geschrieben;
+}
+
+pub fn DtlsHsSeqSchreiben(z: int64): int64 { return peek64(z + D_HS_SEQ_SCHR); }
+
+// ── Handschlagnachrichten: zusammensetzen ────────────────────────────────
+//
+// Eingespeist wird der KLARTEXT eines Handschlagrecords -- also was
+// DtlsRecordLesen geliefert hat. Ein Record kann mehrere Fragmente tragen
+// (§5.5), darum die Schleife.
+//
+// Zusammengesetzt wird EINE Nachricht zur Zeit. Trifft ein Fragment einer
+// ANDEREN message_seq ein, waehrend eine in Arbeit ist, wird es verworfen
+// und gezaehlt -- nicht gepuffert. Das ist eine bewusste Grenze dieser
+// Stufe: der Handschlag verarbeitet die Nachrichten ohnehin in Reihenfolge,
+// und die Wiederholung (Stufe 4 in #2580) bringt das verworfene Fragment
+// erneut. Wer mehrere Nachrichten gleichzeitig halten will, braucht mehrere
+// Puffer samt Bitmasken -- und soll das bauen, statt hier eine halbe
+// Verwaltung zu finden.
+//
+// Die BITMASKE ist byteweise und nicht intervallweise: zwei Fragmente
+// duerfen sich ueberlappen, teilweise doppeln und in beliebiger Reihenfolge
+// kommen. Eine Intervallliste waere kleiner, aber sie muesste
+// Ueberlappungen verschmelzen, und genau dort liegt der Fehler, den man erst
+// unter Paketverlust sieht.
+fn bmSetzen(z: int64, von: int64, laenge: int64): int64 {
+    var bm: int64 := pBm(z);
+    var doppelt: int64 := 0;
+    var i: int64 := 0;
+    while (i < laenge) {
+        var pos: int64 := von + i;
+        var byte: int64 := pos >> 3;
+        var bit: int64 := 1 << (pos & 7);
+        if ((peek8(bm + byte) & bit) != 0) { doppelt := doppelt + 1; }
+        else { poke8(bm + byte, (peek8(bm + byte) & 0xFF) | bit); }
+        i := i + 1;
+    }
+    return doppelt;
+}
+
+fn bmVollstaendig(z: int64, laenge: int64): bool {
+    var bm: int64 := pBm(z);
+    var i: int64 := 0;
+    while (i < laenge) {
+        var byte: int64 := i >> 3;
+        if ((i & 7) == 0 && laenge - i >= 8) {
+            if ((peek8(bm + byte) & 0xFF) != 0xFF) { return false; }
+            i := i + 8;
+        } else {
+            if ((peek8(bm + byte) & (1 << (i & 7))) == 0) { return false; }
+            i := i + 1;
+        }
+    }
+    return true;
+}
+
+fn hsNeuBeginnen(z: int64, typ: int64, len: int64, seq: int64): void {
+    poke64(z + D_HS_AKTIV, 1);
+    poke64(z + D_HS_TYP, typ);
+    poke64(z + D_HS_LEN, len);
+    poke64(z + D_HS_SEQ, seq);
+    poke64(z + D_HS_DA, 0);
+    var bm: int64 := pBm(z);
+    var i: int64 := 0;
+    while (i < B_BM) { poke8(bm + i, 0); i := i + 1; }
+}
+
+pub fn DtlsHsFragmentEinspeisen(z: int64, daten: int64, len: int64): int64 {
+    if (z == 0 || daten == 0 || len < 0) { return DE_FORMAT; }
+    var p: int64 := 0;
+    while (p + HS_KOPF <= len) {
+        var typ: int64 := peek8(daten + p) & 0xFF;
+        var gLen: int64 := ((peek8(daten + p + 1) & 0xFF) << 16)
+                         | ((peek8(daten + p + 2) & 0xFF) << 8)
+                         |  (peek8(daten + p + 3) & 0xFF);
+        var mseq: int64 := ((peek8(daten + p + 4) & 0xFF) << 8)
+                         |  (peek8(daten + p + 5) & 0xFF);
+        var off: int64 := ((peek8(daten + p + 6) & 0xFF) << 16)
+                        | ((peek8(daten + p + 7) & 0xFF) << 8)
+                        |  (peek8(daten + p + 8) & 0xFF);
+        var fLen: int64 := ((peek8(daten + p + 9) & 0xFF) << 16)
+                         | ((peek8(daten + p + 10) & 0xFF) << 8)
+                         |  (peek8(daten + p + 11) & 0xFF);
+        if (p + HS_KOPF + fLen > len) { return DE_FORMAT; }
+        if (gLen > B_HSM) { return DE_UEBERLANG; }
+        if (off + fLen > gLen) { return DE_FORMAT; }
+
+        if (peek64(z + D_HS_AKTIV) != 1) {
+            hsNeuBeginnen(z, typ, gLen, mseq);
+        } else {
+            if (peek64(z + D_HS_SEQ) != mseq) {
+                // Fragment einer anderen Nachricht: verworfen, gezaehlt.
+                poke64(z + D_Z_FRAGMENTE, peek64(z + D_Z_FRAGMENTE) + 1);
+                p := p + HS_KOPF + fLen;
+                continue;
+            }
+            // Dieselbe Nachricht MUSS dieselbe Laenge und denselben Typ
+            // nennen. Weicht das ab, ist eines der beiden Pakete gefaelscht
+            // oder verstuemmelt -- und dann wird nicht zusammengesetzt.
+            if (peek64(z + D_HS_TYP) != typ) { return DE_WIDERSPRUCH; }
+            if (peek64(z + D_HS_LEN) != gLen) { return DE_WIDERSPRUCH; }
+        }
+
+        var ziel: int64 := pHsm(z);
+        var i: int64 := 0;
+        while (i < fLen) { poke8(ziel + off + i, peek8(daten + p + HS_KOPF + i)); i := i + 1; }
+        var doppelt: int64 := bmSetzen(z, off, fLen);
+        poke64(z + D_Z_DOPPELT, peek64(z + D_Z_DOPPELT) + doppelt);
+        poke64(z + D_HS_DA, peek64(z + D_HS_DA) + (fLen - doppelt));
+        poke64(z + D_Z_FRAGMENTE, peek64(z + D_Z_FRAGMENTE) + 1);
+
+        p := p + HS_KOPF + fLen;
+    }
+    if (p != len) { return DE_FORMAT; }
+    return 0;
+}
+
+// Liegt eine VOLLSTAENDIGE Nachricht? Geprueft wird die Bitmaske und nicht
+// die Summe der Fragmentlaengen: mit Ueberlappungen zaehlt die Summe zu
+// hoch, und eine Luecke faellt dann nicht auf.
+pub fn DtlsHsFertig(z: int64): int64 {
+    if (peek64(z + D_HS_AKTIV) != 1) { return 0; }
+    if (peek64(z + D_HS_DA) != peek64(z + D_HS_LEN)) { return 0; }
+    if (!bmVollstaendig(z, peek64(z + D_HS_LEN))) { return 0; }
+    return 1;
+}
+
+pub fn DtlsHsTyp(z: int64): int64     { return peek64(z + D_HS_TYP); }
+pub fn DtlsHsLen(z: int64): int64     { return peek64(z + D_HS_LEN); }
+pub fn DtlsHsSeq(z: int64): int64     { return peek64(z + D_HS_SEQ); }
+pub fn DtlsHsRumpf(z: int64): int64   { return pHsm(z); }
+
+// Die fertige Nachricht abnehmen. Danach ist der Platz frei fuer die
+// naechste; der Zaehler der fertigen Nachrichten steigt genau hier.
+pub fn DtlsHsVerbrauchen(z: int64): int64 {
+    if (DtlsHsFertig(z) != 1) { return DE_FORMAT; }
+    poke64(z + D_Z_NACHRICHTEN, peek64(z + D_Z_NACHRICHTEN) + 1);
+    poke64(z + D_HS_AKTIV, 0);
+    poke64(z + D_HS_DA, 0);
+    return 0;
+}
