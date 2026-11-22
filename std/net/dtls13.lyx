@@ -140,7 +140,12 @@ con D_HS_TYP:         int64 := 800;
 con D_HS_LEN:         int64 := 808;
 con D_HS_SEQ:         int64 := 816;   // message_seq der Nachricht in Arbeit
 con D_HS_DA:          int64 := 824;   // beisammen liegende Byte
-con D_KOPF:           int64 := 832;
+// Stufe 3 und 4 (#2580): Cookie, ACK-Liste und der gemerkte Flug. Sie
+// liegen HINTER den Feldern der Stufen 1 und 2, damit kein Offset davor
+// verschoben werden musste -- dieselbe Vorsicht wie in std.net.tls13, wo
+// eine Verschiebung einmal den Eingangspuffer ueberschrieben hat (#2579).
+// Die Zahlen stehen bei den Funktionen, die sie benutzen.
+con D_KOPF:           int64 := 1424;
 
 // Obergrenzen. B_HSM ist die groesste Handschlagnachricht, die
 // zusammengesetzt wird; die Bitmaske dazu braucht ein Bit je Byte.
@@ -149,11 +154,12 @@ con B_HSM:   int64 := 16384;
 con B_BM:    int64 := 2048;           // B_HSM / 8
 con B_SCR:   int64 := 1024;
 
-con D_O_OUT: int64 := 832;
-con D_O_HSM: int64 := 21312;          // 832 + 20480
-con D_O_BM:  int64 := 37696;          // 21312 + 16384
-con D_O_SCR: int64 := 39744;          // 37696 + 2048
-con D_SIZE:  int64 := 40768;          // 39744 + 1024
+con D_O_OUT:  int64 := 1424;
+con D_O_HSM:  int64 := 21904;         // 1424 + 20480
+con D_O_BM:   int64 := 38288;         // 21904 + 16384
+con D_O_SCR:  int64 := 40336;         // 38288 + 2048
+con D_O_FLUG: int64 := 41360;         // 40336 + 1024
+con D_SIZE:   int64 := 61840;         // 41360 + 20480
 
 pub fn DtlsSpeicherBedarf(): int64 { return D_SIZE; }
 
@@ -386,6 +392,80 @@ fn fensterVermerken(z: int64, seq: int64): void {
 pub fn DtlsFensterHoch(z: int64): int64  { return peek64(z + D_R_HOCH); }
 pub fn DtlsFensterMaske(z: int64): int64 { return peek64(z + D_R_MASKE); }
 
+// ── Stufe 4: ACK (§7) ────────────────────────────────────────────────────
+//
+// In TLS kommt alles an oder die Verbindung ist tot. In DTLS bestaetigt der
+// Empfaenger, WELCHE Records er hat:
+//
+//     struct { RecordNumber record_numbers<0..2^16-1>; } ACK;
+//     struct { uint64 epoch; uint64 sequence_number; } RecordNumber;
+//
+// Die Unit fuehrt die empfangenen Nummern in einer Liste, aus der ein ACK
+// gebaut wird. Sie ist ABSICHTLICH kurz (32 Eintraege) und fuehrt die
+// JUENGSTEN: ein ACK ist eine Momentaufnahme, und ein Eintrag, der nicht
+// hineinpasst, fuehrt zu einer Wiederholung -- nicht zu einem Fehler.
+con AK_MAX:    int64 := 32;
+con D_AK_ANZ:  int64 := 1088;
+con D_AK_LISTE: int64 := 1096;    // AK_MAX * 8 Byte Sequenznummern
+con D_AK_EPOCHE: int64 := 1352;   // Epoche, zu der die Liste gehoert
+
+fn ackVermerken(z: int64, epoche: int64, seq: int64): void {
+    // Epochenwechsel leert die Liste: Nummern sind je Epoche gezaehlt, und
+    // ein ACK, das Nummern aus zwei Epochen mischt, waere nicht lesbar.
+    if (peek64(z + D_AK_EPOCHE) != epoche) {
+        poke64(z + D_AK_EPOCHE, epoche);
+        poke64(z + D_AK_ANZ, 0);
+    }
+    var anz: int64 := peek64(z + D_AK_ANZ);
+    var i: int64 := 0;
+    while (i < anz) {
+        if (peek64(z + D_AK_LISTE + i * 8) == seq) { return; }   // schon drin
+        i := i + 1;
+    }
+    if (anz < AK_MAX) {
+        poke64(z + D_AK_LISTE + anz * 8, seq);
+        poke64(z + D_AK_ANZ, anz + 1);
+        return;
+    }
+    // Voll: die aelteste fallen lassen und hinten anfuegen.
+    var k: int64 := 0;
+    while (k + 1 < AK_MAX) {
+        poke64(z + D_AK_LISTE + k * 8, peek64(z + D_AK_LISTE + (k + 1) * 8));
+        k := k + 1;
+    }
+    poke64(z + D_AK_LISTE + (AK_MAX - 1) * 8, seq);
+}
+
+pub fn DtlsAckAnzahl(z: int64): int64 { return peek64(z + D_AK_ANZ); }
+
+// Ein ACK-Nachrichtenrumpf bauen (ohne Recordkopf -- der kommt von
+// DtlsRecordSchreiben mit Typ 26). Rueckgabe ist die Laenge.
+pub fn DtlsAckBauen(z: int64, out: int64, outCap: int64): int64 {
+    var anz: int64 := peek64(z + D_AK_ANZ);
+    var laenge: int64 := anz * 16;
+    if (outCap < 2 + laenge) { return DE_PUFFER; }
+    poke8(out, (laenge >> 8) & 0xFF);
+    poke8(out + 1, laenge & 0xFF);
+    var epoche: int64 := peek64(z + D_AK_EPOCHE);
+    var i: int64 := 0;
+    while (i < anz) {
+        var p: int64 := 2 + i * 16;
+        var k: int64 := 0;
+        while (k < 8) {
+            poke8(out + p + k, ((epoche as uint64) >> ((7 - k) * 8)) & 0xFF);
+            k := k + 1;
+        }
+        var seq: int64 := peek64(z + D_AK_LISTE + i * 8);
+        k := 0;
+        while (k < 8) {
+            poke8(out + p + 8 + k, ((seq as uint64) >> ((7 - k) * 8)) & 0xFF);
+            k := k + 1;
+        }
+        i := i + 1;
+    }
+    return 2 + laenge;
+}
+
 // ── Record schreiben ─────────────────────────────────────────────────────
 //
 // Ohne gesetzten Schreibschluessel entsteht ein DTLSPlaintext-Record (13
@@ -599,6 +679,11 @@ pub fn DtlsRecordLesen(z: int64, paket: int64, len: int64,
     poke64(typOut, peek8(rumpf + p) & 0xFF);
     poke64(verbrauchtOut, kopfLen + ctLen);
     fensterVermerken(z, voll);
+    // #2580 Stufe 4: Was angekommen ist, gehoert ins naechste ACK (§7). Das
+    // steht HIER und nicht beim Aufrufer: ein ACK, das eine Nummer nennt,
+    // die diese Unit nie geoeffnet hat, waere eine Luege gegenueber der
+    // Gegenseite -- sie wuerde die Wiederholung einstellen.
+    ackVermerken(z, peek64(z + D_R_EPOCHE), voll);
     return p;
 }
 
@@ -813,3 +898,193 @@ pub fn DtlsHsVerbrauchen(z: int64): int64 {
     poke64(z + D_HS_DA, 0);
     return 0;
 }
+
+// ── Stufe 3: Cookie (§5.1) ───────────────────────────────────────────────
+//
+// Ein Server ohne Zustand waere sonst ein VERSTAERKUNGSZIEL: ein kurzes
+// ClientHello mit gefaelschter Absenderadresse loeste einen langen
+// Serverflug an das Opfer aus. Darum bestaetigt der Server die Adresse
+// zuerst -- er antwortet mit einem HelloRetryRequest, das ein Cookie traegt,
+// und erst ein ClientHello MIT diesem Cookie loest den Flug aus.
+//
+// Das Cookie ist hier
+//
+//     zeit(8) || HMAC(cookieKey, zeit || adresse || transkript)[0..31]
+//
+// und damit ZUSTANDSLOS: der Server muss sich nichts merken, er rechnet beim
+// Pruefen nach. Drei Dinge stehen absichtlich darin:
+//
+//   * die ADRESSE, denn genau sie wird bestaetigt. Ein Cookie ohne Adresse
+//     waere ein Freifahrtschein, den ein Angreifer einmal holt und dann mit
+//     beliebiger Absenderadresse benutzt.
+//   * die ZEIT, damit es ablaeuft. Ohne sie bliebe ein abgehoertes Cookie
+//     ewig gueltig.
+//   * der TRANSKRIPTHASH des ersten ClientHello, damit das Cookie nicht zu
+//     einem anderen ClientHello passt.
+//
+// Verglichen wird KONSTANTZEITIG. Das Cookie ist ein
+// Authentifizierungswert; ein frueh ausspringender Vergleich verraet, wie
+// viele Byte stimmen, und damit laesst sich eines erraten.
+con CK_ZEIT:  int64 := 8;
+con CK_MAC:   int64 := 32;
+pub fn DtlsCookieLaenge(): int64 { return CK_ZEIT + CK_MAC; }
+
+con D_CKKEY:   int64 := 1040;   // 32 Byte Cookie-Schluessel
+con D_CKDA:    int64 := 1072;
+con D_CKFRIST: int64 := 1080;   // Gueltigkeit in Sekunden
+
+// Den Cookie-Schluessel setzen. Er gehoert dem Betreiber und ist ein
+// GEHEIMNIS: wer ihn kennt, baut gueltige Cookies fuer fremde Adressen und
+// hebt den Schutz damit auf. `frist` ist die Gueltigkeit in Sekunden; 0
+// nimmt 60.
+pub fn DtlsCookieSchluessel(z: int64, key: int64, frist: int64): bool {
+    if (z == 0 || key == 0) { return false; }
+    var i: int64 := 0;
+    while (i < 32) { poke8(z + D_CKKEY + i, peek8(key + i)); i := i + 1; }
+    poke64(z + D_CKDA, 1);
+    if (frist <= 0) { poke64(z + D_CKFRIST, 60); } else { poke64(z + D_CKFRIST, frist); }
+    return true;
+}
+
+fn cookieMac(z: int64, zeit: int64, adresse: int64, adrLen: int64,
+             transkript: int64, tLen: int64, out: int64): bool {
+    if (peek64(z + D_CKDA) != 1) { return false; }
+    if (adrLen < 0 || adrLen > 128) { return false; }
+    if (tLen < 0 || tLen > 64) { return false; }
+    var buf: int64 := pScr(z);
+    var i: int64 := 0;
+    while (i < 8) { poke8(buf + i, ((zeit as uint64) >> ((7 - i) * 8)) & 0xFF); i := i + 1; }
+    var p: int64 := 8;
+    i := 0;
+    while (i < adrLen) { poke8(buf + p + i, peek8(adresse + i)); i := i + 1; }
+    p := p + adrLen;
+    i := 0;
+    while (i < tLen) { poke8(buf + p + i, peek8(transkript + i)); i := i + 1; }
+    p := p + tLen;
+    HmacHash(32, z + D_CKKEY, 32, buf, p, out);
+    return true;
+}
+
+// Ein Cookie bauen. Rueckgabe ist seine Laenge, 0 bei Fehler.
+pub fn DtlsCookieBauen(z: int64, jetzt: int64, adresse: int64, adrLen: int64,
+                       transkript: int64, tLen: int64,
+                       out: int64, outCap: int64): int64 {
+    if (outCap < CK_ZEIT + CK_MAC) { return 0; }
+    var i: int64 := 0;
+    while (i < 8) { poke8(out + i, ((jetzt as uint64) >> ((7 - i) * 8)) & 0xFF); i := i + 1; }
+    var mac: int64 := pScr(z) + 512;
+    if (!cookieMac(z, jetzt, adresse, adrLen, transkript, tLen, mac)) { return 0; }
+    i := 0;
+    while (i < CK_MAC) { poke8(out + CK_ZEIT + i, peek8(mac + i)); i := i + 1; }
+    return CK_ZEIT + CK_MAC;
+}
+
+// Ein Cookie pruefen. 1 = gueltig, 0 = nicht.
+//
+// Geprueft wird GEGEN DIESELBE Adresse und denselben Transkripthash. Ein
+// Cookie, das zu einer anderen Adresse gehoert, ist hier nicht "etwas
+// unsauber", sondern ungueltig -- das ist der ganze Zweck.
+pub fn DtlsCookiePruefen(z: int64, jetzt: int64, adresse: int64, adrLen: int64,
+                         transkript: int64, tLen: int64,
+                         cookie: int64, ckLen: int64): int64 {
+    if (ckLen != CK_ZEIT + CK_MAC) { return 0; }
+    if (peek64(z + D_CKDA) != 1) { return 0; }
+    var zeit: int64 := 0;
+    var i: int64 := 0;
+    while (i < 8) { zeit := (zeit << 8) | (peek8(cookie + i) & 0xFF); i := i + 1; }
+    // Zu alt oder aus der Zukunft: beides ist unbrauchbar. Die Uhr des
+    // SERVERS entscheidet.
+    if (jetzt < zeit) { return 0; }
+    if (jetzt - zeit > peek64(z + D_CKFRIST)) { return 0; }
+    var mac: int64 := pScr(z) + 512;
+    if (!cookieMac(z, zeit, adresse, adrLen, transkript, tLen, mac)) { return 0; }
+    // CTMemEqual liefert eine MASKE (-1 bei Gleichheit), keinen
+    // Wahrheitswert -- darum der ausdrueckliche Vergleich mit 0.
+    if (CTMemEqual(mac, cookie + CK_ZEIT, CK_MAC) == 0) { return 0; }
+    return 1;
+}
+
+// ── Stufe 4: Wiederholung mit Rueckfall (§5.8) ───────────────────────────
+//
+// Gemerkt wird EIN Flug -- der letzte eigene. Mehr braucht DTLS 1.3 nicht:
+// ein neuer Flug bestaetigt den vorigen (§5.8.1), und was danach noch fehlt,
+// bestaetigt das ACK.
+//
+// Die Frist verdoppelt sich mit jeder Wiederholung (§5.8.2) und ist nach
+// oben gedeckelt; nach `grenze` Versuchen gilt der Weg als tot. Beide Werte
+// sind VORGABEN und keine Konstanten dieser Unit: wer sie fest einbaut,
+// zwingt ein Satellitennetz und ein Rechenzentrum in dieselbe Frist.
+con D_FL_LEN:    int64 := 1360;
+con D_FL_FRIST:  int64 := 1368;   // naechste Frist in ms
+con D_FL_FAELLIG: int64 := 1376;  // Zeitpunkt in ms, ab dem wiederholt wird
+con D_FL_VERSUCHE: int64 := 1384;
+con D_FL_GRENZE: int64 := 1392;
+con D_FL_ANFANG: int64 := 1400;   // Anfangsfrist in ms
+con D_FL_DECKEL: int64 := 1408;   // Obergrenze der Frist in ms
+con D_Z_WIEDERHOLUNGEN: int64 := 1416;
+
+// Der Flugpuffer liegt hinter den anderen Puffern (siehe D_O_FLUG).
+fn pFlug(z: int64): int64 { return z + D_O_FLUG; }
+
+pub fn DtlsFristen(z: int64, anfangMs: int64, deckelMs: int64, grenze: int64): bool {
+    if (anfangMs <= 0 || deckelMs < anfangMs || grenze <= 0) { return false; }
+    poke64(z + D_FL_ANFANG, anfangMs);
+    poke64(z + D_FL_DECKEL, deckelMs);
+    poke64(z + D_FL_GRENZE, grenze);
+    return true;
+}
+
+// Einen gesendeten Flug zum Wiederholen merken. `jetztMs` ist die eigene
+// Uhr; diese Unit liest keine Zeit selbst, damit ein Test sie stellen kann.
+pub fn DtlsFlugMerken(z: int64, daten: int64, len: int64, jetztMs: int64): int64 {
+    if (len <= 0 || len > B_OUT) { return DE_PUFFER; }
+    var anfang: int64 := peek64(z + D_FL_ANFANG);
+    if (anfang <= 0) { anfang := 1000; poke64(z + D_FL_ANFANG, 1000); }
+    if (peek64(z + D_FL_DECKEL) <= 0) { poke64(z + D_FL_DECKEL, 60000); }
+    if (peek64(z + D_FL_GRENZE) <= 0) { poke64(z + D_FL_GRENZE, 6); }
+    var ziel: int64 := pFlug(z);
+    var i: int64 := 0;
+    while (i < len) { poke8(ziel + i, peek8(daten + i)); i := i + 1; }
+    poke64(z + D_FL_LEN, len);
+    poke64(z + D_FL_FRIST, anfang);
+    poke64(z + D_FL_FAELLIG, jetztMs + anfang);
+    poke64(z + D_FL_VERSUCHE, 0);
+    return 0;
+}
+
+// Ist die Frist abgelaufen? 0 = nein, 1 = ja, DE_FORMAT = aufgegeben.
+pub fn DtlsFristFaellig(z: int64, jetztMs: int64): int64 {
+    if (peek64(z + D_FL_LEN) <= 0) { return 0; }
+    if (peek64(z + D_FL_VERSUCHE) >= peek64(z + D_FL_GRENZE)) { return DE_FORMAT; }
+    if (jetztMs < peek64(z + D_FL_FAELLIG)) { return 0; }
+    return 1;
+}
+
+// Den gemerkten Flug herausgeben und die Frist verdoppeln. Rueckgabe ist die
+// Laenge; 0 heisst "nichts zu wiederholen".
+pub fn DtlsFlugWiederholen(z: int64, jetztMs: int64, out: int64, outCap: int64): int64 {
+    var len: int64 := peek64(z + D_FL_LEN);
+    if (len <= 0) { return 0; }
+    if (outCap < len) { return DE_PUFFER; }
+    var quelle: int64 := pFlug(z);
+    var i: int64 := 0;
+    while (i < len) { poke8(out + i, peek8(quelle + i)); i := i + 1; }
+    var frist: int64 := peek64(z + D_FL_FRIST) * 2;
+    var deckel: int64 := peek64(z + D_FL_DECKEL);
+    if (frist > deckel) { frist := deckel; }
+    poke64(z + D_FL_FRIST, frist);
+    poke64(z + D_FL_FAELLIG, jetztMs + frist);
+    poke64(z + D_FL_VERSUCHE, peek64(z + D_FL_VERSUCHE) + 1);
+    poke64(z + D_Z_WIEDERHOLUNGEN, peek64(z + D_Z_WIEDERHOLUNGEN) + 1);
+    return len;
+}
+
+// Der Flug ist bestaetigt: nichts mehr zu wiederholen.
+pub fn DtlsFlugBestaetigt(z: int64): void {
+    poke64(z + D_FL_LEN, 0);
+    poke64(z + D_FL_VERSUCHE, 0);
+}
+
+pub fn DtlsZaehlerWiederholungen(z: int64): int64 { return peek64(z + D_Z_WIEDERHOLUNGEN); }
+pub fn DtlsFlugVersuche(z: int64): int64          { return peek64(z + D_FL_VERSUCHE); }
+pub fn DtlsFlugFrist(z: int64): int64             { return peek64(z + D_FL_FRIST); }
