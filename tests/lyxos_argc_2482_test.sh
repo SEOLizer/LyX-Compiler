@@ -63,10 +63,10 @@ fi
 ERFASST=$(grep -vc '^#' "$STAND")
 BELEGT=$(grep -v '^#' work/lyxos/syscall-ist.txt | awk '{s += $2 - $1 + 1} END {print s+0}')
 echo "    erfasst: $ERFASST Nummern mit Argumentzahl, belegter Raum: $BELEGT Nummern"
-if [ "$ERFASST" -ge 195 ]; then
-  ok "mindestens 195 Nummern tragen eine Argumentzahl (jetzt $ERFASST)"
+if [ "$ERFASST" -ge 285 ]; then
+  ok "mindestens 285 Nummern tragen eine Argumentzahl (jetzt $ERFASST)"
 else
-  bad "Abdeckung" "nur $ERFASST Nummern — war 199, die Zahl darf nur steigen"
+  bad "Abdeckung" "nur $ERFASST Nummern — war 287 nach #2598, die Zahl darf nur steigen"
 fi
 
 # 6) Stichproben gegen den Kernel, von Hand nachgelesen in ring3.lyx:
@@ -138,6 +138,69 @@ else
   ok "60 (sys_exit) gilt als nicht erfasst — der Durchfall ist begruendet, nicht geraten"
 fi
 
+# 10) #2598: Signaturen mit vorangestelltem Arbeitspaketkuerzel. Der Auszug
+#     verlangte die Signatur am SPALTENANFANG und liess damit 62 der 293
+#     lesbaren Gestalten durchfallen -- darunter die beiden, mit denen ein
+#     Geraetelauf seine Ausgabe zurueckholt. Stichproben auf genau diese Form:
+#       389  "WP-S0 sys_serial_set(rolle, wert): ..."      -> 2
+#       404  "WP-S4 sys_stdio_vormerken(welche, fd): ..."  -> 2
+#       230  "DRV-3: sys_map_device(phys, size) -> uva"    -> 2
+#     Sie stehen hier mit WERT und nicht als Anwesenheitsprobe: eine Liste,
+#     die nur Vorhandensein prueft, ist blind fuer die falsche Zahl darin.
+fehler=""
+for paar in "389 2" "404 2" "230 2" "2561 3"; do
+  set -- $paar
+  ist=$(grep -P "^$1\t" "$STAND" | cut -f3)
+  [ "$ist" = "$2" ] || fehler="$fehler nr$1(ist=${ist:-fehlt},soll=$2)"
+done
+if [ -z "$fehler" ]; then
+  ok "Kuerzel-Form ist erfasst: 389->2, 404->2, 230->2, 2561->3 (#2598)"
+else
+  bad "Kuerzel-Form" "$fehler"
+fi
+
+# 11) Die andere Seite derselben Verschaerfung, AM ERZEUGNIS. Mit 2561 im
+#     Auszug fiel auf, dass das Backend dort nur ZWEI Werte lud, waehrend
+#     ir_lower drei Slots ablegt und der Kernelrumpf a0, a1 und a2 liest
+#     (lyx-os ring3.lyx: TraceEvent(a0, tep, a2)). Die Laenge fiel still weg.
+#
+#     Geprueft wird die WIRKUNG im LBF, nicht der Quelltext: zwischen
+#     `mov rax, 2561` (48 b8 01 0a 00..) und `syscall` (0f 05) muessen drei
+#     Registerladungen stehen, einschliesslich rdx (48 8b 55). Vor dem Fix
+#     endete die Folge nach rsi -- dieser Test waere rot gewesen.
+if [ -x ./lyxc ]; then
+  TD=$(mktemp -d)
+  printf 'unit main;\nfn main(): int64 { return sys_trace_event(17, 0, 3); }\n' > "$TD/te.lyx"
+  if ./lyxc --std-path=. --target=lyxos "$TD/te.lyx" -o "$TD/te.lbf" >"$TD/te.log" 2>&1; then
+    if python3 - "$TD/te.lbf" <<'PYEOF'
+import sys
+d = open(sys.argv[1], 'rb').read()
+i = d.find(bytes.fromhex('48b8010a000000000000'))
+if i < 0:
+    print('kein mov rax, 2561 im Erzeugnis'); sys.exit(1)
+rest = d[i+10:i+40]
+ende = rest.find(bytes.fromhex('0f05'))
+if ende < 0:
+    print('kein syscall nach dem Laden'); sys.exit(1)
+lade = rest[:ende]
+fehlt = [n for n, b in (('rdi','488b7d'), ('rsi','488b75'), ('rdx','488b55')) if bytes.fromhex(b) not in lade]
+if fehlt:
+    print('es fehlt die Ladung fuer: ' + ', '.join(fehlt) + ' -- ' + lade.hex(' ')); sys.exit(1)
+sys.exit(0)
+PYEOF
+    then
+      ok "sys_trace_event laedt im Erzeugnis drei Register (rdi, rsi, rdx) (#2598)"
+    else
+      bad "Erzeugnis 2561" "die dritte Ladung fehlt im LBF"
+    fi
+  else
+    bad "Erzeugnis 2561" "sys_trace_event(17, 0, 3) uebersetzt nicht: $(head -2 "$TD/te.log" | tr '\n' ' ')"
+  fi
+  rm -rf "$TD"
+else
+  echo "    SKIP 11: ./lyxc fehlt (make bootstrap)"
+fi
+
 echo "--- $P PASS, $F FAIL"
 [ "$F" -eq 0 ] || exit 1
-echo "OK: Gestaltpruefung ist nicht mehr fail-open (#2482)"
+echo "OK: Gestaltpruefung ist nicht mehr fail-open (#2482), Kuerzel-Form erfasst (#2598)"

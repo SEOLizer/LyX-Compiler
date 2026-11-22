@@ -118,14 +118,25 @@ awk -F'|' '
     # Pruefung rot, und zwar zu Recht -- die Tabelle war falsch, nicht der
     # Compiler. Zwei Bedingungen schliessen das aus:
     #
-    #   1. Die Signatur muss am ANFANG der Spalte stehen und mit dem Namen
-    #      aus der Namensspalte beginnen. Prosa tut das nicht.
+    #   1. Die Signatur muss mit dem Namen aus der Namensspalte beginnen,
+    #      und davor darf kein Namenszeichen stehen. Prosa, die den Namen
+    #      als Wortteil fuehrt, faellt damit aus.
     #   2. Kein Argument darf eine reine Zahl sein. Eine Signatur nennt
     #      Parameternamen; "(136)" ist ein Verweis, kein Parameter.
+    #
+    # NICHT am Spaltenanfang verankert (#2598). 62 der 293 lesbaren Signaturen
+    # tragen ein Arbeitspaketkuerzel davor -- "WP-S0 sys_serial_set(rolle,
+    # wert)", "DRV-3: sys_map_device(phys, size)". Die Verankerung liess
+    # genau die durchfallen, also auch sys_serial_set und
+    # sys_stdio_vormerken, mit denen ein Gerätelauf seine Ausgabe
+    # zurueckholt. Gemessen gegen LyxOS 886b8cf: 231 -> 293 erfasste
+    # Gestalten, keine verlorene.
     if (name == "") next
-    if (substr(bed, 1, 1) == " ") sub(/^[ \t]+/, "", bed)
-    if (index(bed, name "(") != 1) next
-    sig = substr(bed, length(name) + 2)
+    sub(/^[ \t]+/, "", bed)
+    p = index(bed, name "(")
+    if (p == 0) next
+    if (p > 1 && substr(bed, p - 1, 1) ~ /[A-Za-z0-9_]/) next
+    sig = substr(bed, p + length(name) + 1)
     if (index(sig, ")") == 0) next
     inner = substr(sig, 1, index(sig, ")") - 1)
     gsub(/^[ \t]+|[ \t]+$/, "", inner)
