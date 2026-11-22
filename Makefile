@@ -939,7 +939,8 @@ test: lyxc
 	@bash tests/tls_wiederaufnahme_test.sh
 	@bash tests/tls_fuzz_test.sh
 	@bash tests/tls13_tlsfuzzer_test.sh
-	@echo "--- TLS-Interop gegen OpenSSL (1.3 und 1.2): in tests/known-red.txt (!flaky, #2418) ---"
+	@bash tests/tls13_interop_openssl_test.sh
+	@bash tests/tls12_interop_openssl_test.sh
 	@bash tests/ir_datei_builtins_test.sh
 	@bash tests/unit_private_globals_test.sh
 	@bash tests/ir_kein_stiller_ausdruck_test.sh
