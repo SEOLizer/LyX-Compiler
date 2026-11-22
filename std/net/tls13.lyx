@@ -190,7 +190,13 @@ con HS_CERT_VERIFY:   int64 := 15;
 con HS_FINISHED:      int64 := 20;
 con HS_CERT_REQUEST:  int64 := 13;
 con HS_KEY_UPDATE:    int64 := 24;
+con HS_EOED:          int64 := 5;      // end_of_early_data (§4.5)
 con HS_MESSAGE_HASH:  int64 := 254;    // §4.4.1, Ersatz fuer ClientHello1 bei HRR
+// Erweiterung early_data (§4.2.10). Sie steht an DREI Stellen mit DREI
+// Bedeutungen: im ClientHello leer ("ich sende fruehe Daten"), in den
+// EncryptedExtensions leer ("angenommen") und im NewSessionTicket mit vier
+// Byte max_early_data_size.
+con EXT_EARLY:        int64 := 42;
 
 // Zustaende
 con Z_START:        int64 := 0;
@@ -368,6 +374,7 @@ con S_WUNSCH:int64 := 1424;      // 3 Suites in Server-Vorliebe
 con S_EXP1:  int64 := 1448;      // 64 Byte Exporter-Zwischenwert
 con S_EXP2:  int64 := 1512;      // 64 Byte Exporter-Kontexthash
 con S_FK:    int64 := 1576;      // 64 Byte finished_key
+con S_ARID:  int64 := 1640;      // 16 Byte Kennung fuer den Wiederholungsschutz (#2578)
 con S_SIGBUF: int64 := 1640;     // 512 Byte fertige Signatur (RSA bis 4096 Bit)
 con S_SEED:  int64 := 2152;      // 32 Byte Ed25519-Seed
 
@@ -459,12 +466,65 @@ con V_PSKDA:      int64 := 132112;   // 1 = angenommen
 con V_ZCERT:      int64 := 132120;
 con V_ZCV:        int64 := 132128;
 con V_ZNST:       int64 := 132136;
+// ── 0-RTT (#2578) ────────────────────────────────────────────────────────
+// Die Felder liegen HINTEN, wie schon die der Wiederaufnahme: eine
+// Verschiebung im Kopfteil hat keine sichtbare Wirkung, bis zwei Felder
+// sich ueberlappen, und dann liest eine Rolle, was eine andere geschrieben
+// hat (#2579 hat das einmal mit dem Eingangspuffer vorgemacht).
+//
+// V_EDZUSTAND ist der ganze Ablauf in einer Zahl:
+//   0  kein 0-RTT
+//   1  angeboten (Client: ClientHello traegt early_data; Schreibschluessel
+//      steht auf dem fruehen Geheimnis)
+//   2  angenommen (Client: EncryptedExtensions sagt ja; Server: er nimmt an)
+//   3  abgelehnt (Client: EE sagt nichts; Server: er nimmt nicht an)
+con V_EDZUSTAND:  int64 := 132144;
+con V_EDWUNSCH:   int64 := 132152;   // Server: ClientHello traegt early_data
+con V_EDMAX:      int64 := 132160;   // Obergrenze dieser Verbindung in Byte
+con V_EDGESCHR:   int64 := 132168;   // Client: frueh gesendete Byte
+con V_EDGELESEN:  int64 := 132176;   // Server: frueh empfangene Byte
+con V_EDFLAG:     int64 := 132184;   // 1 = das letzte TlsLese war frueh
+// Bis zu dieser Stelle im Anwendungspuffer sind die Byte FRUEH. Alles
+// danach kam unter den Anwendungsschluesseln. Eine Grenze und kein Flag je
+// Record: der Puffer ist fortlaufend, und ein Flag je Record koennte nicht
+// sagen, wo in einem Lesevorgang die Grenze liegt.
+con V_EDGRENZE:   int64 := 132192;
+con V_EOEDGES:    int64 := 132200;   // Client: end_of_early_data gesendet
+con V_EOEDEMP:    int64 := 132208;   // Server: end_of_early_data gesehen
+// Ablehnungsweg (§4.2.10): der Server kennt den fruehen Schluessel nicht und
+// MUSS die Records verwerfen koennen, ohne sie zu entschluesseln. Wie viele
+// es sind, weiss er nicht — verworfen wird, bis einer sich mit dem
+// Handschlagschluessel oeffnen laesst.
+con V_SKIPUNDEC:  int64 := 132216;
+con V_SKIPZAHL:   int64 := 132224;
+// Client: max_early_data_size aus dem NewSessionTicket. Ohne diesen Wert
+// bietet der Client kein 0-RTT an — der Server hat dann nie gesagt, dass er
+// es annimmt.
+con V_TKTEDMAX:   int64 := 132232;
+// Server: Ausstellzeit des vorgelegten Tickets (aus dem Ticket selbst, nicht
+// aus der Behauptung des Clients) und dessen Kennung fuer den
+// Wiederholungsschutz. Die Kennung IST die GCM-Nonce des Tickets: sie ist
+// zufaellig, je Ticket einmalig, und steht im Klartextkopf.
+con V_TKTAUSZEIT: int64 := 132240;
+con V_TKTID:      int64 := 132248;   // 16 Byte
+// client_early_traffic_secret (§7.1). Eigenes Feld und nicht V_SEC_CHS
+// mitbenutzt: beim Ablehnen laeuft der Handschlag mit den
+// Handschlaggeheimnissen weiter, und beide muessen gleichzeitig gelten.
+con V_SEC_CET:    int64 := 132264;   // bis 64 Byte
+// Wurde das Dummy-CCS (Anhang D.4) schon gesendet? Es gehoert UNMITTELBAR
+// hinter die erste eigene Handschlagnachricht, und bei einem
+// HelloRetryRequest ist das der HRR und nicht das ServerHello. Ein zweites
+// waere nicht verboten, aber dieser Zaehler macht die Stelle eindeutig.
+con V_CCSGES:     int64 := 132328;
 // Erst hinter den neuen Feldern beginnt der dynamische Teil: RSA-Schluessel,
 // dann der Zertifikatssatz. O_RSAKEY MUSS gleich V_SIZE sein — stand es
 // davor, lag der RSA-Modulus auf den EC-Feldern, und beim ersten Handschlag
 // mit RSA-Kette haette eine Rolle gelesen, was die andere geschrieben hat.
-con V_SIZE:   int64 := 132160;
-con O_RSAKEY: int64 := 132160;
+// V_SIZE ist um die 0-RTT-Felder gewachsen (#2578). O_RSAKEY MUSS gleich
+// V_SIZE bleiben — stand es davor, lag der RSA-Modulus auf den neuen
+// Feldern.
+con V_SIZE:   int64 := 132352;
+con O_RSAKEY: int64 := 132352;
 
 pub fn TlsSpeicherBedarf(): int64 {
     // #2579: zwei X509-Saetze und ein OCSP-Satz. Der zweite Satz ist der
@@ -504,6 +564,27 @@ pub fn TlsNeu(cfg: int64): int64 {
     poke64(c + V_PEERALERTST, 0);
     poke64(c + V_CFG, cfg);
     poke64(c + V_ROLLE, TlsCfgRolle(cfg));
+    // #2578: Die Nullschleife oben laeuft nur bis V_KOPF — alles, was HINTER
+    // den Puffern liegt, bleibt unberuehrt. Fuer die 0-RTT-Felder ist das
+    // nicht hinnehmbar: ein Muellwert in V_EDZUSTAND hiesse "angeboten",
+    // und V_EDMAX wuerde ueber die Grenze der fruehen Daten entscheiden.
+    // Dass alloc() heute genullte Seiten liefert, ist eine Eigenschaft des
+    // Allokators und keine Zusage dieser Unit (es gibt zwei davon, und der
+    // Arena-Allokator gibt Speicher wieder heraus).
+    poke64(c + V_EDZUSTAND, 0);
+    poke64(c + V_EDWUNSCH, 0);
+    poke64(c + V_EDMAX, 0);
+    poke64(c + V_EDGESCHR, 0);
+    poke64(c + V_EDGELESEN, 0);
+    poke64(c + V_EDFLAG, 0);
+    poke64(c + V_EDGRENZE, 0);
+    poke64(c + V_EOEDGES, 0);
+    poke64(c + V_EOEDEMP, 0);
+    poke64(c + V_SKIPUNDEC, 0);
+    poke64(c + V_SKIPZAHL, 0);
+    poke64(c + V_TKTEDMAX, 0);
+    poke64(c + V_TKTAUSZEIT, 0);
+    poke64(c + V_CCSGES, 0);
     poke64(c + V_PEERCERT, c + V_SIZE + RsaSchluesselGroesse());
     if (TlsCfgRolle(cfg) == 1) {
         poke64(c + V_ZUSTAND, Z_WARTE_CH);
@@ -622,6 +703,16 @@ pub fn TlsTicketEinsetzen(c: int64, tkt: int64, tktLen: int64,
 
 // Die Angaben, die zu einem Ticket gehoeren und beim Einsetzen gebraucht
 // werden. Ohne sie koennte der Aufrufer das Ticket nicht wiederverwenden.
+// #2578: max_early_data_size dieses Tickets. 0 heisst "der Server erlaubt
+// damit kein 0-RTT" — und ohne diese Zahl bietet der Client auch keines an.
+// Beim Uebertragen eines Tickets in eine neue Verbindung gehoert sie
+// mitgenommen, sonst ist das Ticket brauchbar und 0-RTT trotzdem aus.
+pub fn TlsTicketFruehMax(c: int64): int64 { return peek64(c + V_TKTEDMAX); }
+pub fn TlsTicketFruehMaxEinsetzen(c: int64, max: int64): void {
+    if (max < 0) { poke64(c + V_TKTEDMAX, 0); return; }
+    poke64(c + V_TKTEDMAX, max);
+}
+
 pub fn TlsTicketSuite(c: int64): int64   { return peek64(c + V_TKTSUITE); }
 pub fn TlsTicketAgeAdd(c: int64): int64  { return peek64(c + V_TKTAGEADD); }
 pub fn TlsTicketZeit(c: int64): int64    { return peek64(c + V_TKTZEIT); }
@@ -850,6 +941,34 @@ fn binderKey(c: int64, hl: int64, psk: int64, pskLen: int64, out: int64): bool {
     return ok;
 }
 
+// client_early_traffic_secret (RFC 8446 §7.1, #2578):
+//
+//     cet = Derive-Secret(early_secret, "c e traffic", ClientHello)
+//
+// Zwei Dinge sind hier anders als im uebrigen Plan, und beide sind schon
+// einmal Fehlerquellen gewesen:
+//
+//   * Die HASHLAENGE kommt vom TICKET und nicht aus V_HASHLEN. Beim Client
+//     steht die Suite noch nicht fest, wenn er die fruehen Daten schreibt —
+//     V_HASHLEN ist dort 0, und HKDF scheitert laut mit "unbekannte
+//     Digestlaenge". Dieselbe Regel wie beim Binder (§4.2.11.2).
+//   * Der Transkriptstand ist GENAU das ClientHello, einschliesslich der
+//     Binder. Gerechnet wird darum ueber die aufbewahrten Byte und nicht
+//     ueber den laufenden Hashzustand: der beginnt beim Client erst mit dem
+//     ServerHello, und auf der Serverseite laeuft er zu diesem Zeitpunkt
+//     schon weiter.
+fn planFrueh(c: int64, hl: int64, psk: int64, pskLen: int64,
+             chPos: int64, chLen: int64): bool {
+    var early: int64 := pScr(c) + S_K3;
+    var th: int64 := pScr(c) + S_TH;
+    planEarly(c, hl, psk, pskLen, early);
+    if (hl == 48) { Sha384(chPos, chLen, th); } else { SHA256(chPos, chLen, th); }
+    var ok: bool := HkdfExpandLabel(hl, early, hl, "c e traffic"c as int64, 11,
+                                    th, hl, c + V_SEC_CET, hl);
+    SecureZero(early, 64);
+    return ok;
+}
+
 // Der ganze Schluesselplan bis zu den Handschlagschluesseln. `psk` == 0
 // heisst voller Handschlag.
 fn planHandschlagPsk(c: int64, psk: int64, pskLen: int64): bool {
@@ -1037,6 +1156,10 @@ fn ticketOeffnen(c: int64, tkt: int64, tktLen: int64, jetzt: int64,
 
     poke64(suiteOut, ((peek8(pt) & 0xFF) << 8) | (peek8(pt + 1) & 0xFF));
     poke64(hlOut, hl);
+    // #2578: Die Ausstellzeit wird aufbewahrt. Der Wiederholungsschutz
+    // braucht sie, und zwar DIESE aus dem gesiegelten Ticket — das vom
+    // Client gemeldete Alter ist seine Behauptung.
+    poke64(c + V_TKTAUSZEIT, aus);
     i := 0;
     while (i < hl) { poke8(secOut + i, peek8(pt + 16 + i)); i := i + 1; }
     SecureZero(pt, ctLen);
@@ -1085,7 +1208,22 @@ fn ticketSenden(c: int64): int64 {
     p := wByte(buf, p, 0);
     p := w16(buf, p, tl);
     p := wBytes(buf, p, tkt, tl);
-    p := w16(buf, p, 0);               // keine Erweiterungen
+    // #2578: early_data mit max_early_data_size (§4.6.1). Ohne diese
+    // Erweiterung darf der Client mit diesem Ticket kein 0-RTT versuchen —
+    // sie ist die Erlaubnis, nicht bloss eine Zahl. Darum steht sie nur
+    // drin, wenn 0-RTT wirklich eingeschaltet ist (Vorgabe UND
+    // Wiederholungsschutz, siehe TlsCfgFruehAn).
+    if (TlsCfgFruehAn(cfg)) {
+        var edm: int64 := TlsCfgFruehMax(cfg);
+        p := w16(buf, p, 8);                       // Laenge der Erweiterungen
+        p := w16(buf, p, EXT_EARLY); p := w16(buf, p, 4);
+        p := wByte(buf, p, (edm >> 24) & 0xFF);
+        p := wByte(buf, p, (edm >> 16) & 0xFF);
+        p := wByte(buf, p, (edm >> 8) & 0xFF);
+        p := wByte(buf, p, edm & 0xFF);
+    } else {
+        p := w16(buf, p, 0);           // keine Erweiterungen
+    }
     return hsSenden(c, HS_NEW_TICKET, buf, p);
 }
 
@@ -1128,6 +1266,25 @@ fn ticketLesen(c: int64, pos: int64, len: int64): int64 {
     poke64(c + V_TKTAGEADD, ageAdd);
     poke64(c + V_TKTLEBEN, leben);
     poke64(c + V_TKTZEIT, TlsCfgJetzt(peek64(c + V_CFG)));
+
+    // #2578: max_early_data_size. Fehlt die Erweiterung, bleibt die Zahl 0
+    // und der Client bietet mit diesem Ticket kein 0-RTT an. Das ist kein
+    // Mangel, sondern die Aussage des Servers.
+    poke64(c + V_TKTEDMAX, 0);
+    var extPos: int64 := 9 + nl + 2 + tl;
+    if (extPos + 2 <= len) {
+        var extLen: int64 := r16(pos, extPos);
+        if (extPos + 2 + extLen <= len) {
+            var elT: int64 := pScr(c) + S_EL;
+            var edp: int64 := extSuchen(pos, extPos, 2 + extLen, EXT_EARLY, elT);
+            if (edp >= 0 && peek64(elT) >= 4) {
+                var m: int64 := 0;
+                var q: int64 := 0;
+                while (q < 4) { m := (m << 8) | (peek8(edp + q) & 0xFF); q := q + 1; }
+                poke64(c + V_TKTEDMAX, m);
+            }
+        }
+    }
     return 0;
 }
 
@@ -1217,6 +1374,17 @@ fn pskAnnehmen(c: int64, chAnf: int64, chLen: int64,
     while (i < hlT) { poke8(c + V_TKTPSK + i, peek8(sec + i)); i := i + 1; }
     poke64(c + V_TKTHL, hlT);
     SecureZero(sec, 64);
+
+    // #2578: Kennung dieses Tickets fuer den Wiederholungsschutz. Die
+    // GCM-Nonce des Tickets (tPos+2, 12 Byte) ist zufaellig und je Ticket
+    // einmalig; das erste Byte markiert die ART der Kennung, damit eine
+    // Ticketkennung nie mit einer ClientHello-Kennung zusammenfaellt.
+    poke8(c + V_TKTID, 1);
+    var n: int64 := 0;
+    while (n < 12) { poke8(c + V_TKTID + 1 + n, peek8(tPos + 2 + n)); n := n + 1; }
+    poke8(c + V_TKTID + 13, 0);
+    poke8(c + V_TKTID + 14, 0);
+    poke8(c + V_TKTID + 15, 0);
     return 1;
 }
 
@@ -1403,8 +1571,35 @@ fn recordVerarbeiten(c: int64): int64 {
         nonceBauen(c + V_IV_LESE, peek64(c + V_SEQ_LESE), nonce);
         var ctLen: int64 := len - 16;
         if (!aeadOeffnen(c, nonce, b, 5, inhalt, ctLen, inhalt + ctLen, inhalt)) {
+            // #2578: Abgelehntes 0-RTT. Der Server kennt den fruehen
+            // Schluessel nicht und MUSS die Records verwerfen koennen, ohne
+            // sie zu entschluesseln (§4.2.10). Wie viele es sind, steht
+            // nirgends — verworfen wird, bis einer sich mit dem
+            // Handschlagschluessel oeffnen laesst.
+            //
+            // Die Sequenznummer wird dabei NICHT erhoeht: sie zaehlt die
+            // Records UNTER DIESEM Schluessel, und der verworfene gehoerte
+            // zu einem anderen. Wer sie mitzaehlt, kann den ersten echten
+            // Record nicht mehr oeffnen.
+            //
+            // Der Deckel ist kein Schoenheitswert: ohne ihn koennte eine
+            // Gegenseite beliebig viele unlesbare Records schicken, und
+            // diese Schleife verwirft sie geduldig weiter.
+            if (peek64(c + V_SKIPUNDEC) == 1 && peek64(c + V_SKIPZAHL) < 64) {
+                poke64(c + V_SKIPZAHL, peek64(c + V_SKIPZAHL) + 1);
+                var restS: int64 := vorhanden - (5 + len);
+                var kS: int64 := 0;
+                while (kS < restS) { poke8(b + kS, peek8(b + 5 + len + kS)); kS := kS + 1; }
+                poke64(c + V_INPOS, restS);
+                return 0;
+            }
             return E_ENTSCHLUESS;
         }
+        // Ein Record, der sich oeffnen liess, beendet das Verwerfen: ab hier
+        // spricht die Gegenseite wieder unter einem Schluessel, den wir
+        // haben. Bliebe das Verwerfen an, wuerde ein spaeterer echter
+        // Entschluesselungsfehler still uebergangen.
+        poke64(c + V_SKIPUNDEC, 0);
         poke64(c + V_SEQ_LESE, peek64(c + V_SEQ_LESE) + 1);
         // Der INNERE Klartext darf 2^14 + 1 Byte nicht ueberschreiten
         // (§5.2: Inhalt plus Polsterung plus das Typbyte). Der Deckel auf
@@ -1419,7 +1614,27 @@ fn recordVerarbeiten(c: int64): int64 {
         echterTyp := peek8(inhalt + p) & 0xFF;
         nutzLen := p;
     } else {
-        if (typ == RT_APPDATA) { return E_ABLAUF; }  // unverschluesselt verboten
+        if (typ == RT_APPDATA) {
+            // #2578: Im Ablehnungsweg kommen die fruehen Records des Clients
+            // an, BEVOR ueberhaupt ein Leseschluessel steht — dann ist die
+            // Lesestufe noch 0 und der Record waere "unverschluesselte
+            // Anwendungsdaten", also verboten. Verworfen wird er trotzdem,
+            // denn genau das verlangt §4.2.10: die fruehen Records sind
+            // unlesbar, und der Handschlag darf daran nicht scheitern.
+            // Gemessen an tlsfuzzer test-tls13-0rtt-garbage ("fake 0-RTT
+            // resumption with HRR"): der Client schickt sein
+            // application_data unmittelbar hinter dem ClientHello, noch vor
+            // dem HelloRetryRequest.
+            if (peek64(c + V_SKIPUNDEC) == 1 && peek64(c + V_SKIPZAHL) < 64) {
+                poke64(c + V_SKIPZAHL, peek64(c + V_SKIPZAHL) + 1);
+                var restK: int64 := vorhanden - (5 + len);
+                var kK: int64 := 0;
+                while (kK < restK) { poke8(b + kK, peek8(b + 5 + len + kK)); kK := kK + 1; }
+                poke64(c + V_INPOS, restK);
+                return 0;
+            }
+            return E_ABLAUF;                        // unverschluesselt verboten
+        }
     }
 
     var rc: int64 := 0;
@@ -1443,13 +1658,32 @@ fn recordVerarbeiten(c: int64): int64 {
             // Anwendungsdaten gibt es erst nach dem Handschlag. Vorher sind
             // sie ein Ablauffehler (RFC 8446 §5.1) — tls12 hat diese
             // Pruefung von Anfang an, hier fehlte sie.
-            if (peek64(c + V_ZUSTAND) != Z_FERTIG) { return E_ABLAUF; }
+            // #2578: FRUEHE Daten kommen vor dem Handschlagende an — sie
+            // sind die eine Ausnahme von "Anwendungsdaten erst nach dem
+            // Handschlag". Erkannt werden sie an der Lesestufe 3 und nicht
+            // am Zustand: die Stufe sagt, unter WELCHEM Schluessel der
+            // Record ankam, und genau das ist die Aussage.
+            var frueh: bool := peek64(c + V_KRYPT_LESE) == 3;
+            if (!frueh && peek64(c + V_ZUSTAND) != Z_FERTIG) { return E_ABLAUF; }
+            if (frueh) {
+                // §4.2.10: mehr als max_early_data_size beendet die
+                // Verbindung. Gezaehlt wird, was ANKOMMT, nicht was der
+                // Client behauptet.
+                if (peek64(c + V_EDGELESEN) + nutzLen > peek64(c + V_EDMAX)) {
+                    return E_ABLAUF;
+                }
+                poke64(c + V_EDGELESEN, peek64(c + V_EDGELESEN) + nutzLen);
+            }
             var ap: int64 := peek64(c + V_APPPOS);
             if (ap + nutzLen > B_APP) { rc := E_PUFFER; }
             else {
                 var i2: int64 := 0;
                 while (i2 < nutzLen) { poke8(pApp(c) + ap + i2, peek8(inhalt + i2)); i2 += 1; }
                 poke64(c + V_APPPOS, ap + nutzLen);
+                // Die Grenze wandert nur bei FRUEHEN Daten mit. Alles
+                // dahinter kam unter den Anwendungsschluesseln, und die
+                // Anwendung muss die beiden unterscheiden koennen.
+                if (frueh) { poke64(c + V_EDGRENZE, ap + nutzLen); }
             }
         } else {
             if (echterTyp == RT_ALERT) {
@@ -1988,6 +2222,22 @@ fn clientHelloBauen(c: int64, zweites: bool): int64 {
     var hlT: int64 := peek64(c + V_TKTHL);
     if (!zweites && tktLen > 0 && hlT > 0
         && peek64(c + V_TKTSUITE) != 0) {
+        // #2578: early_data, leer. Sie steht VOR pre_shared_key, weil
+        // pre_shared_key die LETZTE Erweiterung sein muss (§4.2.11) — der
+        // Binder rechnet ueber alles davor.
+        //
+        // Angeboten wird nur, wenn drei Dinge zusammenkommen: die eigene
+        // Vorgabe erlaubt es, das Ticket nennt ein max_early_data_size, und
+        // es ist das erste ClientHello. Nach einem HelloRetryRequest ist
+        // 0-RTT ausgeschlossen (§4.2.10) — der Server hat die fruehen Daten
+        // dann ohnehin schon verworfen.
+        var edMaxC: int64 := TlsCfgFruehMax(cfg);
+        if (edMaxC > peek64(c + V_TKTEDMAX)) { edMaxC := peek64(c + V_TKTEDMAX); }
+        if (edMaxC > 0) {
+            p := w16(buf, p, EXT_EARLY); p := w16(buf, p, 0);
+            poke64(c + V_EDMAX, edMaxC);
+            poke64(c + V_EDZUSTAND, 1);
+        }
         // psk_key_exchange_modes: NUR psk_dhe_ke (1).
         p := w16(buf, p, 45); p := w16(buf, p, 2);
         p := wByte(buf, p, 1); p := wByte(buf, p, 1);
@@ -2152,6 +2402,12 @@ fn eeSenden(c: int64): int64 {
         p := w16(buf, p, 16); p := w16(buf, p, l + 3);
         p := w16(buf, p, l + 1); p := wByte(buf, p, l);
         p := wBytes(buf, p, peek64(c + V_ALPNSEL), l);
+    }
+    // #2578: early_data, leer — das IST die Annahme (§4.2.10). Es gibt kein
+    // Feld fuer "abgelehnt": fehlt die Erweiterung, sind die fruehen Daten
+    // abgelehnt.
+    if (peek64(c + V_EDZUSTAND) == 2) {
+        p := w16(buf, p, EXT_EARLY); p := w16(buf, p, 0);
     }
     w16(buf, extLenPos, p - extStart);
     return hsSenden(c, HS_EE, buf, p);
@@ -2573,6 +2829,11 @@ fn finishedSenden(c: int64, secret: int64): int64 {
 // Grundgespraechstest erwartet das CCS, weil praktisch jeder Server es
 // sendet, und ohne es verwerfen Mittelboxen den Handschlag.
 fn ccsDummySenden(c: int64): int64 {
+    // Genau EINMAL je Verbindung. Nach einem HelloRetryRequest geht es schon
+    // dort hinaus (siehe serverClientHello), und der Aufruf hinter dem
+    // ServerHello darf es dann nicht wiederholen.
+    if (peek64(c + V_CCSGES) == 1) { return 0; }
+    poke64(c + V_CCSGES, 1);
     var pos: int64 := peek64(c + V_OUTPOS);
     if (pos + 6 > B_OUT) { return E_PUFFER; }
     poke8(pOut(c) + pos, RT_CCS);
@@ -2781,6 +3042,14 @@ fn clientHelloLesen(c: int64, pos: int64, len: int64): int64 {
     if (p + 2 > len) { return E_FORMAT; }
 
     var el: int64 := pScr(c) + S_EL;
+    // #2578: early_data im ClientHello ist leer und heisst nur "ich sende
+    // fruehe Daten". Ob sie angenommen werden, entscheidet serverClientHello
+    // — hier wird nur VERMERKT. Die Entscheidung braucht den PSK, und der
+    // ist an dieser Stelle noch nicht geprueft.
+    poke64(c + V_EDWUNSCH, 0);
+    if (extSuchen(pos, p, len - p, EXT_EARLY, el) >= 0) {
+        poke64(c + V_EDWUNSCH, 1);
+    }
     // supported_versions muss 0x0304 enthalten
     var sv: int64 := extSuchen(pos, p, len - p, 43, el);
     if (sv < 0) { return E_VERSION; }
@@ -3249,6 +3518,23 @@ fn chBietet13(ch: int64, len: int64, elPtr: int64): bool {
 // Server: steht im Eingangspuffer ein vollstaendiges ClientHello, das kein
 // TLS 1.3 anbietet? Dann uebernimmt die 1.2-Maschine.
 // Rueckgabe: 1 uebergeben, 0 noch nichts zu entscheiden, <0 Fehler.
+// Traegt dieses ClientHello die genannte Erweiterung? Dieselbe Wanderung
+// durch den Rumpf wie chBietet13 — der Unterschied ist nur die Nummer.
+fn chExtDa(ch: int64, len: int64, typ: int64, elPtr: int64): bool {
+    if (len < 38) { return false; }
+    var sidLen: int64 := peek8(ch + 34) & 0xFF;
+    if (sidLen > 32) { return false; }
+    var p: int64 := 35 + sidLen;
+    if (p + 2 > len) { return false; }
+    var csLen: int64 := r16(ch, p);
+    p := p + 2 + csLen;
+    if (p + 1 > len) { return false; }
+    var compLen: int64 := peek8(ch + p) & 0xFF;
+    p := p + 1 + compLen;
+    if (p + 2 > len) { return false; }
+    return extSuchen(ch, p, len - p, typ, elPtr) >= 0;
+}
+
 fn verteilerServer(c: int64): int64 {
     var cfg: int64 := peek64(c + V_CFG);
     if (!TlsCfgErlaubt12(cfg)) { return 0; }
@@ -3268,6 +3554,42 @@ fn verteilerServer(c: int64): int64 {
     // Server mit abgeschaltetem 1.3 darf nicht doch 1.3 sprechen, bloss weil
     // der Client es anbietet.
     if (TlsCfgErlaubt13(cfg) && chBietet13(b + 9, chLen, el)) { return 0; }
+    // #2578: Hat das ClientHello fruehe Daten angeboten und wird auf TLS 1.2
+    // umgeschaltet, liegen hinter dem ClientHello Records, die NIEMAND lesen
+    // kann: sie stehen unter einem 1.3-Schluessel, und die 1.2-Maschine
+    // kennt weder ihn noch 0-RTT. Sie werden hier entfernt, nicht
+    // weitergegeben — sonst sieht die 1.2-Maschine Anwendungsdaten vor dem
+    // Handschlag und bricht ab. Gemessen an tlsfuzzer
+    // test-tls13-0rtt-garbage ("invalid 0-RTT and unknown version (downgrade
+    // to TLS 1.2)").
+    if (chExtDa(b + 9, chLen, EXT_EARLY, el)) {
+        var schreib: int64 := 5 + len;
+        var lese: int64 := 5 + len;
+        var geworfen: int64 := 0;
+        while (lese + 5 <= vorhanden) {
+            var rtyp: int64 := peek8(b + lese) & 0xFF;
+            var rlen: int64 := ((peek8(b + lese + 3) & 0xFF) << 8)
+                             |  (peek8(b + lese + 4) & 0xFF);
+            if (lese + 5 + rlen > vorhanden) {
+                lese := vorhanden;          // unvollstaendig: liegen lassen
+            } else {
+                if (rtyp == RT_APPDATA) {
+                    geworfen := geworfen + 1;
+                } else {
+                    var kv: int64 := 0;
+                    while (kv < 5 + rlen) {
+                        poke8(b + schreib + kv, peek8(b + lese + kv));
+                        kv := kv + 1;
+                    }
+                    schreib := schreib + 5 + rlen;
+                }
+                lese := lese + 5 + rlen;
+            }
+        }
+        poke64(c + V_SKIPZAHL, peek64(c + V_SKIPZAHL) + geworfen);
+        vorhanden := schreib;
+    }
+
     var c12: int64 := Tls12Neu(cfg);
     if (c12 == 0) { return E_KONFIG; }
     // ALLES Rohmaterial weitergeben; die 1.2-Maschine packt selbst aus.
@@ -3379,6 +3701,30 @@ fn clientStart(c: int64): int64 {
     if (!eigeneWerte(c, true)) { return fehlerSetzen(c, E_KONFIG); }
     var rc: int64 := clientHelloSenden(c);
     if (rc != 0) { return fehlerSetzen(c, rc); }
+
+    // #2578: Hat das ClientHello early_data angeboten, steht ab jetzt der
+    // fruehe Schreibschluessel. Erst danach darf TlsSchreibeFrueh etwas
+    // senden — und genau darum wird hier gestellt und nicht beim ersten
+    // Schreibaufruf: ein Aufrufer, der zu frueh schreibt, bekaeme sonst
+    // Klartext auf die Leitung.
+    if (peek64(c + V_EDZUSTAND) == 1) {
+        // Die Suite des TICKETS gilt vorlaeufig. Ohne sie ist V_HASHLEN 0,
+        // und verkehrsSchluessel koennte den Schluessel nicht bilden. Waehlt
+        // der Server eine andere Suite, nimmt er den PSK nicht an, und die
+        // fruehen Daten sind damit abgelehnt — serverHelloLesen setzt die
+        // Suite dann neu.
+        if (!suiteSetzen(c, peek64(c + V_TKTSUITE))) {
+            poke64(c + V_EDZUSTAND, 0);
+            poke64(c + V_ZUSTAND, Z_WARTE_SH);
+            return TlsWantRead();
+        }
+        var hlT: int64 := peek64(c + V_TKTHL);
+        if (!planFrueh(c, hlT, c + V_TKTPSK, hlT, pCh(c), peek64(c + V_CHLEN))) {
+            return fehlerSetzen(c, E_KONFIG);
+        }
+        if (!schreibSchluessel(c, c + V_SEC_CET, 3)) { return fehlerSetzen(c, E_KONFIG); }
+    }
+
     poke64(c + V_ZUSTAND, Z_WARTE_SH);
     return TlsWantRead();
 }
@@ -3426,7 +3772,15 @@ fn clientServerHello(c: int64): int64 {
     }
     if (!planOkC) { return fehlerSetzen(c, E_KONFIG); }
     if (!leseSchluessel(c, c + V_SEC_SHS, 1)) { return fehlerSetzen(c, E_KONFIG); }
-    if (!schreibSchluessel(c, c + V_SEC_CHS, 1)) { return fehlerSetzen(c, E_KONFIG); }
+    // #2578: Hat der Client fruehe Daten angeboten, bleibt der
+    // SCHREIBschluessel auf dem fruehen Geheimnis. Er braucht ihn noch fuer
+    // das end_of_early_data (§4.5: "MUST be encrypted with the 0-RTT traffic
+    // keys"), und zwischen ServerHello und EncryptedExtensions sendet der
+    // Client nichts. Umgestellt wird entweder beim Ablehnen oder nach dem
+    // end_of_early_data — beide Stellen stehen in clientHandschlag.
+    if (peek64(c + V_EDZUSTAND) != 1) {
+        if (!schreibSchluessel(c, c + V_SEC_CHS, 1)) { return fehlerSetzen(c, E_KONFIG); }
+    }
     poke64(c + V_ZUSTAND, Z_WARTE_HS);
     return 0;
 }
@@ -3453,6 +3807,21 @@ fn clientHandschlag(c: int64): int64 {
                 while (z2 < pl) { poke8(c + V_ALPNBUF + z2, peek8(ap + 3 + z2)); z2 += 1; }
                 poke64(c + V_ALPNSEL, c + V_ALPNBUF);
                 poke64(c + V_ALPNSELLEN, pl);
+            }
+            // #2578: early_data in den EncryptedExtensions heisst
+            // ANGENOMMEN (§4.2.10). Fehlt sie, sind die fruehen Daten
+            // abgelehnt, und der Schreibschluessel wechselt sofort — es
+            // folgt kein end_of_early_data.
+            if (peek64(c + V_EDZUSTAND) == 1) {
+                var edp: int64 := extSuchen(pos, 0, len, EXT_EARLY, el);
+                if (edp >= 0) {
+                    poke64(c + V_EDZUSTAND, 2);
+                } else {
+                    poke64(c + V_EDZUSTAND, 3);
+                    if (!schreibSchluessel(c, c + V_SEC_CHS, 1)) {
+                        return fehlerSetzen(c, E_KONFIG);
+                    }
+                }
             }
             hsVerbrauchen(c, len, true);
         } else {
@@ -3483,6 +3852,22 @@ fn clientHandschlag(c: int64): int64 {
             // geht im Klartext hinaus, obwohl die Schreibstufe schon steht.
             var rcc: int64 := ccsDummySenden(c);
             if (rcc != 0) { return fehlerSetzen(c, rcc); }
+
+            // #2578: end_of_early_data (§4.5) — ZUERST, noch unter dem
+            // fruehen Schluessel, und danach erst der Wechsel auf den
+            // Handschlagschluessel. Die Nachricht gehoert ins Transkript
+            // (§4.4.1 zaehlt sie zwischen EncryptedExtensions und dem
+            // Finished des Clients auf); wer sie auslaesst, rechnet ein
+            // anderes verify_data als der Server.
+            if (peek64(c + V_EDZUSTAND) == 2 && peek64(c + V_EOEDGES) == 0) {
+                var leerE: int64 := pScr(c) + S_K1;
+                var rcE: int64 := hsSenden(c, HS_EOED, leerE, 0);
+                if (rcE != 0) { return fehlerSetzen(c, rcE); }
+                poke64(c + V_EOEDGES, 1);
+                if (!schreibSchluessel(c, c + V_SEC_CHS, 1)) {
+                    return fehlerSetzen(c, E_KONFIG);
+                }
+            }
 
             if (peek64(c + V_CERTREQ) != 0) {
                 if (TlsCfgCert(cfg) != 0 && TlsCfgCertN(cfg) > 0) {
@@ -3533,6 +3918,12 @@ fn serverClientHello(c: int64): int64 {
     if (!hsAnsehen(c, tp, pp, lp)) { return TlsWantRead(); }
     if (peek64(tp) != HS_CLIENT_HELLO) { return fehlerSetzen(c, E_ABLAUF); }
     var zweites: bool := peek64(c + V_ZUSTAND) == Z_WARTE_CH2;
+    // #2578: Mit dem zweiten ClientHello ist die fruehe Phase vorbei. Das
+    // Verwerfen unlesbarer Records MUSS hier enden, sonst wird ein spaeterer
+    // echter Entschluesselungsfehler still uebergangen — tlsfuzzer prueft
+    // genau das ("0-RTT, HRR and early data after 2nd Client Hello" erwartet
+    // bad_record_mac fuer einen Klartextrecord nach dem Handschlag).
+    if (zweites) { poke64(c + V_SKIPUNDEC, 0); }
     var rc: int64 := clientHelloLesen(c, peek64(pp), peek64(lp));
     if (rc != 0) { return fehlerSetzen(c, rc); }
     // Nach einem HRR muss das ClientHello2 genau die verlangte Gruppe
@@ -3550,6 +3941,67 @@ fn serverClientHello(c: int64): int64 {
                                       peek64(c + V_PSKPOS), peek64(c + V_PSKLEN));
         if (rcp < 0) { return fehlerSetzen(c, rcp); }
         poke64(c + V_PSKDA, rcp);
+    }
+
+    // ── 0-RTT: annehmen oder ablehnen (#2578) ────────────────────────────
+    //
+    // HIER und nicht weiter unten, weil beides noch die ClientHello-Byte
+    // braucht: das fruehe Geheimnis rechnet ueber sie, und hsVerbrauchen
+    // raeumt sie gleich weg.
+    //
+    // Angenommen wird nur, wenn ALLES zusammenkommt:
+    //   * der Client hat early_data angeboten,
+    //   * der PSK ist angenommen (ohne Wiederaufnahme gibt es kein 0-RTT),
+    //   * die Vorgabe erlaubt es UND ein Wiederholungsschutz steht
+    //     (TlsCfgFruehAn prueft beides zusammen),
+    //   * das Ticket ist innerhalb des Fensters ausgestellt (§8.2) und
+    //   * weder das Ticket noch dieses ClientHello wurden schon gesehen.
+    //
+    // Fehlt eines davon, wird abgelehnt — nicht abgebrochen. Ein abgelehntes
+    // 0-RTT ist ein gueltiger Handschlag (§4.2.10), und der Client sendet
+    // seine Daten danach normal.
+    // Nach einem HelloRetryRequest gibt es kein 0-RTT (§4.2.10): der Client
+    // darf dann keine fruehen Daten senden, und ein Server, der sie
+    // trotzdem annimmt, rechnet mit einem Transkript, das die Gegenseite
+    // nicht hat. V_HRR == 2 heisst "HRR faellig" und ist hier schon gesetzt
+    // (clientHelloLesen hat die Gruppen bewertet).
+    if (peek64(c + V_EDWUNSCH) == 1 && peek64(c + V_PSKDA) == 1
+        && peek64(c + V_HRR) != 2 && !zweites
+        && TlsCfgFruehAn(cfg)) {
+        var jetztE: int64 := TlsCfgJetzt(cfg);
+        var alterE: int64 := jetztE - peek64(c + V_TKTAUSZEIT);
+        if (alterE >= 0 && alterE <= TlsCfgArFenster(cfg)) {
+            // Zwei Kennungen, zwei Luecken (RFC 8446 §8.1 und §8.2):
+            //   Ticketkennung  macht das Ticket EINMALIG — eine Wiederholung
+            //                  mit demselben Ticket und anderem ClientHello
+            //                  faellt damit auch.
+            //   ClientHello    faengt die Wiederholung des IDENTISCHEN Flugs
+            //                  innerhalb des Fensters.
+            // Mit nur einer von beiden bliebe die jeweils andere Luecke
+            // offen; darum beide, und 0-RTT nur, wenn BEIDE neu sind.
+            var rid: int64 := pScr(c) + S_ARID;
+            poke8(rid, 2);
+            var ri: int64 := 0;
+            while (ri < 15) { poke8(rid + 1 + ri, peek8(c + V_PEER_RAND + ri)); ri := ri + 1; }
+            var neuT: int64 := TlsArVermerken(cfg, c + V_TKTID, jetztE);
+            var neuR: int64 := TlsArVermerken(cfg, rid, jetztE);
+            if (neuT == 1 && neuR == 1) {
+                var hlE: int64 := peek64(c + V_TKTHL);
+                if (planFrueh(c, hlE, c + V_TKTPSK, hlE,
+                              peek64(pp) - 4, peek64(lp) + 4)) {
+                    poke64(c + V_EDZUSTAND, 2);
+                    poke64(c + V_EDMAX, TlsCfgFruehMax(cfg));
+                }
+            }
+        }
+    }
+    if (peek64(c + V_EDZUSTAND) != 2 && peek64(c + V_EDWUNSCH) == 1) {
+        // Abgelehnt, und der Client hat trotzdem schon gesendet: seine
+        // Records liegen unter einem Schluessel, den dieser Server nicht
+        // kennt. Sie MUESSEN verworfen werden koennen, ohne sie zu
+        // entschluesseln (§4.2.10) — wie viele es sind, weiss niemand.
+        poke64(c + V_EDZUSTAND, 3);
+        poke64(c + V_SKIPUNDEC, 1);
     }
 
     // Kette nach SNI waehlen, bevor irgendetwas gesendet wird: ohne
@@ -3585,6 +4037,15 @@ fn serverClientHello(c: int64): int64 {
         hsVerbrauchen(c, peek64(lp), false);
         var rh: int64 := hrrSenden(c);
         if (rh != 0) { return fehlerSetzen(c, rh); }
+        // Dummy-CCS unmittelbar hinter der ERSTEN eigenen
+        // Handschlagnachricht (Anhang D.4) — bei einem HelloRetryRequest ist
+        // das der HRR. Bis #2578 ging es erst hinter dem ServerHello hinaus;
+        // tlsfuzzer erwartet es an dieser Stelle (test-tls13-0rtt-garbage,
+        // Faelle mit HRR), und der RFC-Text nennt ausdruecklich beide
+        // Moeglichkeiten mit "immediately after its first handshake
+        // message".
+        var rhc: int64 := ccsDummySenden(c);
+        if (rhc != 0) { return fehlerSetzen(c, rhc); }
         poke64(c + V_ZUSTAND, Z_WARTE_CH2);
         return 0;
     }
@@ -3613,7 +4074,16 @@ fn serverClientHello(c: int64): int64 {
     }
     if (!planOk) { return fehlerSetzen(c, E_KONFIG); }
     if (!schreibSchluessel(c, c + V_SEC_SHS, 1)) { return fehlerSetzen(c, E_KONFIG); }
-    if (!leseSchluessel(c, c + V_SEC_CHS, 1)) { return fehlerSetzen(c, E_KONFIG); }
+    // #2578: Bei angenommenen fruehen Daten liest der Server zuerst mit dem
+    // FRUEHEN Schluessel. Umgestellt wird beim end_of_early_data
+    // (serverClientFinished) — und damit erzwingt die Entschluesselung die
+    // Reihenfolge: ein Finished vor dem end_of_early_data liegt unter einem
+    // anderen Schluessel und laesst sich hier gar nicht oeffnen.
+    if (peek64(c + V_EDZUSTAND) == 2) {
+        if (!leseSchluessel(c, c + V_SEC_CET, 3)) { return fehlerSetzen(c, E_KONFIG); }
+    } else {
+        if (!leseSchluessel(c, c + V_SEC_CHS, 1)) { return fehlerSetzen(c, E_KONFIG); }
+    }
 
     rc := eeSenden(c);
     // Bei angenommenem PSK entfallen Certificate UND CertificateVerify
@@ -3649,6 +4119,18 @@ fn serverClientFinished(c: int64): int64 {
         var typ: int64 := peek64(tp);
         var pos: int64 := peek64(pp);
         var len: int64 := peek64(lp);
+        // #2578: end_of_early_data (§4.5). Es gehoert INS TRANSKRIPT und
+        // steht dort zwischen den EncryptedExtensions und dem Finished des
+        // Clients (§4.4.1) — wer es nur verwirft, rechnet ein anderes
+        // verify_data als der Client. Danach wird der Leseschluessel auf
+        // das Handschlaggeheimnis umgestellt; alles Weitere kommt von dort.
+        if (typ == HS_EOED) {
+            if (peek64(c + V_EDZUSTAND) != 2) { return fehlerSetzen(c, E_ABLAUF); }
+            if (len != 0) { return fehlerSetzen(c, E_FORMAT); }
+            hsVerbrauchen(c, len, true);
+            poke64(c + V_EOEDEMP, 1);
+            if (!leseSchluessel(c, c + V_SEC_CHS, 1)) { return fehlerSetzen(c, E_KONFIG); }
+        } else {
         if (typ == HS_CERT) {
             // Leeres Certificate: der Client hat keines.
             var leerKette: bool := false;
@@ -3672,6 +4154,16 @@ fn serverClientFinished(c: int64): int64 {
             hsVerbrauchen(c, len, true);
         } else {
         if (typ == HS_FINISHED) {
+            // #2578: Bei angenommenen fruehen Daten MUSS das
+            // end_of_early_data vorher gekommen sein (§4.5). Praktisch
+            // erzwingt das schon die Entschluesselung — das Finished liegt
+            // unter dem Handschlagschluessel, und auf den wird erst beim
+            // end_of_early_data umgestellt. Die Pruefung steht trotzdem da:
+            // sie meldet den Ablauffehler statt eines Tagfehlers, und der
+            // naechste Leser sucht dann nicht in der Krypto.
+            if (peek64(c + V_EDZUSTAND) == 2 && peek64(c + V_EOEDEMP) == 0) {
+                return fehlerSetzen(c, E_ABLAUF);
+            }
             var rc3: int64 := finishedLesen(c, pos, len, c + V_SEC_CHS);
             if (rc3 != 0) { return fehlerSetzen(c, rc3); }
             hsVerbrauchen(c, len, true);
@@ -3695,7 +4187,7 @@ fn serverClientFinished(c: int64): int64 {
             return 0;
         } else {
             return fehlerSetzen(c, E_ABLAUF);
-        } } }
+        } } } }
     }
     return TlsWantRead();
 }
@@ -3858,6 +4350,18 @@ pub fn TlsLese(c: int64, buf: int64, cap: int64): int64 {
     }
     var n: int64 := da;
     if (n > cap) { n := cap; }
+    // #2578: Stammen diese Byte aus 0-RTT? Entschieden wird an der Grenze im
+    // Puffer, und ein Lesevorgang wird NICHT ueber sie hinaus gefuehrt:
+    // sonst traege ein einzelner Rueckgabewert zwei Herkuenfte, und die
+    // Anwendung koennte sie nicht trennen. Lieber zwei Aufrufe als ein
+    // Ergebnis, dessen zweite Haelfte etwas anderes bedeutet.
+    var grenze: int64 := peek64(c + V_EDGRENZE);
+    if (gelesen < grenze) {
+        if (gelesen + n > grenze) { n := grenze - gelesen; }
+        poke64(c + V_EDFLAG, 1);
+    } else {
+        poke64(c + V_EDFLAG, 0);
+    }
     var i: int64 := 0;
     while (i < n) { poke8(buf + i, peek8(pApp(c) + gelesen + i)); i := i + 1; }
     gelesen += n;
@@ -3967,6 +4471,74 @@ fn nachHandschlag(c: int64): int64 {
 }
 
 // close_notify senden (§6.1).
+// ── 0-RTT: oeffentliche Schnittstelle (#2578) ─────────────────────────────
+
+// Fruehe Anwendungsdaten senden (Client). Rueckgabe wie TlsSchreibe: die
+// Zahl der uebernommenen Byte, TlsWantWrite() wenn der Ausgabepuffer voll
+// ist, sonst ein Fehler.
+//
+// Aufzurufen NACH dem ersten TlsSchritt (das ClientHello muss draussen sein,
+// und der fruehe Schluessel steht erst danach) und VOR dem Handschlagende.
+// Ein Aufruf zu einem anderen Zeitpunkt liefert E_ABLAUF statt still etwas
+// anderes zu tun — ein stiller Default waere hier besonders teuer, weil er
+// Klartext bedeuten koennte.
+pub fn TlsSchreibeFrueh(c: int64, buf: int64, len: int64): int64 {
+    if (peek64(c + V_12) != 0) { return E_UNTERSTUETZT; }
+    if (peek64(c + V_ROLLE) != 2) { return E_ABLAUF; }       // nur der Client
+    if (peek64(c + V_EDZUSTAND) != 1) { return E_ABLAUF; }
+    if (peek64(c + V_KRYPT_SCHR) != 3) { return E_ABLAUF; }
+    if (len < 0) { return E_PUFFER; }
+    // §4.2.10: mehr als max_early_data_size darf nicht gesendet werden. Die
+    // Grenze ist das Kleinere aus eigener Vorgabe und Ticketangabe; sie
+    // steht in V_EDMAX und wurde beim Bauen des ClientHello gesetzt.
+    if (peek64(c + V_EDGESCHR) + len > peek64(c + V_EDMAX)) { return E_PUFFER; }
+    var pos: int64 := 0;
+    while (pos < len) {
+        var nn: int64 := len - pos;
+        if (nn > 16384) { nn := 16384; }
+        if (peek64(c + V_OUTPOS) + nn + 22 > B_OUT) {
+            if (pos == 0) { return TlsWantWrite(); }
+            poke64(c + V_EDGESCHR, peek64(c + V_EDGESCHR) + pos);
+            return pos;
+        }
+        var rc: int64 := recordSenden(c, RT_APPDATA, buf + pos, nn);
+        if (rc != 0) { return rc; }
+        pos += nn;
+    }
+    poke64(c + V_EDGESCHR, peek64(c + V_EDGESCHR) + pos);
+    return pos;
+}
+
+// Der Stand der fruehen Daten: 0 keine, 1 angeboten, 2 angenommen,
+// 3 abgelehnt. Fuer den Client ist 3 die Aufforderung, die Daten normal zu
+// senden; fuer den Server sagt 2, dass gelesene Byte aus 0-RTT stammen
+// koennen.
+pub fn TlsFruehZustand(c: int64): int64 { return peek64(c + V_EDZUSTAND); }
+
+// Wurden die fruehen Daten angenommen? Eine eigene Funktion, weil das die
+// Frage ist, die die Anwendung wirklich stellt.
+pub fn TlsFruehAngenommen(c: int64): int64 {
+    if (peek64(c + V_EDZUSTAND) == 2) { return 1; }
+    return 0;
+}
+
+// Stammen die Byte des LETZTEN TlsLese aus 0-RTT? Diese Frage muss die
+// Anwendung stellen koennen, bevor sie eine nicht-wiederholbare Anfrage
+// ausfuehrt: 0-RTT-Daten sind wiederholbar, und ein TlsLese, das sie wie
+// normale Daten liefert, verlagert das Problem still auf jeden Aufrufer
+// (#2578).
+pub fn TlsLetzteLeseFrueh(c: int64): int64 { return peek64(c + V_EDFLAG); }
+
+// Wie viele fruehe Byte sind angekommen (Server) bzw. hinausgegangen
+// (Client)? Zahlen fuer Protokoll und Nachweis.
+pub fn TlsFruehGelesen(c: int64): int64 { return peek64(c + V_EDGELESEN); }
+pub fn TlsFruehGesendet(c: int64): int64 { return peek64(c + V_EDGESCHR); }
+
+// Wie viele unlesbare Records hat diese Verbindung verworfen? Nach einem
+// abgelehnten 0-RTT ist das die Zahl der fruehen Records der Gegenseite --
+// und 0, wenn nichts verworfen werden musste.
+pub fn TlsVerworfeneRecords(c: int64): int64 { return peek64(c + V_SKIPZAHL); }
+
 pub fn TlsSchliessen(c: int64): void {
     if (peek64(c + V_12) != 0) { Tls12Schliessen(peek64(c + V_12)); return; }
     if (peek64(c + V_ZUSTAND) == Z_FERTIG && peek64(c + V_CLOSEGESENDET) == 0) {

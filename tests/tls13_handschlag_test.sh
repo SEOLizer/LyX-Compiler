@@ -18,6 +18,13 @@
 # Ein Test, der nur den guten Fall kennt, waere auch von einer Umsetzung
 # erfuellt, die jedes Zertifikat annimmt — darum steht jeder Ablehnungsfall
 # mit seinem eigenen Code hier.
+#
+# `speicher-je-verbindung` im Erwartungsblock ist eine ZAHL und kein
+# Richtwert: sie waechst, sobald Felder im Verbindungszustand dazukommen.
+# Wer sie nachzieht, rechnet die Differenz vorher gegen die neuen Felder --
+# 136256 -> 136448 sind die 192 Byte der 0-RTT-Felder (#2578). Eine
+# Differenz, die sich nicht erklaeren laesst, heisst dass zwei Felder
+# uebereinander liegen, und genau davor steht der Wert hier.
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LYXC="${LYXC:-$ROOT/lyxc}"
@@ -330,7 +337,7 @@ falscher-hostname -6
 unbekannte-wurzel -6
 gekipptes-byte -5
 verfaelschter-record -5
-speicher-je-verbindung 136256
+speicher-je-verbindung 136448
 SOLLEOF
 
 if ! ( ulimit -v 4000000; timeout 300 "$TMP/s" > "$TMP/ist.txt" 2>"$TMP/err.txt" ); then
