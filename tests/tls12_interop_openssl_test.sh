@@ -288,11 +288,23 @@ fn main(): int64 {
   var ein: int64 := alloc(4096);
   var gelesen: int64 := 0;
   runden := 0;
+  // #2418: ZUERST fragen, was schon entschluesselt bereitliegt, und nur dann
+  // lesen. Unter Last koaleszieren Finished und die Anfrage in EIN
+  // TCP-Segment; die Handschlagschleife liest das Segment dann ganz, und die
+  // Anfrage liegt bereits im TLS-Puffer. Wer in dieser Lage mit `read`
+  // anfaengt, blockiert, bis die Gegenseite die Verbindung schliesst --
+  // gemessen mit `strace -T`: read(4, "", 32768) = 0 <39.948270>. Die Antwort
+  // ging danach hinaus, aber s_client war schon in seinem Zeitlimit getoetet.
+  // Darum war der Test unter Last rot, waehrend BEIDE Seiten den Handschlag
+  // als gelungen meldeten.
   while (gelesen <= 0 && runden < 100) {
-    var n2: int64 := TCPConnRead(conn, puf as pchar, 32768);
-    if (n2 > 0) { Tls12Fuetter(c, puf, n2); }
     gelesen := Tls12Lese(c, ein, 4096);
-    if (n2 <= 0 && gelesen <= 0) { runden := 100; }
+    if (gelesen <= 0) {
+      var n2: int64 := TCPConnRead(conn, puf as pchar, 32768);
+      if (n2 > 0) { Tls12Fuetter(c, puf, n2); }
+      gelesen := Tls12Lese(c, ein, 4096);
+      if (n2 <= 0 && gelesen <= 0) { runden := 100; }
+    }
     runden := runden + 1;
   }
   Print("empfangen "); PrintInt(gelesen); Print(" ");
@@ -391,11 +403,23 @@ fn main(): int64 {
   var ein: int64 := alloc(4096);
   var gelesen: int64 := 0;
   runden := 0;
+  // #2418: ZUERST fragen, was schon entschluesselt bereitliegt, und nur dann
+  // lesen. Unter Last koaleszieren Finished und die Anfrage in EIN
+  // TCP-Segment; die Handschlagschleife liest das Segment dann ganz, und die
+  // Anfrage liegt bereits im TLS-Puffer. Wer in dieser Lage mit `read`
+  // anfaengt, blockiert, bis die Gegenseite die Verbindung schliesst --
+  // gemessen mit `strace -T`: read(4, "", 32768) = 0 <39.948270>. Die Antwort
+  // ging danach hinaus, aber s_client war schon in seinem Zeitlimit getoetet.
+  // Darum war der Test unter Last rot, waehrend BEIDE Seiten den Handschlag
+  // als gelungen meldeten.
   while (gelesen <= 0 && runden < 50) {
-    var n2: int64 := TCPConnRead(conn, puf as pchar, 32768);
-    if (n2 > 0) { Tls12Fuetter(c, puf, n2); }
     gelesen := Tls12Lese(c, ein, 4096);
-    if (n2 <= 0) { runden := 50; }
+    if (gelesen <= 0) {
+      var n2: int64 := TCPConnRead(conn, puf as pchar, 32768);
+      if (n2 > 0) { Tls12Fuetter(c, puf, n2); }
+      gelesen := Tls12Lese(c, ein, 4096);
+      if (n2 <= 0) { runden := 50; }
+    }
     runden := runden + 1;
   }
   Print("antwort "); PrintInt(gelesen); Print(" ");
