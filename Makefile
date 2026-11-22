@@ -941,6 +941,10 @@ test: lyxc
 	@bash tests/tls13_tlsfuzzer_test.sh
 	@bash tests/tls13_interop_openssl_test.sh
 	@bash tests/tls12_interop_openssl_test.sh
+	@bash tests/tls13_interop_clients_2096_test.sh
+	@bash tests/tls13_mtls_ablehnung_2096_test.sh
+	@bash tests/crypto_konstantzeit_2096_test.sh
+	@bash tests/tls13_rss_2096_test.sh
 	@bash tests/ir_datei_builtins_test.sh
 	@bash tests/unit_private_globals_test.sh
 	@bash tests/ir_kein_stiller_ausdruck_test.sh

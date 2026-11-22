@@ -33,6 +33,17 @@
 #   - request_update ausser 0 und 1 mit decode_error statt illegal_parameter
 #     (§4.6.3)
 #
+# ── Stand 2026-11-22, gegen tlsfuzzer-HEAD neu gemessen (#2096 K4) ────────
+# Zwei Fehlschlaege, keiner davon ein TLS-Defekt:
+#   * test-tls13-zero-length-data lief mit dem Schalter `echo` auf 8 von 11.
+#     Ursache war die Betriebsart des TESTSERVERS, nicht der Record-Schicht:
+#     leere Anwendungsdaten-Records nimmt sie seit je an (RFC 8446 §5.1
+#     "Zero-length fragments of Application Data MAY be sent", §5.4 "may
+#     contain a zero-length TLSInnerPlaintext.content"). Ohne `echo` 11 von 11.
+#   * test-tls13-legacy-version erwartet seit tlsfuzzer-Fassung 5 einen
+#     Abbruch, den RFC 8446 §4.2.1 nicht verlangt. Siehe die Begruendung
+#     unten am Ende dieses Tests.
+#
 # ── Was NICHT geprueft wird, und warum ─────────────────────────────────────
 # Skripte, die Funktionen voraussetzen, die diese Umsetzung bewusst nicht
 # hat, koennen nicht bestehen. Sie stehen hier nicht drin, und zwar mit
@@ -91,22 +102,38 @@ export PYTHONPATH="$T:$T/tlslite-ng:$T/ecdsa/src"
 PORT="${TLSFUZZER_PORT:-18880}"
 PASS=0; FAIL=0
 
-# Skript, Mindestzahl bestandener Gespraeche (Stand #2096, lokal gemessen)
+# Skript, Mindestzahl bestandener Gespraeche, Serverbetriebsart
+# (Stand #2096, lokal gemessen gegen tlsfuzzer-HEAD vom 2026-11-22).
+#
+# Die dritte Spalte ist neu und noetig: der Serverschalter `echo` schickt
+# JEDES empfangene Stueck Anwendungsdaten als eigenen Record zurueck, ohne
+# ihn `echo` antwortet er EINMAL mit einer HTTP-Antwort. Beides braucht je ein
+# anderes Skript, und mit einer Betriebsart fuer alle fielen zwei durch:
+#
+#   test-tls13-lengths        braucht echo    (ohne: 2 von 1002 — das Skript
+#                             schickt Nutzdaten und erwartet sie zurueck)
+#   test-tls13-zero-length-data  braucht KEIN echo (mit: 8 von 11 — das Skript
+#                             erwartet EINE Antwort, echo schickt je Fragment
+#                             eine; der Fehlschlag war `Unexpected message
+#                             from peer: ApplicationData(len=7)` an der
+#                             Stelle, an der es den Alert erwartet)
+#
+# Beide Zahlen sind gemessen, in beiden Betriebsarten, nicht geschaetzt.
 faelle="
-test-tls13-conversation 3
-test-tls13-finished 42
-test-tls13-record-layer-limits 68
-test-tls13-lengths 1002
-test-tls13-invalid-ciphers 52
-test-tls13-zero-length-data 11
-test-tls13-empty-alert 10
-test-tls13-legacy-version 10
-test-tls13-nociphers 3
-test-tls13-keyupdate 59
-test-tls13-ecdhe-curves 21
+test-tls13-conversation 3 echo
+test-tls13-finished 42 echo
+test-tls13-record-layer-limits 68 echo
+test-tls13-lengths 1002 echo
+test-tls13-invalid-ciphers 52 echo
+test-tls13-zero-length-data 11 kein_echo
+test-tls13-empty-alert 10 echo
+test-tls13-legacy-version 2 echo
+test-tls13-nociphers 3 echo
+test-tls13-keyupdate 59 echo
+test-tls13-ecdhe-curves 21 echo
 "
 
-while read -r skript soll; do
+while read -r skript soll art; do
   [ -z "$skript" ] && continue
   pfad="$T/tlsfuzzer/scripts/$skript.py"
   if [ ! -f "$pfad" ]; then
@@ -114,8 +141,13 @@ while read -r skript soll; do
   fi
   pkill -x tls_server 2>/dev/null
   sleep 0.3
-  ( ulimit -v 6000000 -c 0; "$TMP/tls_server" "$PORT" "$TMP/certs/cert.pem" \
-      "$TMP/certs/key.pem" x N=0 still echo > "$TMP/srv_$skript.log" 2>&1 & )
+  if [ "${art:-echo}" = echo ]; then
+    ( ulimit -v 6000000 -c 0; "$TMP/tls_server" "$PORT" "$TMP/certs/cert.pem" \
+        "$TMP/certs/key.pem" x N=0 still echo > "$TMP/srv_$skript.log" 2>&1 & )
+  else
+    ( ulimit -v 6000000 -c 0; "$TMP/tls_server" "$PORT" "$TMP/certs/cert.pem" \
+        "$TMP/certs/key.pem" x N=0 still > "$TMP/srv_$skript.log" 2>&1 & )
+  fi
   bereit=0
   for i in $(seq 1 60); do
     if ss -ltn 2>/dev/null | grep -q ":$PORT "; then bereit=1; break; fi
@@ -137,6 +169,40 @@ while read -r skript soll; do
     FAIL=$((FAIL+1))
   fi
 done <<< "$faelle"
+
+# #2096 K4, zweiseitig fuer test-tls13-legacy-version: die Zahl 2 oben ist
+# eine ENTSCHEIDUNG und kein Nachgeben. tlsfuzzer-HEAD erwartet dort seit
+# seiner Fassung 5, dass der Server jede `legacy_version` ausser 0x0303 mit
+# `protocol_version` abweist ("Check that invalid legacy versions are rejected
+# with protocol version alert by the TLS 1.3 server"). RFC 8446 verlangt das
+# NICHT, sobald supported_versions dabei ist:
+#
+#   §4.2.1: "If this extension is present in the ClientHello, servers MUST NOT
+#            use the ClientHello.legacy_version value for version negotiation"
+#   §4.2.1: das Abbruchrecht gilt ausdruecklich fuer den Fall OHNE Erweiterung
+#            ("If this extension is not present, ... Servers MAY abort ...")
+#
+# Ein Abbruch waere also eine Verwendung von legacy_version zur Verhandlung.
+# Diese Umsetzung ignoriert das Feld bewusst (der Weg dorthin steht oben in
+# der Befundliste). Darum steht hier 2 (die sanity-Faelle) und nicht 10.
+#
+# Die Gegenrichtung muss aber auch festgenagelt sein: WUERDEN plotzlich mehr
+# als 2 Gespraeche bestehen, haette jemand das Ignorieren abgeschafft. Dann
+# ist nicht der Test nachzuziehen, sondern die Aenderung zu begruenden.
+LV="$TMP/test-tls13-legacy-version.txt"
+if [ -f "$LV" ]; then
+  lv_ist="$(grep -m1 '^PASS:' "$LV" | awk '{print $2}')"
+  if [ "${lv_ist:-0}" -gt 3 ]; then
+    echo "FAIL test-tls13-legacy-version: $lv_ist Gespraeche bestanden (erwartet 2)."
+    echo "  Das heisst: der Server weist legacy_version != 0x0303 jetzt ab."
+    echo "  RFC 8446 §4.2.1 verlangt das nicht, sobald supported_versions dabei"
+    echo "  ist -- siehe Kommentar oben. Begruenden, nicht die Zahl nachziehen."
+    FAIL=$((FAIL+1))
+  else
+    echo "PASS test-tls13-legacy-version ignoriert legacy_version weiter (RFC 8446 §4.2.1)"
+    PASS=$((PASS+1))
+  fi
+fi
 
 echo "--- $PASS Skripte bestanden, $FAIL gefallen"
 if [ "$FAIL" != 0 ]; then exit 1; fi
