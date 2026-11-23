@@ -252,3 +252,147 @@ pub fn TkNonce(iv: int64, seq: int64, out: int64): void {
         i := i + 1;
     }
 }
+
+// ── Rahmen von ClientHello und ServerHello (#2619, Schritt 2a) ───────────
+//
+// Beide Nachrichten haben in TLS 1.3 und DTLS 1.3 DENSELBEN Aufbau
+// (RFC 9147 §5.3: "the DTLS ClientHello is identical to the TLS 1.3
+// ClientHello except ..."), und beide Protokolle muessen ihn vor jeder
+// Entscheidung auseinandernehmen. Diese Trennung ist der Punkt:
+//
+//   HIER steht das LESEN des Rahmens -- wo die Felder liegen und ob die
+//   Laengen zusammenpassen. Das ist fuer beide Protokolle gleich.
+//
+//   DORT (in tls13.lyx bzw. dtls13.lyx) bleibt die ENTSCHEIDUNG -- welche
+//   Suite genommen wird, welche Gruppe, ob ein HelloRetryRequest faellig
+//   ist, ob ein PSK angenommen wird. Das ist Politik, und sie unterscheidet
+//   sich je Protokoll und je Vorgabe.
+//
+// Wer beides zusammenlegt, bekommt eine Funktion, die nicht wiederverwendbar
+// ist, weil jede Entscheidung mitkommt. Genau daran haengt #2580 Stufe 5.
+//
+// Der Rahmen landet in einem uebergebenen Block (TkRahmenGroesse Byte) mit
+// festen Abstaenden. Ein Block und keine zwanzig Ausgabezeiger: die Felder
+// gehoeren zusammen, und eine Funktion mit zwanzig Parametern ruft niemand
+// richtig auf.
+con TR_RANDOM:   int64 := 0;     // Adresse der 32 Zufallsbyte IM PUFFER
+con TR_SIDPOS:   int64 := 8;     // Adresse der session_id
+con TR_SIDLEN:   int64 := 16;
+con TR_SUITEPOS: int64 := 24;    // ClientHello: Liste; ServerHello: die eine
+con TR_SUITELEN: int64 := 32;    // ClientHello: Laenge der Liste, sonst 2
+con TR_EXTPOS:   int64 := 40;    // Abstand des Erweiterungs-Laengenfeldes
+                                 // VOM NACHRICHTENANFANG (nicht Adresse:
+                                 // TkExtSuchen nimmt Puffer und Abstand)
+con TR_EXTLEN:   int64 := 48;    // noch verfuegbare Byte ab TR_EXTPOS
+con TR_GROESSE:  int64 := 56;
+
+pub fn TkRahmenGroesse(): int64 { return TR_GROESSE; }
+pub fn TkRahmenRandom(r: int64): int64   { return peek64(r + TR_RANDOM); }
+pub fn TkRahmenSidPos(r: int64): int64   { return peek64(r + TR_SIDPOS); }
+pub fn TkRahmenSidLen(r: int64): int64   { return peek64(r + TR_SIDLEN); }
+pub fn TkRahmenSuitePos(r: int64): int64 { return peek64(r + TR_SUITEPOS); }
+pub fn TkRahmenSuiteLen(r: int64): int64 { return peek64(r + TR_SUITELEN); }
+pub fn TkRahmenExtPos(r: int64): int64   { return peek64(r + TR_EXTPOS); }
+pub fn TkRahmenExtLen(r: int64): int64   { return peek64(r + TR_EXTLEN); }
+
+// Rueckgabewerte. Sie sind EIGENE Zahlen und nicht die Fehlercodes von
+// tls13.lyx: diese Unit kennt die Fehlertabelle des Aufrufers nicht, und ein
+// geteilter Zahlenraum waere eine Kopplung, die niemand braucht. Der
+// Aufrufer bildet sie auf seine eigenen Codes ab -- sichtbar an genau einer
+// Stelle.
+pub fn TkRahmenOk(): int64        { return 0; }
+pub fn TkRahmenKurz(): int64      { return 0 - 1; }   // Laengen passen nicht
+pub fn TkRahmenSidZuLang(): int64 { return 0 - 2; }   // session_id > 32
+pub fn TkRahmenKomp(): int64      { return 0 - 3; }   // Kompression != null
+
+// ClientHello-Rahmen lesen. `pos` zeigt auf den RUMPF (hinter den vier Byte
+// Handschlagkopf), `len` ist seine Laenge.
+//
+// legacy_version wird NICHT geprueft. RFC 8446 §4.2.1: wer ueber
+// supported_versions verhandelt, muss legacy_version ignorieren -- dort darf
+// 0x0301 stehen, und der Handschlag ist gueltig. Die alte Pruefung auf
+// 0x0303 wies in tlsfuzzers test-tls13-version-negotiation 193 von 202
+// Faellen ab (#2096), alle zu Unrecht.
+pub fn TkChRahmen(pos: int64, len: int64, r: int64): int64 {
+    if (len < 38) { return 0 - 1; }
+    poke64(r + TR_RANDOM, pos + 2);
+    var sidLen: int64 := peek8(pos + 34) & 0xFF;
+    if (sidLen > 32) { return 0 - 2; }
+    poke64(r + TR_SIDPOS, pos + 35);
+    poke64(r + TR_SIDLEN, sidLen);
+
+    var p: int64 := 35 + sidLen;
+    if (len < p + 2) { return 0 - 1; }
+    var csLen: int64 := TkR16(pos, p);
+    p := p + 2;
+    if (p + csLen > len) { return 0 - 1; }
+    poke64(r + TR_SUITEPOS, pos + p);
+    poke64(r + TR_SUITELEN, csLen);
+    p := p + csLen;
+
+    if (p + 1 > len) { return 0 - 1; }
+    var kLen: int64 := peek8(pos + p) & 0xFF;
+    p := p + 1 + kLen;
+    if (p + 2 > len) { return 0 - 1; }
+    poke64(r + TR_EXTPOS, p);
+    poke64(r + TR_EXTLEN, len - p);
+    return 0;
+}
+
+// ServerHello-Rahmen lesen. Hier WIRD legacy_version geprueft: §4.1.3 legt
+// 0x0303 fest, und die Verhandlung laeuft ueber supported_versions, das der
+// Aufrufer prueft.
+pub fn TkShRahmen(pos: int64, len: int64, r: int64): int64 {
+    if (len < 38) { return 0 - 1; }
+    poke64(r + TR_RANDOM, pos + 2);
+    var sidLen: int64 := peek8(pos + 34) & 0xFF;
+    if (sidLen > 32) { return 0 - 2; }
+    poke64(r + TR_SIDPOS, pos + 35);
+    poke64(r + TR_SIDLEN, sidLen);
+
+    var p: int64 := 35 + sidLen;
+    if (len < p + 3) { return 0 - 1; }
+    poke64(r + TR_SUITEPOS, pos + p);
+    poke64(r + TR_SUITELEN, 2);
+    p := p + 2;
+    if ((peek8(pos + p) & 0xFF) != 0) { return 0 - 3; }
+    p := p + 1;
+    if (p + 2 > len) { return 0 - 1; }
+    poke64(r + TR_EXTPOS, p);
+    poke64(r + TR_EXTLEN, len - p);
+    return 0;
+}
+
+// Der feste Zufallswert, mit dem ein ServerHello als HelloRetryRequest
+// kenntlich ist (RFC 8446 §4.1.3, SHA-256 von "HelloRetryRequest"). Er ist
+// in DTLS derselbe.
+pub fn TkHrrRandom(out: int64): void {
+    poke8(out +  0, 0xCF); poke8(out +  1, 0x21); poke8(out +  2, 0xAD);
+    poke8(out +  3, 0x74); poke8(out +  4, 0xE5); poke8(out +  5, 0x9A);
+    poke8(out +  6, 0x61); poke8(out +  7, 0x11); poke8(out +  8, 0xBE);
+    poke8(out +  9, 0x1D); poke8(out + 10, 0x8C); poke8(out + 11, 0x02);
+    poke8(out + 12, 0x1E); poke8(out + 13, 0x65); poke8(out + 14, 0xB8);
+    poke8(out + 15, 0x91); poke8(out + 16, 0xC2); poke8(out + 17, 0xA2);
+    poke8(out + 18, 0x11); poke8(out + 19, 0x16); poke8(out + 20, 0x7A);
+    poke8(out + 21, 0xBB); poke8(out + 22, 0x8C); poke8(out + 23, 0x5E);
+    poke8(out + 24, 0x07); poke8(out + 25, 0x9E); poke8(out + 26, 0x09);
+    poke8(out + 27, 0xE2); poke8(out + 28, 0xC8); poke8(out + 29, 0xA8);
+    poke8(out + 30, 0x33); poke8(out + 31, 0x9C);
+}
+
+// Ist dieser Zufallswert der HRR-Wert? `scr32` sind 32 Byte Kratzspeicher
+// des Aufrufers -- diese Unit belegt keinen.
+//
+// Verglichen wird NICHT konstantzeitig, und das ist richtig: der Wert ist
+// oeffentlich und steht im RFC. Wer hier CTMemEqual nimmt, suggeriert ein
+// Geheimnis, wo keines ist.
+pub fn TkIstHrr(zufall: int64, scr32: int64): bool {
+    TkHrrRandom(scr32);
+    var i: int64 := 0;
+    var gleich: bool := true;
+    while (i < 32) {
+        if ((peek8(zufall + i) & 0xFF) != (peek8(scr32 + i) & 0xFF)) { gleich := false; }
+        i := i + 1;
+    }
+    return gleich;
+}

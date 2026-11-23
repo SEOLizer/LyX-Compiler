@@ -376,6 +376,7 @@ con S_EXP1:  int64 := 1448;      // 64 Byte Exporter-Zwischenwert
 con S_EXP2:  int64 := 1512;      // 64 Byte Exporter-Kontexthash
 con S_FK:    int64 := 1576;      // 64 Byte finished_key
 con S_ARID:  int64 := 1640;      // 16 Byte Kennung fuer den Wiederholungsschutz (#2578)
+con S_RAHMEN: int64 := 1656;     // 56 Byte Rahmenblock von TkChRahmen/TkShRahmen (#2619)
 con S_SIGBUF: int64 := 1640;     // 512 Byte fertige Signatur (RSA bis 4096 Bit)
 con S_SEED:  int64 := 2152;      // 32 Byte Ed25519-Seed
 
@@ -2266,32 +2267,13 @@ fn serverHelloSenden(c: int64): int64 {
 
 // Der feste Zufallswert, der ein ServerHello als HelloRetryRequest
 // kennzeichnet (RFC 8446 §4.1.3): SHA-256 von "HelloRetryRequest".
-fn hrrRandom(out: int64): void {
-    poke8(out +  0, 0xCF); poke8(out +  1, 0x21); poke8(out +  2, 0xAD);
-    poke8(out +  3, 0x74); poke8(out +  4, 0xE5); poke8(out +  5, 0x9A);
-    poke8(out +  6, 0x61); poke8(out +  7, 0x11); poke8(out +  8, 0xBE);
-    poke8(out +  9, 0x1D); poke8(out + 10, 0x8C); poke8(out + 11, 0x02);
-    poke8(out + 12, 0x1E); poke8(out + 13, 0x65); poke8(out + 14, 0xB8);
-    poke8(out + 15, 0x91); poke8(out + 16, 0xC2); poke8(out + 17, 0xA2);
-    poke8(out + 18, 0x11); poke8(out + 19, 0x16); poke8(out + 20, 0x7A);
-    poke8(out + 21, 0xBB); poke8(out + 22, 0x8C); poke8(out + 23, 0x5E);
-    poke8(out + 24, 0x07); poke8(out + 25, 0x9E); poke8(out + 26, 0x09);
-    poke8(out + 27, 0xE2); poke8(out + 28, 0xC8); poke8(out + 29, 0xA8);
-    poke8(out + 30, 0x33); poke8(out + 31, 0x9C);
-}
+fn hrrRandom(out: int64): void { TkHrrRandom(out); }
 
-// Ist dieses ServerHello ein HelloRetryRequest? Der Wert ist oeffentlich,
-// der Vergleich braucht also keine konstante Laufzeit.
 fn istHrr(c: int64, zufall: int64): bool {
-    var erw: int64 := pScr(c) + S_HRRC;
-    hrrRandom(erw);
-    var i: int64 := 0;
-    var gleich: bool := true;
-    while (i < 32) {
-        if ((peek8(zufall + i) & 0xFF) != (peek8(erw + i) & 0xFF)) { gleich := false; }
-        i += 1;
-    }
-    return gleich;
+    // #2619: derselbe feste Wert und derselbe Vergleich in beiden
+    // Protokollen -- darum in std.net.tls_kern. Der Kratzplatz bleibt S_HRRC,
+    // damit die Rolle dieses Bereichs hier sichtbar ist.
+    return TkIstHrr(zufall, pScr(c) + S_HRRC);
 }
 
 // Das Transkript bei HRR: ClientHello1 wird durch eine synthetische
@@ -2835,27 +2817,32 @@ fn extSuchen(buf: int64, pos: int64, len: int64, typ: int64, lenPtr: int64): int
 
 // ServerHello (Client-Seite)
 fn serverHelloLesen(c: int64, pos: int64, len: int64): int64 {
-    if (len < 38) { return E_FORMAT; }
+    // #2619: Rahmen aus std.net.tls_kern, Entscheidung hier. Siehe
+    // clientHelloLesen -- derselbe Schnitt, derselbe Grund.
     // Vor dem Lesen zuruecksetzen: ein ServerHello OHNE pre_shared_key
     // heisst "PSK nicht angenommen", und das muss den Stand eines frueheren
     // Versuchs loeschen.
     poke64(c + V_PSKDA, 0);
     if (r16(pos, 0) != 0x0303) { return E_VERSION; }
+
+    var rh: int64 := pScr(c) + S_RAHMEN;
+    var rr: int64 := TkShRahmen(pos, len, rh);
+    if (rr == TkRahmenKomp()) { return E_FORMAT; }
+    if (rr != TkRahmenOk()) { return E_FORMAT; }
+
     var i: int64 := 0;
-    while (i < 32) { poke8(c + V_PEER_RAND + i, peek8(pos + 2 + i)); i := i + 1; }
-    var sidLen: int64 := peek8(pos + 34) & 0xFF;
-    if (sidLen > 32) { return E_FORMAT; }
-    var p: int64 := 35 + sidLen;
-    if (len < p + 3) { return E_FORMAT; }
+    while (i < 32) {
+        poke8(c + V_PEER_RAND + i, peek8(TkRahmenRandom(rh) + i));
+        i := i + 1;
+    }
+    var sidLen: int64 := TkRahmenSidLen(rh);
     // Die session_id muss die des ClientHello sein (§4.1.3).
     if (sidLen != peek64(c + V_SESSIDLEN)) { return E_FORMAT; }
-    if (CTMemEqual(pos + 35, c + V_SESSID, sidLen) != -1) { return E_FORMAT; }
+    if (CTMemEqual(TkRahmenSidPos(rh), c + V_SESSID, sidLen) != 0 - 1) { return E_FORMAT; }
 
-    var suite: int64 := r16(pos, p);
+    var suite: int64 := r16(pos, TkRahmenSuitePos(rh) - pos);
     if (!suiteSetzen(c, suite)) { return E_SUITE; }
-    p += 2;
-    if ((peek8(pos + p) & 0xFF) != 0) { return E_FORMAT; }
-    p += 1;
+    var p: int64 := TkRahmenExtPos(rh);
 
     var extLen: int64 := pScr(c) + S_EL;
     var sv: int64 := extSuchen(pos, p, len - p, 43, extLen);
@@ -2921,29 +2908,40 @@ fn serverHelloLesen(c: int64, pos: int64, len: int64): int64 {
 
 // ClientHello (Server-Seite): Suite waehlen, key_share und SNI/ALPN lesen.
 fn clientHelloLesen(c: int64, pos: int64, len: int64): int64 {
-    if (len < 38) { return E_FORMAT; }
-    // legacy_version wird NICHT geprueft. RFC 8446 §4.2.1: wer ueber
-    // supported_versions verhandelt, muss legacy_version ignorieren — dort
-    // darf 0x0301 (TLS 1.0) stehen, und der Handschlag ist trotzdem
-    // gueltig. Die alte Pruefung auf 0x0303 wies 193 von 202 Faellen in
-    // tlsfuzzers test-tls13-version-negotiation ab (#2096), alle mit
-    // protocol_version — und alle zu Unrecht. Die VERSION entscheidet
-    // allein supported_versions, weiter unten.
+    // #2619: Der RAHMEN kommt aus std.net.tls_kern -- wo die Felder liegen
+    // und ob die Laengen zusammenpassen, ist in TLS 1.3 und DTLS 1.3
+    // dasselbe (RFC 9147 §5.3). Was hier bleibt, ist die ENTSCHEIDUNG:
+    // Suite, Gruppe, HelloRetryRequest, PSK. Vorher standen beide
+    // zusammen, und genau das machte den Leser fuer DTLS unbrauchbar.
+    //
+    // legacy_version prueft der Rahmen bewusst nicht (§4.2.1: wer ueber
+    // supported_versions verhandelt, muss es ignorieren -- die alte
+    // Pruefung auf 0x0303 wies 193 von 202 Faellen in tlsfuzzers
+    // test-tls13-version-negotiation ab, alle zu Unrecht, #2096).
+    var rh: int64 := pScr(c) + S_RAHMEN;
+    var rr: int64 := TkChRahmen(pos, len, rh);
+    if (rr == TkRahmenSidZuLang()) { return E_FORMAT; }
+    if (rr != TkRahmenOk()) { return E_FORMAT; }
+
     var i: int64 := 0;
-    while (i < 32) { poke8(c + V_PEER_RAND + i, peek8(pos + 2 + i)); i := i + 1; }
-    var sidLen: int64 := peek8(pos + 34) & 0xFF;
-    if (sidLen > 32) { return E_FORMAT; }
+    while (i < 32) {
+        poke8(c + V_PEER_RAND + i, peek8(TkRahmenRandom(rh) + i));
+        i := i + 1;
+    }
     // Die session_id wird im ServerHello zurueckgespiegelt (§4.1.3).
+    var sidLen: int64 := TkRahmenSidLen(rh);
     i := 0;
-    while (i < sidLen) { poke8(c + V_SESSID + i, peek8(pos + 35 + i)); i := i + 1; }
+    while (i < sidLen) {
+        poke8(c + V_SESSID + i, peek8(TkRahmenSidPos(rh) + i));
+        i := i + 1;
+    }
     poke64(c + V_SESSIDLEN, sidLen);
 
-    var p: int64 := 35 + sidLen;
-    if (len < p + 2) { return E_FORMAT; }
-    var csLen: int64 := r16(pos, p);
-    p += 2;
-    if (p + csLen > len) { return E_FORMAT; }
-
+    var csLen: int64 := TkRahmenSuiteLen(rh);
+    // Die Suiteliste als ABSTAND im Puffer: der Rest dieser Funktion
+    // rechnet mit Abstaenden (r16(pos, p)), und zwei Schreibweisen
+    // nebeneinander waere die Verwechslung, auf die niemand wartet.
+    var p: int64 := TkRahmenSuitePos(rh) - pos;
     // Reihenfolge der Server-Vorliebe, nicht die des Clients.
     var gewaehlt: int64 := 0;
     var wunsch: int64 := pScr(c) + S_WUNSCH;
@@ -2961,12 +2959,10 @@ fn clientHelloLesen(c: int64, pos: int64, len: int64): int64 {
     }
     if (gewaehlt == 0) { return E_SUITE; }
     if (!suiteSetzen(c, gewaehlt)) { return E_SUITE; }
-    p += csLen;
 
-    if (p + 1 > len) { return E_FORMAT; }
-    var compLen: int64 := peek8(pos + p) & 0xFF;
-    p := p + 1 + compLen;
-    if (p + 2 > len) { return E_FORMAT; }
+    // Ab hier die Erweiterungen. Der Abstand kommt aus dem Rahmen -- die
+    // Kompressionsliste hat er schon uebersprungen und die Laengen geprueft.
+    p := TkRahmenExtPos(rh);
 
     var el: int64 := pScr(c) + S_EL;
     // #2578: early_data im ClientHello ist leer und heisst nur "ich sende
