@@ -63,10 +63,10 @@ fi
 ERFASST=$(grep -vc '^#' "$STAND")
 BELEGT=$(grep -v '^#' work/lyxos/syscall-ist.txt | awk '{s += $2 - $1 + 1} END {print s+0}')
 echo "    erfasst: $ERFASST Nummern mit Argumentzahl, belegter Raum: $BELEGT Nummern"
-if [ "$ERFASST" -ge 285 ]; then
-  ok "mindestens 285 Nummern tragen eine Argumentzahl (jetzt $ERFASST)"
+if [ "$ERFASST" -ge 300 ]; then
+  ok "mindestens 300 Nummern tragen eine Argumentzahl (jetzt $ERFASST)"
 else
-  bad "Abdeckung" "nur $ERFASST Nummern — war 287 nach #2598, die Zahl darf nur steigen"
+  bad "Abdeckung" "nur $ERFASST Nummern — war 304 nach #2621, die Zahl darf nur steigen"
 fi
 
 # 6) Stichproben gegen den Kernel, von Hand nachgelesen in ring3.lyx:
