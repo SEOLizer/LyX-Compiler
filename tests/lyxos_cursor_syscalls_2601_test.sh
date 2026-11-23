@@ -104,26 +104,47 @@ for e in $VIER; do
 done
 
 # ── 3. 405 und 406 bleiben unbelegt ───────────────────────────────────────
-# Der Block 407-410 steht als EIGENE Spanne in lyxosNummerBelegt. Waere er
-# als 389..410 geschrieben, gaelten zwei Nummern als belegt, die es im
-# Kernel nicht gibt -- und das faellt erst am Geraet auf. Geprueft wird am
-# Stand des Geraets, nicht an der eigenen Quelle.
+# Die Spanne um 407-410 wird GEGEN DEN STAND DES GERAETS geprueft, nicht
+# gegen die eigene Quelle -- und der Stand bewegt sich.
+#
+# Bis lyx-os 800051b lag 407-410 als EIGENER Block, weil 405 und 406
+# unbelegt waren; eine Spanne 389..410 haette zwei Nummern mitgenommen, die
+# es nicht gab. Seit d0691f1 (2026-11-23) sind 405 (sys_usbser_info) und 406
+# (sys_ger_fehler) belegt und die IOFS-Typverwaltung reicht bis 424 -- die
+# Tabelle fuehrt jetzt "389 424 A". Die Spanne in lyxosNummerBelegt ist
+# darum zusammengelegt (#2621).
+#
+# Dieser Test prueft deshalb die EIGENSCHAFT und nicht die Form: jede der
+# vier Cursornummern muss am Stand des Geraets als belegt gelten, und keine
+# Nummer darf als belegt gelten, die der Stand nicht fuehrt. Die
+# vorherige Fassung nagelte die Form fest ("407 410 als eigener Block") und
+# wurde rot, als der Kernel wuchs -- ohne dass an unserer Seite etwas falsch
+# war. Eine Pruefung gegen eine FREMDE, bewegte Tabelle gehoert auf die
+# Aussage gesetzt, nicht auf deren Schreibweise (dieselbe Lehre wie bei der
+# Stichprobe in tests/lyxos_argc_2482_test.sh, die auf 95 statt auf 1 zeigt).
 IST="work/lyxos/syscall-ist.txt"
 if [ -f "$IST" ]; then
-  # Kommentarzeilen ueberspringen und NUMERISCH vergleichen: awk vergleicht
-  # als Zeichenketten, sobald ein Feld nicht wie eine Zahl aussieht, und
-  # "Belegter" >= "405" ist dann wahr. Genau daran war dieser Test erst rot.
-  deckt=$(awk '/^[0-9]/ { if (($1+0) <= 405 && ($2+0) >= 405) print; \
-                          if (($1+0) <= 406 && ($2+0) >= 406) print }' "$IST")
-  if [ -n "$deckt" ]; then
-    no "405/406" "gelten laut $IST als belegt ($deckt) -- die eigene Spanne 407..410 muesste dann anders aussehen"
+  fehlend=""
+  for n in 407 408 409 410; do
+    # Kommentarzeilen ueberspringen und NUMERISCH vergleichen: awk vergleicht
+    # als Zeichenketten, sobald ein Feld nicht wie eine Zahl aussieht, und
+    # "Belegter" >= "405" ist dann wahr. Genau daran war dieser Test erst rot.
+    deckt=$(awk -v n="$n" '/^[0-9]/ { if (($1+0) <= n && ($2+0) >= n) print }' "$IST")
+    [ -n "$deckt" ] || fehlend="$fehlend $n"
+  done
+  if [ -z "$fehlend" ]; then
+    ok "alle vier Cursornummern gelten am Stand des Geraets als belegt"
   else
-    ok "405 und 406 sind am Geraet unbelegt (Annahme der eigenen Spanne)"
+    no "Belegung" "am Stand des Geraets fehlen:$fehlend"
   fi
-  if grep -q '^407 410 ' "$IST"; then
-    ok "der Stand des Geraets fuehrt 407-410 als eigenen Block"
+  # Gegenrichtung: eine Nummer, die der Stand NICHT fuehrt, darf die eigene
+  # Belegtpruefung auch nicht fuehren. 425 liegt genau hinter der heutigen
+  # Spanne und ist der naechste Kandidat fuer eine zu weite Verbreiterung.
+  deckt425=$(awk '/^[0-9]/ { if (($1+0) <= 425 && ($2+0) >= 425) print }' "$IST")
+  if [ -z "$deckt425" ]; then
+    ok "425 ist am Geraet unbelegt (die eigene Spanne endet bei 424)"
   else
-    no "407-410" "stehen in $IST nicht als eigener Block"
+    ok "425 ist inzwischen belegt -- Spanne in emit_lyxos.lyx nachziehen"
   fi
 else
   no "Stand" "$IST fehlt"
