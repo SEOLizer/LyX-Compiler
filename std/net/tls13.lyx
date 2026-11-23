@@ -377,6 +377,7 @@ con S_EXP2:  int64 := 1512;      // 64 Byte Exporter-Kontexthash
 con S_FK:    int64 := 1576;      // 64 Byte finished_key
 con S_ARID:  int64 := 1640;      // 16 Byte Kennung fuer den Wiederholungsschutz (#2578)
 con S_RAHMEN: int64 := 1656;     // 56 Byte Rahmenblock von TkChRahmen/TkShRahmen (#2619)
+con S_SIGLIST: int64 := 1712;    // 8 Schemata je int64 fuer TkExtSigAlgs (#2619)
 con S_SIGBUF: int64 := 1640;     // 512 Byte fertige Signatur (RSA bis 4096 Bit)
 con S_SEED:  int64 := 2152;      // 32 Byte Ed25519-Seed
 
@@ -1197,13 +1198,8 @@ fn ticketSenden(c: int64): int64 {
     // drin, wenn 0-RTT wirklich eingeschaltet ist (Vorgabe UND
     // Wiederholungsschutz, siehe TlsCfgFruehAn).
     if (TlsCfgFruehAn(cfg)) {
-        var edm: int64 := TlsCfgFruehMax(cfg);
         p := w16(buf, p, 8);                       // Laenge der Erweiterungen
-        p := w16(buf, p, EXT_EARLY); p := w16(buf, p, 4);
-        p := wByte(buf, p, (edm >> 24) & 0xFF);
-        p := wByte(buf, p, (edm >> 16) & 0xFF);
-        p := wByte(buf, p, (edm >> 8) & 0xFF);
-        p := wByte(buf, p, edm & 0xFF);
+        p := TkExtEarlyMax(buf, p, TlsCfgFruehMax(cfg));
     } else {
         p := w16(buf, p, 0);           // keine Erweiterungen
     }
@@ -2048,53 +2044,41 @@ fn clientHelloBauen(c: int64, zweites: bool): int64 {
     p += 2;
     var extStart: int64 := p;
 
-    // supported_versions
-    if (mit12) {
-        p := w16(buf, p, 43); p := w16(buf, p, 5);
-        p := wByte(buf, p, 4); p := w16(buf, p, 0x0304); p := w16(buf, p, 0x0303);
-    } else {
-        p := w16(buf, p, 43); p := w16(buf, p, 3);
-        p := wByte(buf, p, 2); p := w16(buf, p, 0x0304);
-    }
+    // supported_versions -- die Byte baut std.net.tls_kern (#2619).
+    p := TkExtSupportedVersionsCh(buf, p, mit12);
     // supported_groups: alles, was die Konfiguration erlaubt, in der eigenen
     // Rangfolge — und nur, was diese Unit auch rechnen kann. Was hier steht,
     // darf der Server waehlen; eine Gruppe anzubieten, die wir nicht koennen,
     // waere eine Einladung in den Abbruch (genau das war 0x0503 in tls12).
-    var anz: int64 := 0;
+    // Die ERLAUBNIS bleibt hier (sie haengt an der Vorgabe), die Byte
+    // schreibt std.net.tls_kern. Uebergeben wird eine Maske in der
+    // Rangfolge: Bit i gehoert zu Rang i.
+    var grMaske: int64 := 0;
     var rg1: int64 := 0;
     while (rg1 < GRP_ANZAHL) {
-        if (gruppeErlaubt(c, gruppeNachRang(rg1))) { anz += 1; }
-        rg1 += 1;
+        if (gruppeErlaubt(c, gruppeNachRang(rg1))) { grMaske := grMaske | (1 << rg1); }
+        rg1 := rg1 + 1;
     }
-    p := w16(buf, p, 10); p := w16(buf, p, 2 + anz * 2);
-    p := w16(buf, p, anz * 2);
-    var rg2: int64 := 0;
-    while (rg2 < GRP_ANZAHL) {
-        if (gruppeErlaubt(c, gruppeNachRang(rg2))) {
-            p := w16(buf, p, gruppeNachRang(rg2));
-        }
-        rg2 += 1;
-    }
+    p := TkExtSupportedGroups(buf, p, grMaske);
     // key_share: ein Anteil, in der Gruppe aus V_GRUPPE. Bietet der Server
     // sie nicht an, kommt ein HelloRetryRequest — darum reicht einer.
     var pkLen: int64 := gruppenPkLen(c);
-    p := w16(buf, p, 51); p := w16(buf, p, pkLen + 6);
-    p := w16(buf, p, pkLen + 4);
-    p := w16(buf, p, peek64(c + V_GRUPPE)); p := w16(buf, p, pkLen);
-    p := wBytes(buf, p, gruppenPk(c), pkLen);
+    p := TkExtKeyShareCh(buf, p, peek64(c + V_GRUPPE), gruppenPk(c), pkLen);
     // signature_algorithms (RFC 8446 §4.2.3), in unserer Vorliebe:
     // ecdsa_secp256r1_sha256, ecdsa_secp384r1_sha384,
     // rsa_pss_rsae_sha256/384/512, ed25519.
     // Was hier steht, darf die Gegenseite waehlen — es gehoert also nur
     // hinein, was die Pruefung unten auch kann.
-    p := w16(buf, p, 13); p := w16(buf, p, 14);
-    p := w16(buf, p, 12);
-    p := w16(buf, p, 0x0403);
-    p := w16(buf, p, 0x0503);
-    p := w16(buf, p, 0x0804);
-    p := w16(buf, p, 0x0805);
-    p := w16(buf, p, 0x0806);
-    p := w16(buf, p, 0x0807);
+    // Die LISTE ist die eigene Vorliebe und bleibt hier; die Byte schreibt
+    // std.net.tls_kern. Sechs Schemata, je ein int64 im Kratzbereich.
+    var sl: int64 := pScr(c) + S_SIGLIST;
+    poke64(sl,      0x0403);     // ecdsa_secp256r1_sha256
+    poke64(sl +  8, 0x0503);     // ecdsa_secp384r1_sha384
+    poke64(sl + 16, 0x0804);     // rsa_pss_rsae_sha256
+    poke64(sl + 24, 0x0805);     // rsa_pss_rsae_sha384
+    poke64(sl + 32, 0x0806);     // rsa_pss_rsae_sha512
+    poke64(sl + 40, 0x0807);     // ed25519
+    p := TkExtSigAlgs(buf, p, sl, 6);
     // #2579: status_request (RFC 6066 Paragraph 8, Typ 5). NUR wenn die
     // Vorgabe das Pruefen ueberhaupt will -- eine Erweiterung anzubieten und
     // die Antwort dann wegzuwerfen waere eine Zusage ohne Deckung, und die
@@ -2107,30 +2091,16 @@ fn clientHelloBauen(c: int64, zweites: bool): int64 {
     //
     // Leere Listen heissen "der Server waehlt" -- das ist die Form, die auch
     // Browser senden.
-    if (TlsCfgOcspModus(cfg) != 0) {
-        p := w16(buf, p, 5); p := w16(buf, p, 5);
-        p := wByte(buf, p, 1);
-        p := w16(buf, p, 0);
-        p := w16(buf, p, 0);
-    }
+    if (TlsCfgOcspModus(cfg) != 0) { p := TkExtStatusRequest(buf, p); }
     // server_name
     var hostLen: int64 := TlsCfgHostLen(cfg);
     if (TlsCfgHost(cfg) != 0 && hostLen > 0) {
-        p := w16(buf, p, 0); p := w16(buf, p, hostLen + 5);
-        p := w16(buf, p, hostLen + 3);
-        p := wByte(buf, p, 0); p := w16(buf, p, hostLen);
-        p := wBytes(buf, p, TlsCfgHost(cfg), hostLen);
+        p := TkExtSni(buf, p, TlsCfgHost(cfg), hostLen);
     }
     // ALPN
     var alpnLen: int64 := TlsCfgAlpnLen(cfg);
     if (TlsCfgAlpn(cfg) != 0 && alpnLen > 0) {
-        var merk: int64 := p;
-        p := w16(buf, p, 16); p += 4;                     // Laengen spaeter
-        var listenStart: int64 := p;
-        p := alpnSchreiben(buf, p, TlsCfgAlpn(cfg), alpnLen);
-        var listenLen: int64 := p - listenStart;
-        w16(buf, merk + 2, listenLen + 2);
-        w16(buf, merk + 4, listenLen);
+        p := TkExtAlpn(buf, p, TlsCfgAlpn(cfg), alpnLen);
     }
 
     // Die Zutaten, die TLS 1.2 braucht: ohne sie lehnt die 1.2-Maschine den
@@ -2145,11 +2115,7 @@ fn clientHelloBauen(c: int64, zweites: bool): int64 {
 
     // Cookie aus dem HelloRetryRequest unveraendert zurueckgeben (§4.2.2).
     var ckLen: int64 := peek64(c + V_COOKIELEN);
-    if (zweites && ckLen > 0) {
-        p := w16(buf, p, 44); p := w16(buf, p, ckLen + 2);
-        p := w16(buf, p, ckLen);
-        p := wBytes(buf, p, c + V_COOKIE, ckLen);
-    }
+    if (zweites && ckLen > 0) { p := TkExtCookie(buf, p, c + V_COOKIE, ckLen); }
 
     // ── Wiederaufnahme (#2577) ───────────────────────────────────────────
     //
@@ -2174,13 +2140,12 @@ fn clientHelloBauen(c: int64, zweites: bool): int64 {
         var edMaxC: int64 := TlsCfgFruehMax(cfg);
         if (edMaxC > peek64(c + V_TKTEDMAX)) { edMaxC := peek64(c + V_TKTEDMAX); }
         if (edMaxC > 0) {
-            p := w16(buf, p, EXT_EARLY); p := w16(buf, p, 0);
+            p := TkExtEarlyLeer(buf, p);
             poke64(c + V_EDMAX, edMaxC);
             poke64(c + V_EDZUSTAND, 1);
         }
         // psk_key_exchange_modes: NUR psk_dhe_ke (1).
-        p := w16(buf, p, 45); p := w16(buf, p, 2);
-        p := wByte(buf, p, 1); p := wByte(buf, p, 1);
+        p := TkExtPskModes(buf, p);
 
         // pre_shared_key, als LETZTE Erweiterung.
         //   identities<7..2^16-1>:  identity<1..2^16-1> + obfuscated_age(4)
@@ -2248,7 +2213,7 @@ fn serverHelloSenden(c: int64): int64 {
     p += 2;
     var extStart: int64 := p;
     // supported_versions
-    p := w16(buf, p, 43); p := w16(buf, p, 2); p := w16(buf, p, 0x0304);
+    p := TkExtSupportedVersionsSh(buf, p);
     // pre_shared_key: WELCHE Identitaet genommen wurde (#2577, §4.2.11).
     // Wir betrachten nur die erste, also immer 0. Ohne diese Erweiterung
     // wuesste der Client nicht, dass sein PSK angenommen wurde — und wuerde
@@ -2258,9 +2223,7 @@ fn serverHelloSenden(c: int64): int64 {
     }
     // key_share
     var pkLen: int64 := gruppenPkLen(c);
-    p := w16(buf, p, 51); p := w16(buf, p, pkLen + 4);
-    p := w16(buf, p, peek64(c + V_GRUPPE)); p := w16(buf, p, pkLen);
-    p := wBytes(buf, p, gruppenPk(c), pkLen);
+    p := TkExtKeyShareSh(buf, p, peek64(c + V_GRUPPE), gruppenPk(c), pkLen);
     w16(buf, extLenPos, p - extStart);
     return hsSenden(c, HS_SERVER_HELLO, buf, p);
 }
@@ -2305,9 +2268,8 @@ fn hrrSenden(c: int64): int64 {
     var extLenPos: int64 := p;
     p += 2;
     var extStart: int64 := p;
-    p := w16(buf, p, 43); p := w16(buf, p, 2); p := w16(buf, p, 0x0304);
-    p := w16(buf, p, 51); p := w16(buf, p, 2);
-    p := w16(buf, p, peek64(c + V_GRUPPE));
+    p := TkExtSupportedVersionsSh(buf, p);
+    p := TkExtKeyShareHrr(buf, p, peek64(c + V_GRUPPE));
     w16(buf, extLenPos, p - extStart);
     return hsSenden(c, HS_SERVER_HELLO, buf, p);
 }
@@ -2327,9 +2289,7 @@ fn eeSenden(c: int64): int64 {
     // #2578: early_data, leer — das IST die Annahme (§4.2.10). Es gibt kein
     // Feld fuer "abgelehnt": fehlt die Erweiterung, sind die fruehen Daten
     // abgelehnt.
-    if (peek64(c + V_EDZUSTAND) == 2) {
-        p := w16(buf, p, EXT_EARLY); p := w16(buf, p, 0);
-    }
+    if (peek64(c + V_EDZUSTAND) == 2) { p := TkExtEarlyLeer(buf, p); }
     w16(buf, extLenPos, p - extStart);
     return hsSenden(c, HS_EE, buf, p);
 }
