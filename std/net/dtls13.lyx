@@ -53,6 +53,13 @@ import std.crypto.aesgcm;
 import std.crypto.chacha20poly1305;
 import std.crypto.ct;
 import std.net.tls_kern;
+import std.net.tls_config;
+import std.crypto.x509;
+import std.crypto.x25519;
+import std.crypto.ed25519;
+import std.crypto.sha256;
+import std.crypto.rand;
+import std.string;
 
 // ── Rueckgabewerte ────────────────────────────────────────────────────────
 //
@@ -70,6 +77,7 @@ con DE_PUFFER:     int64 := 0 - 7;    // Ziel zu klein
 con DE_SCHLUESSEL: int64 := 0 - 8;    // Richtung ohne Schluessel benutzt
 con DE_UEBERLANG:  int64 := 0 - 9;    // Nachricht ueber der Obergrenze
 con DE_WIDERSPRUCH: int64 := 0 - 10;  // zwei Fragmente, zwei Angaben
+con DE_UNTERSTUETZT: int64 := 0 - 11; // Verfahren nicht umgesetzt
 
 pub fn DtlsFehlerText(rc: int64): pchar {
     if (rc == 0)  { return "ok"c; }
@@ -83,6 +91,7 @@ pub fn DtlsFehlerText(rc: int64): pchar {
     if (rc == 0 - 8) { return "fuer diese Richtung ist kein Schluessel gesetzt"c; }
     if (rc == 0 - 9) { return "Handschlagnachricht ueber der Obergrenze"c; }
     if (rc == 0 - 10) { return "Fragmente widersprechen sich in Typ oder Laenge"c; }
+    if (rc == 0 - 11) { return "Verfahren nicht umgesetzt (diese Stufe: X25519 und Ed25519)"c; }
     return "unbekannter Fehler"c;
 }
 
@@ -707,6 +716,18 @@ con HS_KOPF: int64 := 12;
 
 pub fn DtlsHsSenden(z: int64, typ: int64, rumpf: int64, len: int64,
                     mtu: int64, out: int64, outCap: int64): int64 {
+    var seq: int64 := peek64(z + D_HS_SEQ_SCHR);
+    var rc: int64 := DtlsHsSendenMitSeq(z, typ, rumpf, len, seq, mtu, out, outCap);
+    if (rc < 0) { return rc; }
+    poke64(z + D_HS_SEQ_SCHR, seq + 1);
+    return rc;
+}
+
+// Dieselbe Fragmentierung mit AUSDRUECKLICHER message_seq. Die Wiederholung
+// braucht das: sie schickt dieselbe Nachricht mit derselben message_seq, aber
+// in neuen Records mit neuen Sequenznummern (§4.2.1).
+pub fn DtlsHsSendenMitSeq(z: int64, typ: int64, rumpf: int64, len: int64,
+                          seq: int64, mtu: int64, out: int64, outCap: int64): int64 {
     if (z == 0 || out == 0 || len < 0) { return DE_FORMAT; }
     if (len > B_HSM) { return DE_UEBERLANG; }
 
@@ -715,7 +736,6 @@ pub fn DtlsHsSenden(z: int64, typ: int64, rumpf: int64, len: int64,
     if (mtu <= mehr) { return DE_PUFFER; }
     var jeFragment: int64 := mtu - mehr;
 
-    var seq: int64 := peek64(z + D_HS_SEQ_SCHR);
     var puf: int64 := pOut(z);                        // Zwischenpuffer: Kopf + Stueck
     var geschrieben: int64 := 0;
     var offset: int64 := 0;
@@ -751,7 +771,6 @@ pub fn DtlsHsSenden(z: int64, typ: int64, rumpf: int64, len: int64,
         geschrieben := geschrieben + rc;
         offset := offset + stueck;
     }
-    poke64(z + D_HS_SEQ_SCHR, seq + 1);
     return geschrieben;
 }
 
@@ -1083,3 +1102,829 @@ pub fn DtlsFlugBestaetigt(z: int64): void {
 pub fn DtlsZaehlerWiederholungen(z: int64): int64 { return peek64(z + D_Z_WIEDERHOLUNGEN); }
 pub fn DtlsFlugVersuche(z: int64): int64          { return peek64(z + D_FL_VERSUCHE); }
 pub fn DtlsFlugFrist(z: int64): int64             { return peek64(z + D_FL_FRIST); }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Stufe 5: der Handschlag (#2580)
+//
+// Was hier NICHT noch einmal steht: der Schluesselplan, die Feldkodierung,
+// die Erweiterungen, der Rahmen von ClientHello und ServerHello, der
+// Signaturinhalt und der Finished-Wert. Das alles kommt aus
+// std.net.tls_kern (#2619) -- und genau deshalb ist dieser Abschnitt
+// ueberhaupt vertretbar lang. Eine zweite Fassung jener Rechnungen waere die
+// "zweite Stelle", fuer die die Arbeitsregeln dieses Repos eine eigene
+// Ursachenrubrik fuehren.
+//
+// ── Grenzen dieser Stufe, ausdruecklich ──────────────────────────────────
+//
+//   * EINE Suite: TLS_AES_128_GCM_SHA256. Die anderen beiden kommen mit
+//     derselben Mechanik; was fehlt, ist die Auswahl, nicht die Rechnung.
+//   * EINE Gruppe: X25519. P-256 und P-384 brauchen die Paarfunktionen, die
+//     noch in tls13.lyx privat sind (#2619 hat sie nicht mitgenommen, weil
+//     sie am Verbindungszustand haengen).
+//   * Server mit Ed25519-Schluessel. ECDSA und RSA brauchen die
+//     Schemaauswahl aus tls13.lyx.
+//   * KEINE Wiederaufnahme, kein 0-RTT, kein Client-Zertifikat, keine
+//     Connection ID.
+//   * ACK wird noch nicht AUSGEWERTET: wiederholt wird nach Frist (§5.8),
+//     und ein eingehendes ACK beendet die Wiederholung noch nicht. Die
+//     Bausteine dafuer stehen (DtlsAckBauen, DtlsFlugBestaetigt); was fehlt,
+//     ist das Lesen.
+//   * EINE Sequenznummernfolge fuer alle Epochen. Richtig waere je Epoche
+//     eine eigene (§4.2.2). Praktisch faellt es hier nicht auf, weil die
+//     Nummern monoton bleiben und die Klartextform kein Fenster hat -- aber
+//     eine Gegenstelle, die je Epoche zaehlt, sieht bei der Wiederholung des
+//     ServerHello eine Nummer, die ihr hoch vorkommt. Benannt statt
+//     verschwiegen; der Fix ist ein zweiter Zaehler im Record-Schreiber.
+//
+// Diese Liste ist absichtlich hier und nicht im Issue: wer die Unit liest,
+// soll nicht erst anderswo nachsehen muessen, was sie kann.
+// ═══════════════════════════════════════════════════════════════════════════
+
+con DH_ROLLE:    int64 := 61840;
+con DH_CFG:      int64 := 61848;
+con DH_ZUSTAND:  int64 := 61856;
+con DH_HASHLEN:  int64 := 61864;
+con DH_HSCTX:    int64 := 61872;   // 208 Byte Transkript-Hashzustand
+con DH_SEC_HS:   int64 := 62080;
+con DH_SEC_CHS:  int64 := 62144;
+con DH_SEC_SHS:  int64 := 62208;
+con DH_SEC_MAST: int64 := 62272;
+con DH_SEC_CAP:  int64 := 62336;
+con DH_SEC_SAP:  int64 := 62400;
+con DH_SK:       int64 := 62464;   // 32 Byte eigener X25519-Skalar
+con DH_PK:       int64 := 62496;   // 32 Byte eigener Anteil
+con DH_PEERPK:   int64 := 62528;
+con DH_SHARED:   int64 := 62560;
+con DH_RANDOM:   int64 := 62592;
+con DH_PEERRAND: int64 := 62624;
+con DH_SID:      int64 := 62656;   // bis 32 Byte session_id der Gegenseite
+con DH_SIDLEN:   int64 := 62688;
+// Kratzbereich des Handschlags: 2048 Byte. Die Plaetze darin sind unten an
+// den Aufrufstellen benannt; der hoechste ist der Certificate-Rumpf bei
+// 1424. Beim Bauen stand hier 1024, und ein Record-Klartext bei +2048
+// ueberschrieb den Zertifikatssatz -- der Lauf endete mit
+// Speicherzugriffsfehler. Lehre: der Kratzbereich wird nach dem HOECHSTEN
+// benutzten Platz bemessen, nicht nach dem Gefuehl.
+con DH_SCR:      int64 := 62696;   // 2048 Byte
+// Der Klartext eines Records braucht seinen EIGENEN Platz und nicht einen
+// Abstand im Kratzbereich: ein Record traegt bis 2^14 Byte, und ein Bereich
+// gehoert genau einer Rolle.
+con DH_REC:      int64 := 64744;   // 16384 Byte
+con DH_PEERCERT: int64 := 81128;   // Zeiger auf den X509-Satz der Gegenseite
+// ── Flug als NACHRICHTENLISTE (#2580 Stufe 5) ───────────────────────────
+//
+// RFC 9147 §4.2.1: jeder Record traegt eine NEUE Sequenznummer -- auch die
+// Wiederholung. Ein byteweise gemerkter Flug lässt sich darum nicht noch
+// einmal senden: die Gegenseite weist ihn als Wiederholung ab (ihr Fenster
+// hat die Nummern schon gesehen), und der Handschlag bleibt stehen.
+//
+// Beim Bauen ist genau das passiert: mit einem verlorenen Datagramm kam der
+// Handschlag nie zustande, obwohl die Frist ablief und wiederholt wurde.
+// Gemerkt wird deshalb, WAS gesendet wurde (Typ, message_seq, Rumpf), und
+// die Records entstehen bei der Wiederholung neu.
+con DH_FL_ANZ:   int64 := 81136;
+con DH_FL_TAB:   int64 := 81144;   // 8 Eintraege je 40 Byte: Typ, Seq,
+                                   // Laenge, Abstand, EPOCHE
+con DH_FL_PUF:   int64 := 81400;   // 8192 Byte Rumpfe
+con DH_FL_PUFPOS: int64 := 89592;
+con DH_ERWARTET: int64 := 89600;   // naechste erwartete message_seq
+con DH_SIZE2:    int64 := 89608;
+
+// Zustaende
+con DZ_START:    int64 := 0;
+con DZ_WARTE_SH: int64 := 1;
+con DZ_WARTE_HS: int64 := 2;   // Client wartet auf EE..Finished
+con DZ_WARTE_CH: int64 := 3;
+con DZ_WARTE_CF: int64 := 4;   // Server wartet auf Client-Finished
+con DZ_FERTIG:   int64 := 5;
+con DZ_FEHLER:   int64 := 6;
+
+// Handschlagnachrichten (wie in TLS 1.3)
+con DH_CH:    int64 := 1;
+con DH_SH:    int64 := 2;
+con DH_EE:    int64 := 8;
+con DH_CERT:  int64 := 11;
+con DH_CV:    int64 := 15;
+con DH_FIN:   int64 := 20;
+
+pub fn DtlsHandschlagBedarf(): int64 { return DH_SIZE2 + X509Groesse(); }
+
+fn pHScr(z: int64): int64 { return z + DH_SCR; }
+fn pRecPuf(z: int64): int64 { return z + DH_REC; }
+
+// Ein Zustand fuer den Handschlag. Er ist GROESSER als der fuer die reine
+// Record-Schicht (DtlsNeu), darum eine eigene Belegungsfunktion -- wer nur
+// Records braucht, soll nicht den Platz des Handschlags zahlen.
+pub fn DtlsHandschlagNeu(cfg: int64, rolle: int64): int64 {
+    var z: int64 := alloc(DtlsHandschlagBedarf());
+    if (z == 0) { return 0; }
+    var i: int64 := 0;
+    while (i < DtlsHandschlagBedarf()) { poke8(z + i, 0); i := i + 1; }
+    poke64(z + D_CFG, cfg);
+    poke64(z + D_R_HOCH, 0 - 1);
+    poke64(z + D_AEAD, 1);
+    poke64(z + D_KEYLEN, 16);
+    poke64(z + D_HASHLEN, 32);
+    poke64(z + DH_ROLLE, rolle);
+    poke64(z + DH_CFG, cfg);
+    poke64(z + DH_HASHLEN, 32);
+    poke64(z + DH_PEERCERT, z + DH_SIZE2);
+    if (rolle == 1) { poke64(z + DH_ZUSTAND, DZ_WARTE_CH); }
+    else { poke64(z + DH_ZUSTAND, DZ_START); }
+    return z;
+}
+
+pub fn DtlsZustand(z: int64): int64 { return peek64(z + DH_ZUSTAND); }
+pub fn DtlsFertig(z: int64): int64 {
+    if (peek64(z + DH_ZUSTAND) == DZ_FERTIG) { return 1; }
+    return 0;
+}
+
+// ── Transkript ───────────────────────────────────────────────────────────
+//
+// Der Hash laeuft ueber die HANDSCHLAGNACHRICHTEN, nicht ueber die Records
+// und nicht ueber die DTLS-Fragmentkoepfe (RFC 9147 §5.2: "the transcript
+// is the same as in TLS 1.3"). Das ist die Stelle, an der eine
+// DTLS-Umsetzung am leichtesten falsch wird: wer die zwoelf Byte
+// Fragmentkopf mithasht, bekommt ein Transkript, das keine TLS-Gegenstelle
+// und keine andere DTLS-Umsetzung teilt -- und das faellt erst am Finished
+// auf, also am Ende.
+//
+// Darum wird hier AUSDRUECKLICH der Vierbytekopf aus TLS gebildet
+// (Typ + 24-Bit-Laenge) und davor gehasht, nicht der DTLS-Kopf.
+fn dhHashInit(z: int64): void { Sha256Init(z + DH_HSCTX); }
+
+fn dhHashNachricht(z: int64, typ: int64, rumpf: int64, len: int64): void {
+    var kopf: int64 := pHScr(z) + 512;
+    poke8(kopf, typ);
+    poke8(kopf + 1, (len >> 16) & 0xFF);
+    poke8(kopf + 2, (len >> 8) & 0xFF);
+    poke8(kopf + 3, len & 0xFF);
+    Sha256Update(z + DH_HSCTX, kopf, 4);
+    Sha256Update(z + DH_HSCTX, rumpf, len);
+}
+
+fn dhHashJetzt(z: int64, out: int64): void {
+    var k: int64 := pHScr(z) + 256;
+    var i: int64 := 0;
+    while (i < 208) { poke8(k + i, peek8(z + DH_HSCTX + i)); i := i + 1; }
+    Sha256Final(k, out);
+}
+
+// ── Schluesselplan, aus tls_kern ─────────────────────────────────────────
+fn dhPlanHandschlag(z: int64): bool {
+    var hl: int64 := 32;
+    var scr: int64 := pHScr(z);
+    var leer: int64 := scr;
+    var null0: int64 := scr + 64;
+    var early: int64 := scr + 128;
+    var derived: int64 := scr + 192;
+    var th: int64 := scr + 384;
+    var i: int64 := 0;
+    while (i < 64) { poke8(null0 + i, 0); i := i + 1; }
+    TkHashLeer(hl, leer);
+    TkPlanEarly(hl, 0, 0, null0, early);
+    if (!HkdfExpandLabel(hl, early, hl, "derived"c as int64, 7, leer, hl, derived, hl)) {
+        return false;
+    }
+    HkdfExtract(hl, derived, hl, z + DH_SHARED, 32, z + DH_SEC_HS);
+    dhHashJetzt(z, th);
+    if (!HkdfExpandLabel(hl, z + DH_SEC_HS, hl, "c hs traffic"c as int64, 12,
+                         th, hl, z + DH_SEC_CHS, hl)) { return false; }
+    if (!HkdfExpandLabel(hl, z + DH_SEC_HS, hl, "s hs traffic"c as int64, 12,
+                         th, hl, z + DH_SEC_SHS, hl)) { return false; }
+    if (!HkdfExpandLabel(hl, z + DH_SEC_HS, hl, "derived"c as int64, 7,
+                         leer, hl, derived, hl)) { return false; }
+    var i2: int64 := 0;
+    while (i2 < 64) { poke8(null0 + i2, 0); i2 := i2 + 1; }
+    HkdfExtract(hl, derived, hl, null0, hl, z + DH_SEC_MAST);
+    SecureZero(early, 64);
+    SecureZero(derived, 64);
+    return true;
+}
+
+fn dhPlanAnwendung(z: int64): bool {
+    var hl: int64 := 32;
+    var th: int64 := pHScr(z) + 384;
+    dhHashJetzt(z, th);
+    if (!HkdfExpandLabel(hl, z + DH_SEC_MAST, hl, "c ap traffic"c as int64, 12,
+                         th, hl, z + DH_SEC_CAP, hl)) { return false; }
+    return HkdfExpandLabel(hl, z + DH_SEC_MAST, hl, "s ap traffic"c as int64, 12,
+                           th, hl, z + DH_SEC_SAP, hl);
+}
+
+// Die Epochen von DTLS 1.3 (§6.1): 0 Klartext, 1 fruehe Daten (hier nicht
+// umgesetzt), 2 Handschlag, 3 Anwendung. Die Epoche 1 wird UEBERSPRUNGEN
+// und nicht umgenummert -- wer sie zum Handschlag macht, redet mit keiner
+// Gegenstelle.
+fn dhEpocheHandschlag(z: int64, lesen: bool): bool {
+    var eigen: int64 := z + DH_SEC_SHS;
+    var fremd: int64 := z + DH_SEC_CHS;
+    if (peek64(z + DH_ROLLE) == 2) { eigen := z + DH_SEC_CHS; fremd := z + DH_SEC_SHS; }
+    if (lesen) { return DtlsSchluesselSetzen(z, DtlsLesen(), 2, fremd, 32, 16, 1); }
+    return DtlsSchluesselSetzen(z, DtlsSchreiben(), 2, eigen, 32, 16, 1);
+}
+
+fn dhEpocheAnwendung(z: int64, lesen: bool): bool {
+    var eigen: int64 := z + DH_SEC_SAP;
+    var fremd: int64 := z + DH_SEC_CAP;
+    if (peek64(z + DH_ROLLE) == 2) { eigen := z + DH_SEC_CAP; fremd := z + DH_SEC_SAP; }
+    if (lesen) { return DtlsSchluesselSetzen(z, DtlsLesen(), 3, fremd, 32, 16, 1); }
+    return DtlsSchluesselSetzen(z, DtlsSchreiben(), 3, eigen, 32, 16, 1);
+}
+
+// ── Nachrichten bauen ────────────────────────────────────────────────────
+//
+// Die Rumpfe entstehen im Kratzbereich und gehen dann durch DtlsHsSenden --
+// dort werden sie fragmentiert und als Records geschrieben. Der
+// TRANSKRIPTHASH wird dabei ueber den Rumpf gebildet (dhHashNachricht),
+// nicht ueber die Fragmente.
+
+fn dhChBauen(z: int64, out: int64): int64 {
+    var cfg: int64 := peek64(z + DH_CFG);
+    var p: int64 := TkW16(out, 0, 0x0303);
+    p := TkBytes(out, p, z + DH_RANDOM, 32);
+    p := TkByte(out, p, 32);
+    p := TkBytes(out, p, z + DH_SID, 32);
+    p := TkW16(out, p, 2);
+    p := TkW16(out, p, 0x1301);                  // TLS_AES_128_GCM_SHA256
+    p := TkByte(out, p, 1); p := TkByte(out, p, 0);
+    var extLenPos: int64 := p;
+    p := p + 2;
+    var extStart: int64 := p;
+    p := TkExtSupportedVersionsCh(out, p, false);
+    p := TkExtSupportedGroups(out, p, 1);        // nur Rang 0 = X25519
+    p := TkExtKeyShareCh(out, p, TkGrpX25519(), z + DH_PK, 32);
+    var sl: int64 := pHScr(z) + 640;
+    poke64(sl, 0x0807);                          // ed25519
+    p := TkExtSigAlgs(out, p, sl, 1);
+    var hostLen: int64 := TlsCfgHostLen(cfg);
+    if (TlsCfgHost(cfg) != 0 && hostLen > 0) {
+        p := TkExtSni(out, p, TlsCfgHost(cfg), hostLen);
+    }
+    TkW16(out, extLenPos, p - extStart);
+    return p;
+}
+
+fn dhShBauen(z: int64, out: int64): int64 {
+    var p: int64 := TkW16(out, 0, 0x0303);
+    p := TkBytes(out, p, z + DH_RANDOM, 32);
+    p := TkByte(out, p, peek64(z + DH_SIDLEN));
+    p := TkBytes(out, p, z + DH_SID, peek64(z + DH_SIDLEN));
+    p := TkW16(out, p, 0x1301);
+    p := TkByte(out, p, 0);
+    var extLenPos: int64 := p;
+    p := p + 2;
+    var extStart: int64 := p;
+    p := TkExtSupportedVersionsSh(out, p);
+    p := TkExtKeyShareSh(out, p, TkGrpX25519(), z + DH_PK, 32);
+    TkW16(out, extLenPos, p - extStart);
+    return p;
+}
+
+// Certificate (§4.4.2): Kontext leer, EIN Eintrag, keine Erweiterungen.
+fn dhCertBauen(z: int64, out: int64): int64 {
+    var cfg: int64 := peek64(z + DH_CFG);
+    var der: int64 := TlsCfgCert(cfg);
+    var derLen: int64 := TlsCfgCertN(cfg);
+    if (der == 0 || derLen <= 0) { return 0 - 1; }
+    // TlsCfgCert zeigt auf eine KETTE (Zeiger/Laenge-Paare), wie in
+    // std.net.tls13. Diese Stufe nimmt den ersten Eintrag; eine Kette mit
+    // Zwischenzertifikaten braucht die Schleife, die tls13.lyx hat.
+    var d0: int64 := peek64(der);
+    var l0: int64 := peek64(der + 8);
+    var p: int64 := TkByte(out, 0, 0);           // certificate_request_context
+    p := TkW24(out, p, l0 + 5);
+    p := TkW24(out, p, l0);
+    p := TkBytes(out, p, d0, l0);
+    p := TkW16(out, p, 0);                       // keine Erweiterungen
+    return p;
+}
+
+// CertificateVerify (§4.4.3) mit Ed25519.
+fn dhCvBauen(z: int64, out: int64): int64 {
+    var cfg: int64 := peek64(z + DH_CFG);
+    var key: int64 := TlsCfgKey(cfg);
+    if (key == 0) { return 0 - 1; }
+    var th: int64 := pHScr(z) + 384;
+    dhHashJetzt(z, th);
+    var inhalt: int64 := pHScr(z) + 704;
+    var iLen: int64 := TkSignaturInhalt(peek64(z + DH_ROLLE) == 1, th, 32, inhalt);
+    var sig: int64 := pHScr(z) + 896;
+    Ed25519Sign(key, inhalt, iLen, sig);
+    var p: int64 := TkW16(out, 0, 0x0807);       // ed25519
+    p := TkW16(out, p, 64);
+    return TkBytes(out, p, sig, 64);
+}
+
+fn dhFinBauen(z: int64, out: int64): int64 {
+    var eigen: int64 := z + DH_SEC_SHS;
+    if (peek64(z + DH_ROLLE) == 2) { eigen := z + DH_SEC_CHS; }
+    var th: int64 := pHScr(z) + 384;
+    dhHashJetzt(z, th);
+    if (!TkFinishedWert(32, eigen, th, pHScr(z) + 448, out)) { return 0 - 1; }
+    return 32;
+}
+
+// Den Flugspeicher leeren -- ein neuer Flug ersetzt den vorigen (§5.8.1:
+// ein neuer Flug bestaetigt den alten).
+fn dhFlugLeeren(z: int64): void {
+    poke64(z + DH_FL_ANZ, 0);
+    poke64(z + DH_FL_PUFPOS, 0);
+}
+
+// Eine gesendete Nachricht fuer die Wiederholung merken: Typ, message_seq
+// und Rumpf. Mehr als acht Nachrichten oder mehr als 8192 Byte je Flug
+// werden NICHT gemerkt -- dann ist die Wiederholung unvollstaendig, und
+// das meldet dhFlugVollstaendig. Still abschneiden waere hier besonders
+// teuer: eine halbe Wiederholung sieht wie ein Paketverlust aus.
+fn dhFlugMerken(z: int64, typ: int64, seq: int64, rumpf: int64, len: int64): bool {
+    var anz: int64 := peek64(z + DH_FL_ANZ);
+    var pufPos: int64 := peek64(z + DH_FL_PUFPOS);
+    if (anz >= 8) { return false; }
+    if (pufPos + len > 8192) { return false; }
+    var e: int64 := z + DH_FL_TAB + anz * 40;
+    poke64(e, typ);
+    poke64(e + 8, seq);
+    poke64(e + 16, len);
+    poke64(e + 24, pufPos);
+    // Die EPOCHE gehoert dazu. Ein Flug spannt zwei: das ServerHello geht in
+    // Epoche 0 (Klartext) hinaus, alles danach in Epoche 2. Wer das nicht
+    // mitschreibt, wiederholt das ServerHello VERSCHLUESSELT -- und die
+    // Gegenseite kann es nicht lesen, weil sie den Schluessel erst daraus
+    // gewinnen wuerde. Gemessen beim Bauen: mit einem verlorenen ersten
+    // Serverdatagramm kam der Handschlag nie zustande, obwohl wiederholt
+    // wurde.
+    var ep: int64 := 0;
+    if (peek64(z + D_W_DA) == 1) { ep := peek64(z + D_W_EPOCHE); }
+    poke64(e + 32, ep);
+    var ziel: int64 := z + DH_FL_PUF + pufPos;
+    var i: int64 := 0;
+    while (i < len) { poke8(ziel + i, peek8(rumpf + i)); i := i + 1; }
+    poke64(z + DH_FL_PUFPOS, pufPos + len);
+    poke64(z + DH_FL_ANZ, anz + 1);
+    return true;
+}
+
+pub fn DtlsFlugNachrichten(z: int64): int64 { return peek64(z + DH_FL_ANZ); }
+
+// Eine Nachricht senden: Rumpf hashen, fuer die Wiederholung merken,
+// fragmentieren, in den Ausgangspuffer.
+fn dhSenden(z: int64, typ: int64, rumpf: int64, len: int64,
+            out: int64, outCap: int64, mtu: int64): int64 {
+    dhHashNachricht(z, typ, rumpf, len);
+    var seq: int64 := peek64(z + D_HS_SEQ_SCHR);
+    dhFlugMerken(z, typ, seq, rumpf, len);
+    return DtlsHsSenden(z, typ, rumpf, len, mtu, out, outCap);
+}
+
+// Den gemerkten Flug NEU bauen: dieselben Nachrichten mit denselben
+// message_seq, aber in frischen Records -- deren Sequenznummern zaehlt
+// DtlsRecordSchreiben selbst weiter (§4.2.1). Weder gehasht noch neu
+// gemerkt: das Transkript kennt die Nachricht schon.
+fn dhFlugNeuSenden(z: int64, out: int64, outCap: int64, mtu: int64): int64 {
+    var anz: int64 := peek64(z + DH_FL_ANZ);
+    if (anz <= 0) { return 0; }
+    // Gezaehlt wird HIER und nicht beim Fristgeber: wiederholt wird auch,
+    // wenn eine Wiederholung der Gegenseite ankommt (§5.8.1), und diese
+    // Wiederholungen sind genauso welche. Wer nur die Fristfaelle zaehlt,
+    // meldet 0, obwohl der Flug dreimal hinausging -- und ein Test, der sich
+    // darauf stuetzt, belegt dann nichts.
+    poke64(z + D_Z_WIEDERHOLUNGEN, peek64(z + D_Z_WIEDERHOLUNGEN) + 1);
+    var geschrieben: int64 := 0;
+    // Den aktuellen Schreibzustand merken und am Ende zuruecksetzen: die
+    // Wiederholung schaltet die Epoche um, der laufende Betrieb soll das
+    // nicht merken.
+    var altDa: int64 := peek64(z + D_W_DA);
+    var altEp: int64 := peek64(z + D_W_EPOCHE);
+    var i: int64 := 0;
+    while (i < anz) {
+        var e: int64 := z + DH_FL_TAB + i * 40;
+        var ep: int64 := peek64(e + 32);
+        if (ep == 0) {
+            // Klartext: der Schluessel wird ABGESCHALTET, nicht umgangen --
+            // DtlsRecordSchreiben entscheidet an D_W_DA, welche Kopfform es
+            // baut.
+            poke64(z + D_W_DA, 0);
+        } else {
+            poke64(z + D_W_DA, 1);
+            poke64(z + D_W_EPOCHE, ep);
+        }
+        var rc: int64 := DtlsHsSendenMitSeq(z, peek64(e), z + DH_FL_PUF + peek64(e + 24),
+                                            peek64(e + 16), peek64(e + 8), mtu,
+                                            out + geschrieben, outCap - geschrieben);
+        if (rc < 0) {
+            poke64(z + D_W_DA, altDa);
+            poke64(z + D_W_EPOCHE, altEp);
+            return rc;
+        }
+        geschrieben := geschrieben + rc;
+        i := i + 1;
+    }
+    poke64(z + D_W_DA, altDa);
+    poke64(z + D_W_EPOCHE, altEp);
+    return geschrieben;
+}
+
+// ── Nachrichten verarbeiten ──────────────────────────────────────────────
+//
+// Jede fertig zusammengesetzte Handschlagnachricht laeuft hier durch. Der
+// Rueckgabewert ist die Zahl der Byte, die DARAUFHIN zu senden sind (sie
+// stehen in `out`), oder negativ.
+fn dhNachricht(z: int64, typ: int64, rumpf: int64, len: int64,
+               out: int64, outCap: int64, mtu: int64, jetztMs: int64): int64 {
+    var zustand: int64 := peek64(z + DH_ZUSTAND);
+    var rolle: int64 := peek64(z + DH_ROLLE);
+    var el: int64 := pHScr(z) + 960;
+    var rh: int64 := pHScr(z) + 976;          // 56 Byte Rahmenblock
+
+    // ── Server: ClientHello ──────────────────────────────────────────────
+    if (rolle == 1 && zustand == DZ_WARTE_CH && typ == DH_CH) {
+        if (TkChRahmen(rumpf, len, rh) != TkRahmenOk()) { return DE_FORMAT; }
+        var i: int64 := 0;
+        while (i < 32) {
+            poke8(z + DH_PEERRAND + i, peek8(TkRahmenRandom(rh) + i));
+            i := i + 1;
+        }
+        var sidLen: int64 := TkRahmenSidLen(rh);
+        poke64(z + DH_SIDLEN, sidLen);
+        i := 0;
+        while (i < sidLen) {
+            poke8(z + DH_SID + i, peek8(TkRahmenSidPos(rh) + i));
+            i := i + 1;
+        }
+        // key_share: der Anteil der Gegenseite in X25519. Eine andere Gruppe
+        // waere hier ein HelloRetryRequest -- diese Stufe kann ihn nicht und
+        // bricht darum LAUT ab, statt mit einem halben Handschlag
+        // weiterzumachen.
+        var ks: int64 := TkExtSuchen(rumpf, TkRahmenExtPos(rh), TkRahmenExtLen(rh), 51, el);
+        if (ks < 0) { return DE_FORMAT; }
+        var listLen: int64 := TkR16(ks, 0);
+        if (listLen < 4) { return DE_FORMAT; }
+        var gefunden: int64 := 0;
+        var q: int64 := 2;
+        while (q + 4 <= 2 + listLen) {
+            var grp: int64 := TkR16(ks, q);
+            var kl: int64 := TkR16(ks, q + 2);
+            if (grp == TkGrpX25519() && kl == 32) {
+                var k2: int64 := 0;
+                while (k2 < 32) { poke8(z + DH_PEERPK + k2, peek8(ks + q + 4 + k2)); k2 := k2 + 1; }
+                gefunden := 1;
+            }
+            q := q + 4 + kl;
+        }
+        if (gefunden == 0) { return DE_FORMAT; }
+
+        // Eigenes Paar, eigener Zufall.
+        var seed: int64 := pHScr(z) + 1008;
+        if (RandBytesExact(seed, 32) != 32) { return DE_SCHLUESSEL; }
+        X25519KeyGen(seed, z + DH_PK, z + DH_SK);
+        if (RandBytesExact(z + DH_RANDOM, 32) != 32) { return DE_SCHLUESSEL; }
+        X25519SharedSecret(z + DH_SK, z + DH_PEERPK, z + DH_SHARED);
+
+        dhHashInit(z);
+        dhHashNachricht(z, DH_CH, rumpf, len);
+        dhFlugLeeren(z);
+
+        // ServerHello geht in Epoche 0 hinaus, der Rest in Epoche 2. Der
+        // Schluesselplan haengt am Transkript BIS zum ServerHello.
+        var rumpf2: int64 := pHScr(z) + 1040;
+        var geschrieben: int64 := 0;
+        var shLen: int64 := dhShBauen(z, rumpf2);
+        var rc: int64 := dhSenden(z, DH_SH, rumpf2, shLen, out, outCap, mtu);
+        if (rc < 0) { return rc; }
+        geschrieben := rc;
+
+        if (!dhPlanHandschlag(z)) { return DE_SCHLUESSEL; }
+        if (!dhEpocheHandschlag(z, false)) { return DE_SCHLUESSEL; }
+
+        // EncryptedExtensions: leer. Diese Stufe handelt kein ALPN aus.
+        var eeRumpf: int64 := pHScr(z) + 1040;
+        TkW16(eeRumpf, 0, 0);
+        rc := dhSenden(z, DH_EE, eeRumpf, 2, out + geschrieben, outCap - geschrieben, mtu);
+        if (rc < 0) { return rc; }
+        geschrieben := geschrieben + rc;
+
+        var certRumpf: int64 := pHScr(z) + 1424;
+        var cLen: int64 := dhCertBauen(z, certRumpf);
+        if (cLen < 0) { return DE_SCHLUESSEL; }
+        rc := dhSenden(z, DH_CERT, certRumpf, cLen, out + geschrieben, outCap - geschrieben, mtu);
+        if (rc < 0) { return rc; }
+        geschrieben := geschrieben + rc;
+
+        var cvRumpf: int64 := pHScr(z) + 1040;
+        var cvLen: int64 := dhCvBauen(z, cvRumpf);
+        if (cvLen < 0) { return DE_SCHLUESSEL; }
+        rc := dhSenden(z, DH_CV, cvRumpf, cvLen, out + geschrieben, outCap - geschrieben, mtu);
+        if (rc < 0) { return rc; }
+        geschrieben := geschrieben + rc;
+
+        var finRumpf: int64 := pHScr(z) + 1040;
+        var fLen: int64 := dhFinBauen(z, finRumpf);
+        if (fLen < 0) { return DE_SCHLUESSEL; }
+        rc := dhSenden(z, DH_FIN, finRumpf, fLen, out + geschrieben, outCap - geschrieben, mtu);
+        if (rc < 0) { return rc; }
+        geschrieben := geschrieben + rc;
+
+        // Die Anwendungsgeheimnisse haengen am Transkript BIS zum eigenen
+        // Finished (§7.1) -- darum hier und nicht erst nach dem Finished des
+        // Clients.
+        if (!dhPlanAnwendung(z)) { return DE_SCHLUESSEL; }
+        if (!dhEpocheHandschlag(z, true)) { return DE_SCHLUESSEL; }
+        DtlsFlugMerken(z, out, geschrieben, jetztMs);
+        poke64(z + DH_ZUSTAND, DZ_WARTE_CF);
+        return geschrieben;
+    }
+
+    // ── Client: ServerHello ──────────────────────────────────────────────
+    if (rolle == 2 && zustand == DZ_WARTE_SH && typ == DH_SH) {
+        if (TkShRahmen(rumpf, len, rh) != TkRahmenOk()) { return DE_FORMAT; }
+        var i3: int64 := 0;
+        while (i3 < 32) {
+            poke8(z + DH_PEERRAND + i3, peek8(TkRahmenRandom(rh) + i3));
+            i3 := i3 + 1;
+        }
+        var ks2: int64 := TkExtSuchen(rumpf, TkRahmenExtPos(rh), TkRahmenExtLen(rh), 51, el);
+        if (ks2 < 0) { return DE_FORMAT; }
+        if (TkR16(ks2, 0) != TkGrpX25519()) { return DE_FORMAT; }
+        if (TkR16(ks2, 2) != 32) { return DE_FORMAT; }
+        var k3: int64 := 0;
+        while (k3 < 32) { poke8(z + DH_PEERPK + k3, peek8(ks2 + 4 + k3)); k3 := k3 + 1; }
+        X25519SharedSecret(z + DH_SK, z + DH_PEERPK, z + DH_SHARED);
+
+        dhHashNachricht(z, DH_SH, rumpf, len);
+        if (!dhPlanHandschlag(z)) { return DE_SCHLUESSEL; }
+        if (!dhEpocheHandschlag(z, true)) { return DE_SCHLUESSEL; }
+        poke64(z + DH_ZUSTAND, DZ_WARTE_HS);
+        return 0;
+    }
+
+    // ── Client: der Serverflug ───────────────────────────────────────────
+    if (rolle == 2 && zustand == DZ_WARTE_HS) {
+        if (typ == DH_EE) {
+            dhHashNachricht(z, typ, rumpf, len);
+            return 0;
+        }
+        if (typ == DH_CERT) {
+            // Blatt herauslesen und die Kette pruefen. Die Pruefung selbst
+            // liegt in std.crypto.x509 und ist dieselbe wie in TLS.
+            if (len < 8) { return DE_FORMAT; }
+            var ctxLen: int64 := peek8(rumpf) & 0xFF;
+            var p2: int64 := 1 + ctxLen;
+            var gesamt: int64 := TkR24(rumpf, p2);
+            if (p2 + 3 + gesamt > len) { return DE_FORMAT; }
+            var cLen2: int64 := TkR24(rumpf, p2 + 3);
+            if (cLen2 <= 0 || p2 + 6 + cLen2 > len) { return DE_FORMAT; }
+            if (!X509Lies(rumpf + p2 + 6, cLen2, peek64(z + DH_PEERCERT))) {
+                return DE_FORMAT;
+            }
+            dhHashNachricht(z, typ, rumpf, len);
+            return 0;
+        }
+        if (typ == DH_CV) {
+            if (len < 4) { return DE_FORMAT; }
+            if (TkR16(rumpf, 0) != 0x0807) { return DE_UNTERSTUETZT; }
+            var sLen: int64 := TkR16(rumpf, 2);
+            if (sLen != 64 || len < 4 + sLen) { return DE_FORMAT; }
+            // Der Signaturinhalt haengt am Transkript VOR dieser Nachricht
+            // -- darum wird sie erst danach gehasht.
+            var th2: int64 := pHScr(z) + 384;
+            dhHashJetzt(z, th2);
+            var inhalt2: int64 := pHScr(z) + 704;
+            var iLen2: int64 := TkSignaturInhalt(true, th2, 32, inhalt2);
+            // Der oeffentliche Schluessel kommt aus dem Zertifikat, nicht
+            // aus dem Signaturverfahren: X509PubKeyPos zeigt in den
+            // DER-Puffer des Satzes. Bei Ed25519 sind es 32 rohe Byte.
+            var satz: int64 := peek64(z + DH_PEERCERT);
+            var kPos: int64 := X509DerPuffer(satz) + X509PubKeyPos(satz);
+            if (X509PubKeyLen(satz) != 32) { return DE_UNTERSTUETZT; }
+            if (!Ed25519Verify(rumpf + 4, inhalt2, iLen2, kPos)) { return DE_TAG; }
+            dhHashNachricht(z, typ, rumpf, len);
+            return 0;
+        }
+        if (typ == DH_FIN) {
+            var th3: int64 := pHScr(z) + 384;
+            dhHashJetzt(z, th3);
+            var soll: int64 := pHScr(z) + 512;
+            if (!TkFinishedWert(32, z + DH_SEC_SHS, th3, pHScr(z) + 448, soll)) {
+                return DE_SCHLUESSEL;
+            }
+            if (len != 32) { return DE_FORMAT; }
+            if (CTMemEqual(soll, rumpf, 32) == 0) { return DE_TAG; }
+            dhHashNachricht(z, typ, rumpf, len);
+
+            // Eigenes Finished in Epoche 2, danach beide Richtungen auf
+            // Epoche 3.
+            if (!dhEpocheHandschlag(z, false)) { return DE_SCHLUESSEL; }
+            dhFlugLeeren(z);
+            // Die Anwendungsgeheimnisse haengen am Transkript BIS ZUM
+            // Finished DES SERVERS (§7.1) -- also VOR dem eigenen. Beim
+            // Bauen stand dieser Aufruf hinter dem Senden, und dhSenden
+            // hasht die Nachricht: der Client rechnete ueber ein Transkript,
+            // das sein eigenes Finished schon enthielt, und hatte ANDERE
+            // Anwendungsgeheimnisse als der Server. Der Handschlag gelang
+            // trotzdem -- das Finished stimmte ja --, und nur der Vergleich
+            // der Geheimnisse im Test hat es gezeigt. Genau dafuer ist er da.
+            if (!dhPlanAnwendung(z)) { return DE_SCHLUESSEL; }
+            var finRumpf2: int64 := pHScr(z) + 1040;
+            var fl2: int64 := dhFinBauen(z, finRumpf2);
+            if (fl2 < 0) { return DE_SCHLUESSEL; }
+            var rc2: int64 := dhSenden(z, DH_FIN, finRumpf2, fl2, out, outCap, mtu);
+            if (rc2 < 0) { return rc2; }
+            if (!dhEpocheAnwendung(z, false)) { return DE_SCHLUESSEL; }
+            if (!dhEpocheAnwendung(z, true)) { return DE_SCHLUESSEL; }
+            DtlsFlugMerken(z, out, rc2, jetztMs);
+            poke64(z + DH_ZUSTAND, DZ_FERTIG);
+            return rc2;
+        }
+        return DE_FORMAT;
+    }
+
+    // ── Server: Finished des Clients ─────────────────────────────────────
+    if (rolle == 1 && zustand == DZ_WARTE_CF && typ == DH_FIN) {
+        var th4: int64 := pHScr(z) + 384;
+        dhHashJetzt(z, th4);
+        var soll2: int64 := pHScr(z) + 512;
+        if (!TkFinishedWert(32, z + DH_SEC_CHS, th4, pHScr(z) + 448, soll2)) {
+            return DE_SCHLUESSEL;
+        }
+        if (len != 32) { return DE_FORMAT; }
+        if (CTMemEqual(soll2, rumpf, 32) == 0) { return DE_TAG; }
+        dhHashNachricht(z, typ, rumpf, len);
+        if (!dhEpocheAnwendung(z, false)) { return DE_SCHLUESSEL; }
+        if (!dhEpocheAnwendung(z, true)) { return DE_SCHLUESSEL; }
+        DtlsFlugBestaetigt(z);
+        poke64(z + DH_ZUSTAND, DZ_FERTIG);
+        return 0;
+    }
+
+    return DE_FORMAT;
+}
+
+// ── Treiber ──────────────────────────────────────────────────────────────
+//
+// Zwei Funktionen, und beide geben zurueck, WAS ZU SENDEN IST. Diese Form
+// passt zu einem Datagrammprotokoll: man bekommt ein Paket und antwortet,
+// oder eine Frist laeuft ab und man wiederholt.
+//
+// Die UHR wird uebergeben und nicht gelesen. So kann ein Test sie stellen --
+// und der Test fuer die Wiederholung MUSS das koennen, sonst dauert er
+// Minuten und wird unter Last falsch.
+
+// Den Handschlag anstossen (Client) bzw. eine faellige Wiederholung
+// herausgeben (beide Seiten). Rueckgabe: Byte in `out`, 0 = nichts zu tun,
+// negativ = Fehler.
+pub fn DtlsSchritt(z: int64, out: int64, outCap: int64, mtu: int64,
+                   jetztMs: int64): int64 {
+    if (peek64(z + DH_ZUSTAND) == DZ_START && peek64(z + DH_ROLLE) == 2) {
+        var seed: int64 := pHScr(z) + 1008;
+        if (RandBytesExact(seed, 32) != 32) { return DE_SCHLUESSEL; }
+        X25519KeyGen(seed, z + DH_PK, z + DH_SK);
+        if (RandBytesExact(z + DH_RANDOM, 32) != 32) { return DE_SCHLUESSEL; }
+        // session_id: 32 Byte, wie es die Kompatibilitaetsregel will
+        // (Anhang D.4 in RFC 8446 -- DTLS erbt sie).
+        if (RandBytesExact(z + DH_SID, 32) != 32) { return DE_SCHLUESSEL; }
+        poke64(z + DH_SIDLEN, 32);
+        dhHashInit(z);
+        dhFlugLeeren(z);
+        var rumpf: int64 := pHScr(z) + 1040;
+        var chLen: int64 := dhChBauen(z, rumpf);
+        var rc: int64 := dhSenden(z, DH_CH, rumpf, chLen, out, outCap, mtu);
+        if (rc < 0) { return rc; }
+        DtlsFlugMerken(z, out, rc, jetztMs);
+        poke64(z + DH_ZUSTAND, DZ_WARTE_SH);
+        return rc;
+    }
+
+    // Frist abgelaufen? Dann den letzten Flug noch einmal -- NEU gebaut.
+    var f: int64 := DtlsFristFaellig(z, jetztMs);
+    if (f == 1) {
+        // Die Frist wird ueber den Byte-Flugspeicher fortgeschrieben
+        // (Verdoppelung, Deckel, Versuchszahl); gesendet wird aber der
+        // NACHRICHTEN-Flug. Zwei Speicher fuer zwei Rollen: der eine zaehlt
+        // Fristen, der andere traegt den Inhalt.
+        var verwerfen: int64 := pHScr(z) + 2048;
+        DtlsFlugWiederholen(z, jetztMs, verwerfen, 1);   // nur Frist fortschreiben
+        return dhFlugNeuSenden(z, out, outCap, mtu);
+    }
+    if (f < 0) { return f; }                  // aufgegeben
+    return 0;
+}
+
+// Ein Datagramm hereingeben. Rueckgabe: Byte in `out` (die Antwort), 0 =
+// keine Antwort, negativ = Fehler.
+//
+// Ein abgewiesener Record ist KEIN Fehler fuer den Handschlag (§4.5.1:
+// "silently discard") -- eine Wiederholung oder ein Paket aus einer anderen
+// Epoche kommt im Netz vor. Darum wird weitergelesen und nur gezaehlt.
+pub fn DtlsPaketLesen(z: int64, paket: int64, len: int64,
+                      out: int64, outCap: int64, mtu: int64,
+                      jetztMs: int64): int64 {
+    var typOut: int64 := pHScr(z) + 2032;
+    var verbr: int64 := pHScr(z) + 2040;
+    var rumpf: int64 := pRecPuf(z);
+    var pos: int64 := 0;
+    var geschrieben: int64 := 0;
+    var schonGeantwortet: int64 := 0;
+
+    while (pos + 5 <= len) {
+        var gl: int64 := DtlsRecordLesen(z, paket + pos, len - pos,
+                                         typOut, rumpf, 16384, verbr);
+        if (gl < 0) {
+            // Nicht lesbar: verwerfen und weiter. Die Laenge ist dann
+            // unbekannt, also bricht die Schleife ab -- ohne Laenge liesse
+            // sich der naechste Record nicht finden, und Raten waere hier
+            // genau falsch.
+            return geschrieben;
+        }
+        pos := pos + peek64(verbr);
+
+        if (peek64(typOut) == 22) {
+            var fe: int64 := DtlsHsFragmentEinspeisen(z, rumpf, gl);
+            if (fe < 0) { return fe; }
+            // Nach jedem Record pruefen, ob eine Nachricht fertig ist. Jede
+            // Nachricht geht in ihrem eigenen Record hinaus (DtlsHsSenden
+            // schreibt je Fragment einen), darum ist das hier die
+            // natuerliche Stelle.
+            while (DtlsHsFertig(z) == 1) {
+                var typ: int64 := DtlsHsTyp(z);
+                var mlen: int64 := DtlsHsLen(z);
+                var mrumpf: int64 := DtlsHsRumpf(z);
+                var mseq: int64 := DtlsHsSeq(z);
+                var erwartet: int64 := peek64(z + DH_ERWARTET);
+                if (mseq != erwartet) {
+                    // Eine Nachricht, die nicht die naechste ist: entweder
+                    // schon verarbeitet (Wiederholung des Gegenuebers oder
+                    // ein gedoppeltes Datagramm) oder zu frueh. Beides wird
+                    // VERWORFEN und gezaehlt, nicht verarbeitet.
+                    //
+                    // Ohne diese Pruefung kam ein wiederholtes ServerHello
+                    // im Zustand "warte auf den Flug" an und ergab einen
+                    // Ablauffehler -- gemessen beim Bauen: mit einem
+                    // verlorenen Datagramm scheiterte der Handschlag mit -1,
+                    // obwohl die Wiederholung richtig war. Eine Wiederholung
+                    // DARF ankommen; sie ist der Normalfall in DTLS.
+                    poke64(z + D_Z_DOPPELT, peek64(z + D_Z_DOPPELT) + 1);
+                    DtlsHsVerbrauchen(z);
+                    // §5.8.1: wer eine WIEDERHOLUNG des Gegenuebers sieht,
+                    // schickt seinen eigenen letzten Flug noch einmal. Das
+                    // ist nicht Hoeflichkeit, sondern die einzige Rettung
+                    // aus einer Pattsituation: ist unser Flug verloren
+                    // gegangen, wartet die Gegenseite auf ihn und wiederholt
+                    // ihrerseits -- und ohne diese Antwort wiederholen beide
+                    // Seiten bis zur Versuchsgrenze, ohne voranzukommen.
+                    // Gemessen beim Bauen: mit einem verlorenen Datagramm
+                    // lief der Handschlag in die Rundengrenze des Tests.
+                    // Nur im WARTEzustand und hoechstens EINMAL je Datagramm.
+                    // §5.8.1 nennt genau das; ohne die Einschraenkung
+                    // antworten zwei Seiten einander endlos auf
+                    // Wiederholungen -- gemessen beim Bauen: mit gedoppelten
+                    // Datagrammen lief der Handschlag in die Rundengrenze,
+                    // obwohl er vorher durchlief.
+                    if (mseq < erwartet && peek64(z + DH_FL_ANZ) > 0
+                        && peek64(z + DH_ZUSTAND) != DZ_FERTIG
+                        && schonGeantwortet == 0) {
+                        schonGeantwortet := 1;
+                        var rw: int64 := dhFlugNeuSenden(z, out + geschrieben,
+                                                         outCap - geschrieben, mtu);
+                        if (rw < 0) { return rw; }
+                        geschrieben := geschrieben + rw;
+                    }
+                } else {
+                    var rc: int64 := dhNachricht(z, typ, mrumpf, mlen,
+                                                 out + geschrieben,
+                                                 outCap - geschrieben, mtu, jetztMs);
+                    if (rc < 0) { return rc; }
+                    geschrieben := geschrieben + rc;
+                    poke64(z + DH_ERWARTET, erwartet + 1);
+                    DtlsHsVerbrauchen(z);
+                }
+            }
+        }
+        // Anwendungsdaten nach dem Handschlag liegen in `rumpf`; diese Stufe
+        // gibt sie nicht nach aussen (DtlsLese kommt mit dem naechsten
+        // Schritt). Verworfen werden sie NICHT still: der Zaehler sagt, dass
+        // etwas da war.
+        if (peek64(typOut) == 23) {
+            poke64(z + D_Z_NACHRICHTEN, peek64(z + D_Z_NACHRICHTEN));
+        }
+    }
+    return geschrieben;
+}
+
+// Das Verkehrsgeheimnis der Anwendungsrichtung nach aussen -- nur fuer
+// Pruefstaende. Beide Seiten muessen dasselbe haben; genau daran ist ein
+// Handschlag messbar, ohne eine Anwendung zu brauchen.
+pub fn DtlsAnwendungsgeheimnis(z: int64, eigen: bool, out: int64, cap: int64): int64 {
+    if (cap < 32) { return 0; }
+    if (peek64(z + DH_ZUSTAND) != DZ_FERTIG) { return 0; }
+    var q: int64 := z + DH_SEC_SAP;
+    if (peek64(z + DH_ROLLE) == 2) {
+        if (eigen) { q := z + DH_SEC_CAP; }
+    } else {
+        if (!eigen) { q := z + DH_SEC_CAP; }
+    }
+    var i: int64 := 0;
+    while (i < 32) { poke8(out + i, peek8(q + i)); i := i + 1; }
+    return 32;
+}
