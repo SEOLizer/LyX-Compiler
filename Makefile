@@ -948,6 +948,7 @@ test: lyxc
 	@bash tests/tls13_0rtt_2578_test.sh
 	@bash tests/dtls13_record_2580_test.sh
 	@bash tests/dtls13_cookie_ack_2580_test.sh
+	@bash tests/dtls13_handschlag_2580_test.sh
 	@bash tests/ir_datei_builtins_test.sh
 	@bash tests/unit_private_globals_test.sh
 	@bash tests/ir_kein_stiller_ausdruck_test.sh
