@@ -93,6 +93,7 @@ import std.crypto.pkey;
 import std.crypto.rsa_native;
 import std.crypto.ed25519;
 import std.net.tls_config;
+import std.net.tls_kern;
 import std.net.tls12;
 
 // ---------------------------------------------------------------------------
@@ -873,18 +874,13 @@ fn hashJetzt(c: int64, out: int64): void {
 }
 
 fn hashLeer(c: int64, out: int64): void {
-    if (peek64(c + V_HASHLEN) == 48) { Sha384(out, 0, out); }
-    else { SHA256(out, 0, out); }
+    TkHashLeer(peek64(c + V_HASHLEN), out);
 }
 
 // Schluessel und IV eines Verkehrsgeheimnisses (RFC 8446 §7.3).
 fn verkehrsSchluessel(c: int64, secret: int64, keyOut: int64, ivOut: int64): bool {
-    var hl: int64 := peek64(c + V_HASHLEN);
-    var kl: int64 := peek64(c + V_KEYLEN);
-    if (!HkdfExpandLabel(hl, secret, hl, "key"c as int64, 3, 0, 0, keyOut, kl)) {
-        return false;
-    }
-    return HkdfExpandLabel(hl, secret, hl, "iv"c as int64, 2, 0, 0, ivOut, 12);
+    return TkVerkehrsSchluessel(peek64(c + V_HASHLEN), peek64(c + V_KEYLEN),
+                                secret, keyOut, ivOut);
 }
 
 // Das early_secret — der einzige Unterschied zwischen vollem Handschlag und
@@ -903,42 +899,28 @@ fn verkehrsSchluessel(c: int64, secret: int64, keyOut: int64, ivOut: int64): boo
 // ("unbekannte Digestlaenge"), also durch laut Scheitern und nicht durch
 // stilles Weiterrechnen.
 fn planEarly(c: int64, hl: int64, psk: int64, pskLen: int64, early: int64): void {
-    var null0: int64 := pScr(c) + S_K2;
-    var i: int64 := 0;
-    while (i < 64) { poke8(null0 + i, 0); i := i + 1; }
-    if (psk == 0 || pskLen <= 0) {
-        HkdfExtract(hl, 0, 0, null0, hl, early);
-    } else {
-        HkdfExtract(hl, 0, 0, psk, pskLen, early);
-    }
+    // Der Nullplatz bleibt S_K2 -- der Bereich gehoert dieser Rolle, und die
+    // Rechnung steht seit #2619 in std.net.tls_kern.
+    TkPlanEarly(hl, psk, pskLen, pScr(c) + S_K2, early);
 }
 
 // finished_key aus einem Geheimnis (§4.4.4). Dieselbe Rechnung braucht das
 // Finished und der PSK-Binder — der Binder IST ein Finished ueber das halbe
 // ClientHello, darum EINE Funktion fuer beide.
 fn finishedKey(c: int64, hl: int64, secret: int64, out: int64): bool {
-    return HkdfExpandLabel(hl, secret, hl, "finished"c as int64, 8, 0, 0,
-                           out, hl);
+    return TkFinishedKey(hl, secret, out);
 }
 
 // binder_key = Derive-Secret(early_secret, "res binder", "") (§7.1).
 // Danach daraus der finished_key, mit dem der Binder gerechnet wird.
 fn binderKey(c: int64, hl: int64, psk: int64, pskLen: int64, out: int64): bool {
-    var leer: int64 := pScr(c) + S_K1;
-    var early: int64 := pScr(c) + S_K3;
-    // Der leere Hash gehoert zur HASHLAENGE DES TICKETS, nicht zu V_HASHLEN.
-    if (hl == 48) { Sha384(leer, 0, leer); } else { SHA256(leer, 0, leer); }
-    planEarly(c, hl, psk, pskLen, early);
-    var bk: int64 := pScr(c) + S_K4;
-    if (!HkdfExpandLabel(hl, early, hl, "res binder"c as int64, 10,
-                         leer, hl, bk, hl)) {
-        SecureZero(early, 64);
-        return false;
-    }
-    var ok: bool := finishedKey(c, hl, bk, out);
-    SecureZero(early, 64);
-    SecureZero(bk, 64);
-    return ok;
+    // Dieselben drei Kratzplaetze wie vorher (S_K1 leerer Hash, S_K3
+    // early_secret, S_K4 binder_key), nur dass die Rechnung seit #2619 in
+    // std.net.tls_kern liegt. Sie werden EINZELN uebergeben, damit die
+    // Zuordnung Bereich-zu-Rolle hier sichtbar bleibt und nicht in einer
+    // Abstandsrechnung der anderen Unit verschwindet.
+    return TkBinderKey(hl, psk, pskLen,
+                       pScr(c) + S_K1, pScr(c) + S_K3, pScr(c) + S_K4, out);
 }
 
 // client_early_traffic_secret (RFC 8446 §7.1, #2578):
@@ -1467,14 +1449,7 @@ fn schreibSchluessel(c: int64, secret: int64, stufe: int64): bool {
 // ---------------------------------------------------------------------------
 
 fn nonceBauen(iv: int64, seq: int64, out: int64): void {
-    var i: int64 := 0;
-    while (i < 12) { poke8(out + i, peek8(iv + i)); i := i + 1; }
-    i := 0;
-    while (i < 8) {
-        var b: int64 := ((seq as uint64) >> ((7 - i) * 8)) & 0xFF;
-        poke8(out + 4 + i, peek8(out + 4 + i) ^ b);
-        i += 1;
-    }
+    TkNonce(iv, seq, out);
 }
 
 fn aeadSiegeln(c: int64, nonce: int64, aad: int64, aadLen: int64,
@@ -1750,38 +1725,20 @@ fn pumpe(c: int64): int64 {
 // ---------------------------------------------------------------------------
 
 // Schreibhilfe auf einem Puffer mit laufender Position.
-fn wByte(buf: int64, pos: int64, v: int64): int64 {
-    poke8(buf + pos, v & 0xFF);
-    return pos + 1;
-}
-
-fn w16(buf: int64, pos: int64, v: int64): int64 {
-    poke8(buf + pos, (v >> 8) & 0xFF);
-    poke8(buf + pos + 1, v & 0xFF);
-    return pos + 2;
-}
-
-fn w24(buf: int64, pos: int64, v: int64): int64 {
-    poke8(buf + pos, (v >> 16) & 0xFF);
-    poke8(buf + pos + 1, (v >> 8) & 0xFF);
-    poke8(buf + pos + 2, v & 0xFF);
-    return pos + 3;
-}
-
+//
+// #2619: Die Rechnungen liegen in std.net.tls_kern, weil DTLS 1.3 dieselben
+// braucht. Was hier bleibt, ist die WEITERLEITUNG -- so blieben die
+// Aufrufstellen unveraendert und der Nachweis liefert dieselben Zahlen.
+// Zwei Fassungen von w24 koennten auseinanderlaufen, ohne dass es auffaellt;
+// 24-Bit-Laengen stehen in jeder Handschlagnachricht.
+fn wByte(buf: int64, pos: int64, v: int64): int64 { return TkByte(buf, pos, v); }
+fn w16(buf: int64, pos: int64, v: int64): int64 { return TkW16(buf, pos, v); }
+fn w24(buf: int64, pos: int64, v: int64): int64 { return TkW24(buf, pos, v); }
 fn wBytes(buf: int64, pos: int64, src: int64, len: int64): int64 {
-    var i: int64 := 0;
-    while (i < len) { poke8(buf + pos + i, peek8(src + i)); i := i + 1; }
-    return pos + len;
+    return TkBytes(buf, pos, src, len);
 }
-
-fn r16(buf: int64, pos: int64): int64 {
-    return ((peek8(buf + pos) & 0xFF) << 8) | (peek8(buf + pos + 1) & 0xFF);
-}
-
-fn r24(buf: int64, pos: int64): int64 {
-    return ((peek8(buf + pos) & 0xFF) << 16) | ((peek8(buf + pos + 1) & 0xFF) << 8)
-         |  (peek8(buf + pos + 2) & 0xFF);
-}
+fn r16(buf: int64, pos: int64): int64 { return TkR16(buf, pos); }
+fn r24(buf: int64, pos: int64): int64 { return TkR24(buf, pos); }
 
 // Eine Handschlagnachricht: Kopf anlegen, in den Transkript-Hash geben und
 // als Record hinausschreiben.
@@ -1879,28 +1836,14 @@ fn gruppenMaske(c: int64): int64 {
 }
 
 // Laenge des key_share-Anteils einer Gruppe im Protokoll.
-fn gruppenRohLen(grp: int64): int64 {
-    if (grp == GRP_SECP256R1) { return 65; }
-    if (grp == GRP_SECP384R1) { return 97; }
-    if (grp == GRP_X25519) { return 32; }
-    return 0;
-}
+fn gruppenRohLen(grp: int64): int64 { return TkGruppenRohLen(grp); }
 
 // Die Kurvenkennung von std.crypto.ec zur Gruppenkennung des Protokolls.
 // -1 heisst "keine Weierstrass-Kurve" (also x25519).
-fn gruppenKurve(grp: int64): int64 {
-    if (grp == GRP_SECP256R1) { return EC_P256; }
-    if (grp == GRP_SECP384R1) { return EC_P384; }
-    return -1;
-}
+fn gruppenKurve(grp: int64): int64 { return TkGruppenKurve(grp); }
 
 // Laenge des gemeinsamen Geheimnisses der Gruppe in Byte.
-fn gruppenGeheimLen(grp: int64): int64 {
-    if (grp == GRP_SECP256R1) { return 32; }
-    if (grp == GRP_SECP384R1) { return 48; }
-    if (grp == GRP_X25519) { return 32; }
-    return 0;
-}
+fn gruppenGeheimLen(grp: int64): int64 { return TkGruppenGeheimLen(grp); }
 
 // Ein key_share-Eintrag fuer eine Gruppe, die wir koennen, MUSS die Laenge
 // dieser Gruppe haben und bei P-256 ein gueltiger Punkt in unkomprimierter
@@ -1940,11 +1883,7 @@ fn gruppeErlaubt(c: int64, grp: int64): bool {
 // drei muessen.
 con GRP_ANZAHL: int64 := 3;
 
-fn gruppeNachRang(i: int64): int64 {
-    if (i == 0) { return GRP_X25519; }
-    if (i == 1) { return GRP_SECP256R1; }
-    return GRP_SECP384R1;
-}
+fn gruppeNachRang(i: int64): int64 { return TkGruppeNachRang(i); }
 
 // Eigenes Paar fuer die gewaehlte Gruppe erzeugen. Wird bei HRR ein zweites
 // Mal mit einer anderen Gruppe aufgerufen.
@@ -2891,19 +2830,7 @@ fn hsVerbrauchen(c: int64, len: int64, hashen: bool): void {
 // Rueckgabewert dagegen die ABSOLUTE Adresse des Inhalts (oder -1), weil die
 // Aufrufer gleich daraus lesen. Der Block beginnt mit zwei Laengenbyte.
 fn extSuchen(buf: int64, pos: int64, len: int64, typ: int64, lenPtr: int64): int64 {
-    if (len < 2) { return -1; }
-    var gesamt: int64 := r16(buf, pos);
-    if (gesamt + 2 > len) { return -1; }
-    var p: int64 := pos + 2;
-    var ende: int64 := pos + 2 + gesamt;
-    while (p + 4 <= ende) {
-        var t: int64 := r16(buf, p);
-        var l: int64 := r16(buf, p + 2);
-        if (p + 4 + l > ende) { return -1; }
-        if (t == typ) { poke64(lenPtr, l); return buf + p + 4; }
-        p := p + 4 + l;
-    }
-    return -1;
+    return TkExtSuchen(buf, pos, len, typ, lenPtr);
 }
 
 // ServerHello (Client-Seite)
