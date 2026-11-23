@@ -4037,27 +4037,44 @@ pub type IRLower = class {
           var tidTemp: int64 := self.allocTemp();
           self.irAddInstrDirect(IRO_LOAD_FIELD, tidTemp, mcSelf, 0, 0);   // tid = obj[0]
           var vEnd: int64 := self.genLabel();
+          // #2628: Der Vergleichszweig entsteht fuer JEDE Unterklasse, nicht
+          // nur fuer die, die die Methode SELBST ueberschreibt.
+          //
+          // Die Bedingung `_tregOwnHasMethodG` liess die dritte Stufe
+          // durchfallen: `C extends B extends A`, B ueberschreibt `Wer`, C
+          // nicht. Fuer tid == C entstand kein Zweig, der Lauf landete im
+          // Nachspann und rief die Aufloesung ab der BASIS — also A.Wer.
+          // Gemessen: `C` ueber einen `A`-Bezug gab 1 statt 2, derselbe
+          // Aufruf ueber einen `C`-Bezug gab 2 (#2628, lyxos und arm64;
+          // x86 geht einen anderen Weg und war richtig).
+          //
+          // Welche Fassung C erbt, weiss `_tregResolveMethodIdxG` schon: es
+          // laeuft die Kette nach oben und nimmt die naechste eigene
+          // Definition. Gefragt werden muss es nur — die eigene Definition
+          // ist dafuer keine Vorbedingung, sondern bloss der Sonderfall, in
+          // dem die Antwort die Klasse selbst ist.
+          var vBaseIdxVor: int64 := self._tregResolveMethodIdxG(baseG, mNameP, mNameL);
           var gi: int64 := 0;
           while gi < self._tregN {
             if self._extendsClassG(gi, baseG) != 0 {
-              if self._tregOwnHasMethodG(gi, mNameP, mNameL) != 0 {
-                var subIdx: int64 := self._tregResolveMethodIdxG(gi, mNameP, mNameL);
-                if subIdx >= 0 {
-                  var cTid: int64 := self.allocTemp();
-                  self.irAddInstrDirect(IRO_CONST_INT, cTid, -1, -1, gi);
-                  var cmpT: int64 := self.allocTemp();
-                  self.irAddInstrDirect(IRO_CMP_EQ, cmpT, tidTemp, cTid, 0);
-                  var vNext: int64 := self.genLabel();
-                  self.irEmitBrFalse(cmpT, vNext);
-                  self.irAddInstrDirect(IRO_CALL, mcDest, subIdx, mcArgBase, mcCnt);
-                  self.irEmitJmp(vEnd);
-                  self.irEmitLabel(vNext);
-                }
+              var subIdx: int64 := self._tregResolveMethodIdxG(gi, mNameP, mNameL);
+              // Erbt die Unterklasse genau die Fassung der Basis, traegt ein
+              // eigener Zweig nichts: der Nachspann ruft dieselbe Funktion.
+              if subIdx >= 0 && subIdx != vBaseIdxVor {
+                var cTid: int64 := self.allocTemp();
+                self.irAddInstrDirect(IRO_CONST_INT, cTid, -1, -1, gi);
+                var cmpT: int64 := self.allocTemp();
+                self.irAddInstrDirect(IRO_CMP_EQ, cmpT, tidTemp, cTid, 0);
+                var vNext: int64 := self.genLabel();
+                self.irEmitBrFalse(cmpT, vNext);
+                self.irAddInstrDirect(IRO_CALL, mcDest, subIdx, mcArgBase, mcCnt);
+                self.irEmitJmp(vEnd);
+                self.irEmitLabel(vNext);
               }
             }
             gi += 1;
           }
-          var baseIdx: int64 := self._tregResolveMethodIdxG(baseG, mNameP, mNameL);
+          var baseIdx: int64 := vBaseIdxVor;
           if baseIdx >= 0 { self.irAddInstrDirect(IRO_CALL, mcDest, baseIdx, mcArgBase, mcCnt); }
           self.irEmitLabel(vEnd);
         }
@@ -8843,18 +8860,73 @@ pub type IRLower = class {
   // Feldname bezeichnet bei einem Inline-Aggregat die ADRESSE und nicht einen
   // Zeiger, den man laden koennte (so haelt es cg_emitInlineArrayAddr).
   fn _feldInlineElemBytes(baseNode: int64): int64 {
-    if baseNode < 0 { return 0; }
-    if self.nodeKind(baseNode) != NK_FIELD { return 0; }
-    var od: int64 := self._typeNodeToDecl(self._exprTypeNode(self.nodeC0(baseNode)));
-    if od < 0 { return 0; }
-    var ftn: int64 := self._fieldTypeNodeIn(od, self.nodeSVal(baseNode), self.nodeSLen(baseNode));
+    return self._feldAggrBytes(baseNode, 0);
+  }
+
+  // #2611: Die Frage „wie viele Bytes belegt dieses Feld inline" fuer alle
+  // drei Spielarten an EINER Stelle — und mit derselben Aufzaehlung der
+  // Herkunft, die _instanceFieldOffset schon fuehrt: Klasse der eigenen Unit,
+  // sonst Registry im Kontext der deklarierenden Unit.
+  //
+  // Vorher kannten die Inline-Fragen nur die eigene Unit. Bei einer
+  // IMPORTIERTEN Klasse mit einem Wert-Struct-Feld fiel die Antwort auf 0,
+  // der Feldzugriff nahm den LOAD-Zweig und las die ersten acht Byte der
+  // Struktur als Zeiger — `z.Clip.Left` von aussen faultete, waehrend
+  // dieselbe Klasse in ihrer eigenen Unit richtig rechnete (#2611).
+  //
+  //   art 0: Elementbreite eines `[N]T`-Feldes bzw. Groesse eines
+  //          Wert-Struct-Feldes (= „liegt inline")
+  //   art 1: nur `[N]T` mit WERT-STRUCT-Elementen: Elementgroesse (#2542)
+  //   art 2: nur ein Feld, das SELBST ein Wert-Struct ist: seine Groesse
+  fn _feldAggrBytes(feldExpr: int64, art: int64): int64 {
+    if feldExpr < 0 { return 0; }
+    if self.nodeKind(feldExpr) != NK_FIELD { return 0; }
+    var fp: pchar := self.nodeSVal(feldExpr);
+    var fl: int64 := self.nodeSLen(feldExpr);
+    var bn: int64 := self.nodeC0(feldExpr);
+    var od: int64 := self._typeNodeToDecl(self._exprTypeNode(bn));
+    if od >= 0 { return self._feldAggrBytesIn(od, fp, fl, art); }
+    var tn: int64 := self._baseTypeNode(bn);
+    var g: int64 := 0 - 1;
+    if tn >= 0 { g := self._tregFind(self.nodeSVal(tn), self.nodeSLen(tn)); }
+    else if self._exprKlasse(bn) != 0 { g := self._tregFind(self._ekP, self._ekL); }
+    if g < 0 { return 0; }
+    var sS: pchar := self.src; var sN: int64 := self.nodes; var sC: int64 := self.nodeCount;
+    self.src := peek64(self._tregSrc + g * 8) as pchar;
+    self.nodes := peek64(self._tregNodes + g * 8);
+    self.nodeCount := peek64(self._tregCnt + g * 8);
+    var r: int64 := self._feldAggrBytesIn(peek64(self._tregIdx + g * 8), fp, fl, art);
+    self.src := sS; self.nodes := sN; self.nodeCount := sC;
+    return r;
+  }
+
+  // #2611: Rumpf von _feldAggrBytes — getrennt, weil er fuer eine importierte
+  // Klasse im Kontext IHRER Unit laufen muss (dieselbe Bauart wie
+  // _tregFieldOffG).
+  fn _feldAggrBytesIn(typeDecl: int64, fp: pchar, fl: int64, art: int64): int64 {
+    var ftn: int64 := self._fieldTypeNodeIn(typeDecl, fp, fl);
     if ftn < 0 { return 0; }
     if self.nodeKind(ftn) == NK_TYPE_ARRAY_FIXED {
+      if art == 2 { return 0; }
+      if art == 1 { return self._wertStructBytes(self.nodeC0(ftn)); }
       return self._aggrElemBytes(self.nodeC0(ftn));
     }
+    if art == 1 { return 0; }
     if self.nodeKind(ftn) != NK_TYPE_NAME { return 0; }
     if self._istSkalarTypName(ftn) != 0 { return 0; }
     return self._wertStructBytes(ftn);
+  }
+
+  // #2611: Bytes eines Feldes, das selbst ein WERT-STRUCT ist (`Clip: TR`),
+  // sonst 0. Abgegrenzt von _feldInlineElemBytes: das liefert bei einem
+  // `[N]T`-Feld die ELEMENTbreite und darf eine Zuweisung an das ganze Feld
+  // deshalb nicht steuern.
+  //
+  // Die Frage geht an den TYPKNOTEN des Feldes, nicht an den Ausdruck —
+  // dieselbe Quelle, aus der _feldInlineElemBytes und cg_buildClassLayout
+  // rechnen; die drei muessen uebereinstimmen.
+  fn _feldWertStructBytes(feldExpr: int64): int64 {
+    return self._feldAggrBytes(feldExpr, 2);
   }
 
   // #2542: Nur fuer ein inline liegendes `[N]T`-Feld mit WERT-STRUCT-Elementen
@@ -8864,14 +8936,7 @@ pub type IRLower = class {
   // der WERT. Wer beides gleich behandelt, gibt fuer `[N]int64` Adressen aus,
   // wo Zahlen erwartet werden.
   fn _feldInlineStructElemBytes(baseNode: int64): int64 {
-    if baseNode < 0 { return 0; }
-    if self.nodeKind(baseNode) != NK_FIELD { return 0; }
-    var od: int64 := self._typeNodeToDecl(self._exprTypeNode(self.nodeC0(baseNode)));
-    if od < 0 { return 0; }
-    var ftn: int64 := self._fieldTypeNodeIn(od, self.nodeSVal(baseNode), self.nodeSLen(baseNode));
-    if ftn < 0 { return 0; }
-    if self.nodeKind(ftn) != NK_TYPE_ARRAY_FIXED { return 0; }
-    return self._wertStructBytes(self.nodeC0(ftn));
+    return self._feldAggrBytes(baseNode, 1);
   }
 
   // #2157: Eine verborgene Modulvariable anlegen (Anfangswert 0) — dieselbe
@@ -11316,6 +11381,31 @@ pub type IRLower = class {
             && self._fieldIsMethodType(self.nodeC0(target), self.nodeSVal(target), self.nodeSLen(target)) != 0) {
           var afFat: int64 := self._lowerMethodRef(val);
           self.irAddInstrDirect(IRO_STORE_FIELD, afOff, afFat, afBase, 0);
+        } else if (afOff >= 0 && self._feldWertStructBytes(target) > 0
+                   && self.nodeKind(val) != NK_CAST && self.nodeKind(val) != NK_NEW) {
+          // #2611: Ein Feld vom WERT-STRUCT-Typ liegt INLINE im Objekt. Eine
+          // Zuweisung ist deshalb eine KOPIE der Bytes an die Feldadresse —
+          // kein Ablegen eines Wortes.
+          //
+          // Vorher lief `self.Clip := MkR(0, 0, w, h)` durch den Store
+          // darunter: abgelegt wurde valTemp, bei einem Wert-Struct also
+          // dessen ADRESSE, und zwar in die ersten acht Byte des Feldes. Das
+          // Lesen aus einer Methode nimmt (seit #2542) die Feldadresse und
+          // las damit genau diesen Zeiger als `Clip.Left` — ein Rechteck aus
+          // Muell, das jede Schnittmenge leer machte, ohne irgendetwas
+          // auszuloesen (#2611, gemessen auf lyxos UND arm64: gemeinsamer
+          // IR-Weg).
+          //
+          // Dieselbe Kopie, die die Zuweisung an ein Wert-Struct-LOCAL schon
+          // macht (#2147) und die #2542 fuer das Element eines inline
+          // liegenden `[N]T`-Feldes nachgezogen hat — dieselbe Rechnung wie
+          // cg_emitStructKopieNach auf x86 (#1351). Drei Stellen, eine
+          // Bedeutung; sie muessen uebereinstimmen.
+          var afWsT: int64 := self.allocTemp();
+          self.irAddInstrDirect(IRO_CONST_INT, afWsT, -1, -1, afOff);
+          var afDstT: int64 := self.allocTemp();
+          self.irAddInstrDirect(IRO_ADD, afDstT, afBase, afWsT, 0);
+          self._structKopieNach(afDstT, valTemp, self._feldWertStructBytes(target));
         } else if (afOff >= 0) {
           var afArt: int64 := self.letzteFeldArt;   // _isF64Expr kann sie ueberschreiben
           var afF32: int64 := self.letzteFeldF32;
