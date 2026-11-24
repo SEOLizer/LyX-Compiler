@@ -921,6 +921,8 @@ test: lyxc
 	@bash tests/lyxos_rueckspruenge_2627_test.sh
 	@echo "--- #2607: spaeter deklarierte Klasse mit extends ist vorwaerts aufloesbar ---"
 	@bash tests/klasse_vorwaerts_extends_2607_test.sh
+	@echo "--- #2637: Print/PrintLn mit f64 auf allen Zielen, gleiche Ausgabe ---"
+	@bash tests/print_f64_ir_2637_test.sh
 	@echo "--- Kernelnummern kommen aus der erzeugten Tabelle an (#2549) ---"
 	@bash tests/lyxos_gen_builtins_2549_test.sh
 	@echo "--- Zeiger-Syscalls 407-410 einzeln am Erzeugnis (#2601) ---"

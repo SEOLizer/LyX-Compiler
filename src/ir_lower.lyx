@@ -4278,8 +4278,9 @@ pub type IRLower = class {
             Print("lyxc: --target="c);
             Print(self._targetName());
             PrintLn(": Print/PrintLn kann den Typ des Arguments nicht bestimmen."c);
-            PrintLn("  Behandelt sind: String-Literal, pchar-Variable, Ganzzahl-Ausdruck"c);
-            PrintLn("  und die zeichenkettenliefernden stdlib-Aufrufe (IntToStr u. a.)."c);
+            PrintLn("  Behandelt sind: String-Literal, pchar-Variable, Ganzzahl-Ausdruck,"c);
+            PrintLn("  f64/f32 (ueber FloatToStr, #2637) und die zeichenkettenliefernden"c);
+            PrintLn("  stdlib-Aufrufe (IntToStr u. a.)."c);
             PrintLn("  Behelf: das Argument einer Variablen mit ausdruecklichem Typ zuweisen."c);
             exit(1);
           }
@@ -4315,6 +4316,25 @@ pub type IRLower = class {
             var pnLen: int64 := self.allocTemp();
             self.irAddInstrDirect(IRO_CONST_INT, pnLen, -1, -1, 0 - 1);  // Sentinel: strlen zur Laufzeit
             self.irAddInstrDirect(IRO_STORE_LOCAL, 1, pnLen, -1, 0);
+            self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 1);
+          } else if pnArt == 2 {
+            // #2637: f64/f32. Die Stelle, an der das Richtige entsteht, gab es
+            // schon: FloatToStr ist Builtin 403 und laeuft auf ALLEN Zielen
+            // (auch arm64, riscv, lyxos) -- gemessen. Erst Text erzeugen, dann
+            // denselben Weg wie ein pchar gehen.
+            //
+            // Die Ausgabeform ist damit die des x86-Weges, nachgemessen an
+            // 2.5, -3.125 und 1234.5: `Print(x)` auf x86 liefert dasselbe wie
+            // `FloatToStr(x, 6)`. Die Praezision steckt im Builtin; sie hier
+            // zu wiederholen waere eine zweite Stelle derselben Angabe.
+            var pnFv: int64 := self.lowerExpr(pnA);
+            self.irAddInstrDirect(IRO_STORE_LOCAL, 0, pnFv, -1, 0);
+            var pnFs: int64 := self.allocTemp();
+            self.irAddInstrDirect(IRO_CALL_BUILTIN, pnFs, -1, -1, 403);
+            self.irAddInstrDirect(IRO_STORE_LOCAL, 0, pnFs, -1, 0);
+            var pnFl: int64 := self.allocTemp();
+            self.irAddInstrDirect(IRO_CONST_INT, pnFl, -1, -1, 0 - 1);   // strlen zur Laufzeit
+            self.irAddInstrDirect(IRO_STORE_LOCAL, 1, pnFl, -1, 0);
             self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 1);
           } else {
             var pnVal: int64 := self.lowerExpr(pnA);
@@ -15512,7 +15532,7 @@ pub type IRLower = class {
         if pnCt >= 0 {
           var pnCp: pchar := self.nodeSVal(pnCt);
           var pnCl: int64 := self.nodeSLen(pnCt);
-          pnArt := self._artVonTypname(pnCp, pnCl);
+          pnArt := self._printArtVonTypname(pnCp, pnCl);
         }
       }
       else if (pnK == NK_BINOP || pnK == NK_UNOP) {
@@ -15559,7 +15579,7 @@ pub type IRLower = class {
               // Zeichenkettenausgabe — `s + 1` ist Zeigerrechnung, und was
               // dabei herauskommt, entscheidet diese Stelle nicht. Deshalb
               // wird ein pchar hier ausdruecklich wieder unentscheidbar.
-              var pnLa: int64 := self._artVonTypname(self.nodeSVal(pnLt), self.nodeSLen(pnLt));
+              var pnLa: int64 := self._printArtVonTypname(self.nodeSVal(pnLt), self.nodeSLen(pnLt));
               if pnLa == 0 { pnArt := 0; }
             }
           }
@@ -15570,7 +15590,7 @@ pub type IRLower = class {
         if pnTn >= 0 {
           var pnTp: pchar := self.nodeSVal(pnTn);
           var pnTl: int64 := self.nodeSLen(pnTn);
-          pnArt := self._artVonTypname(pnTp, pnTl);
+          pnArt := self._printArtVonTypname(pnTp, pnTl);
         }
       }
       // #2039: `Print(r.s)` — ein FELD. Die Aufzaehlung kannte diese Herkunft
@@ -15583,7 +15603,7 @@ pub type IRLower = class {
       // Hand nachgebaut worden, also eine zweite Stelle.
       else if (pnK == NK_FIELD) {
         var pnFt: int64 := self._exprTypeNode(nd);
-        if pnFt >= 0 { pnArt := self._artVonTypname(self.nodeSVal(pnFt), self.nodeSLen(pnFt)); }
+        if pnFt >= 0 { pnArt := self._printArtVonTypname(self.nodeSVal(pnFt), self.nodeSLen(pnFt)); }
       }
       else if (pnK == NK_CALL) {
         // stdlib-Funktionen, die eine Zeichenkette liefern.
@@ -15614,7 +15634,7 @@ pub type IRLower = class {
                   if pnRt >= 0 {
                     var pnRp: pchar := self.nodeSVal(pnRt);
                     var pnRl: int64 := self.nodeSLen(pnRt);
-                    pnArt := self._artVonTypname(pnRp, pnRl);
+                    pnArt := self._printArtVonTypname(pnRp, pnRl);
                   }
                   pnFd := self.nodeCount;
                 }
@@ -15630,7 +15650,7 @@ pub type IRLower = class {
           // Modulgrenze gilt. Dieselbe Auskunft fragt x86 ueber
           // cg_callRetTypeIs (Registry der Benutzerfunktionen).
           if pnArt < 0 {
-            if self._exprKlasse(nd) != 0 { pnArt := self._artVonTypname(self._ekP, self._ekL); }
+            if self._exprKlasse(nd) != 0 { pnArt := self._printArtVonTypname(self._ekP, self._ekL); }
           }
         }
       }
@@ -16381,6 +16401,18 @@ pub type IRLower = class {
   // NICHT RATEN: was hier nicht steht, bleibt -1 und scheitert laut. Die
   // Umkehrung ("alles, was nicht pchar ist, ist eine Zahl") machte aus einem
   // f64 still eine Integer-Ausgabe — ein falsches Ergebnis ohne Meldung.
+  // #2637: Die Art FUER DIE AUSGABE. f64/f32 kommt hier als 2 heraus, und
+  // zwar ausdruecklich NICHT in _artVonTypname: dessen Antwort lesen auch
+  // _indexBasisArt und zwei Abkuerzungen (Zeile 2801, 17122). _indexBasisArt
+  // verzweigt auf 1 und 0 und faellt bei allem anderen auf `return 0` durch --
+  // eine neue Art dort haette `x[i]` auf einem f64 STILL zum Feldzugriff
+  // gemacht, statt laut mit #2131 zu scheitern. Deshalb eine eigene Frage fuer
+  // eine eigene Verwendung.
+  fn _printArtVonTypname(tp: pchar, tl: int64): int64 {
+    if (self.seq(tp, tl, "f64", 3) || self.seq(tp, tl, "f32", 3)) { return 2; }
+    return self._artVonTypname(tp, tl);
+  }
+
   fn _artVonTypname(tp: pchar, tl: int64): int64 {
     if self.seq(tp, tl, "pchar", 5) { return 1; }
     if (self.seq(tp, tl, "int64", 5) || self.seq(tp, tl, "int32", 5)
