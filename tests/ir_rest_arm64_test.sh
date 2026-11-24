@@ -115,9 +115,9 @@ for ziel in arm64 riscv; do
     nok "$ziel: f64-Feld uebersetzt nicht: $(grep -m1 -E '^lyxc:|error' "$TMP/f64.log")"
     continue
   fi
-  em="qemu-aarch64"; [ "$ziel" = riscv ] && em="qemu-riscv64"
-  if ! command -v "$em" >/dev/null 2>&1; then
-    echo "    (SKIP $ziel: $em fehlt, Wert nicht messbar)"
+  em="$QEMU_ARM64"; [ "$ziel" = riscv ] && em="$QEMU_RISCV64"
+  if [ -z "$em" ]; then
+    echo "    (SKIP $ziel: kein Emulator gefunden, Wert nicht messbar)"
     continue
   fi
   ist="$("$em" "$TMP/f64_$ziel.bin" 2>&1 | tr -d '\n')"

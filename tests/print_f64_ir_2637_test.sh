@@ -28,6 +28,7 @@ set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LYXC="${LYXC:-$ROOT/lyxc}"
 _g="$ROOT/tests/lib/lyxc_guard.sh"; [ -f "$_g" ] && . "$_g"   # #1294
+. "$ROOT/tests/lib/qemu.sh"   # #2048: der Emulator wird EINMAL gesucht, unter beiden Namen
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 PASS=0; FAIL=0
 ulimit -c 0 2>/dev/null
@@ -68,10 +69,10 @@ if [ -x "$TMP/f_linux" ]; then
     pr fail "x86 gibt '$SOLL'"
   fi
 fi
-for paar in "qemu-aarch64 arm64" "qemu-riscv64 riscv"; do
+for paar in "$QEMU_ARM64 arm64" "$QEMU_RISCV64 riscv"; do
   set -- $paar
-  if ! command -v "$1" >/dev/null 2>&1; then
-    echo "    (SKIP $2: $1 fehlt)"
+  if [ -z "${1:-}" ] || [ "$1" = "arm64" ] || [ "$1" = "riscv" ]; then
+    echo "    (SKIP ${2:-$1}: kein Emulator gefunden)"
   elif [ ! -x "$TMP/f_$2" ]; then
     echo "    (SKIP $2: kein Erzeugnis)"
   else

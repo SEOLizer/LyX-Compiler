@@ -246,9 +246,9 @@ for t in arm64 riscv; do
     nok "Print(importierter f64) [$t]: uebersetzt nicht: $(head -c 200 "$TMP/f.log")"
     continue
   fi
-  em="qemu-aarch64"; [ "$t" = riscv ] && em="qemu-riscv64"
-  if ! command -v "$em" >/dev/null 2>&1; then
-    echo "    (SKIP $t: $em fehlt, Wert nicht messbar)"
+  em="$QEMU_ARM64"; [ "$t" = riscv ] && em="$QEMU_RISCV64"
+  if [ -z "$em" ]; then
+    echo "    (SKIP $t: kein Emulator gefunden, Wert nicht messbar)"
     continue
   fi
   ist="$("$em" "$TMP/f" 2>&1 | tr -d '\n')"
