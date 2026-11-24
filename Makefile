@@ -1392,6 +1392,8 @@ test: lyxc
 
 	@echo "--- sec_tls: TLS Hostname-Verifikation (5 tests) ---"
 	@bash tests/sec_tls_hostname_test.sh
+	@echo "--- #2647: Client prueft die Kette wirklich (leere Liste, falscher Name) ---"
+	@bash tests/tls13_kette_gegenprobe_2647_test.sh
 	@echo "OK"
 
 	@echo "--- sec_stdpath: --std-path off-by-one (2 tests) ---"
