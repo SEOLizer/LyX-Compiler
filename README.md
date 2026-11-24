@@ -284,8 +284,11 @@ The standard library is written entirely in Lyx. All modules are available as so
 | `std.crypto.aes` | AES-128/256 (ECB, CBC, GCM) |
 | `std.crypto.sha1` | SHA-1 |
 | `std.crypto.sha256` | SHA-256 |
-| `std.crypto.hmac` | HMAC |
+| `std.crypto.hmac` | HMAC over MD4, MD5, SHA-1, SHA-256, SHA-384, SHA-512 |
+| `std.crypto.aescmac` | AES-CMAC (RFC 4493), SP 800-108 counter-mode KDF |
+| `std.crypto.aesccm` | AES-CCM AEAD (RFC 3610) |
 | `std.crypto.md5` | MD5 |
+| `std.crypto.md4` | MD4 (legacy only: NTLM NT hash) |
 | `std.crypto.rsa` | RSA encrypt/decrypt/sign |
 | `std.crypto.ecc` | Elliptic Curve Cryptography |
 | `std.crypto.x25519` | X25519 key exchange |

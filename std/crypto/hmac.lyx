@@ -1,53 +1,171 @@
-// std/crypto/hmac.lyx — HMAC-SHA256 (RFC 2104 / FIPS 198-1)
+// std/crypto/hmac.lyx — HMAC (RFC 2104 / FIPS 198-1) ueber eine Hash-Kennung
 //
-// Public API:
-//   HMAC_SHA256(key, keyLen, data, dataLen, out)
-//       Writes 32-byte MAC into out.
+// Bis 1.2.36E war HMAC hier auf SHA-256 festverdrahtet. #2638 braucht
+// HMAC-MD5 (NTLMv2-Antwort), HMAC-SHA-1 und HMAC-SHA-512 (SMB-Preauth und
+// SP-800-108-Ableitungen); MD5, SHA-1 und SHA-512 lagen als Hashes schon im
+// Baum, waren aber ueber HMAC nicht erreichbar.
 //
-//   HMAC_SHA256_Hex(key, keyLen, data, dataLen, out)
-//       Writes 64-char lowercase hex + NUL (65 bytes) into out.
+// Oeffentliche API:
+//   HMAC(hashId, key, keyLen, data, dataLen, out): int64
+//       Schreibt HMACDigestSize(hashId) Byte nach out, liefert 1.
+//       Eine unbekannte Kennung bricht ab (panic) statt still etwas
+//       Plausibles zu rechnen.
+//   HMACDigestSize(hashId): int64   — 0 bei unbekannter Kennung
+//   HMACBlockSize(hashId): int64    — 0 bei unbekannter Kennung
+//   HMACHash(hashId, data, len, out): int64 — der nackte Hash, 1 bei Erfolg
+//
+//   HMAC_MD4 / HMAC_MD5 / HMAC_SHA1 / HMAC_SHA256 / HMAC_SHA384 /
+//   HMAC_SHA512 (key, keyLen, data, dataLen, out): void
+//       Huellen fuer die einzelnen Hashes. HMAC_SHA256 behaelt Signatur und
+//       Verhalten der alten Fassung, damit kein Bestandsaufrufer bricht.
+//   HMAC_SHA256_Hex(...) — 64 Hexzeichen + NUL (65 Byte), unveraendert.
+//
+// Pruefvektoren: RFC 2202 (HMAC-MD5, HMAC-SHA-1), RFC 4231 (HMAC-SHA-2),
+// ausgefuehrt in tests/hmac_generisch_2638_test.sh.
+//
+// MD4 und MD5 stehen hier fuer fremdbestimmte Altschnittstellen (NTLM), nicht
+// als Empfehlung — siehe Kopf von std/crypto/md4.lyx.
 
 unit std.crypto.hmac;
 
 import std.alloc;
+import std.crypto.md4;
+import std.crypto.md5;
+import std.crypto.sha1;
 import std.crypto.sha256;
+import std.crypto.sha512;
 
-pub fn HMAC_SHA256(key: int64, keyLen: int64, data: int64, dataLen: int64, out: int64): void {
-    // K' = key padded / hashed to 64 bytes (SHA256 block size)
-    var kprime: int64 := alloc(64);
+// Hash-Kennungen. Die drei Aufzaehlungen HMACDigestSize, HMACBlockSize und
+// HMACHash muessen zusammen wachsen: eine neue Kennung gehoert in ALLE drei,
+// sonst rechnet eine davon mit 0 weiter.
+pub con HMAC_HASH_MD4:    int64 := 1;
+pub con HMAC_HASH_MD5:    int64 := 2;
+pub con HMAC_HASH_SHA1:   int64 := 3;
+pub con HMAC_HASH_SHA256: int64 := 4;
+pub con HMAC_HASH_SHA384: int64 := 5;
+pub con HMAC_HASH_SHA512: int64 := 6;
+
+// Groesste vorkommende Werte — Puffergroessen im Kern.
+pub con HMAC_MAX_BLOCK:  int64 := 128;
+pub con HMAC_MAX_DIGEST: int64 := 64;
+
+pub fn HMACDigestSize(hashId: int64): int64 {
+    if (hashId == HMAC_HASH_MD4)    { return 16; }
+    if (hashId == HMAC_HASH_MD5)    { return 16; }
+    if (hashId == HMAC_HASH_SHA1)   { return 20; }
+    if (hashId == HMAC_HASH_SHA256) { return 32; }
+    if (hashId == HMAC_HASH_SHA384) { return 48; }
+    if (hashId == HMAC_HASH_SHA512) { return 64; }
+    return 0;
+}
+
+pub fn HMACBlockSize(hashId: int64): int64 {
+    if (hashId == HMAC_HASH_MD4)    { return 64; }
+    if (hashId == HMAC_HASH_MD5)    { return 64; }
+    if (hashId == HMAC_HASH_SHA1)   { return 64; }
+    if (hashId == HMAC_HASH_SHA256) { return 64; }
+    if (hashId == HMAC_HASH_SHA384) { return 128; }
+    if (hashId == HMAC_HASH_SHA512) { return 128; }
+    return 0;
+}
+
+// Der nackte Hash. Liefert 1 bei Erfolg; eine unbekannte Kennung bricht ab.
+pub fn HMACHash(hashId: int64, data: int64, len: int64, out: int64): int64 {
+    if (hashId == HMAC_HASH_MD4)    { MD4(data, len, out);    return 1; }
+    if (hashId == HMAC_HASH_MD5)    { MD5(data, len, out);    return 1; }
+    if (hashId == HMAC_HASH_SHA1)   { SHA1(data, len, out);   return 1; }
+    if (hashId == HMAC_HASH_SHA256) { SHA256(data, len, out); return 1; }
+    if (hashId == HMAC_HASH_SHA384) { Sha384(data, len, out); return 1; }
+    if (hashId == HMAC_HASH_SHA512) { Sha512(data, len, out); return 1; }
+    panic("HMAC: unbekannte Hash-Kennung");
+    return 0;
+}
+
+// HMAC(K, m) = H((K' ^ opad) || H((K' ^ ipad) || m))
+//
+// K' ist der auf die Blockgroesse gebrachte Schluessel: zu lange Schluessel
+// werden gehasht, zu kurze mit Nullen aufgefuellt (RFC 2104 Abschnitt 2).
+pub fn HMAC(hashId: int64, key: int64, keyLen: int64,
+            data: int64, dataLen: int64, out: int64): int64 {
+    var bs: int64 := HMACBlockSize(hashId);
+    var ds: int64 := HMACDigestSize(hashId);
+    if (bs == 0 || ds == 0) { panic("HMAC: unbekannte Hash-Kennung"); }
+
+    var kprime: int64 := alloc(bs);
+    if (kprime == 0) { panic("HMAC: kein Speicher"); }
     var i: int64 := 0;
-    while (i < 64) { poke8(kprime + i, 0); i := i + 1; }
+    while (i < bs) { poke8(kprime + i, 0); i := i + 1; }
 
-    if (keyLen > 64) {
-        // Key longer than block size: K' = SHA256(key)
-        SHA256(key, keyLen, kprime);
+    if (keyLen > bs) {
+        HMACHash(hashId, key, keyLen, kprime);
     } else {
         i := 0;
         while (i < keyLen) { poke8(kprime + i, peek8(key + i)); i := i + 1; }
     }
 
-    // inner = SHA256((K' XOR ipad) || data)
-    // Allocate 64 + dataLen bytes for the inner message
-    var innerBuf: int64 := alloc(64 + dataLen + 1);  // +1 to avoid zero-size alloc
+    // inner = H((K' ^ ipad) || data)
+    var innerLen: int64 := bs + dataLen;
+    var innerBuf: int64 := alloc(innerLen + 1);   // +1 verhindert alloc(0)
+    if (innerBuf == 0) { panic("HMAC: kein Speicher"); }
     i := 0;
-    while (i < 64) { poke8(innerBuf + i, peek8(kprime + i) ^ 0x36); i := i + 1; }
+    while (i < bs) { poke8(innerBuf + i, peek8(kprime + i) ^ 0x36); i := i + 1; }
     i := 0;
-    while (i < dataLen) { poke8(innerBuf + 64 + i, peek8(data + i)); i := i + 1; }
-    var inner: int64 := alloc(32);
-    SHA256(innerBuf, 64 + dataLen, inner);
-    free(innerBuf, 64 + dataLen + 1);
+    while (i < dataLen) { poke8(innerBuf + bs + i, peek8(data + i)); i := i + 1; }
+    var inner: int64 := alloc(ds);
+    if (inner == 0) { panic("HMAC: kein Speicher"); }
+    HMACHash(hashId, innerBuf, innerLen, inner);
+    // Der Puffer trug Schluesselmaterial (K' ^ ipad) — der Arena-Allokator
+    // gibt Speicher ohne Loeschen wieder heraus.
+    i := 0;
+    while (i < innerLen) { poke8(innerBuf + i, 0); i := i + 1; }
+    free(innerBuf, innerLen + 1);
 
-    // outer = SHA256((K' XOR opad) || inner)
-    var outerBuf: int64 := alloc(96);  // 64 + 32
+    // outer = H((K' ^ opad) || inner)
+    var outerLen: int64 := bs + ds;
+    var outerBuf: int64 := alloc(outerLen);
+    if (outerBuf == 0) { panic("HMAC: kein Speicher"); }
     i := 0;
-    while (i < 64) { poke8(outerBuf + i, peek8(kprime + i) ^ 0x5C); i := i + 1; }
+    while (i < bs) { poke8(outerBuf + i, peek8(kprime + i) ^ 0x5C); i := i + 1; }
     i := 0;
-    while (i < 32) { poke8(outerBuf + 64 + i, peek8(inner + i)); i := i + 1; }
-    SHA256(outerBuf, 96, out);
+    while (i < ds) { poke8(outerBuf + bs + i, peek8(inner + i)); i := i + 1; }
+    HMACHash(hashId, outerBuf, outerLen, out);
 
-    free(kprime, 64);
-    free(inner, 32);
-    free(outerBuf, 96);
+    i := 0;
+    while (i < bs) { poke8(kprime + i, 0); i := i + 1; }
+    i := 0;
+    while (i < outerLen) { poke8(outerBuf + i, 0); i := i + 1; }
+    free(kprime, bs);
+    free(inner, ds);
+    free(outerBuf, outerLen);
+    return 1;
+}
+
+// ---------------------------------------------------------------------------
+// Huellen je Hash
+// ---------------------------------------------------------------------------
+
+pub fn HMAC_MD4(key: int64, keyLen: int64, data: int64, dataLen: int64, out: int64): void {
+    HMAC(HMAC_HASH_MD4, key, keyLen, data, dataLen, out);
+}
+
+pub fn HMAC_MD5(key: int64, keyLen: int64, data: int64, dataLen: int64, out: int64): void {
+    HMAC(HMAC_HASH_MD5, key, keyLen, data, dataLen, out);
+}
+
+pub fn HMAC_SHA1(key: int64, keyLen: int64, data: int64, dataLen: int64, out: int64): void {
+    HMAC(HMAC_HASH_SHA1, key, keyLen, data, dataLen, out);
+}
+
+pub fn HMAC_SHA256(key: int64, keyLen: int64, data: int64, dataLen: int64, out: int64): void {
+    HMAC(HMAC_HASH_SHA256, key, keyLen, data, dataLen, out);
+}
+
+pub fn HMAC_SHA384(key: int64, keyLen: int64, data: int64, dataLen: int64, out: int64): void {
+    HMAC(HMAC_HASH_SHA384, key, keyLen, data, dataLen, out);
+}
+
+pub fn HMAC_SHA512(key: int64, keyLen: int64, data: int64, dataLen: int64, out: int64): void {
+    HMAC(HMAC_HASH_SHA512, key, keyLen, data, dataLen, out);
 }
 
 pub fn HMAC_SHA256_Hex(key: int64, keyLen: int64, data: int64, dataLen: int64, out: int64): void {

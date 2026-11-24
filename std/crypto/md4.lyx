@@ -1,0 +1,243 @@
+// std/crypto/md4.lyx — RFC 1320 MD4 Message-Digest Algorithm
+//
+// NUR FUER ALTLAST. MD4 ist kryptographisch gebrochen (Kollisionen in
+// Sekundenbruchteilen, Preimage-Angriffe unter 2^100); es gehoert in keinen
+// neuen Entwurf. Es steht hier aus einem Grund: der NT-Hash in NTLMv2 ist
+// MD4(UTF-16LE(Passwort)) und ist von der Gegenstelle vorgegeben
+// (#2638, SMB 3.1.1). Wer MD4 fuer etwas anderes als eine fremdbestimmte
+// Altschnittstelle waehlt, waehlt falsch — fuer neue Zwecke SHA-256 oder
+// SHA-3 (std.crypto.sha256, std.crypto.keccak).
+//
+// Oeffentliche API:
+//   MD4(data: int64, len: int64, out: int64)      — 16-Byte-Digest nach out
+//   MD4Hex(data: int64, len: int64, out: int64)   — 32 Hexzeichen + NUL
+//   MD4HexStr(data: pchar, len: int64, out: int64)
+//
+// Pruefvektoren: RFC 1320 Anhang A.5, ausgefuehrt in tests/md4_2638_test.sh.
+
+unit std.crypto.md4;
+
+import std.alloc;
+
+// ============================================================================
+// Hilfsfunktionen — alle Arithmetik ist 32 Bit, maskiert mit 0xFFFFFFFF
+// ============================================================================
+
+fn md4RotL(x: int64, n: int64): int64 {
+  return (((x << n) | ((x & 0xFFFFFFFF) >> (32 - n))) & 0xFFFFFFFF);
+}
+
+// 32-Bit-Wort little-endian aus buf lesen
+fn md4W(buf: int64, off: int64): int64 {
+  var b0: int64 := peek8(buf + off)     & 0xFF;
+  var b1: int64 := peek8(buf + off + 1) & 0xFF;
+  var b2: int64 := peek8(buf + off + 2) & 0xFF;
+  var b3: int64 := peek8(buf + off + 3) & 0xFF;
+  return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+}
+
+// 32-Bit-Wort little-endian nach buf schreiben
+fn md4PutW(buf: int64, off: int64, v: int64) {
+  poke8(buf + off,     v         & 0xFF);
+  poke8(buf + off + 1, (v >> 8)  & 0xFF);
+  poke8(buf + off + 2, (v >> 16) & 0xFF);
+  poke8(buf + off + 3, (v >> 24) & 0xFF);
+}
+
+// ============================================================================
+// Rundenplan (RFC 1320 Abschnitt 3.4)
+//
+// Die Wortreihenfolge und die Rotationsweiten stehen als Tabelle im Speicher,
+// damit der 48-Schritt-Kern eine Schleife bleibt. Die Indizes sind
+// Konstanten des Verfahrens und haengen nicht an den Daten — kein
+// Seitenkanal, anders als bei einer S-Box.
+//
+// Runde 1: k = 0..15,                        s = 3, 7, 11, 19
+// Runde 2: k = 0,4,8,12,1,5,9,13,...         s = 3, 5,  9, 13
+// Runde 3: k = 0,8,4,12,2,10,6,14,...        s = 3, 9, 11, 15
+// ============================================================================
+
+var _md4K: int64 := 0;    // 48 Byte Wortindizes
+var _md4S: int64 := 0;    // 48 Byte Rotationsweiten
+
+fn md4Setze(p: int64, i: int64, v: int64) {
+  poke8(p + i, v);
+}
+
+fn md4Plan(): int64 {
+  if (_md4K != 0) { return _md4K; }
+  var kk: int64 := alloc(48);
+  var ss: int64 := alloc(48);
+  if (kk == 0 || ss == 0) { panic("MD4: kein Speicher fuer den Rundenplan"); }
+
+  // Runde 1
+  var i: int64 := 0;
+  while (i < 16) {
+    md4Setze(kk, i, i);
+    md4Setze(ss, i, 3 + (i & 3) * 4);        // 3, 7, 11, 19 — 19 korrigiert unten
+    i := i + 1;
+  }
+  // 3 + 3*4 = 15, gebraucht wird 19: die vierte Weite steht ausserhalb der
+  // arithmetischen Folge und wird einzeln gesetzt.
+  i := 3;
+  while (i < 16) { md4Setze(ss, i, 19); i := i + 4; }
+
+  // Runde 2: k = 4*(i mod 4) + (i div 4), s = 3, 5, 9, 13
+  i := 0;
+  while (i < 16) {
+    md4Setze(kk, 16 + i, (i % 4) * 4 + (i / 4));
+    var r: int64 := i & 3;
+    if (r == 0) { md4Setze(ss, 16 + i, 3); }
+    if (r == 1) { md4Setze(ss, 16 + i, 5); }
+    if (r == 2) { md4Setze(ss, 16 + i, 9); }
+    if (r == 3) { md4Setze(ss, 16 + i, 13); }
+    i := i + 1;
+  }
+
+  // Runde 3: Bitumkehr des 4-Bit-Index, s = 3, 9, 11, 15
+  i := 0;
+  while (i < 16) {
+    var b: int64 := ((i & 1) << 3) | ((i & 2) << 1) | ((i & 4) >> 1) | ((i & 8) >> 3);
+    md4Setze(kk, 32 + i, b);
+    var r3: int64 := i & 3;
+    if (r3 == 0) { md4Setze(ss, 32 + i, 3); }
+    if (r3 == 1) { md4Setze(ss, 32 + i, 9); }
+    if (r3 == 2) { md4Setze(ss, 32 + i, 11); }
+    if (r3 == 3) { md4Setze(ss, 32 + i, 15); }
+    i := i + 1;
+  }
+
+  _md4S := ss;
+  _md4K := kk;
+  return kk;
+}
+
+// Einen 64-Byte-Block verarbeiten. state = {A, B, C, D}, je 32 Bit little-endian.
+fn md4Block(state: int64, block: int64) {
+  if (md4Plan() == 0) { panic("MD4: Rundenplan fehlt"); }
+
+  var a: int64 := md4W(state, 0);
+  var b: int64 := md4W(state, 4);
+  var c: int64 := md4W(state, 8);
+  var d: int64 := md4W(state, 12);
+
+  var a0: int64 := a;
+  var b0: int64 := b;
+  var c0: int64 := c;
+  var d0: int64 := d;
+
+  var i: int64 := 0;
+  while (i < 48) {
+    var k: int64 := peek8(_md4K + i) & 0xFF;
+    var s: int64 := peek8(_md4S + i) & 0xFF;
+    var x: int64 := md4W(block, k * 4);
+
+    var f: int64 := 0;
+    var kon: int64 := 0;
+    if (i < 16) {
+      f := (b & c) | ((~b) & d);
+      kon := 0;
+    } else {
+      if (i < 32) {
+        f := (b & c) | (b & d) | (c & d);
+        kon := 0x5A827999;
+      } else {
+        f := b ^ c ^ d;
+        kon := 0x6ED9EBA1;
+      }
+    }
+
+    var t: int64 := (a + (f & 0xFFFFFFFF) + x + kon) & 0xFFFFFFFF;
+    t := md4RotL(t, s);
+
+    // Reihenfolge weiterdrehen: naechstes Ziel ist das alte d.
+    a := d;
+    d := c;
+    c := b;
+    b := t;
+
+    i := i + 1;
+  }
+
+  md4PutW(state, 0,  (a0 + a) & 0xFFFFFFFF);
+  md4PutW(state, 4,  (b0 + b) & 0xFFFFFFFF);
+  md4PutW(state, 8,  (c0 + c) & 0xFFFFFFFF);
+  md4PutW(state, 12, (d0 + d) & 0xFFFFFFFF);
+}
+
+// ============================================================================
+// Oeffentliche API
+// ============================================================================
+
+// MD4(data, len, out): schreibt 16 Byte Rohdigest nach out[0..15]
+pub fn MD4(data: int64, len: int64, out: int64) {
+  var state: int64 := alloc(16);
+  md4PutW(state, 0,  0x67452301);
+  md4PutW(state, 4,  0xEFCDAB89);
+  md4PutW(state, 8,  0x98BADCFE);
+  md4PutW(state, 12, 0x10325476);
+
+  var block: int64 := alloc(64);
+
+  var pos: int64 := 0;
+  while (pos + 64 <= len) {
+    var i: int64 := 0;
+    while (i < 64) { poke8(block + i, peek8(data + pos + i)); i := i + 1; }
+    md4Block(state, block);
+    pos += 64;
+  }
+
+  var rest: int64 := len - pos;
+  var i2: int64 := 0;
+  while (i2 < 64) { poke8(block + i2, 0); i2 := i2 + 1; }
+  i2 := 0;
+  while (i2 < rest) { poke8(block + i2, peek8(data + pos + i2)); i2 := i2 + 1; }
+  poke8(block + rest, 0x80);
+
+  if (rest >= 56) {
+    md4Block(state, block);
+    i2 := 0; while (i2 < 64) { poke8(block + i2, 0); i2 := i2 + 1; }
+  }
+
+  // Laenge in Bit, little-endian 64 Bit, auf Byte 56..63
+  var bitLen: int64 := len * 8;
+  poke8(block + 56,  bitLen        & 0xFF);
+  poke8(block + 57, (bitLen >>  8) & 0xFF);
+  poke8(block + 58, (bitLen >> 16) & 0xFF);
+  poke8(block + 59, (bitLen >> 24) & 0xFF);
+  poke8(block + 60, (bitLen >> 32) & 0xFF);
+  poke8(block + 61, (bitLen >> 40) & 0xFF);
+  poke8(block + 62, (bitLen >> 48) & 0xFF);
+  poke8(block + 63, (bitLen >> 56) & 0xFF);
+  md4Block(state, block);
+
+  i2 := 0;
+  while (i2 < 16) { poke8(out + i2, peek8(state + i2)); i2 := i2 + 1; }
+
+  free(state, 16);
+  free(block, 64);
+}
+
+fn md4Hex4(v: int64): int64 {
+  if (v < 10) { return 48 + v; }
+  return 87 + v;
+}
+
+// MD4Hex(data, len, out): 32 Hexzeichen (klein) + NUL nach out[0..32]
+pub fn MD4Hex(data: int64, len: int64, out: int64) {
+  var digest: int64 := alloc(16);
+  MD4(data, len, digest);
+  var i: int64 := 0;
+  while (i < 16) {
+    var b: int64 := peek8(digest + i) & 0xFF;
+    poke8(out + i * 2,     md4Hex4((b >> 4) & 0xF));
+    poke8(out + i * 2 + 1, md4Hex4(b & 0xF));
+    i += 1;
+  }
+  poke8(out + 32, 0);
+  free(digest, 16);
+}
+
+pub fn MD4HexStr(data: pchar, len: int64, out: int64) {
+  MD4Hex(data as int64, len, out);
+}

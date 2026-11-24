@@ -1,0 +1,221 @@
+// std/crypto/aescmac.lyx — AES-CMAC (RFC 4493 / NIST SP 800-38B) und die
+// Schluesselableitung in Counter Mode nach SP 800-108.
+//
+// #2638: SMB 3.x signiert mit AES-CMAC und leitet seine Sitzungsschluessel
+// mit KDF in Counter Mode darueber ab (SP 800-108 Abschnitt 5.1, r = 32).
+//
+// Oeffentliche API:
+//   AesCmac(key, keyLen, msg, msgLen, mac): int64
+//       16-Byte-MAC nach mac. keyLen ist 16 oder 32; ein anderer Wert wird
+//       abgewiesen (0) und NICHT still auf 16 gerundet. msgLen darf 0 sein.
+//   AesCmacVerify(key, keyLen, msg, msgLen, mac, macLen): int64
+//       1 bei Uebereinstimmung der ersten macLen Byte, sonst 0. Der
+//       Vergleich laeuft in konstanter Zeit (CTMemEqual).
+//   AesCmacKdfCtr(key, keyLen, label, labelLen, context, contextLen,
+//                 out, outLen): int64
+//       KDF in Counter Mode: K(i) = CMAC(key, [i]_32 || label || 0x00 ||
+//       context || [outLen*8]_32), aneinandergereiht bis outLen Byte.
+//
+// Der Kern ist AES aus std/crypto/aescore.lyx — dieselbe Rundenrechnung wie
+// AES-GCM, mit AES-NI, wenn die CPU es hat. Die Unterschluessel K1/K2
+// entstehen durch Verdoppelung im GF(2^128); die Reduktion haengt am
+// obersten Bit eines GEHEIMEN Wertes und laeuft darum ueber eine Maske, nicht
+// ueber einen Sprung.
+//
+// Pruefvektoren: RFC 4493 Anhang (AES-128) und SP 800-38B (AES-256),
+// ausgefuehrt in tests/aes_cmac_2638_test.sh.
+
+unit std.crypto.aescmac;
+
+import std.alloc;
+import std.crypto.aescore;
+import std.crypto.ct;
+
+pub con AES_CMAC_BLOCK: int64 := 16;
+
+// Verdoppelung im GF(2^128) mit dem Reduktionspolynom
+// x^128 + x^7 + x^2 + x + 1 (RFC 4493 Abschnitt 2.3):
+//   dbl(X) = X << 1              wenn MSB(X) = 0
+//          = (X << 1) ^ 0x87     wenn MSB(X) = 1
+//
+// MSB(X) haengt am Schluessel. Ein `if` darauf waere ein Seitenkanal, darum
+// wird die Konstante ueber eine Maske eingerechnet: maske ist 0xFF, wenn das
+// oberste Bit gesetzt war, sonst 0x00.
+fn cmacDbl(x: int64): void {
+    var msb: int64 := (peek8(x) >> 7) & 1;
+    var maske: int64 := 0 - msb;                 // -1 oder 0
+    var uebertrag: int64 := 0;
+    var i: int64 := AES_CMAC_BLOCK - 1;
+    while (i >= 0) {
+        var b: int64 := peek8(x + i) & 0xFF;
+        poke8(x + i, ((b << 1) | uebertrag) & 0xFF);
+        uebertrag := (b >> 7) & 1;
+        i := i - 1;
+    }
+    poke8(x + 15, (peek8(x + 15) ^ (0x87 & maske)) & 0xFF);
+}
+
+fn cmacXor16(ziel: int64, a: int64, b: int64): void {
+    var i: int64 := 0;
+    while (i < 16) { poke8(ziel + i, peek8(a + i) ^ peek8(b + i)); i := i + 1; }
+}
+
+pub fn AesCmac(key: int64, keyLen: int64, msg: int64, msgLen: int64, mac: int64): int64 {
+    if (keyLen != 16 && keyLen != 32) { return 0; }
+    if (msgLen < 0) { return 0; }
+
+    var rk: int64 := alloc(240);
+    if (rk == 0) { return 0; }
+    var rounds: int64 := AesCoreKeyExpand(key, keyLen, rk);
+    if (rounds == 0) { free(rk, 240); return 0; }
+
+    // L = AES_K(0^128); K1 = dbl(L); K2 = dbl(K1)
+    var k1: int64 := alloc(16);
+    var k2: int64 := alloc(16);
+    var x:  int64 := alloc(16);
+    var y:  int64 := alloc(16);
+    if (k1 == 0 || k2 == 0 || x == 0 || y == 0) { free(rk, 240); return 0; }
+    var i: int64 := 0;
+    while (i < 16) { poke8(k1 + i, 0); i := i + 1; }
+    AesCoreEncBlock(k1, rk, rounds);
+    cmacDbl(k1);
+    i := 0;
+    while (i < 16) { poke8(k2 + i, peek8(k1 + i)); i := i + 1; }
+    cmacDbl(k2);
+
+    // n = Anzahl Bloecke; bei msgLen = 0 ist der einzige Block unvollstaendig.
+    var n: int64 := (msgLen + 15) / 16;
+    var vollstaendig: int64 := 0;
+    if (n == 0) { n := 1; } else {
+        if (msgLen % 16 == 0) { vollstaendig := 1; }
+    }
+
+    i := 0;
+    while (i < 16) { poke8(x + i, 0); i := i + 1; }
+
+    // Bloecke 1..n-1
+    var blk: int64 := 0;
+    while (blk < n - 1) {
+        cmacXor16(y, x, msg + blk * 16);
+        i := 0;
+        while (i < 16) { poke8(x + i, peek8(y + i)); i := i + 1; }
+        AesCoreEncBlock(x, rk, rounds);
+        blk := blk + 1;
+    }
+
+    // Letzter Block: vollstaendig -> ^ K1, sonst 0x80-gepolstert und ^ K2
+    var letzter: int64 := alloc(16);
+    if (letzter == 0) { free(rk, 240); return 0; }
+    var rest: int64 := msgLen - (n - 1) * 16;
+    if (vollstaendig != 0) {
+        i := 0;
+        while (i < 16) { poke8(letzter + i, peek8(msg + (n - 1) * 16 + i) ^ peek8(k1 + i)); i := i + 1; }
+    } else {
+        i := 0;
+        while (i < 16) { poke8(letzter + i, 0); i := i + 1; }
+        i := 0;
+        while (i < rest) { poke8(letzter + i, peek8(msg + (n - 1) * 16 + i)); i := i + 1; }
+        poke8(letzter + rest, 0x80);
+        i := 0;
+        while (i < 16) { poke8(letzter + i, peek8(letzter + i) ^ peek8(k2 + i)); i := i + 1; }
+    }
+
+    cmacXor16(y, x, letzter);
+    i := 0;
+    while (i < 16) { poke8(x + i, peek8(y + i)); i := i + 1; }
+    AesCoreEncBlock(x, rk, rounds);
+
+    i := 0;
+    while (i < 16) { poke8(mac + i, peek8(x + i)); i := i + 1; }
+
+    // Schluesselplan und Unterschluessel sind Schluesselmaterial; der
+    // Arena-Allokator gibt Speicher ungeloescht wieder heraus.
+    SecureZero(rk, 240);
+    SecureZero(k1, 16);
+    SecureZero(k2, 16);
+    SecureZero(x, 16);
+    SecureZero(y, 16);
+    SecureZero(letzter, 16);
+    free(rk, 240);
+    free(k1, 16);
+    free(k2, 16);
+    free(x, 16);
+    free(y, 16);
+    free(letzter, 16);
+    return 1;
+}
+
+pub fn AesCmacVerify(key: int64, keyLen: int64, msg: int64, msgLen: int64,
+                     mac: int64, macLen: int64): int64 {
+    if (macLen < 1 || macLen > 16) { return 0; }
+    var eigen: int64 := alloc(16);
+    if (eigen == 0) { return 0; }
+    if (AesCmac(key, keyLen, msg, msgLen, eigen) == 0) { free(eigen, 16); return 0; }
+    var gleich: int64 := CTMemEqual(eigen, mac, macLen);   // -1 oder 0
+    SecureZero(eigen, 16);
+    free(eigen, 16);
+    return 0 - gleich;                                      // 1 oder 0
+}
+
+// ---------------------------------------------------------------------------
+// KDF in Counter Mode (SP 800-108 Abschnitt 5.1) mit CMAC als PRF
+//
+//   K(i) = PRF(key, [i]_32 || Label || 0x00 || Context || [L]_32)
+//   out  = K(1) || K(2) || ... , auf outLen Byte gekuerzt
+//
+// L ist die Ausgabelaenge in BIT, beides big-endian in 4 Byte. Das ist die
+// Form, die SMB 3.x verwendet (MS-SMB2 3.1.4.2).
+// ---------------------------------------------------------------------------
+pub fn AesCmacKdfCtr(key: int64, keyLen: int64,
+                     label: int64, labelLen: int64,
+                     context: int64, contextLen: int64,
+                     out: int64, outLen: int64): int64 {
+    if (outLen <= 0) { return 0; }
+    if (labelLen < 0 || contextLen < 0) { return 0; }
+
+    var eingLen: int64 := 4 + labelLen + 1 + contextLen + 4;
+    var eing: int64 := alloc(eingLen);
+    if (eing == 0) { return 0; }
+
+    var i: int64 := 0;
+    while (i < labelLen) { poke8(eing + 4 + i, peek8(label + i)); i := i + 1; }
+    poke8(eing + 4 + labelLen, 0);
+    i := 0;
+    while (i < contextLen) { poke8(eing + 5 + labelLen + i, peek8(context + i)); i := i + 1; }
+
+    var bits: int64 := outLen * 8;
+    var lpos: int64 := eing + 5 + labelLen + contextLen;
+    poke8(lpos,     (bits >> 24) & 0xFF);
+    poke8(lpos + 1, (bits >> 16) & 0xFF);
+    poke8(lpos + 2, (bits >>  8) & 0xFF);
+    poke8(lpos + 3,  bits        & 0xFF);
+
+    var block: int64 := alloc(16);
+    if (block == 0) { free(eing, eingLen); return 0; }
+
+    var geschrieben: int64 := 0;
+    var zaehler: int64 := 1;
+    while (geschrieben < outLen) {
+        poke8(eing,     (zaehler >> 24) & 0xFF);
+        poke8(eing + 1, (zaehler >> 16) & 0xFF);
+        poke8(eing + 2, (zaehler >>  8) & 0xFF);
+        poke8(eing + 3,  zaehler        & 0xFF);
+        if (AesCmac(key, keyLen, eing, eingLen, block) == 0) {
+            SecureZero(block, 16);
+            free(block, 16);
+            free(eing, eingLen);
+            return 0;
+        }
+        var nimm: int64 := outLen - geschrieben;
+        if (nimm > 16) { nimm := 16; }
+        i := 0;
+        while (i < nimm) { poke8(out + geschrieben + i, peek8(block + i)); i := i + 1; }
+        geschrieben := geschrieben + nimm;
+        zaehler := zaehler + 1;
+    }
+
+    SecureZero(block, 16);
+    free(block, 16);
+    free(eing, eingLen);
+    return 1;
+}
