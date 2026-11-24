@@ -91,25 +91,40 @@ EOF
 alle_ziele "geerbtes pchar-Feld" "$TMP/erbe.lyx" "Geerbt|7|"
 
 echo
-echo "--- #2039 GEGENPROBE: ein f64-Feld wird weiterhin ABGEWIESEN ---"
+echo "--- #2039/#2637: ein f64-Feld wird AUSGEGEBEN, nicht geraten ---"
 #
 # Die wichtigste Haelfte. Waere die Aufzaehlung durch ein "alles andere ist
 # eine Zahl" ersetzt worden, gaebe dieser Fall still eine Ganzzahl aus —
 # fehlerfrei uebersetzt, falsches Ergebnis. Genau davor warnt der Kommentar
 # an der Fundstelle.
+# #2637: HIER WURDE DIE ABWEISUNG ALS NACHWEIS GENOMMEN ("f64-Feld wird
+# abgewiesen statt geraten"). Seit #2637 gibt der IR-Weg f64 aus, also ging
+# der Fall durch und der Test wurde rot — die Falle aus CLAUDE.md. Die Sorge
+# dahinter war aber nie die Abweisung, sondern das STILLE RATEN: ein f64, das
+# als Ganzzahl ausgegeben wird. Genau das wird jetzt gemessen, und zwar am
+# WERT: 1.5 muss als 1.500000 herauskommen, nicht als 1 und nicht als
+# Bitmuster. Damit ist die Zusage staerker als vorher.
 cat > "$TMP/f64.lyx" <<'EOF'
 unit main;
 import std.io;
 type G = struct { w: f64; }
-fn main(): int64 { var g: G; g.w := 1.5; Print(g.w); return 0; }
+fn main(): int64 { var g: G; g.w := 1.5; Print(g.w); PrintLn(""); return 0; }
 EOF
 for ziel in arm64 riscv; do
-  if ( cd "$ROOT" && timeout 300 "$LYXC" --std-path="$ROOT" --target="$ziel" "$TMP/f64.lyx" -o "$TMP/f64.bin" ) >"$TMP/f64.log" 2>&1; then
-    nok "$ziel: ein f64-Feld ging durch — wird es als Ganzzahl ausgegeben?"
-  elif grep -q "kann den Typ des Arguments nicht bestimmen" "$TMP/f64.log"; then
-    ok "$ziel: f64-Feld wird abgewiesen statt geraten"
+  if ! ( cd "$ROOT" && timeout 300 "$LYXC" --std-path="$ROOT" --target="$ziel" "$TMP/f64.lyx" -o "$TMP/f64_$ziel.bin" ) >"$TMP/f64.log" 2>&1; then
+    nok "$ziel: f64-Feld uebersetzt nicht: $(grep -m1 -E '^lyxc:|error' "$TMP/f64.log")"
+    continue
+  fi
+  em="qemu-aarch64"; [ "$ziel" = riscv ] && em="qemu-riscv64"
+  if ! command -v "$em" >/dev/null 2>&1; then
+    echo "    (SKIP $ziel: $em fehlt, Wert nicht messbar)"
+    continue
+  fi
+  ist="$("$em" "$TMP/f64_$ziel.bin" 2>&1 | tr -d '\n')"
+  if [ "$ist" = "1.500000" ]; then
+    ok "$ziel: f64-Feld wird als 1.500000 ausgegeben, nicht geraten"
   else
-    nok "$ziel: abgewiesen, aber anders: $(grep -m1 -E '^lyxc:|error' "$TMP/f64.log")"
+    nok "$ziel: f64-Feld gibt '$ist' aus, erwartet 1.500000"
   fi
 done
 

@@ -108,9 +108,16 @@ baut "#1717 StrNew" \
 # nicht "unbekannter Builtin/Funktion: PrintLn" dastehen — der Name ist ja
 # behandelt. Genau diese Fehlleitung war der Kern von #1716.
 # ---------------------------------------------------------------------------
+# #2637: HIER STAND `fn h(): f64` als Beispiel fuer einen unbestimmbaren Typ.
+# Seit #2637 gibt der IR-Weg f64 aus (ueber FloatToStr), der Fall ist also
+# gueltig geworden und der Test wurde rot — genau die Falle aus CLAUDE.md:
+# wer eine Ablehnungsmeldung als Nachweis nimmt, macht den Test rot, sobald
+# die Luecke zugeht. Die ABSICHT bleibt richtig und wird weiter geprueft, nur
+# mit einem Fall, der wirklich unbestimmbar ist: ein Struct hat keine
+# Ausgabeform, und keine ist vorgesehen.
 bricht "#1716 unbestimmbarer Typ nennt nicht faelschlich den Namen" \
-'fn h(): f64 { return 1.0; }
-fn main(): int64 { PrintLn(h()); return 0; }' \
+'type TP = struct { a: int64; };
+fn main(): int64 { var s: TP; s.a := 1; PrintLn(s); return 0; }' \
 'kann den Typ des Arguments nicht bestimmen'
 
 # ---------------------------------------------------------------------------
