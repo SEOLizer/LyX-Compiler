@@ -76,6 +76,34 @@ SHARE_DST := $(PKG_DIR)/usr/share/lyx
 UNITS_LYU := $(patsubst std/%.lyx,  $(UNITS_DST)/%.lyu, $(UNITS_SRC))
 DATA_LYU  := $(patsubst data/%.lyx, $(DATA_DST)/%.lyu,  $(DATA_SRC))
 
+# #2622: Die Musterregeln weiter unten nennen als Abhaengigkeit nur die eigene
+# .lyx und den Compiler. Die IMPORTE fehlten -- eine Aenderung an
+# std/net/tls13.lyx liess std/net/http.lyu und std/cloud/s3.lyu weiter als
+# aktuell gelten, und die Drift war nicht am Rueckgabewert sichtbar, sondern
+# erst am sha256 gegen einen Neubau (gemessen 2026-11-22).
+#
+# tools/unit_deps.sh traegt sie nach: je Vorkompilat die TRANSITIVE Huelle der
+# importierten QUELLEN. Dass es die Quellen sind und nicht die .lyu daneben,
+# ist gemessen und nicht angenommen -- der Bau ruft `--std-path=.`, und der
+# Aufloeser bevorzugt .lyx vor .lyu (strace: beim Uebersetzen von http.lyx
+# oeffnet lyxc tls13.lyx und von dort tls12/tls_kern/tls_config).
+#
+# Die erzeugten Regeln verweisen auf $(UNITS_DST)/$(DATA_DST) und gelten damit
+# fuer JEDEN Unit-Baum: aufgeloest wird erst beim Einlesen, mit dem dann
+# gueltigen LYU_ARCH. Erzeugen kostet 0,1 s ueber alle 498 Units.
+UNIT_DEPS := build/unit_deps.mk
+
+$(UNIT_DEPS): tools/unit_deps.sh $(UNITS_SRC) $(DATA_SRC)
+	@mkdir -p $(dir $@)
+	@bash tools/unit_deps.sh > $@.neu
+	@mv -f $@.neu $@
+
+# Erst nach .neu, dann umbenennen: ein abgebrochener Lauf darf keine halbe
+# Abhaengigkeitsdatei hinterlassen, die anschliessend als gueltig eingelesen
+# wird. Der Bindestrich vor include ist noetig, damit `make clean` in einem
+# frischen Checkout raeumt statt an der fehlenden Datei zu scheitern.
+-include $(UNIT_DEPS)
+
 .PHONY: build bootstrap singularity test test-external test-lyxos test-lyx-integration test-known-red snapshot snapshot-update clean package precompile-units install-bin install-data lic_build_flags keygen deb dist dist-win64 dist-linux
 
 # ── Compiler bauen ────────────────────────────────────────────────────────────
@@ -574,6 +602,10 @@ test: lyxc
 	@bash tests/lyu_leser_laut_test.sh
 	@echo "--- #2446: .lyu ist reproduzierbar und ortsunabhaengig ---"
 	@bash tests/lyu_reproduzierbar_test.sh
+	@echo "--- #2622: eine Quellaenderung zieht die importierenden .lyu nach ---"
+	@bash tests/unit_deps_2622_test.sh
+	@echo "--- #2633: lokal gebauter Unit-Baum ueberlebt das Hochruesten ---"
+	@bash tests/paket_units_erhalt_2633_test.sh
 	@echo "--- #2448: LPM-Paket std ---"
 	@bash tests/lpm_std_paket_test.sh
 	@echo "--- std.aero: Atmosphaere, Flugleistung, Vorhersage, Profile, Warteschleifen ---"
@@ -1573,7 +1605,7 @@ keygen:
 # ── Aufräumen ─────────────────────────────────────────────────────────────────
 
 clean:
-	rm -f lyxc lyxc.new lyxc-keygen
+	rm -f lyxc lyxc.new lyxc-keygen build/unit_deps.mk build/unit_deps.mk.neu
 
 # Alle uebersetzbaren .lyx-Tests ausserhalb von `make test` (Inventur zu #1004).
 # Dauert rund fuenf Minuten und ist deshalb nicht Teil von `make test`.
