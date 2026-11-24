@@ -606,6 +606,8 @@ test: lyxc
 	@bash tests/unit_deps_2622_test.sh
 	@echo "--- #2633: lokal gebauter Unit-Baum ueberlebt das Hochruesten ---"
 	@bash tests/paket_units_erhalt_2633_test.sh
+	@echo "--- #2642: jeder eingecheckte Unit-Baum steht in LYU_BAEUME ---"
+	@bash tests/unit_baum_gelistet_2642_test.sh
 	@echo "--- #2448: LPM-Paket std ---"
 	@bash tests/lpm_std_paket_test.sh
 	@echo "--- std.aero: Atmosphaere, Flugleistung, Vorhersage, Profile, Warteschleifen ---"
