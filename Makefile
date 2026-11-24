@@ -905,6 +905,8 @@ test: lyxc
 	@bash tests/net_wait_portabel_2511_test.sh
 	@echo "--- lyxos-Gestaltpruefung ist nicht mehr fail-open (#2482) ---"
 	@bash tests/lyxos_argc_2482_test.sh
+	@echo "--- #2609: sys_timeline_query hat die Gestalt des Kernels (4 Argumente) ---"
+	@bash tests/lyxos_timeline_gestalt_2609_test.sh
 	@echo "--- Kernelnummern kommen aus der erzeugten Tabelle an (#2549) ---"
 	@bash tests/lyxos_gen_builtins_2549_test.sh
 	@echo "--- Zeiger-Syscalls 407-410 einzeln am Erzeugnis (#2601) ---"
