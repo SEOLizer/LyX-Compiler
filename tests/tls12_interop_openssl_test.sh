@@ -720,6 +720,40 @@ for art in ec rsa; do
   fi
 done
 
+# --- 5b. #2615: unser CLIENT gegen einen Server, der NUR CBC anbietet ---
+#
+# Fall 3 oben deckt die Serverrolle ab (s_client -cipher ...-AES128-SHA wird
+# mit -3 abgewiesen). Die Clientrolle fehlte, und genau sie ist die Richtung,
+# um die es in #2096 Kriterium 7 geht: eine Lucky-13-artige Luecke sitzt im
+# EMPFANGSweg, beim Entschluesseln und Pruefen des Paddings.
+#
+# Der Nachweis ist hier die ABWESENHEIT dieses Weges, und sie wird am
+# Verhalten gegen eine echte Gegenstelle gezeigt, nicht am Quelltext: bietet
+# der Server ausschliesslich CBC an, kommt kein Handschlag zustande. Damit
+# gibt es keine CBC-Satzschicht, in der eine Padding-Pruefung konstantzeitig
+# sein muesste.
+#
+# Die Gegenprobe steht direkt daneben (Abschnitt 5, GCM): ohne sie waere
+# dieser Fall auch von einem Client erfuellt, der ueberhaupt nichts
+# zustandebringt.
+p="$(freierPort)"; PORT=$((PORT+1))
+rm -f "$TMP/fifo_ccbc"; mkfifo "$TMP/fifo_ccbc"
+openssl s_server -accept "$p" -cert "$TMP/certs/tlssrv.pem" -key "$TMP/certs/tlssrvkey.pem" \
+  -tls1_2 -cipher 'ECDHE-ECDSA-AES128-SHA:ECDHE-ECDSA-AES256-SHA:AES128-SHA' \
+  -quiet < "$TMP/fifo_ccbc" > "$TMP/os_srv_cbc.txt" 2>&1 &
+( printf 'pong aus openssl\n'; sleep 8 ) > "$TMP/fifo_ccbc" &
+warteAufPort "$p" 20 || echo "  HINWEIS: s_server lauscht nach 20 s nicht auf $p"
+( ulimit -v 4000000 -c 0; timeout 25 "$TMP/cli" "$p" ec ) > "$TMP/cli_cbc.txt" 2>&1
+pkill -f "s_server -accept $p" 2>/dev/null
+rm -f "$TMP/fifo_ccbc"
+ok=1
+# Kein Handschlag und keine Nutzdaten -- beides, damit ein halb gelungener
+# Lauf nicht als Abweisung durchgeht.
+grep -q "handschlag-fertig" "$TMP/cli_cbc.txt" && ok=0
+grep -q "antwort 17 pong aus openssl" "$TMP/cli_cbc.txt" && ok=0
+pruefe "Client gegen reinen CBC-Server: kein Handschlag (#2615)" "$ok"
+[ "$ok" != 1 ] && echo "  lyx: $(tr '\n' ' ' < "$TMP/cli_cbc.txt")"
+
 p="$(freierPort)"; PORT=$((PORT+1))
 rm -f "$TMP/fifo_cm"; mkfifo "$TMP/fifo_cm"
 openssl s_server -accept "$p" -cert "$TMP/certs/tlssrv.pem" -key "$TMP/certs/tlssrvkey.pem" \

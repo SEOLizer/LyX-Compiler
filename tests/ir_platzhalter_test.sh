@@ -230,16 +230,30 @@ fn main(): int64 {
 }
 EOF
 pruefe "Print(BaseName(..)) aus src.std.fs" "$TMP/imp2.lyx" "datei.txt|y|"
-# Gegenseite: ein importierter f64 bleibt auf dem IR-Weg unbestimmbar —
-# laut, nicht als Ganzzahl geraten.
+# #2637: HIER WURDE DIE ABWEISUNG ALS NACHWEIS GENOMMEN ("ein importierter
+# f64 bleibt auf dem IR-Weg unbestimmbar — laut, nicht als Ganzzahl geraten").
+# Seit #2637 gibt der IR-Weg f64 aus, der Fall ging also durch und der Test
+# wurde rot — die Falle aus CLAUDE.md. Die Sorge war das stille Raten, nicht
+# die Abweisung; gemessen wird deshalb jetzt der WERT. 1.5 muss als 1.500000
+# herauskommen, auch wenn der Typ aus einer ANDEREN Unit stammt (das ist die
+# Herkunft, um die es hier geht).
 cat > "$TMP/imp/f64.lyx" <<'EOF'
 import hilf;
-fn main(): int64 { Print(Wert()); return 0; }
+fn main(): int64 { Print(Wert()); PrintLn(""); return 0; }
 EOF
 for t in arm64 riscv; do
-  if baue $t f64.lyx "$TMP/f" "$TMP/imp"; then nok "Print(importierter f64) [$t]: uebersetzt"
-  elif grep -q "kann den Typ des Arguments nicht bestimmen" "$TMP/f.log"; then ok "Print(importierter f64) [$t]: laut abgewiesen"
-  else nok "Print(importierter f64) [$t]: $(head -c 200 "$TMP/f.log")"; fi
+  if ! baue $t f64.lyx "$TMP/f" "$TMP/imp"; then
+    nok "Print(importierter f64) [$t]: uebersetzt nicht: $(head -c 200 "$TMP/f.log")"
+    continue
+  fi
+  em="$QEMU_ARM64"; [ "$t" = riscv ] && em="$QEMU_RISCV64"
+  if [ -z "$em" ]; then
+    echo "    (SKIP $t: kein Emulator gefunden, Wert nicht messbar)"
+    continue
+  fi
+  ist="$("$em" "$TMP/f" 2>&1 | tr -d '\n')"
+  if [ "$ist" = "1.500000" ]; then ok "Print(importierter f64) [$t]: 1.500000, nicht geraten"
+  else nok "Print(importierter f64) [$t]: '$ist', erwartet 1.500000"; fi
 done
 
 # --- (5) Print mit Literal: bekannte Laenge --------------------------------

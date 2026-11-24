@@ -339,15 +339,38 @@ else
   nok "std.cloud.cf.transport laesst sich nicht einbinden"
 fi
 
-# GEGENPROBE: ein Cast auf f64 als Print-Argument darf NICHT als Ganzzahl
-# durchgehen. Der neue NK_CAST-Zweig liest den Zieltyp — er darf daraus nicht
-# "alles, was ich nicht als pchar erkenne, ist eine Zahl" machen.
-printf 'unit fc;\nimport std.io;\npub fn f(x: int64) { Print(x as f64); }\n' > "$TMP/fc.lyx"
-if ( cd "$ROOT" && timeout 120 "$LYXC" --std-path="$ROOT" --compile-unit --target=arm64 "$TMP/fc.lyx" -o /dev/null ) >"$TMP/fc.log" 2>&1; then
-  nok "Print(x as f64) ging als Ganzzahl durch — der Cast-Zweig raet"
-else
-  ok "Cast auf f64 wird weiterhin abgewiesen"
-fi
+# Ein Cast auf f64 als Print-Argument darf NICHT als Ganzzahl durchgehen. Der
+# NK_CAST-Zweig liest den Zieltyp — er darf daraus nicht "alles, was ich nicht
+# als pchar erkenne, ist eine Zahl" machen.
+#
+# #2637: HIER WURDE DIE ABWEISUNG ALS NACHWEIS GENOMMEN, und zwar aus der
+# bloszen Uebersetzbarkeit geschlossen ("ging durch -> raet"). Das ist die
+# Invariantenfalle: der WERT wurde nie gemessen. Seit #2637 gibt der IR-Weg
+# f64 aus, der Fall geht also durch -- und zwar RICHTIG. Gemessen wird deshalb
+# jetzt das Ergebnis, auf allen drei Zielen: `3 as f64` muss 3.000000 ergeben,
+# nicht 3 und nicht ein Bitmuster. Genau das war die Sorge hinter der alten
+# Formulierung.
+cat > "$TMP/fc.lyx" <<'EOF'
+unit main;
+import std.io;
+fn main(): int64 {
+  var n: int64 := 3;
+  Print(n as f64); PrintLn("");
+  return 0;
+}
+EOF
+for ziel in x86_64 arm64 riscv; do
+  lauf "$ziel" "$TMP/fc.lyx" "$TMP/fc.out"; rc=$?
+  if [ "$rc" = 2 ]; then
+    echo "    (SKIP $ziel: kein qemu, Wert nicht messbar)"
+  elif [ "$rc" != 0 ]; then
+    nok "Print(n as f64) [$ziel]: uebersetzt oder laeuft nicht"
+  elif [ "$(tr -d '\n' < "$TMP/fc.out")" = "3.000000" ]; then
+    ok "Print(n as f64) [$ziel]: 3.000000 -- der Cast-Zweig raet nicht"
+  else
+    nok "Print(n as f64) [$ziel]: [$(tr '\n' '|' < "$TMP/fc.out")], erwartet 3.000000"
+  fi
+done
 
 echo
 echo "Ergebnis: $PASS PASS, $FAIL FAIL"
