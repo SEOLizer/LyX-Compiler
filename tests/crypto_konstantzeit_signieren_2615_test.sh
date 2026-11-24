@@ -18,9 +18,18 @@
 #   2. ECDSA ganz (EcdsaSign): ein fester Schluessel gegen je einen neuen.
 #      Hier ist die Streuung ueber den RFC-6979-Nonce schon drin; die Messung
 #      belegt, dass die SCHLUESSELklasse darueber hinaus nichts hinzufuegt.
-#   3. RSA (RsaSignPkcs1, 2048 Bit, CRT): zwei verschiedene private Schluessel.
-#      Die Zusage steht im Kopf von rsa_native.lyx (BnModExpCT, maskierter
-#      CRT-Weg) und wird hier gemessen statt geglaubt.
+#   3. RSA (RsaSignPkcs1, 2048 Bit, CRT): EIN Schluessel, zwei
+#      NACHRICHTENklassen. Die Zusage steht im Kopf von rsa_native.lyx
+#      (BnModExpCT, maskierter CRT-Weg) und wird hier gemessen statt geglaubt.
+#
+#      WARUM NICHT ZWEI SCHLUESSEL, obwohl #2615 das vorschlaegt: gemessen am
+#      2026-11-24 unterscheiden sich zwei frisch erzeugte 2048-Bit-Schluessel um
+#      rund 700 us je 20 Signaturen. Das ist kein Leck, sondern Struktur -- p,
+#      q, dp, dq und der private Exponent haben je Schluessel andere
+#      Bitlaengen, und der CRT-Weg rechnet entsprechend verschieden lange. Fuer
+#      das Bedrohungsmodell ist das auch die falsche Frage: der Schluessel ist
+#      beim Signieren fest, waehlen kann der Angreifer die NACHRICHT. Genau die
+#      wird hier variiert -- Hash aus Nullbytes gegen Hash mit dichten Bits.
 #
 # GEGENPROBE IM TEST SELBST. Ohne sie waere jede dieser Messungen auch von
 # einem Geschirr erfuellt, das zu grob ist, um irgendetwas zu finden. Gemessen
@@ -170,15 +179,19 @@ fn main(): int64 {
 
   var h: int64 := alloc(32); var r: int64 := alloc(32); var s32: int64 := alloc(32);
   var i: int64 := 0; while (i < 32) { poke8(h + i, (i * 7 + 3) & 255); i := i + 1; }
+  // Zweite Nachrichtenklasse: alles Nullbytes. Der zu potenzierende Wert ist
+  // damit klein und bitarm -- der Fall, in dem eine nicht-konstante
+  // Fensterauswahl kuerzer rechnet.
+  var h0: int64 := alloc(32);
+  i := 0; while (i < 32) { poke8(h0 + i, 0); i := i + 1; }
 
   // RSA: zwei verschiedene private Schluessel, wenn openssl sie geliefert hat.
-  var der1: int64 := alloc(8192); var der2: int64 := alloc(8192);
-  var k1: int64 := alloc(RsaSchluesselGroesse()); var k2: int64 := alloc(RsaSchluesselGroesse());
+  var der1: int64 := alloc(8192);
+  var k1: int64 := alloc(RsaSchluesselGroesse());
   var rsaDa: int64 := 0;
   var n1: int64 := ladeDer("RSA1MARKER"c, "PRIVATE KEY"c, der1);
-  var n2: int64 := ladeDer("RSA2MARKER"c, "PRIVATE KEY"c, der2);
-  if (n1 > 0 && n2 > 0) {
-    if (RsaPrivAusPkcs8(der1, n1, k1) && RsaPrivAusPkcs8(der2, n2, k2)) { rsaDa := 1; }
+  if (n1 > 0) {
+    if (RsaPrivAusPkcs8(der1, n1, k1)) { rsaDa := 1; }
   }
   var sig: int64 := alloc(512);
   Print("rsa_da "c); PrintInt(rsaDa); PrintLn(""c);
@@ -187,7 +200,7 @@ fn main(): int64 {
   messeLeiter(kVoll, gx, gy, ox, oy, wdh, senke);
   messeLeck(kVoll, puf, 1, senke);
   messeEcdsa(h, kVoll, r, s32, 1, senke);
-  if (rsaDa != 0) { messeRsa(k1, h, sig, 1, senke); }
+  if (rsaDa != 0) { messeRsa(k1, h, sig, 1, senke); messeRsa(k1, h0, sig, 1, senke); }
 
   var p: int64 := 0;
   while (p < proben) {
@@ -206,9 +219,10 @@ fn main(): int64 {
     Print(" ecdsa_a2 "c);     PrintInt(messeEcdsa(h, kVoll,  r, s32, wdh, senke));
     // 3. RSA: zwei Schluessel
     if (rsaDa != 0) {
-      Print(" rsa_a "c);      PrintInt(messeRsa(k1, h, sig, wdh, senke));
-      Print(" rsa_b "c);      PrintInt(messeRsa(k2, h, sig, wdh, senke));
-      Print(" rsa_a2 "c);     PrintInt(messeRsa(k1, h, sig, wdh, senke));
+      // EIN Schluessel, zwei Nachrichtenklassen; rsa_a2 ist der Rauschboden.
+      Print(" rsa_a "c);      PrintInt(messeRsa(k1, h,  sig, wdh, senke));
+      Print(" rsa_b "c);      PrintInt(messeRsa(k1, h0, sig, wdh, senke));
+      Print(" rsa_a2 "c);     PrintInt(messeRsa(k1, h,  sig, wdh, senke));
     }
     PrintLn(""c);
     p := p + 1;
@@ -220,19 +234,54 @@ LYXEOF
 
 # RSA-Schluessel: zwei verschiedene. Ohne openssl bleibt der RSA-Teil aus --
 # ein roter Test aus Umgebungsgruenden sagt nichts ueber den Code.
-RSA1="$TMP/r1.pem"; RSA2="$TMP/r2.pem"
+RSA1="$TMP/r1.pem"
 if command -v openssl >/dev/null 2>&1; then
   openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$RSA1" 2>/dev/null
-  openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$RSA2" 2>/dev/null
 fi
-[ -s "$RSA1" ] && [ -s "$RSA2" ] || echo "    (Hinweis: ohne openssl-Schluessel bleibt der RSA-Teil aus)"
+[ -s "$RSA1" ] || echo "    (Hinweis: ohne openssl-Schluessel bleibt der RSA-Teil aus)"
 
 median() { sort -n | awk '{v[NR]=$1} END {if (NR==0) {print 0} else if (NR%2) {print v[(NR+1)/2]} else {print int((v[NR/2]+v[NR/2+1])/2)}}'; }
+
+# Die Schwelle ist das DREIFACHE des Rauschbodens -- aber mindestens ein
+# Promille des Medians.
+#
+# #2615: Ohne diese Untergrenze ist der Test auf einer SEHR ruhigen Maschine
+# rot. Auf dem CI-Laeufer kam der Boden als 1 us heraus (zwei Durchgaenge
+# derselben Klasse lagen gleich), die Schwelle damit auf 3 us -- und ein
+# Unterschied von 4 us auf einen Median von 34973 us, also 0,011 %, galt als
+# Datenabhaengigkeit. Das ist Auflösung und keine Messung: ein Verhaeltnis
+# unter der Untergrenze des Messmittels sagt nichts.
+#
+# Ein Promille ist bewusst streng. Die Gegenprobe behaelt damit reichlich
+# Luft: ihr Leck liegt bei rund 28000 us auf einen Median von 28243 us, also
+# fast 100 %, und reisst die Schwelle um den Faktor 40.
+# Streuung EINER Klasse: p75 - p25 ueber die Proben.
+#
+# #2615: Der Rauschboden war zuerst allein |median(voll) - median(voll2)|,
+# also eine Schaetzung aus ZWEI Zahlen. Die kann klein ausfallen, waehrend die
+# echte Streuung gross ist -- dann urteilt der Test auf eine Schwelle, die die
+# Maschine gar nicht hergibt. Gemessen: im vollen `make test` (Maschine
+# belastet) kam der Boden als 46 us heraus und die Leiter scheiterte mit
+# 258 us; auf dem CI-Laeufer (sehr ruhig) als 1 us und sie scheiterte mit
+# 4 us. Beide Male war nicht der Code das Thema, sondern die Schaetzung.
+#
+# Der Quartilsabstand nutzt alle Proben und ist gegen einzelne Ausreisser
+# robust -- dasselbe Argument wie beim Median gegen den Mittelwert.
+streuung() { sort -n | awk '{v[NR]=$1} END {
+  if (NR < 4) { print 0; exit }
+  q1 = v[int(NR/4)+1]; q3 = v[int(3*NR/4)]
+  d = q3 - q1; if (d < 0) d = -d; print d }'; }
+
+schwelle() { # boden, median
+  local s3=$(( $1 * 3 ))
+  local rel=$(( $2 / 1000 ))
+  if [ "$rel" -gt "$s3" ]; then echo "$rel"; else echo "$s3"; fi
+}
 spalte() { awk -v f="$1" '{for (i=1;i<NF;i++) if ($i==f) print $(i+1)}' "$2"; }
 
 lauf() { # wdh -> $TMP/mess.txt
   sed -e "s/WDHMARKER/$1/" -e "s/PROBENMARKER/$PROBEN/" \
-      -e "s|RSA1MARKER|$RSA1|" -e "s|RSA2MARKER|$RSA2|" "$TMP/ct.lyx" > "$TMP/run.lyx"
+      -e "s|RSA1MARKER|$RSA1|" "$TMP/ct.lyx" > "$TMP/run.lyx"
   ( cd "$ROOT" && "$LYXC" "$TMP/run.lyx" --std-path="$ROOT" -o "$TMP/ct" ) > "$TMP/bau.log" 2>&1 || return 1
   $BIND "$TMP/ct" > "$TMP/mess.txt" 2>&1 || return 1
   return 0
@@ -252,6 +301,8 @@ while [ "$versuch" -le 3 ]; do
   ME="$(spalte leiter_eins  "$TMP/mess.txt" | median)"
   MV2="$(spalte leiter_voll2 "$TMP/mess.txt" | median)"
   BODEN=$(( MV > MV2 ? MV - MV2 : MV2 - MV ))
+  SV="$(spalte leiter_voll "$TMP/mess.txt" | streuung)"
+  [ "${SV:-0}" -gt "$BODEN" ] && BODEN="$SV"
   [ "$BODEN" -eq 0 ] && BODEN=1
   if [ $(( MV / BODEN )) -ge 10 ]; then break; fi
   WDH=$(( WDH * 4 )); versuch=$(( versuch + 1 ))
@@ -262,8 +313,11 @@ done
 MV="$(spalte leiter_voll  "$TMP/mess.txt" | median)"
 ME="$(spalte leiter_eins  "$TMP/mess.txt" | median)"
 MV2="$(spalte leiter_voll2 "$TMP/mess.txt" | median)"
-BODEN=$(( MV > MV2 ? MV - MV2 : MV2 - MV )); [ "$BODEN" -eq 0 ] && BODEN=1
-SCHWELLE=$(( BODEN * 3 ))
+BODEN=$(( MV > MV2 ? MV - MV2 : MV2 - MV ))
+SV="$(spalte leiter_voll "$TMP/mess.txt" | streuung)"
+[ "${SV:-0}" -gt "$BODEN" ] && BODEN="$SV"
+[ "$BODEN" -eq 0 ] && BODEN=1
+SCHWELLE="$(schwelle "$BODEN" "$MV")"
 UNTERSCHIED=$(( MV > ME ? MV - ME : ME - MV ))
 echo "    Leiter: voll=$MV eins=$ME voll2=$MV2 -> Rauschboden $BODEN us, Schwelle $SCHWELLE us, Unterschied $UNTERSCHIED us"
 if [ "$UNTERSCHIED" -le "$SCHWELLE" ]; then
@@ -276,10 +330,13 @@ fi
 LV="$(spalte leck_voll  "$TMP/mess.txt" | median)"
 LE="$(spalte leck_eins  "$TMP/mess.txt" | median)"
 LV2="$(spalte leck_voll2 "$TMP/mess.txt" | median)"
-LBODEN=$(( LV > LV2 ? LV - LV2 : LV2 - LV )); [ "$LBODEN" -eq 0 ] && LBODEN=1
+LBODEN=$(( LV > LV2 ? LV - LV2 : LV2 - LV ))
+LSV="$(spalte leck_voll "$TMP/mess.txt" | streuung)"
+[ "${LSV:-0}" -gt "$LBODEN" ] && LBODEN="$LSV"
+[ "$LBODEN" -eq 0 ] && LBODEN=1
 LUNTER=$(( LV > LE ? LV - LE : LE - LV ))
 echo "    Gegenprobe: voll=$LV eins=$LE voll2=$LV2 -> Rauschboden $LBODEN us, Unterschied $LUNTER us"
-if [ "$LUNTER" -gt $(( LBODEN * 3 )) ]; then
+if [ "$LUNTER" -gt "$(schwelle "$LBODEN" "$LV")" ]; then
   pr ok "Gegenprobe: das Geschirr findet eine bitabhaengige Laufzeit ($LUNTER us)"
 else
   pr fail "Gegenprobe: eine ABSICHTLICH undichte Routine fiel nicht auf -- der Test belegt nichts"
@@ -289,13 +346,17 @@ fi
 EA="$(spalte ecdsa_a  "$TMP/mess.txt" | median)"
 EB="$(spalte ecdsa_b  "$TMP/mess.txt" | median)"
 EA2="$(spalte ecdsa_a2 "$TMP/mess.txt" | median)"
-EBODEN=$(( EA > EA2 ? EA - EA2 : EA2 - EA )); [ "$EBODEN" -eq 0 ] && EBODEN=1
+EBODEN=$(( EA > EA2 ? EA - EA2 : EA2 - EA ))
+ESV="$(spalte ecdsa_a "$TMP/mess.txt" | streuung)"
+[ "${ESV:-0}" -gt "$EBODEN" ] && EBODEN="$ESV"
+[ "$EBODEN" -eq 0 ] && EBODEN=1
 EUNTER=$(( EA > EB ? EA - EB : EB - EA ))
 echo "    EcdsaSign: a=$EA b=$EB a2=$EA2 -> Rauschboden $EBODEN us, Unterschied $EUNTER us"
-if [ "$EUNTER" -le $(( EBODEN * 3 )) ]; then
-  pr ok "EcdsaSign: Laufzeit unabhaengig vom Schluessel ($EUNTER us <= $(( EBODEN * 3 )) us)"
+ESCHW="$(schwelle "$EBODEN" "$EA")"
+if [ "$EUNTER" -le "$ESCHW" ]; then
+  pr ok "EcdsaSign: Laufzeit unabhaengig vom Schluessel ($EUNTER us <= $ESCHW us)"
 else
-  pr fail "EcdsaSign: Laufzeit haengt am Schluessel ($EUNTER us > $(( EBODEN * 3 )) us)"
+  pr fail "EcdsaSign: Laufzeit haengt am Schluessel ($EUNTER us > $ESCHW us)"
 fi
 
 # RSA: zwei Schluessel, nur wenn openssl sie geliefert hat.
@@ -303,13 +364,17 @@ if grep -q "^rsa_da 1" "$TMP/mess.txt"; then
   RA="$(spalte rsa_a  "$TMP/mess.txt" | median)"
   RB="$(spalte rsa_b  "$TMP/mess.txt" | median)"
   RA2="$(spalte rsa_a2 "$TMP/mess.txt" | median)"
-  RBODEN=$(( RA > RA2 ? RA - RA2 : RA2 - RA )); [ "$RBODEN" -eq 0 ] && RBODEN=1
+  RBODEN=$(( RA > RA2 ? RA - RA2 : RA2 - RA ))
+  RSV="$(spalte rsa_a "$TMP/mess.txt" | streuung)"
+  [ "${RSV:-0}" -gt "$RBODEN" ] && RBODEN="$RSV"
+  [ "$RBODEN" -eq 0 ] && RBODEN=1
   RUNTER=$(( RA > RB ? RA - RB : RB - RA ))
   echo "    RsaSignPkcs1: a=$RA b=$RB a2=$RA2 -> Rauschboden $RBODEN us, Unterschied $RUNTER us"
-  if [ "$RUNTER" -le $(( RBODEN * 3 )) ]; then
-    pr ok "RsaSignPkcs1: Laufzeit unabhaengig vom privaten Schluessel ($RUNTER us)"
+  RSCHW="$(schwelle "$RBODEN" "$RA")"
+  if [ "$RUNTER" -le "$RSCHW" ]; then
+    pr ok "RsaSignPkcs1: Laufzeit unabhaengig von der Nachricht ($RUNTER us <= $RSCHW us)"
   else
-    pr fail "RsaSignPkcs1: Laufzeit haengt am privaten Schluessel ($RUNTER us > $(( RBODEN * 3 )) us)"
+    pr fail "RsaSignPkcs1: Laufzeit haengt an der Nachricht ($RUNTER us > $RSCHW us)"
   fi
 else
   echo "    (SKIP RSA: kein Schluesselpaar -- openssl fehlt oder erzeugt keines)"
