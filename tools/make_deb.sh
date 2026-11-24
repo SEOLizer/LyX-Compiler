@@ -294,6 +294,23 @@ grep -q '^Recommends:.*lyx-lpm' "$CONTROL" \
 
 echo "control: Version $VERSION, Architecture $ARCH"
 
+# ── 4b. Maintainer-Skripte (#2633) ───────────────────────────────────────────
+# preinst/postinst retten einen lokal gebauten Unit-Baum ueber das Auspacken.
+# Ohne sie raeumt dpkg beim Hochruesten weg, was ein frueheres Paket geliefert
+# hat und dieses nicht mehr liefert -- so verschwand units/lyxos und legte
+# jeden --target=lyxos-Bau still. Die Pruefung steht hier und nicht nur im
+# Testlauf, weil ein Paket ohne diese Skripte den Befund wieder einfuehrt und
+# das erst beim Benutzer auffaellt.
+for skript in preinst postinst; do
+  f="$PKG_DIR/DEBIAN/$skript"
+  [ -f "$f" ] || fehler "$f fehlt — ohne $skript loescht das Hochruesten lokal
+        gebaute Unit-Baeume (#2633). lyx-compiler/DEBIAN/$skript gehoert ins Repo."
+  sh -n "$f" || fehler "$f ist syntaktisch fehlerhaft — dpkg bricht damit die
+        Installation ab, und zwar nach dem Auspacken."
+  chmod 755 "$f"
+done
+echo "  preinst/postinst: Unit-Baeume ueberleben das Hochruesten (#2633)"
+
 # ── 5. Bauen ─────────────────────────────────────────────────────────────────
 mkdir -p "$OUTDIR"
 dpkg-deb --root-owner-group --build "$PKG_DIR" "$DEB"
@@ -304,6 +321,18 @@ if [ "$VERIFY" -eq 1 ]; then
   # Ein Feld je Aufruf: bei mehreren stellt dpkg-deb den Feldnamen voran.
   got_p="$(dpkg-deb --field "$DEB" Package)"
   [ "$got_p" = "$PKGNAME" ] || fehler "Paket heisst '$got_p', control sagt '$PKGNAME'."
+  # #2633: liegen die Maintainer-Skripte im fertigen Paket, und ausfuehrbar?
+  # "Im Baum vorhanden" ist keine Aussage ueber "im Paket enthalten".
+  ctrl="$(dpkg-deb --ctrl-tarfile "$DEB" | tar -tvf - 2>/dev/null)"
+  for skript in preinst postinst; do
+    zeile="$(printf '%s\n' "$ctrl" | grep -E "[[:space:]]\./$skript$" || true)"
+    [ -n "$zeile" ] || fehler "$skript liegt nicht im fertigen Paket (#2633)."
+    case "$zeile" in
+      -rwxr-xr-x*) ;;
+      *) fehler "$skript im Paket ist nicht 755: $zeile" ;;
+    esac
+  done
+  echo "  preinst/postinst liegen ausfuehrbar im Paket."
   got_v="$(dpkg-deb --field "$DEB" Version)"
   got_a="$(dpkg-deb --field "$DEB" Architecture)"
   [ "$got_v" = "$VERSION" ] || fehler "Paket meldet Version '$got_v', erwartet '$VERSION'."

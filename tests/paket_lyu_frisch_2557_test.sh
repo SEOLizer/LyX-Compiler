@@ -91,7 +91,13 @@ fi
 if [ "$alt" -eq 0 ]; then
   pr ok "keine veraltete .lyu in der Stichprobe"
 else
-  pr no "$alt von $geprueft Vorkompilaten sind veraltet -- 'make units-baeume' fahren und das Ergebnis einchecken"
+  # #2622: Bis dahin stand hier nur "'make units-baeume' fahren und das
+  # Ergebnis einchecken". Das war NICHT ausreichend, solange die Musterregel
+  # die Importe nicht kannte -- genau das war getan worden, und der Baum blieb
+  # gemischt. Seit build/unit_deps.mk die Huelle nachtraegt, genuegt der Lauf;
+  # fuehrt er nicht zum Ziel, fehlt die Abhaengigkeitsdatei.
+  pr no "$alt von $geprueft Vorkompilaten sind veraltet -- 'make units-baeume' fahren und das Ergebnis einchecken.
+       Bleibt der Baum danach gemischt, fehlt build/unit_deps.mk (#2622): 'bash tools/unit_deps.sh' muss durchlaufen."
 fi
 
 echo "--- Der Vergleich muss einen Unterschied auch FINDEN ---"
