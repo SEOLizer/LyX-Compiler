@@ -477,6 +477,14 @@ test: lyxc
 	@bash tests/aes_ni_test.sh
 	@echo "--- GHASH mit PCLMULQDQ, AES-NI in AES-GCM, beide Wege gleich (#2390) ---"
 	@bash tests/ghash_pclmul_2390_test.sh
+	@echo "--- MD4 (RFC 1320) und NT-Hash, mit Gegenprobe (#2638) ---"
+	@bash tests/md4_2638_test.sh
+	@echo "--- HMAC ueber MD4/MD5/SHA-1/SHA-2, RFC 2202 und 4231 (#2638) ---"
+	@bash tests/hmac_generisch_2638_test.sh
+	@echo "--- AES-CMAC (RFC 4493) und SP-800-108-Ableitung, beide Wege gleich (#2638) ---"
+	@bash tests/aes_cmac_2638_test.sh
+	@echo "--- AES-CCM (RFC 3610), alle 12 Pakete, jedes Bit gekippt (#2638) ---"
+	@bash tests/aes_ccm_2638_test.sh
 	@echo "--- SHA-NI-Schnellweg fuer SHA-256, beide Wege gleich (#2391) ---"
 	@bash tests/sha_ni_2391_test.sh
 	@echo "--- fma mit einer Rundung, Hardware und exakter Rueckfall gegen libm (#2403) ---"

@@ -1,0 +1,266 @@
+// std/crypto/aesccm.lyx — AES-CCM (RFC 3610 / NIST SP 800-38C)
+//
+// #2638: SMB 3.0 und 3.0.2 verschluesseln mit AES-128-CCM. SMB 3.1.1 nutzt
+// GCM (std/crypto/aesgcm.lyx) — CCM ist noetig fuer Gegenstellen, die auf der
+// aelteren Fassung stehen bleiben.
+//
+// CCM ist CTR zur Verschluesselung plus CBC-MAC zur Authentisierung, beide
+// mit demselben Schluessel; die Trennung macht die Formatierung der ersten
+// Bloecke (RFC 3610 Abschnitt 2.2 und 2.3).
+//
+// Oeffentliche API:
+//   AesCcmSeal(key, keyLen, nonce, nonceLen, aad, aadLen,
+//              pt, ptLen, ct, tag, tagLen): int64
+//   AesCcmOpen(key, keyLen, nonce, nonceLen, aad, aadLen,
+//              ct, ctLen, tag, tagLen, pt): int64
+//       1 bei Erfolg, 0 bei Abweisung oder unzulaessigen Parametern.
+//
+// Zulaessig: keyLen 16 oder 32; nonceLen 7..13 (L = 15 - nonceLen);
+// tagLen 4, 6, 8, 10, 12, 14 oder 16. Jeder andere Wert wird ABGEWIESEN, nie
+// still zurechtgebogen — ein zu kurzes Tag ist eine Faelschungsmoeglichkeit,
+// kein Standardfall. ptLen muss in L Byte darstellbar sein.
+//
+// AesCcmOpen rechnet das Tag ueber den entschluesselten Klartext neu, prueft
+// ohne Datenabhaengigkeit der Laufzeit (CTMemEqual) und gibt bei falschem Tag
+// KEINEN Klartext heraus: der Klartext entsteht in einem eigenen Puffer und
+// wird nur nach bestandener Pruefung hinausgeschrieben (Release of Unverified
+// Plaintext, siehe aesgcm.lyx).
+//
+// Pruefvektoren: RFC 3610 Abschnitt 8 (Pakete 1..12),
+// ausgefuehrt in tests/aes_ccm_2638_test.sh.
+
+unit std.crypto.aesccm;
+
+import std.alloc;
+import std.crypto.aescore;
+import std.crypto.ct;
+
+fn ccmTagLenOk(t: int64): int64 {
+    if (t == 4 || t == 6 || t == 8 || t == 10) { return 1; }
+    if (t == 12 || t == 14 || t == 16) { return 1; }
+    return 0;
+}
+
+// Laenge in genau n Byte big-endian schreiben; 0, wenn der Wert nicht passt.
+fn ccmSchreibeBE(p: int64, n: int64, wert: int64): int64 {
+    if (wert < 0) { return 0; }
+    if (n < 8) {
+        // 2^(8n) als Obergrenze; n ist 2..8, also kein Ueberlauf.
+        var grenze: int64 := 1 << (8 * n);
+        if (wert >= grenze) { return 0; }
+    }
+    var i: int64 := 0;
+    while (i < n) {
+        poke8(p + i, (wert >> (8 * (n - 1 - i))) & 0xFF);
+        i := i + 1;
+    }
+    return 1;
+}
+
+// Einen Block in den CBC-MAC einrechnen: X := AES_K(X ^ B)
+fn ccmMacBlock(x: int64, b: int64, rk: int64, rounds: int64): void {
+    var i: int64 := 0;
+    while (i < 16) { poke8(x + i, peek8(x + i) ^ peek8(b + i)); i := i + 1; }
+    AesCoreEncBlock(x, rk, rounds);
+}
+
+// Daten blockweise einrechnen, letzter Teilblock mit Nullen aufgefuellt.
+fn ccmMacDaten(x: int64, data: int64, len: int64, rk: int64, rounds: int64): void {
+    var blk: int64 := alloc(16);
+    if (blk == 0) { panic("AES-CCM: kein Speicher"); }
+    var pos: int64 := 0;
+    while (pos < len) {
+        var nimm: int64 := len - pos;
+        if (nimm > 16) { nimm := 16; }
+        var i: int64 := 0;
+        while (i < 16) { poke8(blk + i, 0); i := i + 1; }
+        i := 0;
+        while (i < nimm) { poke8(blk + i, peek8(data + pos + i)); i := i + 1; }
+        ccmMacBlock(x, blk, rk, rounds);
+        pos := pos + nimm;
+    }
+    SecureZero(blk, 16);
+    free(blk, 16);
+}
+
+// Zaehlerblock A_i aufbauen (RFC 3610 Abschnitt 2.3).
+fn ccmCtrBlock(a: int64, nonce: int64, nonceLen: int64, l: int64, i: int64): void {
+    poke8(a, l - 1);
+    var k: int64 := 0;
+    while (k < nonceLen) { poke8(a + 1 + k, peek8(nonce + k)); k := k + 1; }
+    k := 0;
+    while (k < l) {
+        poke8(a + 1 + nonceLen + k, (i >> (8 * (l - 1 - k))) & 0xFF);
+        k := k + 1;
+    }
+}
+
+// Gemeinsamer Rumpf: rechnet T (tagLen Byte nach tagOut) und verschluesselt
+// bzw. entschluesselt inLen Byte von in nach out. richtung = 1 bedeutet
+// "in ist Klartext" (das Tag entsteht vor der Verschluesselung), richtung = 0
+// bedeutet "out ist der Klartext" (das Tag entsteht nach der Entschluesselung).
+fn ccmKern(key: int64, keyLen: int64, nonce: int64, nonceLen: int64,
+           aad: int64, aadLen: int64, eing: int64, inLen: int64,
+           ausg: int64, tagOut: int64, tagLen: int64, richtung: int64): int64 {
+    if (keyLen != 16 && keyLen != 32) { return 0; }
+    if (nonceLen < 7 || nonceLen > 13) { return 0; }
+    if (ccmTagLenOk(tagLen) == 0) { return 0; }
+    if (inLen < 0 || aadLen < 0) { return 0; }
+
+    var l: int64 := 15 - nonceLen;
+
+    var rk: int64 := alloc(240);
+    if (rk == 0) { return 0; }
+    var rounds: int64 := AesCoreKeyExpand(key, keyLen, rk);
+    if (rounds == 0) { free(rk, 240); return 0; }
+
+    var b0: int64 := alloc(16);
+    var x:  int64 := alloc(16);
+    var a:  int64 := alloc(16);
+    var s:  int64 := alloc(16);
+    if (b0 == 0 || x == 0 || a == 0 || s == 0) { free(rk, 240); return 0; }
+
+    // --- B_0: Flags || Nonce || l(m) ---
+    var flags: int64 := ((tagLen - 2) / 2) * 8 + (l - 1);
+    if (aadLen > 0) { flags := flags + 64; }
+    poke8(b0, flags);
+    var i: int64 := 0;
+    while (i < nonceLen) { poke8(b0 + 1 + i, peek8(nonce + i)); i := i + 1; }
+    if (ccmSchreibeBE(b0 + 1 + nonceLen, l, inLen) == 0) {
+        // Nachricht passt nicht in L Byte — abweisen, nicht kuerzen.
+        SecureZero(rk, 240);
+        free(rk, 240); free(b0, 16); free(x, 16); free(a, 16); free(s, 16);
+        return 0;
+    }
+
+    i := 0;
+    while (i < 16) { poke8(x + i, 0); i := i + 1; }
+    ccmMacBlock(x, b0, rk, rounds);
+
+    // --- AAD: Laengenpraefix, Daten, auf Blockgrenze genullt ---
+    if (aadLen > 0) {
+        var kopf: int64 := alloc(10);
+        if (kopf == 0) { free(rk, 240); return 0; }
+        var kopfLen: int64 := 0;
+        if (aadLen < 65280) {                     // 2^16 - 2^8
+            poke8(kopf,     (aadLen >> 8) & 0xFF);
+            poke8(kopf + 1,  aadLen       & 0xFF);
+            kopfLen := 2;
+        } else {
+            if (aadLen < 4294967296) {            // 2^32
+                poke8(kopf, 0xFF); poke8(kopf + 1, 0xFE);
+                ccmSchreibeBE(kopf + 2, 4, aadLen);
+                kopfLen := 6;
+            } else {
+                poke8(kopf, 0xFF); poke8(kopf + 1, 0xFF);
+                ccmSchreibeBE(kopf + 2, 8, aadLen);
+                kopfLen := 10;
+            }
+        }
+        // Kopf und AAD sind EIN Datenstrom: der erste Block enthaelt beides.
+        var ges: int64 := kopfLen + aadLen;
+        var puf: int64 := alloc(ges);
+        if (puf == 0) { free(kopf, 10); free(rk, 240); return 0; }
+        i := 0;
+        while (i < kopfLen) { poke8(puf + i, peek8(kopf + i)); i := i + 1; }
+        i := 0;
+        while (i < aadLen) { poke8(puf + kopfLen + i, peek8(aad + i)); i := i + 1; }
+        ccmMacDaten(x, puf, ges, rk, rounds);
+        free(puf, ges);
+        free(kopf, 10);
+    }
+
+    // --- Richtung 0 (Oeffnen): erst entschluesseln, dann MAC ueber Klartext ---
+    // Richtung 1 (Siegeln): erst MAC ueber Klartext, dann verschluesseln.
+    if (richtung != 0) {
+        ccmMacDaten(x, eing, inLen, rk, rounds);
+    }
+
+    // CTR ab i = 1 ueber die Nutzdaten
+    var pos: int64 := 0;
+    var zaehler: int64 := 1;
+    while (pos < inLen) {
+        ccmCtrBlock(a, nonce, nonceLen, l, zaehler);
+        i := 0;
+        while (i < 16) { poke8(s + i, peek8(a + i)); i := i + 1; }
+        AesCoreEncBlock(s, rk, rounds);
+        var nimm: int64 := inLen - pos;
+        if (nimm > 16) { nimm := 16; }
+        i := 0;
+        while (i < nimm) {
+            poke8(ausg + pos + i, peek8(eing + pos + i) ^ peek8(s + i));
+            i := i + 1;
+        }
+        pos := pos + nimm;
+        zaehler := zaehler + 1;
+    }
+
+    if (richtung == 0) {
+        ccmMacDaten(x, ausg, inLen, rk, rounds);
+    }
+
+    // T = erste tagLen Byte von X ^ S_0
+    ccmCtrBlock(a, nonce, nonceLen, l, 0);
+    i := 0;
+    while (i < 16) { poke8(s + i, peek8(a + i)); i := i + 1; }
+    AesCoreEncBlock(s, rk, rounds);
+    i := 0;
+    while (i < tagLen) { poke8(tagOut + i, peek8(x + i) ^ peek8(s + i)); i := i + 1; }
+
+    SecureZero(rk, 240);
+    SecureZero(x, 16);
+    SecureZero(s, 16);
+    SecureZero(b0, 16);
+    free(rk, 240);
+    free(b0, 16);
+    free(x, 16);
+    free(a, 16);
+    free(s, 16);
+    return 1;
+}
+
+pub fn AesCcmSeal(key: int64, keyLen: int64, nonce: int64, nonceLen: int64,
+                  aad: int64, aadLen: int64, pt: int64, ptLen: int64,
+                  ct: int64, tag: int64, tagLen: int64): int64 {
+    return ccmKern(key, keyLen, nonce, nonceLen, aad, aadLen,
+                   pt, ptLen, ct, tag, tagLen, 1);
+}
+
+pub fn AesCcmOpen(key: int64, keyLen: int64, nonce: int64, nonceLen: int64,
+                  aad: int64, aadLen: int64, ct: int64, ctLen: int64,
+                  tag: int64, tagLen: int64, pt: int64): int64 {
+    if (ccmTagLenOk(tagLen) == 0) { return 0; }
+    if (ctLen < 0) { return 0; }
+
+    // Der Klartext entsteht in einem eigenen Puffer. Erst wenn das Tag
+    // stimmt, wird er nach pt kopiert — eine abgewiesene Entschluesselung
+    // gibt kein einziges Klartextbyte heraus.
+    var roh: int64 := alloc(ctLen + 1);
+    var eigen: int64 := alloc(16);
+    if (roh == 0 || eigen == 0) { return 0; }
+
+    if (ccmKern(key, keyLen, nonce, nonceLen, aad, aadLen,
+                ct, ctLen, roh, eigen, tagLen, 0) == 0) {
+        SecureZero(roh, ctLen + 1);
+        free(roh, ctLen + 1);
+        free(eigen, 16);
+        return 0;
+    }
+
+    var gleich: int64 := CTMemEqual(eigen, tag, tagLen);   // -1 oder 0
+    if (gleich == 0) {
+        SecureZero(roh, ctLen + 1);
+        free(roh, ctLen + 1);
+        SecureZero(eigen, 16);
+        free(eigen, 16);
+        return 0;
+    }
+
+    var i: int64 := 0;
+    while (i < ctLen) { poke8(pt + i, peek8(roh + i)); i := i + 1; }
+    SecureZero(roh, ctLen + 1);
+    free(roh, ctLen + 1);
+    SecureZero(eigen, 16);
+    free(eigen, 16);
+    return 1;
+}
