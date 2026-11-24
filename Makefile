@@ -21,8 +21,8 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.47B
-VERSION_DATE := 2026-11-23
+VERSION   := 1.2.48A
+VERSION_DATE := 2026-11-24
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
 # #2499: Die Vorkompilate liegen je Architektur. Sobald eine .lyu Maschinencode
@@ -1708,7 +1708,16 @@ test-geraet: lyxc
 .PHONY: test-lyxos-abgleich
 test-lyxos-abgleich:
 	@echo "=== Syscall-Abgleich gegen das LyxOS-Repo (#1795, #2635) ==="
-	@bash tools/lyxos_syscall_abgleich.sh
+	@# rc 2 = LyxOS-Repo nicht lesbar. Auf dem CI-Laeufer ist das der Normalfall,
+	@# und ein roter Test aus Umgebungsgruenden sagt nichts ueber den Code --
+	@# deshalb SKIP. rc 1 (Abweichung) bleibt rot: dann ist der abgelegte Stand
+	@# wirklich hinterher. LYXOS_REPO setzen, um ihn hier zu pruefen.
+	@bash tools/lyxos_syscall_abgleich.sh; rc=$$?; \
+	if [ "$$rc" = "2" ]; then \
+	  echo "SKIP: LyxOS-Repo nicht da (LYXOS_REPO setzen) -- nichts zu vergleichen."; \
+	  exit 0; \
+	fi; \
+	exit $$rc
 
 .PHONY: test-lyxos-units
 test-lyxos-units: lyxc
