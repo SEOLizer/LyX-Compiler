@@ -1690,6 +1690,20 @@ test-geraet: lyxc
 
 # LyxOS-Tests aus tests/ (nicht tests/lyxos/ -- dafuer gibt es `test-lyxos`).
 # Nur uebersetzen, der erzeugte Code laeuft nicht auf dem Buildhost.
+# #2635: Der Abgleich gegen das LyxOS-Repo hat sein EIGENES Ziel, weil er ueber
+# einen fremden Arbeitsstand urteilt. In `make test` ist die Abweichung eine
+# laute Nachricht (tests/lyxos_syscall_ist_test.sh) -- dort ist sie kein Befund
+# ueber diesen Baum, und als Fehlschlag verdeckte sie die rund 600 Pruefungen
+# hinter ihrer Rezeptzeile. Hier ist sie die einzige Pruefung und verdeckt
+# nichts, also darf sie rot werden.
+#
+# Gehoert in den Nachweis, sobald das Kernelteam Syscalls landet; der Weg zum
+# Gruen steht in der Meldung des Werkzeugs.
+.PHONY: test-lyxos-abgleich
+test-lyxos-abgleich:
+	@echo "=== Syscall-Abgleich gegen das LyxOS-Repo (#1795, #2635) ==="
+	@bash tools/lyxos_syscall_abgleich.sh
+
 .PHONY: test-lyxos-units
 test-lyxos-units: lyxc
 	@fail=0; n=0; rot=0; auferstanden=""; \
