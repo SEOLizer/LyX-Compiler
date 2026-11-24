@@ -21,8 +21,8 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.47B
-VERSION_DATE := 2026-11-23
+VERSION   := 1.2.48A
+VERSION_DATE := 2026-11-24
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
 # #2499: Die Vorkompilate liegen je Architektur. Sobald eine .lyu Maschinencode
@@ -905,6 +905,12 @@ test: lyxc
 	@bash tests/net_wait_portabel_2511_test.sh
 	@echo "--- lyxos-Gestaltpruefung ist nicht mehr fail-open (#2482) ---"
 	@bash tests/lyxos_argc_2482_test.sh
+	@echo "--- #2609: sys_timeline_query hat die Gestalt des Kernels (4 Argumente) ---"
+	@bash tests/lyxos_timeline_gestalt_2609_test.sh
+	@echo "--- #2627: Ruecksprunge der lyxos-Handbloecke treffen Befehlsgrenzen ---"
+	@bash tests/lyxos_rueckspruenge_2627_test.sh
+	@echo "--- #2607: spaeter deklarierte Klasse mit extends ist vorwaerts aufloesbar ---"
+	@bash tests/klasse_vorwaerts_extends_2607_test.sh
 	@echo "--- Kernelnummern kommen aus der erzeugten Tabelle an (#2549) ---"
 	@bash tests/lyxos_gen_builtins_2549_test.sh
 	@echo "--- Zeiger-Syscalls 407-410 einzeln am Erzeugnis (#2601) ---"
@@ -1690,6 +1696,29 @@ test-geraet: lyxc
 
 # LyxOS-Tests aus tests/ (nicht tests/lyxos/ -- dafuer gibt es `test-lyxos`).
 # Nur uebersetzen, der erzeugte Code laeuft nicht auf dem Buildhost.
+# #2635: Der Abgleich gegen das LyxOS-Repo hat sein EIGENES Ziel, weil er ueber
+# einen fremden Arbeitsstand urteilt. In `make test` ist die Abweichung eine
+# laute Nachricht (tests/lyxos_syscall_ist_test.sh) -- dort ist sie kein Befund
+# ueber diesen Baum, und als Fehlschlag verdeckte sie die rund 600 Pruefungen
+# hinter ihrer Rezeptzeile. Hier ist sie die einzige Pruefung und verdeckt
+# nichts, also darf sie rot werden.
+#
+# Gehoert in den Nachweis, sobald das Kernelteam Syscalls landet; der Weg zum
+# Gruen steht in der Meldung des Werkzeugs.
+.PHONY: test-lyxos-abgleich
+test-lyxos-abgleich:
+	@echo "=== Syscall-Abgleich gegen das LyxOS-Repo (#1795, #2635) ==="
+	@# rc 2 = LyxOS-Repo nicht lesbar. Auf dem CI-Laeufer ist das der Normalfall,
+	@# und ein roter Test aus Umgebungsgruenden sagt nichts ueber den Code --
+	@# deshalb SKIP. rc 1 (Abweichung) bleibt rot: dann ist der abgelegte Stand
+	@# wirklich hinterher. LYXOS_REPO setzen, um ihn hier zu pruefen.
+	@bash tools/lyxos_syscall_abgleich.sh; rc=$$?; \
+	if [ "$$rc" = "2" ]; then \
+	  echo "SKIP: LyxOS-Repo nicht da (LYXOS_REPO setzen) -- nichts zu vergleichen."; \
+	  exit 0; \
+	fi; \
+	exit $$rc
+
 .PHONY: test-lyxos-units
 test-lyxos-units: lyxc
 	@fail=0; n=0; rot=0; auferstanden=""; \

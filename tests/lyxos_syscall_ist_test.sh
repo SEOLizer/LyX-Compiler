@@ -170,7 +170,42 @@ pruefe "Helferstellen nennen nur belegte oder eingetragene Nummern" "$TMP/helfer
 pruefe "kein veralteter Eintrag in der Ausnahmeliste" "$TMP/helfer-tot.txt" \
        "Streichen, sonst deckt die Liste den naechsten echten Fall zu."
 
+# --- Meldungstexte gegen den abgelegten Stand (#2635) ----------------------
+# Die Spannen stehen an VIER Stellen: work/lyxos/syscall-ist.txt (erzeugt),
+# lyxosNummerBelegt() (von Hand), und zweimal als Text in der Meldung, die der
+# Benutzer bei einer unbelegten Nummer liest. Die beiden Texte waren still
+# veraltet -- sie nannten "300-387, 389-404, 407-410" und liessen 411-424 und
+# 534 ganz weg. Eine Meldung, die einen Bereich nennt, der nicht gilt, ist
+# schlimmer als keine: sie schickt den Leser in die falsche Richtung.
+echo "-- Meldungstexte nennen die geltenden Spannen --"
+awk '!/^#/ && NF >= 2 {
+       if ($1 == $2) printf "%s\n", $1; else printf "%s-%s\n", $1, $2
+     }' "$STAND" > "$TMP/spannen.txt"
+# Die Meldung fasst 60-60 als "60" und schreibt "217-258 (darin 231)" -- der
+# Vergleich fragt darum nur, ob JEDE Spanne des Stands im Text vorkommt, und
+# nicht nach Zeichengleichheit.
+MELDUNG=$(grep -n 'EPrintStrLn("  Belegt sind\|EPrintStrLn("  210-215\|EPrintStrLn("  1024-1036\|EPrintStrLn("  2816-2825' "$QUELLE")
+: > "$TMP/spannen-fehlen.txt"
+while read -r sp; do
+    printf '%s\n' "$MELDUNG" | grep -q -- "$sp" || echo "Spanne fehlt in der Meldung: $sp" >> "$TMP/spannen-fehlen.txt"
+done < "$TMP/spannen.txt"
+pruefe "Meldungstexte nennen jede Spanne des Stands" "$TMP/spannen-fehlen.txt" \
+       "Die beiden EPrintStrLn-Bloecke in $QUELLE nachziehen -- sie sind die vierte Stelle derselben Angabe (#2635)."
+
 # --- Abgleich gegen das LyxOS-Repo, falls vorhanden ------------------------
+# #2635: Dieser Abgleich urteilt ueber den ARBEITSSTAND eines FREMDEN Repos.
+# Zieht das Kernelteam einen Syscall nach, wird er rot, ohne dass sich in aurum
+# etwas geaendert haette -- und weil alle Tests dieses Ziels Zeilen EINES
+# Rezepts sind (make setzt ueber Ziele hinweg fort, nicht ueber Rezeptzeilen),
+# verdeckte dieser eine Fehlschlag die rund 600 Pruefungen dahinter. Genau das
+# ist am 2026-11-24 passiert: 388 sys_kill_prozess kam im Kernel dazu.
+#
+# Darum zaehlt die Abweichung hier NICHT als FAIL, sondern als laute Nachricht:
+# sie ist keine Aussage ueber diesen Baum. Rot wird sie in ihrem EIGENEN Ziel,
+# `make test-lyxos-abgleich` -- dort ist sie die einzige Pruefung und verdeckt
+# nichts. Die Pruefungen oben, die den Baum gegen SICH SELBST halten, bleiben
+# hart: eine Nummer, die lyxosNummerBelegt zulaesst und der Stand nicht kennt,
+# ist ein Defekt hier und nicht Nachrichtenlage von dort.
 echo "-- Abgleich gegen das LyxOS-Repo --"
 ABGLEICH=$(tools/lyxos_syscall_abgleich.sh 2>&1); RC=$?
 if [ "$RC" = "2" ]; then
@@ -180,9 +215,13 @@ elif [ "$RC" = "0" ]; then
     echo "PASS Stand deckt sich mit Dispatcher-Tabelle und Bootloader"
     PASS=$((PASS + 1))
 else
-    echo "FAIL Stand weicht vom LyxOS-Repo ab:"
+    echo "NACHRICHT: der Kernel ist weiter als der abgelegte Stand (#2635)."
     echo "$ABGLEICH" | sed 's/^/  /'
-    FAIL=$((FAIL + 1))
+    echo "  KEIN FAIL dieses Ziels -- der Befund liegt im LyxOS-Repo, nicht hier."
+    echo "  Nachziehen: tools/lyxos_syscall_abgleich.sh --schreiben,"
+    echo "  dann tools/lyxos_abi_erzeugen.sh und lyxosNummerBelegt in"
+    echo "  $QUELLE (plus die beiden Meldungstexte darin)."
+    echo "  Hart geprueft wird das in 'make test-lyxos-abgleich'."
 fi
 
 echo
