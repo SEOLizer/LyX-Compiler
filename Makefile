@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.49B
+VERSION   := 1.2.49C
 VERSION_DATE := 2026-11-25
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -924,6 +924,7 @@ test: lyxc
 	@bash tests/lyxos_rueckspruenge_2627_test.sh
 	@echo "--- #2607: spaeter deklarierte Klasse mit extends ist vorwaerts aufloesbar ---"
 	@bash tests/klasse_vorwaerts_extends_2607_test.sh
+	@bash tests/zielbaum_fehlt_2634_test.sh
 	@echo "--- #2637: Print/PrintLn mit f64 auf allen Zielen, gleiche Ausgabe ---"
 	@bash tests/print_f64_ir_2637_test.sh
 	@echo "--- Kernelnummern kommen aus der erzeugten Tabelle an (#2549) ---"

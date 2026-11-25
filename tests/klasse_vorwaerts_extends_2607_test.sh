@@ -16,6 +16,16 @@
 # Eine methodenlose Klasse mit extends auf eine VMT-freie Basis fiel durch
 # beide Vorlaeufe und wurde erst im Hauptdurchlauf vermessen.
 #
+# #2650 (derselbe Fehlerklasse eine Ebene hoeher): dieselbe Form scheiterte
+# weiter, sobald die ELTERNKLASSE IMPORTIERT war -- auch mit Methoden, also
+# unabhaengig von der Luecke aus #2607. cg_prebuildClassLayouts ueberspringt
+# eine Klasse, deren Elternklasse nicht in der Registry steht; fuer eine Basis
+# in DERSELBEN Datei holt die naechste Runde sie nach, fuer eine importierte
+# war es eine Endlosbedingung, denn der Import lief NACH dem Vorlauf. Fix:
+# Importschleife vor cg_prebuildStructLayouts/-ClassLayouts (#2102 einen
+# Schritt weiter). Gemessen am Bestand: vega/extctrls.lyx (5457 Zeilen) war
+# nicht uebersetzbar und ist es jetzt.
+#
 # GEPRUEFT WIRD BEIDES: dass die Formen uebersetzen UND dass die Feldversaetze
 # dieselben bleiben. Ein Test, der nur "uebersetzt" prueft, waere auch von
 # einer Fassung erfuellt, die der Klasse ein Layout mit VMT-Platz gibt und
@@ -24,6 +34,7 @@ set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LYXC="${LYXC:-$ROOT/lyxc}"
 _g="$ROOT/tests/lib/lyxc_guard.sh"; [ -f "$_g" ] && . "$_g"   # #1294
+. "$(dirname "$0")/lib/qemu.sh"   # #2048: Emulatornamen EINMAL suchen
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 PASS=0; FAIL=0
 ulimit -c 0 2>/dev/null
@@ -114,6 +125,93 @@ if ( cd "$TMP/v" && "$LYXC" --std-path="$ROOT" -I . m.lyx -o "$TMP/v/p" ) >"$TMP
 else
   pr fail "Messprogramm uebersetzt nicht: $(grep -m1 -i error "$TMP/v/log")"
 fi
+
+# --- #2650: Elternklasse IMPORTIERT ---------------------------------------
+# Die Zutat, die #2607 nicht abdeckte, und die einzige, die zaehlt: alle fuenf
+# Nachbildungen zu #2640 hatten ihre Basis in DERSELBEN Unit und uebersetzten
+# fehlerfrei. Deshalb steht hier beides nebeneinander -- importiert (war rot)
+# und gleiche Unit (war gruen). Faellt die Gegenprobe aus, misst der Test die
+# Reihenfolge der Vorlaeufe nicht mehr.
+echo "--- #2650: Vorwaertsverweis mit IMPORTIERTER Elternklasse ---"
+mkdir -p "$TMP/i"
+cat > "$TMP/i/basis.lyx" <<'LYX'
+unit basis;
+pub type TControl = class { Platz: int64; fn Hm(): int64 { return 1; } };
+LYX
+cat > "$TMP/i/u.lyx" <<'LYX'
+unit u;
+import basis;
+pub type TFrueh = class extends TControl {
+  fn Setze(pc: TSpaet): int64 {
+    pc.Wert  := 7;
+    pc.Platz := 42;
+    return pc.Wert + pc.Platz;
+  }
+};
+pub type TSpaet = class extends TControl {
+  Wert: int64;
+  fn Nix(): int64 { return 0; }
+};
+LYX
+cat > "$TMP/i/m.lyx" <<'LYX'
+import std.io;
+import u;
+fn main(): int64 {
+  var s: TSpaet := new TSpaet();
+  var f: TFrueh := new TFrueh();
+  PrintLn(IntToStr(f.Setze(s)));
+  PrintLn(IntToStr(s.Wert));
+  PrintLn(IntToStr(s.Platz));
+  PrintLn(IntToStr(s.Hm()));
+  return 0;
+}
+LYX
+# Gegenprobe: dieselbe Datei, Basis in der eigenen Unit (ging schon vorher).
+sed -e 's/^import basis;$/pub type TControl = class { Platz: int64; fn Hm(): int64 { return 1; } };/' \
+    "$TMP/i/u.lyx" > "$TMP/i/u_eigen.lyx"
+
+imp_uebersetzt() { # name, unitdatei, [ziel]
+  local ziel="${3:-}"
+  ( cd "$TMP/i" && "$LYXC" --std-path="$ROOT" -I . $ziel --compile-unit "$2" ) >"$TMP/i/log" 2>&1
+  if grep -q "#2134" "$TMP/i/log"; then
+    pr fail "$1${ziel:+ ($ziel)}: $(grep -m1 '#2134' "$TMP/i/log")"
+  else
+    pr ok "$1${ziel:+ ($ziel)}"
+  fi
+}
+imp_uebersetzt "importierte Basis, Klasse weiter unten"  u.lyx
+imp_uebersetzt "eigene Basis (Gegenprobe, war gruen)"    u_eigen.lyx
+for z in --target=arm64 --target=riscv64 --target=lyxos; do
+  imp_uebersetzt "importierte Basis" u.lyx "$z"
+done
+
+# Der WERT, nicht die Uebersetzbarkeit -- und auf einem IR-Ziel dazu, weil
+# dieselbe Registry beide Wege speist. 49 = 7 + 42, dann das eigene Feld, das
+# GEERBTE Feld und die virtuelle Methode der importierten Basis.
+imp_wert() { # ziel, laeufer
+  local ziel="$1"; local lauf="$2"
+  # Fehlt der Emulator, ist das ein HINWEIS und kein Urteil -- lib/qemu.sh
+  # vereinheitlicht die Suche, nicht die Entscheidung. Der x86-Fall (lauf
+  # leer, ziel leer) laeuft nativ und wird nie uebersprungen.
+  if [ -n "$ziel" ] && [ -z "$lauf" ]; then
+    echo "SKIP Wert ($ziel): kein Emulator gefunden"; return
+  fi
+  ( cd "$TMP/i" && "$LYXC" --std-path="$ROOT" -I . ${ziel:+--target=$ziel} m.lyx -o "$TMP/i/p" ) >"$TMP/i/wlog" 2>&1
+  if ! [ -s "$TMP/i/p" ]; then
+    pr fail "Wert ${ziel:-x86}: kein Erzeugnis -- $(grep -m1 -i error "$TMP/i/wlog")"
+    return
+  fi
+  local aus
+  aus="$( $lauf "$TMP/i/p" 2>/dev/null | tr '\n' ' ' )"
+  if [ "$aus" = "49 7 42 1 " ]; then
+    pr ok "Wert ${ziel:-x86}: 49 7 42 1 (eigenes, geerbtes Feld, virtuelle Methode)"
+  else
+    pr fail "Wert ${ziel:-x86}: '$aus', erwartet '49 7 42 1 '"
+  fi
+}
+imp_wert ""      ""
+imp_wert arm64   "$QEMU_ARM64"
+imp_wert riscv64 "$QEMU_RISCV64"
 
 echo ""
 echo "Ergebnis: $PASS PASS, $FAIL FAIL"
