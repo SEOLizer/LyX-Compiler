@@ -21,8 +21,8 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.48B
-VERSION_DATE := 2026-11-24
+VERSION   := 1.2.49A
+VERSION_DATE := 2026-11-25
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
 # #2499: Die Vorkompilate liegen je Architektur. Sobald eine .lyu Maschinencode
@@ -675,6 +675,7 @@ test: lyxc
 	@bash tests/ir_array_kopf_2262_test.sh
 	@echo "--- IR-Ziele: Selbstbau-Builtins, logisches Nicht, Selbstbau arm64/riscv (#2266, #2271) ---"
 	@bash tests/ir_selbstbau_2266_test.sh
+	@bash tests/getrandom_ir_2651_test.sh
 	@echo "--- getpid auf allen IR-Zielen, Wert gegen die Shell gepruefen (#2343) ---"
 	@bash tests/getpid_backends_test.sh
 	@echo "--- Builtin-IDs ohne Doppelbelegung, Float-Speicher auf allen Zielen (#2265) ---"
