@@ -277,13 +277,36 @@ fn main(): int64 {
   var cl4: int64 := TlsNeu(cfgC);
   Print("falscher-hostname "); PrintInt(handschlag(sv4, cl4, 0)); PrintLn("");
 
-  // Fall 5: Client vertraut der Wurzel nicht
+  // Fall 5: Client vertraut der Wurzel nicht.
+  //
+  // #2647: HIER STAND EINE LEERE Vertrauensliste (`TlsConfigTrust(cfgC, t, 0)`)
+  // — der Name sagte "unbekannte Wurzel", die Einrichtung war "gar keine
+  // Wurzel". Das sind zwei verschiedene Lagen, und sie zu vermischen ist genau
+  // der Weg, auf dem die Luecke aus #2647 verborgen blieb: wer die leere Liste
+  // als "Wurzel unbekannt" liest, prueft nie, ob der Handschlag ueberhaupt bis
+  // zur Kettenpruefung kommt.
+  //
+  // Jetzt eine GEFUELLTE Liste mit der falschen Wurzel: das Client-Blatt ist
+  // ein echtes Zertifikat, aber nicht der Aussteller der Serverkette. Damit
+  // ist trustN = 1, der Konfigurationswaechter greift nicht, und geprueft wird
+  // wirklich die Kette.
   TlsConfigHost(cfgC, host as int64, 13);
-  var leerTrust: int64 := alloc(16);
-  TlsConfigTrust(cfgC, leerTrust, 0);
+  var fremdTrust: int64 := alloc(16);
+  poke64(fremdTrust, dCli); poke64(fremdTrust + 8, lCli);
+  TlsConfigTrust(cfgC, fremdTrust, 1);
   var sv5: int64 := TlsNeu(cfgS);
   var cl5: int64 := TlsNeu(cfgC);
   Print("unbekannte-wurzel "); PrintInt(handschlag(sv5, cl5, 0)); PrintLn("");
+
+  // Fall 5b (#2647): GAR KEINE Wurzel, bei verlangter Pruefung. Das ist eine
+  // Aussage ueber die Konfiguration und keine ueber die Kette — der Handschlag
+  // darf nicht einmal beginnen. Eigener Fall, damit die beiden Lagen
+  // auseinandergehalten werden und nicht wieder eine die andere verdeckt.
+  var leerTrust: int64 := alloc(16);
+  TlsConfigTrust(cfgC, leerTrust, 0);
+  var sv5b: int64 := TlsNeu(cfgS);
+  var cl5b: int64 := TlsNeu(cfgC);
+  Print("keine-wurzel "); PrintInt(handschlag(sv5b, cl5b, 0)); PrintLn("");
 
   // Fall 6: ein gekipptes Byte im Datenstrom
   TlsConfigTrust(cfgC, trust, 1);
@@ -335,6 +358,7 @@ server-sah-client-zertifikat 1
 mtls-ohne-client-zertifikat -6
 falscher-hostname -6
 unbekannte-wurzel -6
+keine-wurzel -11
 gekipptes-byte -5
 verfaelschter-record -5
 speicher-je-verbindung 136448
