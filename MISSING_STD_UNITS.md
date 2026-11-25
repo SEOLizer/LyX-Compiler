@@ -7,10 +7,17 @@ Der Bestandsteil wird erzeugt, nicht von Hand geschrieben — die vorige Fassung
 hundert. Vor jeder Änderung an diesem Dokument neu messen:
 
 ```sh
-find std -name '*.lyx' | wc -l
-for d in $(find std -mindepth 1 -type d | sort); do \
+find std -name '*.lyx' | wc -l                 # Units insgesamt  -> 502
+find std -type d | wc -l                       # Verzeichnisse    -> 39
+for d in $(find std -type d | sort); do \
   echo "$d: $(ls $d/*.lyx 2>/dev/null | wc -l)"; done
 ```
+
+`find std -type d` ohne `-mindepth`, denn `std/` selbst ist eine der 39 Zeilen
+der Tabelle unten und trägt mit 131 Units die meisten. Mit `-mindepth 1` kommen
+38 heraus, und dann reproduziert das Rezept seine eigene Zahl nicht — in einem
+Dokument, das gemessen statt gepflegt sein will, ist das der erste Fehler, den
+man nicht machen darf.
 
 Ein Name in der Liste belegt nur, dass die Datei existiert — nicht, dass die
 Unit das tut, was der Name vermuten lässt. `std/cpu/cache.lyx` ist der
