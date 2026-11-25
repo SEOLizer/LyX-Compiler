@@ -2027,6 +2027,74 @@ pub type Sema = class {
     self.errorCount += 1;
   }
 
+  // #2634: Gibt es fuer `--target` ueberhaupt einen Unit-Baum im Suchpfad?
+  //
+  // BEFUND (aus #2633): fehlte `/usr/include/lyx/units/lyxos/`, nannte lyxc
+  // nicht den fehlenden Baum, sondern die Namen, die er deshalb nicht
+  // aufloesen konnte -- an ihren BENUTZUNGSSTELLEN, also in den Dateien
+  // FREMDER Pakete ("vega/forms.lyx: undefined function 'NowMs'"). Der Fehler
+  // wird damit in fremdem Code gesucht, waehrend die Ursache eine fehlende
+  // Verzeichnisebene ist. Ein Bausystem, das bei Fehlschlag auf ELF ausweicht,
+  // baut dann still ein Linux-ELF statt eines LBF.
+  //
+  // Abgesucht wird in DERSELBEN Reihenfolge wie eine einzelne Unit
+  // (_sema_readFile): relativ, -I, --std-path, zuletzt der Installationspfad.
+  // Die letzte Stufe entfaellt bei gesetztem --std-path (#2201) -- auch hier,
+  // sonst nennt die Meldung einen Pfad, der gar nicht durchsucht wurde.
+  //
+  // `ausgeben != 0` nennt jeden abgesuchten Pfad. Rueckgabe: 1 = irgendwo da.
+  fn _zielBaumDa(ausgeben: int64): int64 {
+    if (self.lyuArch == 0) { return 1; }
+    var arch:    pchar := self.lyuArch as pchar;
+    var archLen: int64 := StrLen(arch);
+    var gefunden: int64 := 0;
+    // relativ zum Arbeitsverzeichnis
+    if (self._baumProbe(0 as pchar, arch, archLen, ausgeben) != 0) { gefunden := 1; }
+    if (self.includePath != 0) {
+      var incTeil: int64 := alloc(1024);
+      var incNr:   int64 := 0;
+      var weiter:  int64 := 1;
+      while (weiter != 0) {
+        var incLen: int64 := IncludePfadTeil(self.includePath as pchar, incNr, incTeil, 1024);
+        if (incLen < 0) { weiter := 0; }
+        if (weiter != 0) {
+          poke8(incTeil + incLen, 0);
+          if (self._baumProbe(incTeil as pchar, arch, archLen, ausgeben) != 0) { gefunden := 1; }
+          incNr := incNr + 1;
+        }
+      }
+    }
+    if (self.stdPath != 0) {
+      if (self._baumProbe(self.stdPath as pchar, arch, archLen, ausgeben) != 0) { gefunden := 1; }
+    }
+    if (self.stdPath == 0) {
+      var insBase: pchar := "/usr/include/lyx/units"c;
+      if (self.insWurzel != 0) { insBase := self.insWurzel as pchar; }
+      if (self._baumProbe(insBase, arch, archLen, ausgeben) != 0) { gefunden := 1; }
+    }
+    return gefunden;
+  }
+
+  // #2634: EINEN Pfad probieren. basis == 0 heisst "relativ".
+  fn _baumProbe(basis: pchar, arch: pchar, archLen: int64, ausgeben: int64): int64 {
+    var bLen: int64 := 0;
+    if ((basis as int64) != 0) { bLen := StrLen(basis); }
+    var puf: int64 := alloc(bLen + 1 + archLen + 1);
+    var i: int64 := 0;
+    while (i < bLen) { poke8(puf + i, StrCharAt(basis, i) & 255); i := i + 1; }
+    if (bLen > 0) { poke8(puf + i, 47); i := i + 1; }
+    var j: int64 := 0;
+    while (j < archLen) { poke8(puf + i + j, StrCharAt(arch, j) & 255); j := j + 1; }
+    poke8(puf + i + j, 0);
+    var da: int64 := wciIstVerzeichnis(puf as pchar);
+    if (ausgeben != 0) {
+      EPrintStr("    "c);
+      EPrintStr(puf as pchar);
+      if (da != 0) { EPrintStrLn("  -- da"c); } else { EPrintStrLn("  -- fehlt"c); }
+    }
+    return da;
+  }
+
   fn _sema_readFile(path: pchar): pchar {
     var fd: int64 := open(path, 0, 0);
     self.lastReadPath := path as int64;
@@ -2722,6 +2790,39 @@ pub type Sema = class {
       // Fall bleibt als Beleg stehen).
       if (self.lyuDeklTiefe > 0) { return; }   // #2014/#1971, siehe Pass1-Aufruf unten
       self._errorNodeName("Modul nicht gefunden (weder .lyx noch .lyu)", importNi, modName, modLen);
+      // #2634: Fehlt der Unit-Baum des ZIELS, ist das die Ursache -- und sie
+      // gehoert VOR die Folgefehler, nicht hinter die Namensaufloesung. Steht
+      // sie dahinter, liest wer sucht zuerst "undefined function 'NowMs'" in
+      // einer fremden Paketdatei.
+      //
+      // Die Meldung ist eine AUSKUNFT, kein Urteil: sie nennt jeden
+      // abgesuchten Pfad samt Befund. Ein Quellbaum (--std-path auf ein
+      // Repo) traegt `std/*.lyx` und gar kein `units/<arch>/` -- dort waere
+      // "Baum fehlt" als Urteil falsch, und deshalb bricht der Lauf nur in
+      // dem Fall ab, in dem es keine andere Erklaerung gibt: KEIN --std-path
+      // (also reiner Installationsbau, genau die Lage aus #2633).
+      // Gemessen am 2026-11-25: ohne die stdPath-Bedingung meldete ein
+      // TIPPFEHLER in einem Quellbau ("import std.gibtesnicht" mit
+      // --std-path=std) denselben Baumbefund -- richtig in der Aussage
+      // (`std/x86_64/` gibt es nicht), irrefuehrend als URSACHE. Ein
+      // Quellbaum braucht die Ebene nicht.
+      //
+      // GRENZE, bewusst: ein Paketbau, der --std-path auf einen UNIT-Baum
+      // ohne die Zielebene richtet, bekommt den Befund deshalb nicht. Dort
+      // nennt die Meldung den Pfad (#2201-Zeilen unten), und das Urteil
+      // waere ohne eine Unterscheidung Quell-/Unit-Baum geraten.
+      var baumFehlt: int64 := 0;
+      if (self.lyuArch != 0 && self.stdPath == 0) {
+        if (self._zielBaumDa(0) == 0) { baumFehlt := 1; }
+      }
+      if (baumFehlt != 0) {
+        EPrintStr("  URSACHE: fuer --target gibt es in KEINEM abgesuchten Pfad einen Unit-Baum '"c);
+        EPrintStr(self.lyuArch as pchar);
+        EPrintStrLn("/':"c);
+        self._zielBaumDa(1);
+        EPrintStrLn("  Abhilfe: den Baum des Ziels installieren (make install-units) oder"c);
+        EPrintStrLn("  --std-path auf einen QUELLBAUM richten -- dann wird uebersetzt statt gelesen."c);
+      }
       // pathBuf wurde für den .lyu-Versuch in place umgeschrieben — für die
       // Meldung auf ".lyx" zurücksetzen, sonst steht dort zweimal ".lyu".
       StrSetChar(pathBuf as pchar, modLen + 3, 120);   // 'u' → 'x'
@@ -2742,6 +2843,12 @@ pub type Sema = class {
         EPrintStrLn("  gilt der angegebene Baum (#2201). Wer die installierte Bibliothek mitnutzen"c);
         EPrintStrLn("  will, gibt sie ausdruecklich an: -I/usr/include/lyx/units"c);
       }
+      // #2634: Reiner Installationsbau ohne Baum des Ziels -- jeder weitere
+      // Fehler dieses Laufs ist eine Folge davon, und zwar eine, die in
+      // FREMDEN Dateien auftaucht. Hier zu enden ist die ganze Auskunft; wer
+      // weiterlaeuft, verschuettet sie. Mit gesetztem --std-path bleibt es
+      // beim Weiterlaufen, denn dann ist ein Quellbaum im Spiel.
+      if (baumFehlt != 0) { exit(1); }   // baumFehlt gilt nur ohne --std-path
       return;
     }
 
