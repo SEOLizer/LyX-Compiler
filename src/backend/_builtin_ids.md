@@ -608,6 +608,32 @@ arbeiten auf 16-Byte-Bloecken im Speicher, weil Lyx keinen 128-Bit-Werttyp hat.
 | 569 | obere 64 Bit des VORZEICHENBEHAFTETEN 128-Bit-Produkts | `mulhi(a, b)` | x86-Familie (codegen_x86 direkt), lyxos (`imul rcx`), arm64 (`SMULH`), riscv (`MULH`, M-Erweiterung); arm-cm4/esp32 laut abgewiesen (32-Bit-Wort) | #1552, IR-Weg #2460 |
 | 570 | obere 64 Bit des VORZEICHENLOSEN Produkts | `umulhi(a, b)` | wie 569, mit `mul rcx` / `UMULH` / `MULHU` | #1552, IR-Weg #2460 |
 
+## Bereich 571 … 572 — zwei AES-Bloecke je Aufruf (#2393)
+
+| ID | Was | Aufruf | Ziele | Issue |
+|---|---|---|---|---|
+| 571 | zwei Bloecke verschluesseln (`VAESENC`/`VAESENCLAST` auf ymm) | `aes_enc2_block(dst, src, rk, rounds)` | ELF-x86 (0/1/5/6/13) und lyxos (14); arm64/riscv/arm-cm/xtensa bleiben bei `IRO_PANIC` | #2393 |
+| 572 | zwei Bloecke entschluesseln (`VAESDEC`/`VAESDECLAST`) | `aes_dec2_block(dst, src, drk, rounds)` | wie 571 | #2393 |
+| 573 | VIER Bloecke verschluesseln, zwei ymm-Zustaende | `aes_enc4_block(dst, src, rk, rounds)` | wie 571 | #2393 |
+| 574 | vier Bloecke entschluesseln | `aes_dec4_block(dst, src, drk, rounds)` | wie 571 | #2393 |
+
+**Vier und nicht acht.** AESENC hat auf dieser Familie Latenz vier bei Durchsatz
+eins; vier unabhaengige Bloecke fuellen die Pipeline. Acht brauchen vier weitere
+ymm-Register und bringen erst etwas, wenn die Latenz hoeher ist als die Zahl der
+Spuren — das ist eine Messung auf der Zielmaschine, kein Entwurf.
+
+**Der Schluesselplan bleibt 16 Byte je Runde.** Die VAES-Befehle brauchen ihn in
+BEIDEN Spuren, deshalb `VBROADCASTI128` und nicht `VMOVDQU`: letzteres laedt
+32 Byte, also Runde k unten und Runde k+1 oben — der zweite Block waere mit dem
+falschen Schluessel verschluesselt, und zwar still.
+
+**`VZEROUPPER` am Ende ist Pflicht.** Ohne es zahlt jeder folgende SSE-Befehl die
+AVX-SSE-Uebergangsstrafe, und der ganze uebrige Codegen rechnet in SSE.
+
+**Nicht auf dem Entwicklungsrechner ausfuehrbar** (i5-8250U ohne VAES, erst Ice
+Lake / Zen 3). Nachweis zweistufig: Bytes am Erzeugnis (ueberall) und Werte auf
+dem CI-Laeufer (EPYC mit vaes), bitgleich gegen 560/561.
+
 Die Namen waren seit #1552 nur an ZWEI der drei Stellen bekannt (sema
 `_regBuiltin` und `codegen_x86`); in `ir_lower` fehlten sie. Damit scheiterte
 jedes Ziel, das über das IR geht — gemessen mit 1.2.35C auf win64, arm64,
