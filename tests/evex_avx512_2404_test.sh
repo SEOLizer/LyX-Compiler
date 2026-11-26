@@ -97,6 +97,28 @@ hat512 "vmovups [rdx+rax],zmm0"  "$EVEX_SPEI"
 hat512 "vaddpd zmm0,zmm0,zmm1"   "$EVEX_ADDPD"
 hat512 "vmulps zmm0,zmm0,zmm1"   "62f17c4859"
 
+# Die RESERVIERTE Form darf NICHT vorkommen: VMOVUPS mit EVEX.W = 1
+# (62 f1 fc 48 10 ...) ist laut Spezifikation reserviert, die Hardware wirft
+# dort #UD. `objdump` liest sie bereitwillig als `vmovups` -- das Werkzeug ist
+# nachlaessiger als die CPU, und genau daran ist der erste Anlauf gescheitert:
+# auf einem Zen-4-Laeufer stuerzte das Erzeugnis ohne Ausgabe ab, waehrend ein
+# Zen-3-Laeufer den Wertteil uebersprungen hatte.
+#
+# Diese Pruefung faellt OHNE AVX-512-Hardware auf. Sie ist der Ersatz fuer die
+# Ausfuehrung, die hier nicht moeglich ist.
+if grep -q "62f1fc4810" "$TMP/h512" || grep -q "62f1fc4811" "$TMP/h512"; then
+  no "VMOVUPS mit EVEX.W=1 im Erzeugnis" "reservierte Form -- die CPU wirft #UD (Lade-/Schreibbefehle brauchen W=0)"
+else
+  ok "keine reservierte VMOVUPS-Form (EVEX.W=0 bei Lade- und Schreibbefehlen)"
+fi
+# Und die f64-Rechnung MUSS W=1 tragen -- sonst rechnet sie in f32 weiter und
+# liefert still falsche Werte. Beide Richtungen derselben Frage.
+if grep -q "62f1fd4858" "$TMP/h512"; then
+  ok "f64-Rechnung traegt EVEX.W=1 (vaddpd, nicht vaddps)"
+else
+  no "f64-Rechnung ohne W=1" "vaddpd (62 f1 fd 48 58) fehlt -- rechnet sie in f32?"
+fi
+
 # Die TREPPE: sub rcx,64 / add rax,64 / add rcx,32 muessen in dieser
 # Reihenfolge stehen. Ohne sie koennte der 64er-Block mit einer falschen
 # Schranke laufen und hinter dem Feldende lesen UND schreiben.
