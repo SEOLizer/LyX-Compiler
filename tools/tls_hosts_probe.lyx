@@ -1,0 +1,173 @@
+// tools/tls_hosts_probe.lyx — den EIGENEN TLS-Client gegen oeffentliche Hosts
+// fahren und die Befunde protokollieren (#2613 Punkt 3, Rest aus #2096
+// Kriterium 2).
+//
+// WARUM EIN WERKZEUG UND KEIN TEST, und das ist eine Entscheidung und keine
+// Bequemlichkeit: ein Test, der an einem fremden Dienst im Netz haengt, wird
+// rot, wenn dort jemand ein Zertifikat tauscht, eine Suite abschaltet oder
+// der Hoster ausfaellt -- und misst dann nichts ueber uns. Er haengt deshalb
+// NICHT im `test`-Ziel. Der Befund wird abgekoppelt erhoben und mit Datum
+// unter `work/tls-hosts-stand.md` festgehalten; wer ihn erneuern will, fahrt
+// dieses Werkzeug und legt die Ausgabe dort ab.
+//
+// Aufruf:
+//   tls_hosts_probe                 # die Liste unten
+//   tls_hosts_probe host [host ...] # eigene Hosts
+//
+// Gemessen wird die WIRKUNG, nicht die Uebersetzbarkeit: je Host die
+// ausgehandelte Version, die Suite, ob die KETTENPRUEFUNG gegen den
+// System-Store getragen hat, und die erste Zeile der HTTP-Antwort. Ohne die
+// letzte Zeile waere nur belegt, dass ein Handschlag zustande kam -- nicht,
+// dass die Verbindung danach BENUTZBAR ist.
+//
+// Der Rueckgabewert ist 0, solange das Werkzeug selbst lief. Ein Host, der
+// nicht erreichbar ist, ist ein BEFUND und kein Fehler des Werkzeugs; wer
+// daraus ein Urteil macht, liest die Tabelle.
+
+@description("Probe: eigener TLS-Client gegen oeffentliche Hosts (#2613)")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+
+import std.io;
+import std.alloc;
+import std.string;
+import std.net.socket;
+import std.net.dns;
+import std.net.tls;
+import std.net.tls13;
+import std.time;
+import std.conv;
+
+con HTTPS_PORT: int64 := 443;
+
+fn standardHost(i: int64): pchar {
+  // Bewusst wenige und bewusst verschiedene Gegenstellen: eine eigene
+  // (nginx/OpenSSL), zwei grosse mit eigenem Stapel (Google/BoringSSL,
+  // Cloudflare), eine mit Let's-Encrypt-Kette. Mehr Hosts machen die Probe
+  // nicht aussagekraeftiger, nur laenger.
+  if (i == 0) { return "seolizer.de"c; }
+  if (i == 1) { return "www.google.com"c; }
+  if (i == 2) { return "cloudflare.com"c; }
+  if (i == 3) { return "letsencrypt.org"c; }
+  return 0 as pchar;
+}
+
+con STANDARD_N: int64 := 4;
+
+fn versionText(v: int64): pchar {
+  if (v == TlsVersion13()) { return "TLS1.3"c; }
+  if (v == TlsVersion12()) { return "TLS1.2"c; }
+  return "?"c;
+}
+
+// Ein Host. Liefert 1, wenn Handschlag UND Antwort kamen.
+fn probeHost(host: pchar): int64 {
+  Print(host); Print("  ");
+
+  var ctx: TLSContext := TLSInit();
+  if (ctx.initialized == 0) {
+    PrintLn("KEIN-STORE  (kein System-CA-Store lesbar)");
+    return 0;
+  }
+
+  var ip: int64 := GetHostByName(host);
+  if (ip == 0) {
+    PrintLn("DNS-FEHLER");
+    TLSFree(ctx);
+    return 0;
+  }
+
+  var tcp: TCPConn := TCPConnect(ip, HTTPS_PORT);
+  if (tcp.fd < 0) {
+    PrintLn("TCP-FEHLER");
+    TLSFree(ctx);
+    return 0;
+  }
+
+  var conn: TLSConn := TLSConnect(ctx, tcp.fd, host);
+  if (conn.connected == 0) {
+    // Der Grund gehoert dazu. Ein "ging nicht" ohne Code ist genau das, was
+    // diese Schicht laut ihrem eigenen Kommentar abschaffen sollte.
+    Print("HANDSCHLAG-FEHLER rc="); PrintInt(conn.rc);
+    Print(" ("); Print(TlsFehlerText(conn.rc)); PrintLn(")");
+    sys_close(tcp.fd);
+    TLSFree(ctx);
+    return 0;
+  }
+
+  Print(versionText(TlsVersion(conn.c)));
+  Print(" suite=0x"); Print(IntToHex16(TlsSuite(conn.c)));
+  // Die Kettenpruefung ist in TLSConnect eingeschaltet (TlsConfigKettePruefen
+  // 1) und laeuft gegen die echte Uhr. Ein fertiger Handschlag heisst hier
+  // also: Kette UND Hostname haben getragen.
+  Print(" kette=ok");
+
+  var req: int64 := alloc(512);
+  var rl: int64 := 0;
+  var kopf: pchar := "HEAD / HTTP/1.1\r\nHost: "c;
+  var i: int64 := 0;
+  while (StrCharAt(kopf, i) != 0) { poke8(req + rl, StrCharAt(kopf, i) & 255); rl += 1; i += 1; }
+  i := 0;
+  while (StrCharAt(host, i) != 0) { poke8(req + rl, StrCharAt(host, i) & 255); rl += 1; i += 1; }
+  var schwanz: pchar := "\r\nConnection: close\r\nUser-Agent: lyx-tls-probe\r\n\r\n"c;
+  i := 0;
+  while (StrCharAt(schwanz, i) != 0) { poke8(req + rl, StrCharAt(schwanz, i) & 255); rl += 1; i += 1; }
+
+  var ok: int64 := 0;
+  if (TLSWrite(conn, req, rl) == rl) {
+    var puf: int64 := alloc(4096);
+    var n: int64 := TLSRead(conn, puf, 4095);
+    if (n > 0) {
+      // Nur die erste Zeile, und die Steuerzeichen abgeschnitten.
+      var e: int64 := 0;
+      while (e < n && (peek8(puf + e) & 0xFF) != 13 && (peek8(puf + e) & 0xFF) != 10) { e += 1; }
+      Print(" antwort=\"");
+      sys_write(1, puf, e);
+      Print("\"");
+      ok := 1;
+    } else {
+      Print(" KEINE-ANTWORT n="); PrintInt(n);
+    }
+  } else {
+    Print(" SCHREIBEN-FEHLGESCHLAGEN");
+  }
+  PrintLn("");
+
+  TLSClose(conn);
+  sys_close(tcp.fd);
+  TLSFree(ctx);
+  return ok;
+}
+
+fn main(): int64 {
+  var argc: int64 := GetArgC();
+  var argv: pchar := GetArgV();
+
+  PrintLn("# tls_hosts_probe (#2613) -- eigener Client, System-CA-Store, echte Uhr");
+  Print("# Unix-Zeit: "); PrintInt(NowMs() / 1000); PrintLn("");
+  PrintLn("");
+
+  var gut: int64 := 0;
+  var ges: int64 := 0;
+
+  if (argc > 1) {
+    var a: int64 := 1;
+    while (a < argc) {
+      ges += 1;
+      gut += probeHost(ArgvGet(argv, a));
+      a += 1;
+    }
+  } else {
+    var h: int64 := 0;
+    while (h < STANDARD_N) {
+      ges += 1;
+      gut += probeHost(standardHost(h));
+      h += 1;
+    }
+  }
+
+  PrintLn("");
+  Print("# "); PrintInt(gut); Print(" von "); PrintInt(ges);
+  PrintLn(" Hosts: Handschlag fertig UND Antwort gelesen");
+  return 0;
+}
