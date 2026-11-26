@@ -9108,6 +9108,54 @@ pub type Codegen = class {
     self.cg_vexOpRM(0x7F, 0, 0, 2, 0, l, 2, 1, 0);   // vmovdqu [rdx+rax], v0
   }
 
+  // #2404: derselbe Rechenschritt in 512 Bit. Spiegel von
+  // cg_emitVexF32Schritt -- die beiden muessen uebereinstimmen; Unterschied
+  // sind allein das Praefix (EVEX statt VEX) und die Schrittweite (64 statt
+  // 32 Byte), nicht die Opcodes und nicht das ModRM.
+  //
+  // vmovups und NICHT vmovaps, aus demselben Grund wie dort: die Anlage
+  // (cg_emitSimdBumpAlloc) richtet auf 64 Byte aus, aber der
+  // Schleifen-Vektorisierer nimmt jeden Bezeichner als Basis, und ein aus
+  // alloc() abgeleiteter Zeiger liegt beliebig (#2372).
+  fn cg_emitEvexF32Schritt(op: int64, bytes: int64) {
+    var pp: int64 := 0;
+    var w:  int64 := 0;
+    if (bytes == 8) { pp := 1; w := 1; }   // f64: 0x66-Gruppe und W=1
+    self.cg_evexOpRM(0x10, 0, 0, 7, 0, 0, 1, w);   // vmovups zmm0, [rdi+rax]
+    self.cg_evexOpRM(0x10, 1, 0, 6, 0, 0, 1, w);   // vmovups zmm1, [rsi+rax]
+    self.cg_evexOpRR(self.cg_sseF32Opcode(op), 0, 0, 1, pp, 1, w);
+    self.cg_evexOpRM(0x11, 0, 0, 2, 0, 0, 1, w);   // vmovups [rdx+rax], zmm0
+  }
+
+  // #2404: Ganzzahlen in 512 Bit. Spiegel von cg_emitVexGanzSchritt.
+  //
+  // VMOVDQU64 (pp = 2, W = 1) statt VMOVDQU: EVEX hat keine breitenlose Form
+  // der unausgerichteten Ladebefehle -- die Elementbreite steht im Praefix.
+  // Fuer das reine Kopieren von Bytes ist 64 so gut wie 32; gewaehlt ist 64,
+  // weil es zu W=1 der 64-Bit-Rechenformen passt und ein Praefix weniger
+  // Fallunterscheidung braucht.
+  //
+  // VPMULLQ gibt es erst mit AVX-512DQ, nicht mit F. Eine 64-Bit-Multiplikation
+  // faellt deshalb hier heraus und wird LAUT abgewiesen, statt still eine
+  // falsche Breite zu rechnen -- der Aufrufer nimmt dann den 256-Bit-Pfad.
+  fn cg_emitEvexGanzSchritt(op: int64, bytes: int64) {
+    var gOpc: int64 := self.cg_sseGanzOpcode(op, bytes);
+    if (gOpc < 0) {
+      EPrintStrLn("lyxc: interner Fehler (#2404): Ganzzahl-Vektoroperation ohne Befehl."c);
+      exit(70);
+    }
+    self.cg_evexOpRM(0x6F, 0, 0, 7, 0, 2, 1, 1);   // vmovdqu64 zmm0, [rdi+rax]
+    self.cg_evexOpRM(0x6F, 1, 0, 6, 0, 2, 1, 1);   // vmovdqu64 zmm1, [rsi+rax]
+    var w: int64 := 0;
+    if (bytes == 8) { w := 1; }
+    if (gOpc > 255) {
+      self.cg_evexOpRR(gOpc >> 8, 0, 0, 1, 1, 2, w);   // vpmulld
+    } else {
+      self.cg_evexOpRR(gOpc, 0, 0, 1, 1, 1, w);
+    }
+    self.cg_evexOpRM(0x7F, 0, 0, 2, 0, 2, 1, 1);   // vmovdqu64 [rdx+rax], zmm0
+  }
+
   // #2205: Vektorpfad in 256 Bit, als Vorlauf der 128-Bit-Schleife.
   //
   // Gemessen wurde VOR dem Bauen, weil der Pfad sich nicht ueberall lohnt
@@ -9139,7 +9187,14 @@ pub type Codegen = class {
   // Die dritte Stufe ist dieselbe Pflicht wie in #2184, wo eine einzige
   // 16-Byte-Schleife bei n = 5 zwoelf Byte hinter dem letzten Element
   // gelesen UND geschrieben hat. Mit 32 Byte je Schritt waeren es bis zu 28.
-  fn cg_emitAVX2BinOp(op: int64, kennung: int64) {
+  // #2404: `mit512 != 0` stellt einen 64-Byte-Vorlauf VOR die 32-Byte-Schleife.
+  // Eingefuegt und nicht abgeschrieben: die Stufen 32/16/skalar samt ihrer
+  // Sprungflickerei bleiben EINE Stelle. Zwei Fassungen davon waeren genau die
+  // Doppelung, die hier schon mehrfach auseinandergelaufen ist.
+  //
+  // NACHWEIS DER UNBERUEHRTHEIT: mit mit512 == 0 muss das Erzeugnis
+  // BITGLEICH zum Stand davor sein. Das ist pruefbar und steht im Test.
+  fn cg_emitAVX2BinOp(op: int64, kennung: int64, mit512: int64) {
     // #2199: Bytezahl = Elementzahl * Elementbreite. Die Blockgroessen
     // darunter bleiben in BYTE (32 und 16) — sie haengen an der
     // Registerbreite, nicht an der Elementart; ein 32-Byte-Block fasst acht
@@ -9168,7 +9223,28 @@ pub type Codegen = class {
     var skPf: int64 := self.cg_sseSkalarPraefix(bytes);
     self.cg_e8(0x31); self.cg_e8(0xC0);                                      // xor eax, eax
     self.cg_e8(0x48); self.cg_e8(0xC1); self.cg_e8(0xE1); self.cg_e8(schub); // shl rcx, 2 bzw. 3
-    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xE9); self.cg_e8(0x20);  // sub rcx, 32
+    // #2404: Mit dem 512-Bit-Vorlauf wird zuerst gegen 64 geprueft; die
+    // 32er-Stufe bekommt ihre Schranke danach ueber `add rcx, 32` -- dieselbe
+    // Staffelung, mit der die 16er-Stufe schon `add rcx, 16` bekommt.
+    if (mit512 != 0) {
+      self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xE9); self.cg_e8(0x40); // sub rcx, 64
+      self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xC8);                   // cmp rax, rcx
+      self.cg_e8(0x7F); var jg512: int64 := self.codeLen; self.cg_e8(0);      // jg nach dem Block
+      var v512Body: int64 := self.codeLen;
+      if (ganz != 0) { self.cg_emitEvexGanzSchritt(op, bytes); }
+      else           { self.cg_emitEvexF32Schritt(op, bytes); }
+      self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(0x40); // add rax, 64
+      // #2339: Fuellung VOR den Rumpf, nicht hinein -- wie bei der 32er-Stufe.
+      v512Body := v512Body + self.cg_rumpfAusrichten(v512Body, 5);
+      self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xC8);                   // cmp rax, rcx
+      self.cg_e8(0x7E); var back512: int64 := self.codeLen;                   // jle Rumpf
+      self.cg_e8(v512Body - (back512 + 1));
+      var nach512: int64 := self.codeLen;
+      cg_patchRel8Wert(self.code, jg512, nach512 - (jg512 + 1));
+      self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC1); self.cg_e8(0x20); // add rcx, 32
+    } else {
+      self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xE9); self.cg_e8(0x20); // sub rcx, 32
+    }
 
     // ---- 32 Byte je Durchlauf ----
     // #2215: unten geprueft (Eintrittspruefung einmal, dann add/cmp/jle) —
@@ -15944,7 +16020,22 @@ pub type Codegen = class {
           // es bei 128 Bit — ein VEX-Praefix auf einer aelteren CPU endet
           // in SIGILL, und ein stiller Rueckfall waere hier genau falsch:
           // der Code liefe, waere aber langsamer als zugesagt (#2191).
-          if (self.cg_cpuHat(2) != 0) { self.cg_emitAVX2BinOp(op, simdOpKennung); }
+          // #2404: 512 Bit nur mit ausdruecklicher Zusage. Ohne sie bleibt es
+          // beim 256-Bit-Pfad -- ein EVEX-Befehl auf einer CPU ohne AVX-512
+          // endet in SIGILL, und ein stiller Rueckfall waere hier genau
+          // falsch.
+          //
+          // Eine 64-Bit-Ganzzahl-MULTIPLIKATION faellt heraus: VPMULLQ gibt es
+          // erst mit AVX-512DQ, die Zusage `avx512` deckt nur F. Sie nimmt
+          // deshalb den 256-Bit-Pfad.
+          var mit512: int64 := 0;
+          if (self.cg_cpuHat(3) != 0) {
+            mit512 := 1;
+            if ((simdOpKennung & CG_SIMD_GANZ) != 0
+                && (simdOpKennung & CG_SIMD_BREITE) == 8
+                && self.cg_sseGanzOpcode(op, 8) > 255) { mit512 := 0; }
+          }
+          if (self.cg_cpuHat(2) != 0) { self.cg_emitAVX2BinOp(op, simdOpKennung, mit512); }
           else                        { self.cg_emitSSE2BinOp(op, simdOpKennung); }
           // rax = result SIMD ptr
         } else {
@@ -28481,6 +28572,90 @@ pub type Codegen = class {
   //   src1  erster Quelloperand     (VEX.vvvv)
   //   src2  zweiter Quelloperand    (ModRM.rm, oberes Bit nach VEX.B)
   // Unaere Formen (nur dst und src2) geben src1 = 0 an.
+  // #2404: EVEX, das Praefix der AVX-512-Formen. KEIN breiterer VEX, sondern
+  // vier Byte mit eigenem Aufbau:
+  //
+  //   62  P0  P1  P2
+  //   P0 = R' X' B' R'' 0 0 m m        (invertiert, mm = Opcode-Karte)
+  //   P1 = W  v v v v  1  p p          (vvvv invertiert)
+  //   P2 = z L' L b V'' a a a          (aaa = Maskenregister, hier 0)
+  //
+  // Fuer eine unmaskierte zmm-Operation gilt z=0, L'L=10 (512 Bit), b=0,
+  // V''=1 (invertiert) und aaa=000 -- das ergibt P2 = 0x48.
+  //
+  // MASKENREGISTER sind hier bewusst NICHT benutzt (aaa bleibt 0): der Rest
+  // einer Vektorschleife laeuft weiter skalar, genau wie beim 256-Bit-Pfad
+  // aus #2205. Eine maskierte Restbehandlung ist eine eigene Arbeit und steht
+  // als Nachfolger; sie waere hier eine Verschaerfung ohne Nachweis, weil der
+  // Rest schon richtig rechnet.
+  //
+  // Alle Bytes sind gegen den Assembler geprueft, nicht gerechnet und gehofft:
+  //   62 f1 7c 48 58 c1   vaddps zmm0, zmm0, zmm1
+  //   62 f1 fd 48 58 c1   vaddpd zmm0, zmm0, zmm1
+  //   62 f1 7c 48 10 04 07  vmovups zmm0, [rdi+rax]
+  //   62 f1 fe 48 6f 04 07  vmovdqu64 zmm0, [rdi+rax]
+  fn cg_evexPrefix(r: int64, x: int64, b: int64, vvvv: int64,
+                   pp: int64, mm: int64, w: int64) {
+    if (r < 0 || r > 1 || x < 0 || x > 1 || b < 0 || b > 1) {
+      EPrintStrLn("interner fehler: cg_evexPrefix: r/x/b sind je 0 oder 1 (#2404)."c);
+      exit(1);
+    }
+    if (vvvv < 0 || vvvv > 15) {
+      EPrintStrLn("interner fehler: cg_evexPrefix: vvvv ausserhalb 0..15 (#2404)."c);
+      exit(1);
+    }
+    if (pp < 0 || pp > 3 || mm < 1 || mm > 3 || w < 0 || w > 1) {
+      EPrintStrLn("interner fehler: cg_evexPrefix: pp/mm/w ausserhalb des Bereichs (#2404)."c);
+      exit(1);
+    }
+    var nv: int64 := (15 - vvvv) & 15;
+    self.cg_e8(0x62);
+    // R'' (Bit 4) bleibt 1: die oberen sechzehn Register (zmm16..31) sind hier
+    // nicht erreichbar. Wer sie braucht, setzt es -- und muss dann auch X'
+    // fuer den Index fuehren.
+    self.cg_e8((((1 - r) & 1) << 7) | (((1 - x) & 1) << 6) | (((1 - b) & 1) << 5)
+               | (1 << 4) | mm);
+    self.cg_e8((w << 7) | (nv << 3) | (1 << 2) | pp);
+    self.cg_e8(0x48);   // z=0, L'L=10 (zmm), b=0, V''=1, aaa=000
+  }
+
+  // #2404: zmm-Form mit SPEICHEROPERAND [basis + index]. Dieselben Fallen wie
+  // cg_vexOpRM (#2205): mod=00 mit Basis 101 heisst "Verschiebung ohne Basis",
+  // und rsp/r12 ist als Index nicht kodierbar -- beides wird laut abgewiesen
+  // statt still eine andere Adresse zu kodieren.
+  fn cg_evexOpRM(opcode: int64, dst: int64, src1: int64,
+                 basis: int64, index: int64, pp: int64, mm: int64, w: int64) {
+    if (dst < 0 || dst > 15 || src1 < 0 || src1 > 15
+        || basis < 0 || basis > 15 || index < 0 || index > 15) {
+      EPrintStrLn("interner fehler: cg_evexOpRM: Register ausserhalb 0..15 (#2404)."c);
+      exit(1);
+    }
+    if ((basis & 7) == 5) {
+      EPrintStrLn("interner fehler: cg_evexOpRM: rbp/r13 als Basis braucht eine Verschiebung (#2404)."c);
+      exit(1);
+    }
+    if ((index & 7) == 4) {
+      EPrintStrLn("interner fehler: cg_evexOpRM: rsp/r12 ist als Index nicht kodierbar (#2404)."c);
+      exit(1);
+    }
+    self.cg_evexPrefix(dst >> 3, index >> 3, basis >> 3, src1, pp, mm, w);
+    self.cg_e8(opcode);
+    self.cg_e8(0x04 | ((dst & 7) << 3));
+    self.cg_e8(((index & 7) << 3) | (basis & 7));
+  }
+
+  // #2404: zmm-Form mit zwei Registern.
+  fn cg_evexOpRR(opcode: int64, dst: int64, src1: int64, src2: int64,
+                 pp: int64, mm: int64, w: int64) {
+    if (dst < 0 || dst > 15 || src1 < 0 || src1 > 15 || src2 < 0 || src2 > 15) {
+      EPrintStrLn("interner fehler: cg_evexOpRR: Register ausserhalb 0..15 (#2404)."c);
+      exit(1);
+    }
+    self.cg_evexPrefix(dst >> 3, 0, src2 >> 3, src1, pp, mm, w);
+    self.cg_e8(opcode);
+    self.cg_e8(0xC0 | ((dst & 7) << 3) | (src2 & 7));
+  }
+
   fn cg_vexOpRR(opcode: int64, dst: int64, src1: int64, src2: int64,
                 l: int64, pp: int64, mm: int64, w: int64) {
     if (dst < 0 || dst > 15 || src1 < 0 || src1 > 15 || src2 < 0 || src2 > 15) {
