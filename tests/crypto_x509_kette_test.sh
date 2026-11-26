@@ -201,6 +201,7 @@ import std.alloc;
 import std.fs;
 import std.crypto.der;
 import std.crypto.x509;
+import std.crypto.rsa_native;
 
 fn lade(pfad: pchar, derOut: int64): int64 {
   var pem: int64 := alloc(8192);
@@ -279,6 +280,55 @@ fn main(): int64 {
   poke64(kette + 0,  dLNoKu); poke64(kette + 8,  lLNoKu);
   poke64(kette + 16, dNoKu);  poke64(kette + 24, lNoKu);
   Print("aussteller-ohne-keycertsign "); PrintInt(X509PruefeKette(kette, 2, trust, 1, "ohneku.example"c as int64, 14, jetzt, 0)); PrintLn("");
+
+  // --- #2654: was an X509PubKeyPos steht, und welcher Leser dazu passt ----
+  //
+  // Gemessen wird am ERZEUGNIS: die Bytes an der Stelle, beide Leser, und die
+  // Gegenrichtung. Ohne sie waere der Test auch von einer Fassung erfuellt,
+  // die beide Kodierungen unter einem Namen annimmt -- genau der stille
+  // Default, den das Issue ausdruecklich NICHT will.
+  var satzR: int64 := alloc(X509Groesse());
+  if (!X509Lies(dRsa, lRsa, satzR)) { Print("rsa-liest 0"); PrintLn(""); return 1; }
+  var bitsR: int64 := X509DerPuffer(satzR) + X509PubKeyBitsPos(satzR);
+  Print("keyalg-rsa "); PrintInt(X509KeyAlg(satzR)); PrintLn("");
+  // 30 82 = SEQUENCE lang, 02 82 = INTEGER lang: eine RSAPublicKey (PKCS#1).
+  // Ein SubjectPublicKeyInfo haette hier die Algorithmus-SEQUENCE (30 0D ..).
+  Print("bits-rsa-kopf ");
+  PrintInt(peek8(bitsR) & 0xFF); Print(" ");
+  PrintInt(peek8(bitsR + 1) & 0xFF); Print(" ");
+  PrintInt(peek8(bitsR + 4) & 0xFF); Print(" ");
+  PrintInt(peek8(bitsR + 5) & 0xFF); PrintLn("");
+  // Die alten Namen sind Huellen der neuen -- gleiche Zahl, sonst haette der
+  // Bestand zwei verschiedene Stellen gelesen.
+  var gleich: int64 := 0;
+  if (X509PubKeyPos(satzR) == X509PubKeyBitsPos(satzR)
+      && X509PubKeyLen(satzR) == X509PubKeyBitsLen(satzR)) { gleich := 1; }
+  Print("alte-namen-gleich "); PrintInt(gleich); PrintLn("");
+  // Der passende Leser liest, der unpassende weist weiterhin ab.
+  var keyR: int64 := alloc(RsaSchluesselGroesse());
+  var ausDer: int64 := 0;
+  if (RsaPubAusDer(bitsR, X509PubKeyBitsLen(satzR), keyR)) { ausDer := 1; }
+  Print("rsapubausder "); PrintInt(ausDer); PrintLn("");
+  var ausSpki: int64 := 0;
+  if (RsaPubAusSpki(bitsR, X509PubKeyBitsLen(satzR), keyR)) { ausSpki := 1; }
+  Print("rsapubausspki "); PrintInt(ausSpki); PrintLn("");
+  // Der waehlende Leser nimmt dem Aufrufer die Entscheidung ab.
+  var wahl: int64 := 0;
+  if (X509RsaPubLesen(satzR, keyR)) { wahl := 1; }
+  Print("x509rsapublesen-rsa "); PrintInt(wahl); PrintLn("");
+  // Gegenrichtung: an einem EC-Zertifikat muss er FALSCH liefern, nicht
+  // irgendetwas lesen. Sonst waere die Wahl keine Wahl.
+  var satzE: int64 := alloc(X509Groesse());
+  if (!X509Lies(dLeaf256, lLeaf256, satzE)) { Print("ec-liest 0"); PrintLn(""); return 1; }
+  var wahlE: int64 := 0;
+  if (X509RsaPubLesen(satzE, keyR)) { wahlE := 1; }
+  Print("x509rsapublesen-ec "); PrintInt(wahlE); PrintLn("");
+  // Und die EC-Gestalt, die der Kommentar an der Stelle zusichert:
+  // keyAlg 1, 65 Byte, Fuehrungsbyte 0x04.
+  Print("ec-gestalt ");
+  PrintInt(X509KeyAlg(satzE)); Print(" ");
+  PrintInt(X509PubKeyBitsLen(satzE)); Print(" ");
+  PrintInt(peek8(X509DerPuffer(satzE) + X509PubKeyBitsPos(satzE)) & 0xFF); PrintLn("");
   return 0;
 }
 LYXEOF
@@ -303,6 +353,14 @@ leerer-store 4
 pathlen-ueberschritten 7
 zwei-glieder 0
 aussteller-ohne-keycertsign 8
+keyalg-rsa 3
+bits-rsa-kopf 48 130 2 130
+alte-namen-gleich 1
+rsapubausder 1
+rsapubausspki 0
+x509rsapublesen-rsa 1
+x509rsapublesen-ec 0
+ec-gestalt 1 65 4
 SOLLEOF
 
 if ! ( ulimit -v 4000000; timeout 300 "$TMP/s" > "$TMP/ist.txt" 2>"$TMP/err.txt" ); then
