@@ -20228,6 +20228,100 @@ pub type Codegen = class {
       self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x7F); self.cg_e8(0x07);    // movdqu [rdi], xmm0
       self.cg_zeroRax();
 
+    } else if (self.cg_seq(fname, fnlen, "aes_enc2_block", 14) ||
+               self.cg_seq(fname, fnlen, "aes_dec2_block", 14)) {
+      // #2393: VAES — ZWEI Bloecke je Aufruf, ueber ymm. Dieselbe Rechnung wie
+      // aes_enc_block darueber, nur zwei Spuren breit; die beiden muessen
+      // uebereinstimmen.
+      //
+      // rdi = Ziel (32 Byte), rsi = Quelle (32 Byte), rdx = Rundenschluessel
+      // (rounds+1 Bloecke von je 16 Byte, hintereinander), rcx = Rundenzahl.
+      //
+      // WARUM VBROADCASTI128 UND NICHT VMOVDQU: der Schluesselplan ist je
+      // Runde 16 Byte, die VAES-Befehle brauchen ihn aber in BEIDEN Spuren.
+      // Ein `vmovdqu ymm1, [rdx]` laedt 32 Byte, also Runde k in der unteren
+      // und Runde k+1 in der oberen Spur -- der zweite Block waere mit dem
+      // falschen Schluessel verschluesselt, und zwar still und plausibel
+      // aussehend. VBROADCASTI128 legt dieselben 16 Byte in beide Spuren.
+      //
+      // VZEROUPPER am Ende ist Pflicht, nicht Hoeflichkeit: ohne es zahlt
+      // jeder folgende SSE-Befehl die Uebergangsstrafe (auf dieser Familie
+      // zweistellige Taktzahlen je Uebergang), und der ganze Rest des
+      // Compilerzeugnisses rechnet in SSE.
+      //
+      // Lokal NICHT ausfuehrbar: der Entwicklungsrechner (i5-8250U) hat kein
+      // VAES, das gibt es erst ab Ice Lake und Zen 3. Nachgewiesen wird
+      // deshalb zweistufig -- die Bytes am Erzeugnis (geht ueberall) und die
+      // WERTE auf dem CI-Laeufer (EPYC, hat vaes), bitgleich gegen den
+      // Einzelblockweg. std/crypto/aes.lyx fragt vorher CpuHasVAES().
+      var v2Mid:  int64 := 0xDC;                                                 // VAESENC
+      var v2Last: int64 := 0xDD;                                                 // VAESENCLAST
+      if (self.cg_seq(fname, fnlen, "aes_dec2_block", 14)) {
+        v2Mid := 0xDE; v2Last := 0xDF;                                           // VAESDEC / VAESDECLAST
+      }
+      self.cg_e8(0xC5); self.cg_e8(0xFE); self.cg_e8(0x6F); self.cg_e8(0x06);    // vmovdqu ymm0, [rsi]
+      self.cg_e8(0xC4); self.cg_e8(0xE2); self.cg_e8(0x7D); self.cg_e8(0x5A); self.cg_e8(0x0A);  // vbroadcasti128 ymm1, [rdx]
+      self.cg_e8(0xC5); self.cg_e8(0xFD); self.cg_e8(0xEF); self.cg_e8(0xC1);    // vpxor ymm0, ymm0, ymm1
+      self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC2); self.cg_e8(0x10);    // add rdx, 16
+      self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC9);                      // dec rcx
+      var v2Top: int64 := self.codeLen;
+      self.cg_e8(0xC4); self.cg_e8(0xE2); self.cg_e8(0x7D); self.cg_e8(0x5A); self.cg_e8(0x0A);  // vbroadcasti128 ymm1, [rdx]
+      self.cg_e8(0xC4); self.cg_e8(0xE2); self.cg_e8(0x7D); self.cg_e8(v2Mid); self.cg_e8(0xC1); // vaesenc/vaesdec
+      self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC2); self.cg_e8(0x10);    // add rdx, 16
+      self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC9);                      // dec rcx
+      self.cg_e8(0x75);                                                          // jnz kurz zurueck
+      self.cg_e8((v2Top - (self.codeLen + 1)) & 0xFF);
+      self.cg_e8(0xC4); self.cg_e8(0xE2); self.cg_e8(0x7D); self.cg_e8(0x5A); self.cg_e8(0x0A);  // vbroadcasti128 ymm1, [rdx]
+      self.cg_e8(0xC4); self.cg_e8(0xE2); self.cg_e8(0x7D); self.cg_e8(v2Last); self.cg_e8(0xC1);// vaesenclast/declast
+      self.cg_e8(0xC5); self.cg_e8(0xFE); self.cg_e8(0x7F); self.cg_e8(0x07);    // vmovdqu [rdi], ymm0
+      self.cg_e8(0xC5); self.cg_e8(0xF8); self.cg_e8(0x77);                      // vzeroupper
+      self.cg_zeroRax();
+
+    } else if (self.cg_seq(fname, fnlen, "aes_enc4_block", 14) ||
+               self.cg_seq(fname, fnlen, "aes_dec4_block", 14)) {
+      // #2393: VIER Bloecke je Aufruf -- zwei ymm-Zustaende (ymm0, ymm2),
+      // derselbe Rundenschluessel in ymm1. Dieselbe Rechnung wie
+      // aes_enc2_block darueber, nur mit einer zweiten Spur; die beiden
+      // muessen uebereinstimmen.
+      //
+      // rdi = Ziel (64 Byte), rsi = Quelle (64 Byte), rdx = Rundenschluessel,
+      // rcx = Rundenzahl.
+      //
+      // WARUM VIER UND NICHT ACHT: AESENC hat auf dieser Familie eine Latenz
+      // von vier Takten und einen Durchsatz von eins; vier unabhaengige
+      // Bloecke fuellen die Pipeline. Acht brauchen vier weitere
+      // ymm-Register und bringen erst etwas, wenn die Latenz hoeher ist als
+      // die Zahl der Spuren -- das ist eine Messung auf der Zielmaschine und
+      // kein Entwurf am Schreibtisch. Der Schnitt steht hier, damit ihn
+      // niemand fuer eine Luecke haelt.
+      var v4Mid:  int64 := 0xDC;                                                 // VAESENC
+      var v4Last: int64 := 0xDD;                                                 // VAESENCLAST
+      if (self.cg_seq(fname, fnlen, "aes_dec4_block", 14)) {
+        v4Mid := 0xDE; v4Last := 0xDF;                                           // VAESDEC / VAESDECLAST
+      }
+      self.cg_e8(0xC5); self.cg_e8(0xFE); self.cg_e8(0x6F); self.cg_e8(0x06);    // vmovdqu ymm0, [rsi]
+      self.cg_e8(0xC5); self.cg_e8(0xFE); self.cg_e8(0x6F); self.cg_e8(0x56); self.cg_e8(0x20);  // vmovdqu ymm2, [rsi+32]
+      self.cg_e8(0xC4); self.cg_e8(0xE2); self.cg_e8(0x7D); self.cg_e8(0x5A); self.cg_e8(0x0A);  // vbroadcasti128 ymm1, [rdx]
+      self.cg_e8(0xC5); self.cg_e8(0xFD); self.cg_e8(0xEF); self.cg_e8(0xC1);    // vpxor ymm0, ymm0, ymm1
+      self.cg_e8(0xC5); self.cg_e8(0xED); self.cg_e8(0xEF); self.cg_e8(0xD1);    // vpxor ymm2, ymm2, ymm1
+      self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC2); self.cg_e8(0x10);    // add rdx, 16
+      self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC9);                      // dec rcx
+      var v4Top: int64 := self.codeLen;
+      self.cg_e8(0xC4); self.cg_e8(0xE2); self.cg_e8(0x7D); self.cg_e8(0x5A); self.cg_e8(0x0A);  // vbroadcasti128 ymm1, [rdx]
+      self.cg_e8(0xC4); self.cg_e8(0xE2); self.cg_e8(0x7D); self.cg_e8(v4Mid); self.cg_e8(0xC1); // ymm0
+      self.cg_e8(0xC4); self.cg_e8(0xE2); self.cg_e8(0x6D); self.cg_e8(v4Mid); self.cg_e8(0xD1); // ymm2
+      self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC2); self.cg_e8(0x10);    // add rdx, 16
+      self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC9);                      // dec rcx
+      self.cg_e8(0x75);                                                          // jnz zurueck
+      self.cg_e8((v4Top - (self.codeLen + 1)) & 0xFF);
+      self.cg_e8(0xC4); self.cg_e8(0xE2); self.cg_e8(0x7D); self.cg_e8(0x5A); self.cg_e8(0x0A);  // vbroadcasti128 ymm1, [rdx]
+      self.cg_e8(0xC4); self.cg_e8(0xE2); self.cg_e8(0x7D); self.cg_e8(v4Last); self.cg_e8(0xC1);
+      self.cg_e8(0xC4); self.cg_e8(0xE2); self.cg_e8(0x6D); self.cg_e8(v4Last); self.cg_e8(0xD1);
+      self.cg_e8(0xC5); self.cg_e8(0xFE); self.cg_e8(0x7F); self.cg_e8(0x07);    // vmovdqu [rdi], ymm0
+      self.cg_e8(0xC5); self.cg_e8(0xFE); self.cg_e8(0x7F); self.cg_e8(0x57); self.cg_e8(0x20);  // vmovdqu [rdi+32], ymm2
+      self.cg_e8(0xC5); self.cg_e8(0xF8); self.cg_e8(0x77);                      // vzeroupper
+      self.cg_zeroRax();
+
     } else if (self.cg_seq(fname, fnlen, "aes_imc", 7)) {
       // #2383: AESIMC — InvMixColumns auf einem Block. rdi = Ziel, rsi = Quelle.
       // Gebraucht wird es fuer den aequivalenten inversen Schluesselplan;
