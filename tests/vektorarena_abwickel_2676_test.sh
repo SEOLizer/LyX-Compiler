@@ -38,13 +38,18 @@ S=$(summe 11)
 
 if [ "${F1:-0}" -gt 1000 ]; then
   ok "Grundlinie plausibel ($F1 Fehler bei einem Durchlauf)"
-  # 3,33 war der Stand vor dem Fix (U = 4), 1,33 danach. Die Schwelle liegt
-  # dazwischen und faengt auch U = 2 (2,0 vor dem Fix).
-  GRENZE=$(( F1 * 2 ))
+  # Die Zielmarke ist ERREICHT: 12310 Fehler bei 1 wie bei 41 Durchlaeufen,
+  # Verhaeltnis also 1,0. Die Schwelle liegt bei 1,2 und laesst nur Rauschen zu.
+  #
+  # Sie faengt damit BEIDE Stufen der Ursache: 3,33 (Marke nur je U-ter
+  # Durchlauf, vor 1.2.51B) und 1,33 (aufgegebener Block, vor 1.2.51C). Die
+  # erste Fassung dieses Tests hatte 2,0 und haette den zweiten Teil
+  # durchgelassen -- gegengeprobt: mit 1.2.51B war sie gruen.
+  GRENZE=$(( F1 + (F1 / 5) ))
   if [ "${F21:-0}" -le "$GRENZE" ]; then
-    ok "21 Durchlaeufe bleiben unter dem Doppelten ($F21 <= $GRENZE)"
+    ok "21 Durchlaeufe auf der Zielmarke ($F21 <= $GRENZE, Grundlinie $F1)"
   else
-    no "21 Durchlaeufe: $F21 Fehler gegen $F1 bei einem -- Arena waechst mit dem Abwickelfaktor"
+    no "21 Durchlaeufe: $F21 Fehler gegen $F1 bei einem -- Arena haelt mehr als den Bedarf (Marke je U-ter Durchlauf, oder ein Block wird aufgegeben)"
   fi
   # Konstanz: 41 Durchlaeufe duerfen nicht mehr kosten als 21 (plus Rauschen).
   if [ "${F41:-0}" -le $(( F21 + (F21 / 10) + 100 )) ]; then
@@ -54,6 +59,27 @@ if [ "${F1:-0}" -gt 1000 ]; then
   fi
 else
   no "Grundlinie unplausibel ($F1) -- misst der Lauf ueberhaupt etwas?"
+fi
+
+# --- Die Reihe ueber den Abwickelfaktor muss FLACH sein ---------------------
+#
+# Das ist die Absicherung gegen eine Rueckkehr: der Fehler war PROPORTIONAL zu
+# U und bei U = 1 unsichtbar. Ein Test, der nur bei der Vorgabestufe messt,
+# haette ihn nie gezeigt.
+if "$LYXC" --std-path=. --target-energy=1 bench/arr_add_f32.lyx -o "$T/u1" >/dev/null 2>&1 \
+   && "$LYXC" --std-path=. --target-energy=5 bench/arr_add_f32.lyx -o "$T/u8" >/dev/null 2>&1; then
+  A=$( ulimit -v 4000000; /usr/bin/time -f '%R' "$T/u1" "$N" 21 2>&1 >/dev/null | tail -1 )
+  B=$( ulimit -v 4000000; /usr/bin/time -f '%R' "$T/u8" "$N" 21 2>&1 >/dev/null | tail -1 )
+  case "$A$B" in
+    *[^0-9]*) no "Reihe nicht messbar ('$A' '$B')" ;;
+    *) if [ "$B" -le $(( A + (A / 5) )) ]; then
+         ok "Reihe flach: U=1 $A Fehler, U=8 $B (<= $(( A + (A / 5) )))"
+       else
+         no "Reihe steigt mit dem Abwickelfaktor: U=1 $A, U=8 $B"
+       fi ;;
+  esac
+else
+  no "Reihe ueber --target-energy nicht uebersetzbar"
 fi
 
 echo "PASS: $P  FAIL: $F"

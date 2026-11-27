@@ -642,7 +642,16 @@ con CG_VEC_SUM: int64 := 144;  // data[144..151]: _lyx_vec_sum
 // ohne dass irgendetwas auffaellt. Ein stiller Default genau der Art, die
 // dieses Projekt schon 16 verworfene Opcodes gekostet hat.
 con CG_CPU_STUFE: int64 := 152;
-con CG_RES_DATEN_ENDE: int64 := 160;
+// #2676: data[160..167]: Anfang des ZULETZT geholten Vektorarena-Blocks.
+//
+// Gebraucht wird er beim Zuruecksetzen der Marke: hat ein Durchlauf einen
+// neuen Block geholt, zeigt END nicht mehr auf das gesicherte Ende. Bis
+// 1.2.51B legte das Zuruecksetzen dann eine BEDARFSGROSSE Region per mmap an
+// und liess den gerade geholten Block liegen -- gemessen vier Bloecke zu
+// 16 MB fuer eine Rechnung, die drei braucht. Mit dem Blockanfang kann
+// stattdessen in DIESEN Block re-markiert werden, ohne Syscall.
+con CG_VEC_BLOCK: int64 := 160;
+con CG_RES_DATEN_ENDE: int64 := 168;
 
 // #1971: Groesse eines Eintrags in `ress` (siehe Feld).
 pub con CG_RES_SZ: int64 := 56;
@@ -8944,10 +8953,58 @@ pub type Codegen = class {
     self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x05); self.cg_bumpRip(CG_VEC_END);   // mov rax, [VEC_END]
     self.cg_e8(0x48); self.cg_e8(0x3B); self.cg_e8(0x85); self.cg_e32(self.vecMarkeEnde); // cmp rax, [rbp+ende]
     self.cg_e8(0x0F); self.cg_e8(0x84); var pGleich: int64 := self.codeLen; self.cg_e32(0);  // je gleich
-    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x35); self.cg_bumpRip(CG_VEC_SUM);   // mov rsi, [VEC_SUM]
+    // #2676: In DEN BLOCK re-markieren, den der letzte Durchlauf schon geholt
+    // hat -- statt eine bedarfsgrosse Region per mmap anzulegen und diesen
+    // Block liegen zu lassen.
+    //
+    // Bis 1.2.51B stand hier ein mmap. Gemessen am Pruefstand (4194304, 21
+    // Durchlaeufe) waren es VIER Bloecke zu 16 MB fuer eine Rechnung, die
+    // DREI braucht: a, b, das c des ersten Durchlaufs -- und die neue
+    // Region, ab der dann wiederverwendet wurde. Der dritte Block blieb
+    // ungenutzt liegen; munmap gibt es hier nicht.
+    //
+    // Dass CG_VEC_BLOCK den RICHTIGEN Block nennt, haengt an der Bedingung
+    // darueber: END weicht von der gesicherten Marke ab, es wurde also SEIT
+    // der Marke ein Block geholt, und CG_VEC_BLOCK traegt den zuletzt
+    // geholten -- dessen Ende ist genau das aktuelle END. Ohne diese
+    // Bedingung koennte es ein Block von VOR der Marke sein (etwa der von
+    // `a`), und das Zuruecksetzen gaebe fremden, noch benutzten Speicher
+    // frei.
+    //
+    // Holt ein Durchlauf MEHRERE Bloecke, wird in den letzten re-markiert;
+    // die frueheren bleiben liegen wie bisher. Gespart ist dann der Syscall,
+    // nicht jeder Block -- vollstaendige Rueckgabe braucht eine Blockkette
+    // und ist in #2676 als eigener Schritt benannt.
+    // Bedarf des letzten Durchlaufs, auf Seiten aufgerundet.
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x35); self.cg_bumpRip(CG_VEC_SUM);     // mov rsi, [VEC_SUM]
     self.cg_e8(0x48); self.cg_e8(0x2B); self.cg_e8(0xB5); self.cg_e32(self.vecMarkeSumme); // sub rsi, [rbp+summe]
-    self.cg_e8(0x48); self.cg_e8(0x81); self.cg_e8(0xC6); self.cg_e32(4095);              // add rsi, 4095
-    self.cg_e8(0x48); self.cg_e8(0x81); self.cg_e8(0xE6); self.cg_e32(0 - 4096);          // and rsi, -4096
+    self.cg_e8(0x48); self.cg_e8(0x81); self.cg_e8(0xC6); self.cg_e32(4095);               // add rsi, 4095
+    self.cg_e8(0x48); self.cg_e8(0x81); self.cg_e8(0xE6); self.cg_e32(0 - 4096);           // and rsi, -4096
+
+    // Passt der Bedarf in den ZULETZT geholten Block, wird in DIESEN
+    // re-markiert -- ohne Syscall, und der Block bleibt in Benutzung.
+    //
+    // Passt er NICHT, bleibt es beim mmap einer bedarfsgrossen Region. Das
+    // ist keine Feinheit, sondern der Unterschied zwischen beschraenkt und
+    // unbeschraenkt: bei VERSCHACHTELTEN Schleifen holt ein aeusserer
+    // Durchlauf mehrere Bloecke, der letzte ist dann kleiner als der Bedarf,
+    // und ein Re-Markieren dorthin liesse die Marke mit jedem Durchlauf
+    // vorwaerts wandern. Gemessen, bevor diese Bedingung da war:
+    // 19584 KiB bei 20 Durchlaeufen, 272384 KiB bei 300 -- linear.
+    // tests/vektorarena_test.sh hat genau das gemeldet ("verschachtelt waechst").
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x05); self.cg_bumpRip(CG_VEC_BLOCK);   // mov rax, [VEC_BLOCK]
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x15); self.cg_bumpRip(CG_VEC_END);     // mov rdx, [VEC_END]
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xD1);                                  // mov rcx, rdx
+    self.cg_e8(0x48); self.cg_e8(0x29); self.cg_e8(0xC1);                                  // sub rcx, rax
+    self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xF1);                                  // cmp rcx, rsi
+    self.cg_e8(0x0F); self.cg_e8(0x82); var pMmap: int64 := self.codeLen; self.cg_e32(0);  // jb mmap
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x85); self.cg_e32(slot);               // mov [rbp+marke], rax
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x95); self.cg_e32(self.vecMarkeEnde);  // mov [rbp+ende], rdx
+    self.cg_e8(0xE9); var pUeber: int64 := self.codeLen; self.cg_e32(0);                   // jmp gleich
+    poke32(self.code + pMmap, self.codeLen - pMmap - 4);
+
+    // mmap: bedarfsgrosse Region (der Weg bis 1.2.51B, jetzt nur noch fuer
+    // den Fall, dass kein geholter Block den Bedarf traegt).
     self.cg_e8(0x56);                                                                      // push rsi (Groesse)
     self.cg_e8(0x31); self.cg_e8(0xFF);                                                    // xor edi, edi
     self.cg_e8(0xBA); self.cg_e32(3);                                                      // mov edx, 3
@@ -8961,6 +9018,7 @@ pub type Codegen = class {
     self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x85); self.cg_e32(slot);               // mov [rbp+marke], rax
     self.cg_e8(0x48); self.cg_e8(0x01); self.cg_e8(0xF0);                                  // add rax, rsi
     self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x85); self.cg_e32(self.vecMarkeEnde);  // mov [rbp+ende], rax
+    poke32(self.code + pUeber, self.codeLen - pUeber - 4);
     poke32(self.code + pGleich, self.codeLen - pGleich - 4);
     // gleich: Zaehler auf den Stand der Marke
     self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x85); self.cg_e32(self.vecMarkeSumme); // mov rax, [rbp+summe]
@@ -12166,6 +12224,14 @@ pub type Codegen = class {
       self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x14); self.cg_e8(0x30);       // lea rdx, [rax + rsi]
       self.cg_e8(0x5E);                                                             // pop rsi (Groesse)
       self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x0C); self.cg_e8(0x30);       // lea rcx, [rax + rsi]
+    }
+    // #2676: Nur fuer die VEKTORARENA den Blockanfang merken. rax haelt ihn
+    // noch (die beiden `lea` darueber lesen ihn, schreiben ihn nicht). Fuer
+    // den allgemeinen Heap gibt es keine Marke, also auch nichts zu merken --
+    // die Bedingung steht hier zur UEBERSETZUNGSZEIT, kostet im Erzeugnis
+    // also nichts.
+    if (ptrOff == CG_VEC_PTR) {
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x05); self.cg_bumpRip(CG_VEC_BLOCK);  // mov [VEC_BLOCK], rax
     }
     // Erst PTR, dann END — das zweite gibt die Sperre frei.
     self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x0D); self.cg_bumpRip(ptrOff);   // mov [PTR], rcx
@@ -34565,7 +34631,7 @@ pub type Codegen = class {
     self.resCap      := 0;
     self.resTabOff   := 0 - 1;
     self.cgLesePfad  := 0;   // #1971
-    self.dataLen     := 160; // #2198 +8 CPU-Stufe // WP-18: 88 Byte reserviert, +8 CG_FC_NAME (#1140), +8 CG_ENVBLOCK (#1677), +16 Bump-Allokator (#1836), +8 CG_RESTAB (#1961), +16 Vektorarena (#2206), +8 Vektorarena-Summe (#2253)
+    self.dataLen     := 168; // #2676 +8 Blockanfang // #2198 +8 CPU-Stufe // WP-18: 88 Byte reserviert, +8 CG_FC_NAME (#1140), +8 CG_ENVBLOCK (#1677), +16 Bump-Allokator (#1836), +8 CG_RESTAB (#1961), +16 Vektorarena (#2206), +8 Vektorarena-Summe (#2253)
     self.dOrig := alloc(16 * 16);   // #2146 Stufe C2c
     self.dOrigCount := 0;
     self.dOrigCap := 16;
