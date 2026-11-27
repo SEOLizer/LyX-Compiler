@@ -92,6 +92,14 @@ ok "uebersetzt"
 
 PIN=""
 command -v taskset >/dev/null 2>&1 && PIN="taskset -c 2"
+# #2666: Aufwaermlauf, verworfen. Der erste Lauf nach einer Ruhephase laeuft
+# auf einem Kern, der erst hochtaktet; die gemeldete Frequenz ist dann zu
+# niedrig, und die Gegenprobe gegen perf stat weiter unten (zweiter Lauf, dann
+# schon warmer Kern) sieht wie eine Abweichung aus. Gemessen im
+# `make test`-Lauf: 2 476 684 549 Hz gegen 2 910 232 127 Hz = 14,9 % bei
+# Schranke 10; dieselben beiden Messungen einzeln auf ruhiger Maschine 8,4 %.
+# Die niedrigere Zahl war jedes Mal die ERSTE.
+( cd "$TMP" && $PIN timeout 120 ./c > /dev/null 2>&1 )
 AUS="$( cd "$TMP" && $PIN timeout 120 ./c 2>&1 )" || { no "laeuft" "rc=$?"; echo "=== PASS=$PASS FAIL=$FAIL"; exit 1; }
 hol() { printf '%s\n' "$AUS" | sed -n "s/^$1=//p" | head -1; }
 
@@ -160,16 +168,30 @@ EOF2
       # Feld mehr — das Feld 3 ist dann "msec" statt "task-clock" und die
       # Auswertung findet nichts. Gemessen, nicht vermutet (#2322 war
       # derselbe Fehler bei lscpu).
-      PS="$( cd "$TMP" && LC_ALL=C $PIN perf stat -x, -e cycles,task-clock ./n 2>&1 >/dev/null )"
-      PC="$(printf '%s\n' "$PS" | awk -F, '$3=="cycles"{print $1}')"
-      PT="$(printf '%s\n' "$PS" | awk -F, '$3=="task-clock"{print $1}')"
-      if [ -n "$PC" ] && [ -n "$PT" ]; then
-        PHZ="$(awk -v c="$PC" -v t="$PT" 'BEGIN{printf "%d", c / (t/1000)}')"
+      # #2666: MEDIAN aus drei Proben statt einer einzigen.
+      #
+      # Die Schranke bleibt bei 10 % — an einer Schwelle zu drehen, bis ein
+      # Test gruen wird, macht den Befund nur unsichtbar. Geaendert ist die
+      # MESSUNG: der Aufwaermlauf oben nimmt den Anlauf aus dem Vergleich, der
+      # Median nimmt den Rest der Streuung. Pinnen macht $PIN schon.
+      PROBEN=""
+      PHZ=""
+      for _v in 1 2 3; do
+        PS="$( cd "$TMP" && LC_ALL=C $PIN perf stat -x, -e cycles,task-clock ./n 2>&1 >/dev/null )"
+        PC="$(printf '%s\n' "$PS" | awk -F, '$3=="cycles"{print $1}')"
+        PT="$(printf '%s\n' "$PS" | awk -F, '$3=="task-clock"{print $1}')"
+        [ -n "$PC" ] && [ -n "$PT" ] || continue
+        PROBEN="$PROBEN $(awk -v c="$PC" -v t="$PT" 'BEGIN{printf "%d", c / (t/1000)}')"
+      done
+      if [ -n "$PROBEN" ]; then
+        PHZ="$(printf '%s\n' $PROBEN | sort -n | awk '{a[NR]=$1} END{print a[int((NR+1)/2)]}')"
+      fi
+      if [ -n "$PHZ" ]; then
         REL="$(awk -v a="$HZ" -v b="$PHZ" 'BEGIN{d=(a-b)/b*100; if (d<0) d=-d; printf "%.1f", d}')"
         if awk -v d="$REL" 'BEGIN{exit !(d <= 10)}'; then
-          ok "Gegenprobe perf stat: ${PHZ} Hz gegen ${HZ} Hz (${REL} % Abweichung)"
+          ok "Gegenprobe perf stat: ${PHZ} Hz (Median aus$PROBEN) gegen ${HZ} Hz (${REL} % Abweichung)"
         else
-          no "Gegenprobe perf stat" "${PHZ} Hz gegen ${HZ} Hz (${REL} % Abweichung)"
+          no "Gegenprobe perf stat" "${PHZ} Hz (Median aus$PROBEN) gegen ${HZ} Hz (${REL} % Abweichung)"
         fi
       else
         echo "HINWEIS: perf stat lieferte keine Zaehler. Ausgabe:"
