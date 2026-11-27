@@ -150,26 +150,33 @@ fi
 # geprueft: ohne Compiler unberuehrt, mit Compiler umhuellt. Eine Pruefung
 # nur der ersten Haelfte waere auch von einer Grenze erfuellt, die gar nichts
 # mehr tut.
-cat > "$TMP/probe4.sh" <<PROBEEOF
+# Begrenzer in Anfuehrungszeichen, und ZIEL kommt aus der Umgebung: so steht
+# die LYXC-Zeile UNVERAENDERT in der Datei. Mit offenem Begrenzer wuerde
+# daraus `LYXC="\${LYXC:-...}"`, und das Backslash bricht das
+# Erlaubnis-Muster von tests/lyxc_umgebung_test.sh — die Zeile saehe dann wie
+# eine feste Zuweisung aus, obwohl sie keine ist. Dieselbe Falle steht zehn
+# Zeilen weiter oben schon beschrieben, und hier war sie trotzdem drin
+# (gemessen: "FAIL 1 unbedingte LYXC-Zuweisung" im vollen Lauf).
+cat > "$TMP/probe4.sh" <<'PROBEEOF'
 cd "$ROOT" || exit 1
-LYXC="\${LYXC:-$TMP/gibt-es-nicht}"
+LYXC="${LYXC:-$ZIEL}"
 . "$ROOT/tests/lib/lyxc_guard.sh"
-echo "\$LYXC"
+echo "$LYXC"
 PROBEEOF
-got4=$(bash "$TMP/probe4.sh" 2>/dev/null | tail -1)
+got4=$(ROOT="$ROOT" ZIEL="$TMP/gibt-es-nicht" bash "$TMP/probe4.sh" 2>/dev/null | tail -1)
 if [ "$got4" = "$TMP/gibt-es-nicht" ]; then
   ok "fehlender Compiler: LYXC bleibt unberuehrt (SKIP-Zweige leben)"
 else
   no "fehlender Compiler" "LYXC wurde auf '$got4' umgebogen — -x ist damit immer wahr"
 fi
 
-cat > "$TMP/probe5.sh" <<PROBEEOF
+cat > "$TMP/probe5.sh" <<'PROBEEOF'
 cd "$ROOT" || exit 1
-LYXC="\${LYXC:-$TMP/langsam}"
+LYXC="${LYXC:-$ZIEL}"
 . "$ROOT/tests/lib/lyxc_guard.sh"
-echo "\$LYXC"
+echo "$LYXC"
 PROBEEOF
-got5=$(bash "$TMP/probe5.sh" 2>/dev/null | tail -1)
+got5=$(ROOT="$ROOT" ZIEL="$TMP/langsam" bash "$TMP/probe5.sh" 2>/dev/null | tail -1)
 if [ "$got5" != "$TMP/langsam" ]; then
   ok "vorhandener Compiler: LYXC wird umhuellt"
 else
