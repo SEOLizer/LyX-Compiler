@@ -21,7 +21,7 @@ PASS=0; FAIL=0
 ok()  { echo "PASS $1"; PASS=$((PASS+1)); }
 bad() { echo "FAIL $1${2:+ -- $2}"; FAIL=$((FAIL+1)); }
 
-LISTE="tests/suite-messung.txt"
+LISTE="tests/messung-tests.txt"
 WACHE="tests/lib/lastwache.sh"
 
 if [ -f "$WACHE" ]; then ok "$WACHE vorhanden"; else bad "$WACHE" "fehlt"; fi
@@ -48,7 +48,7 @@ else
   bad "Eintrag ohne Lastwache" "$(printf '%s' "$fehlt_wache" | tr '\n' ' ')"
 fi
 
-if grep -q 'suite-messung\.txt' Makefile; then
+if grep -q 'messung-tests\.txt' Makefile; then
   ok "$LISTE haengt an einem Makefile-Ziel"
 else
   bad "$LISTE" "kein Makefile-Ziel liest sie — die Liste faehrt niemand (#1112)"

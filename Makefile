@@ -1772,7 +1772,7 @@ test-messung: lyxc
 	  else \
 	    echo "FAIL $$t"; fail=$$((fail+1)); \
 	  fi; \
-	done < tests/suite-messung.txt; \
+	done < tests/messung-tests.txt; \
 	echo "Messsuite: $$n Tests, $$fail rot"; \
 	test $$fail -eq 0
 
