@@ -15,6 +15,7 @@
 set -u
 cd "$(dirname "$0")/.." || exit 1
 LYXC="${LYXC:-./lyxc}"
+_g="$(dirname "$0")/lib/lyxc_guard.sh"; [ -f "$_g" ] || _g="$(dirname "$0")/../lib/lyxc_guard.sh"; . "$_g"
 P=0; F=0
 pr() { if [ "$1" = ok ]; then P=$((P+1)); echo "PASS $2"; else F=$((F+1)); echo "FAIL $2"; fi; }
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
