@@ -10,6 +10,8 @@
 # vergessen gibt kein Fehlersignal, sondern ein Abbild, das an einer Stelle in
 # den Helferblock des ERZEUGERS zeigt.
 cd "$(dirname "$0")/.." || exit 1
+LYXC="${LYXC:-./lyxc}"
+_g="$(dirname "$0")/lib/lyxc_guard.sh"; [ -f "$_g" ] || _g="$(dirname "$0")/../lib/lyxc_guard.sh"; . "$_g"
 PASS=0; FAIL=0
 pr() { if [ "$1" = ok ]; then PASS=$((PASS+1)); echo "PASS $2"; else FAIL=$((FAIL+1)); echo "FAIL $2"; fi; }
 
@@ -81,7 +83,7 @@ fn main(): int64 {
   return 0;
 }
 LYX
-if ./lyxc --std-path=. "$T/h.lyx" -o "$T/h" > "$T/build.log" 2>&1; then
+if "$LYXC" --std-path=. "$T/h.lyx" -o "$T/h" > "$T/build.log" 2>&1; then
   AUS=$("$T/h" 2>&1)
   ERW=$'16\ndampf\n6'
   if [ "$AUS" = "$ERW" ]; then pr ok "Helferaufrufe liefern die richtigen Werte (16/dampf/6)"

@@ -40,7 +40,19 @@ while IFS= read -r f; do
   esac
   anzahl=$((anzahl+1))
   grep -q "lyxc_guard" "$f" || ungeschuetzt="$ungeschuetzt $f"
-done < <(grep -rlE '"\$LYXC"|\$\{LYXC\}' "$ROOT/tests" --include='*.sh')
+# #2678: Das Muster hiess einmal '"\$LYXC"|\$\{LYXC\}' und traf damit nur
+# zwei der drei gebraeuchlichen Schreibweisen -- unquotiertes `$LYXC` fiel
+# durch, und `${LYXC:-./lyxc}` ist nicht `${LYXC}`. Gemessen: 11 weitere
+# Scripts benutzen den Compiler so, 9 davon ohne Grenze (u.a.
+# cpu_verteiler_2198_test.sh aus #2674). Aufgefallen ist es nur, weil ein
+# zweiter neuer Test zufaellig quotiert schrieb und deshalb GEMELDET wurde.
+# Jetzt zaehlt jedes Vorkommen des Namens als Benutzung: `$LYXC`, `"$LYXC"`,
+# `${LYXC...}` in jeder Ersetzungsform. Die Abgrenzung nach hinten geschieht
+# ueber eine Zeichenklasse und NICHT ueber \b -- in diesem Projekt ist das
+# eine bekannte Falle (awk kennt \b nicht), und eine Zeichenklasse sagt
+# dasselbe ohne Werkzeugabhaengigkeit. `${LYXC_TIMEOUT}` und `LYXCA` bleiben
+# damit richtigerweise draussen: andere Namen.
+done < <(grep -rlE '\$\{?LYXC([^A-Za-z0-9_]|$)' "$ROOT/tests" --include='*.sh')
 
 if [ -z "$ungeschuetzt" ]; then
   ok "alle $anzahl Scripts mit lyxc-Aufruf binden die Grenze ein"
@@ -129,6 +141,39 @@ if [ "$rc3" = "0" ]; then
   ok "gewoehnliche Uebersetzung laeuft unter der Grenze weiter"
 else
   no "gewoehnliche Uebersetzung" "rc=$rc3 — die Vorgabewerte sind zu eng"
+fi
+
+# --- 5. Die Grenze umhuellt nur einen vorhandenen Compiler ---------------
+# #2678: Der Wrapper ist immer ausfuehrbar. Wuerde die Grenze ihn auch ohne
+# Compiler setzen, waere jedes `[ -x "$LYXC" ]` nach dem Einbinden wahr --
+# gemessen 20 Scripts, deren SKIP-Zweig damit tot war. Beide Seiten werden
+# geprueft: ohne Compiler unberuehrt, mit Compiler umhuellt. Eine Pruefung
+# nur der ersten Haelfte waere auch von einer Grenze erfuellt, die gar nichts
+# mehr tut.
+cat > "$TMP/probe4.sh" <<PROBEEOF
+cd "$ROOT" || exit 1
+LYXC="\${LYXC:-$TMP/gibt-es-nicht}"
+. "$ROOT/tests/lib/lyxc_guard.sh"
+echo "\$LYXC"
+PROBEEOF
+got4=$(bash "$TMP/probe4.sh" 2>/dev/null | tail -1)
+if [ "$got4" = "$TMP/gibt-es-nicht" ]; then
+  ok "fehlender Compiler: LYXC bleibt unberuehrt (SKIP-Zweige leben)"
+else
+  no "fehlender Compiler" "LYXC wurde auf '$got4' umgebogen — -x ist damit immer wahr"
+fi
+
+cat > "$TMP/probe5.sh" <<PROBEEOF
+cd "$ROOT" || exit 1
+LYXC="\${LYXC:-$TMP/langsam}"
+. "$ROOT/tests/lib/lyxc_guard.sh"
+echo "\$LYXC"
+PROBEEOF
+got5=$(bash "$TMP/probe5.sh" 2>/dev/null | tail -1)
+if [ "$got5" != "$TMP/langsam" ]; then
+  ok "vorhandener Compiler: LYXC wird umhuellt"
+else
+  no "vorhandener Compiler" "LYXC blieb '$got5' — die Grenze greift gar nicht mehr"
 fi
 
 echo

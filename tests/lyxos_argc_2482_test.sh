@@ -17,6 +17,8 @@
 # Der abgelegte Stand ist der Grund, warum das ohne das LyxOS-Repo laeuft.
 cd "$(dirname "$0")/.." || exit 1
 ROOT="$PWD"
+LYXC="${LYXC:-./lyxc}"
+_g="$(dirname "$0")/lib/lyxc_guard.sh"; [ -f "$_g" ] || _g="$(dirname "$0")/../lib/lyxc_guard.sh"; . "$_g"
 P=0; F=0
 ok()  { echo "PASS $1"; P=$((P+1)); }
 bad() { echo "FAIL $1${2:+ -- $2}"; F=$((F+1)); }
@@ -168,10 +170,10 @@ fi
 #     `mov rax, 2561` (48 b8 01 0a 00..) und `syscall` (0f 05) muessen drei
 #     Registerladungen stehen, einschliesslich rdx (48 8b 55). Vor dem Fix
 #     endete die Folge nach rsi -- dieser Test waere rot gewesen.
-if [ -x ./lyxc ]; then
+if [ -x "$LYXC" ]; then
   TD=$(mktemp -d)
   printf 'unit main;\nfn main(): int64 { return sys_trace_event(17, 0, 3); }\n' > "$TD/te.lyx"
-  if ./lyxc --std-path=. --target=lyxos "$TD/te.lyx" -o "$TD/te.lbf" >"$TD/te.log" 2>&1; then
+  if "$LYXC" --std-path=. --target=lyxos "$TD/te.lyx" -o "$TD/te.lbf" >"$TD/te.log" 2>&1; then
     if python3 - "$TD/te.lbf" <<'PYEOF'
 import sys
 d = open(sys.argv[1], 'rb').read()
@@ -198,7 +200,7 @@ PYEOF
   fi
   rm -rf "$TD"
 else
-  echo "    SKIP 11: ./lyxc fehlt (make bootstrap)"
+  echo "    SKIP 11: $LYXC fehlt (make bootstrap)"
 fi
 
 echo "--- $P PASS, $F FAIL"
