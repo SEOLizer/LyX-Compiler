@@ -5224,8 +5224,7 @@ pub type Parser = class {
   // Stellen aufgezaehlt wird (vor und nach `pub`, geschachtelt, Methode,
   // freie Funktion). Fuenf Kopien derselben Auswertung waeren fuenf Orte, an
   // denen der naechste Name fehlen kann.
-  fn _parseCpuAttrArg(): int64 {
-    self.Advance();   // (
+  fn _cpuStufeAusName(): int64 {
     var stufe: int64 := -1;
     if (self.Check(TK_IDENT) != 0) {
       if      (self._tokTextEq(self.cur, "baseline"c) != 0) { stufe := 0; }
@@ -5234,12 +5233,56 @@ pub type Parser = class {
       else if (self._tokTextEq(self.cur, "avx512"c)   != 0) { stufe := 3; }
       self.Advance();
     }
-    if (stufe < 0) {
-      self._err("@cpu kennt nur baseline, sse4, avx2, avx512"c);
-      stufe := 0;
-    }
-    self.Expect(TK_RPAREN);
     return stufe;
+  }
+
+  // #2198: `@cpu(avx2, baseline)` -- MEHRERE Stufen. Rueckgabe ist eine MASKE
+  // (Bit n = Stufe n); `@cpu(avx2)` ergibt 0b0100.
+  //
+  // Eine Maske und keine Liste, weil die Reihenfolge der Namen keine Bedeutung
+  // hat: der Verteiler nimmt die hoechste Stufe, die die CPU kann.
+  // `@cpu(baseline, avx2)` und `@cpu(avx2, baseline)` sind dasselbe, und eine
+  // Darstellung, die das nicht zeigt, verleitet zu der Annahme, es sei
+  // verschieden.
+  fn _parseCpuAttrArg(): int64 {
+    self.Advance();   // (
+    var maske: int64 := 0;
+    var weiter: int64 := 1;
+    while (weiter != 0) {
+      var stufe: int64 := self._cpuStufeAusName();
+      if (stufe < 0) {
+        self._err("@cpu kennt nur baseline, sse4, avx2, avx512"c);
+        maske := 1;
+        weiter := 0;
+      } else {
+        if ((maske & (1 << stufe)) != 0) {
+          // Dieselbe Stufe zweimal ist keine zweite Fassung, sondern ein
+          // Schreibfehler -- und einer, der sonst still eine Fassung doppelt
+          // erzeugt haette.
+          self._err("@cpu: dieselbe Stufe zweimal genannt"c);
+          weiter := 0;
+        } else {
+          maske := maske | (1 << stufe);
+          if (self.Check(TK_COMMA) != 0) { self.Advance(); }
+          else { weiter := 0; }
+        }
+      }
+    }
+    if (maske == 0) { maske := 1; }
+    self.Expect(TK_RPAREN);
+    return maske;
+  }
+
+  // #2198: hoechste gesetzte Stufe. Sie bleibt der Wert in den unteren acht
+  // Bit von `iv`, weil #2191 ihn als ZAHL liest.
+  fn _cpuHoechste(maske: int64): int64 {
+    var h: int64 := 0;
+    var i: int64 := 0;
+    while (i < 4) {
+      if ((maske & (1 << i)) != 0) { h := i; }
+      i := i + 1;
+    }
+    return h;
   }
 
   // #2191: `@cpu(avx2);` als eigene Anweisung bzw. vor einer Funktion auf
@@ -5248,10 +5291,14 @@ pub type Parser = class {
   fn _parseAtCpu(): int64 {
     var ti: int64 := self.cur;
     self.Advance();   // "cpu"
-    var stufe: int64 := self._parseCpuAttrArg();
+    var maske: int64 := self._parseCpuAttrArg();
     self.Match(TK_SEMI);
     var n: int64 := self._alloc(NK_AT_CPU, ti);
-    self._siv(n, stufe);
+    // #2198: beide Angaben in `iv` -- hoechste Stufe unten, Maske darueber.
+    // NICHT nach c0: dort haelt der Baum Knotenindizes, und cg_canaryScan
+    // steigt in c0..c3 als KNOTEN ab -- eine Maske 5 waere dort Knoten 5.
+    // Genau diese Falle nennt die Projektnotiz zu AT_DIRECTIVE.
+    self._siv(n, self._cpuHoechste(maske) | (maske << 8));
     return n;
   }
 
