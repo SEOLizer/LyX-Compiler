@@ -141,6 +141,10 @@ is_exempt() {
                                           # von den Scripts eingebunden und vom
                                           # Waechter lyxc_guard_coverage_test.sh
                                           # selbst geprueft
+    lib/lastwache.sh)        return 0 ;;  # #2666: Bibliothek, kein Test — meldet,
+                                          # ob die Maschine ruhig genug fuer eine
+                                          # Zeitmessung ist; geprueft vom Waechter
+                                          # lastwache_abdeckung_2666_test.sh
     lib/vektorzahl.sh)       return 0 ;;  # #2335: Bibliothek, kein Test — zaehlt
                                           # Vektorbefehle ueber Befehlsgrenzen fuer
                                           # autovektor_2194/vektor_hilfsindex_2334/

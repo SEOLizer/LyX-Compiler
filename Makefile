@@ -104,7 +104,7 @@ $(UNIT_DEPS): tools/unit_deps.sh $(UNITS_SRC) $(DATA_SRC)
 # frischen Checkout raeumt statt an der fehlenden Datei zu scheitern.
 -include $(UNIT_DEPS)
 
-.PHONY: build bootstrap singularity test test-external test-lyxos test-lyx-integration test-known-red snapshot snapshot-update clean package precompile-units install-bin install-data lic_build_flags keygen deb dist dist-win64 dist-linux
+.PHONY: build bootstrap singularity test test-messung test-external test-lyxos test-lyx-integration test-known-red snapshot snapshot-update clean package precompile-units install-bin install-data lic_build_flags keygen deb dist dist-win64 dist-linux
 
 # ── Compiler bauen ────────────────────────────────────────────────────────────
 
@@ -1117,8 +1117,11 @@ test: lyxc
 	@echo "--- Array-Deklarationen: leeres Literal, append, mehrdimensional (11 Pruefungen) ---"
 	@bash tests/array_decl_test.sh
 	@echo "OK"
-	@echo "--- Ressourcengrenze um jeden lyxc-Aufruf (5 Pruefungen) ---"
+	@echo "--- Ressourcengrenze um jeden lyxc-Aufruf (7 Pruefungen) ---"
 	@bash tests/lyxc_guard_coverage_test.sh
+	@echo "OK"
+	@echo "--- Lastwache: Zeitmessungen urteilen nur ruhig (#2666) ---"
+	@bash tests/lastwache_abdeckung_2666_test.sh
 	@echo "OK"
 	@echo "--- Enum-Member, doppelte Namen, Escape-Sequenzen (12 Pruefungen) ---"
 	@bash tests/enum_escape_test.sh
@@ -1744,6 +1747,32 @@ test-lyxos-abgleich:
 	  exit 0; \
 	fi; \
 	exit $$rc
+
+.PHONY: test-messung
+# #2666: Die Zeitmessungen gebuendelt auf einer RUHIGEN Maschine fahren.
+#
+# Im `test`-Ziel stehen sie weiter, lassen sich dort aber selbst aus, wenn die
+# Maschine nicht ruhig ist — sonst urteilt der Lauf gegen die Last, die er
+# selbst erzeugt (gemessen: zwei Laeufe, derselbe Compiler, zwei verschiedene
+# rote Tests). Hier wird ohne Fremdlast gemessen; LASTWACHE_AUS=1 erzwingt das
+# Urteil, wenn man die Auslassung gerade nicht will.
+#
+#   make test-messung                 # urteilt, wenn die Maschine ruhig ist
+#   LASTWACHE_AUS=1 make test-messung # urteilt in jedem Fall
+test-messung: lyxc
+	@fail=0; n=0; aus=0; \
+	while read -r t; do \
+	  case "$$t" in ''|\#*) continue ;; esac; \
+	  n=$$((n+1)); \
+	  echo "--- $$t"; \
+	  if bash tests/$$t; then \
+	    :; \
+	  else \
+	    echo "FAIL $$t"; fail=$$((fail+1)); \
+	  fi; \
+	done < tests/suite-messung.txt; \
+	echo "Messsuite: $$n Tests, $$fail rot"; \
+	test $$fail -eq 0
 
 .PHONY: test-lyxos-units
 test-lyxos-units: lyxc
