@@ -14,6 +14,8 @@
 //   N=<zahl> nach <zahl> Verbindungen beenden (Standard: 0 = endlos)
 //   still    je Verbindung nichts ausgeben
 //   echo     Anwendungsdaten zurueckschicken statt einer HTTP-Antwort
+//   http11   nur http/1.1 als ALPN anbieten (ohne h2) -- fuer Browser, die
+//            sonst HTTP/2 waehlen, waehrend dieser Server HTTP/1.1 spricht
 //   tickets  NewSessionTicket ausgeben (Wiederaufnahme, #2577)
 //   frueh    fruehe Daten annehmen (0-RTT, #2578) -- schaltet `tickets` mit
 //            ein, weil 0-RTT ohne Ticket nicht vorkommt
@@ -91,7 +93,14 @@ fn main(): int64 {
   var kette: int64 := alloc(16);
   poke64(kette, dCert); poke64(kette + 8, lCert);
   var cfg: int64 := alloc(TlsConfigGroesse());
+  // #2613: Mit `h2` in der Liste waehlt ein Browser HTTP/2 und schickt als
+  // erstes die h2-Praeambel. Dieser Server antwortet HTTP/1.1; die Pruefung
+  // scheiterte dann an der ANWENDUNGSschicht, obwohl der Handschlag stand
+  // (gemessen in tests/tls13_interop_clients_2096_test.sh mit curl:
+  // "Remote peer returned unexpected data while we expected SETTINGS frame").
+  // Der Schalter `http11` bietet darum nur http/1.1 an.
   var alpn: pchar := "h2,http/1.1"c;
+  if (hatSchalter("http11"c) == 1) { alpn := "http/1.1"c; }
   TlsConfigNeu(cfg, 1);
   TlsConfigKette(cfg, kette, 1, dKey, lKey);
   TlsConfigAlpn(cfg, alpn as int64, StrLen(alpn));
@@ -183,17 +192,36 @@ fn main(): int64 {
       var geantwortet: int64 := 0;
       var stille: int64 := 0;
       var schleife: int64 := 0;
+      // #2675: ZUERST fragen, was schon entschluesselt bereitliegt, und nur
+      // dann vom Socket lesen. Unter Last koaleszieren Finished und die
+      // Anfrage in EIN TCP-Segment; die Handschlagschleife oben liest das
+      // Segment ganz, die Anfrage steckt also bereits im TLS-Puffer. Wer in
+      // dieser Lage mit `read` anfaengt, blockiert, bis die Gegenseite
+      // schliesst -- gemessen in #2418 mit `strace -T`:
+      // read(4, "", 32768) = 0 <39.948270>. Die Antwort ging danach hinaus,
+      // aber `s_client` war schon in seinem Zeitlimit getoetet; der Test war
+      // rot, obwohl beide Seiten den Handschlag als gelungen meldeten.
+      //
+      // DIESELBE REIHENFOLGE wie in tests/tls13_interop_openssl_test.sh und
+      // tests/tls12_interop_openssl_test.sh (je Server und Client) -- die
+      // vier Stellen dort wurden in 1.2.46A umgestellt, diese fuenfte nicht,
+      // und genau sie faellt in #2675 weiter unter Last aus. Die fuenf
+      // muessen uebereinstimmen.
       while (schleife < 200 && stille < 3) {
-        var n2: int64 := TCPConnRead(conn, puf as pchar, 32768);
-        if (n2 > 0) {
-          TlsFuetter(c, puf, n2);
-          stille := 0;
-        } else {
-          stille := stille + 1;
-        }
         var g: int64 := TlsLese(c, ein, 32768);
+        if (g <= 0) {
+          var n2: int64 := TCPConnRead(conn, puf as pchar, 32768);
+          if (n2 > 0) {
+            TlsFuetter(c, puf, n2);
+            stille := 0;
+            g := TlsLese(c, ein, 32768);
+          } else {
+            stille := stille + 1;
+          }
+        }
         if (g < 0) { schleife := 200; }          // close_notify oder Fehler
         if (g > 0) {
+          stille := 0;
           // Im Echo-Betrieb geht der Inhalt zurueck, sonst eine feste
           // HTTP-Antwort. Echo braucht es fuer Pruefwerkzeuge, die die
           // Laenge der Antwort gegen die ihrer Anfrage halten (tlsfuzzer

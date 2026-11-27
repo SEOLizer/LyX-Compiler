@@ -42,7 +42,15 @@ fi
 # (`ok "vorhandenes ./lyxc bleibt unangetastet"`), die gar nichts aufruft.
 # Ein Waechter, der falsch anschlaegt, wird irgendwann entschaerft; deshalb
 # lieber die Regel schaerfen als die Meldung umschreiben.
-vorbei=$(grep -rnE '(^|[;&|(]|\$\()[[:space:]]*("?\$ROOT/lyxc"?|"?\$REPO_ROOT/lyxc"?|\./lyxc)[[:space:]]' \
+# #2678: Die Aufzaehlung der Befehlsstellen war unvollstaendig. `^`, `;`, `&`,
+# `|`, `(` und `$(` erfassen die Pipeline, aber nicht die STEUERWOERTER --
+# `if ./lyxc …` stand damit an einer Befehlsstelle, die der Waechter nicht
+# kannte. Gemessen: zwei echte Aufrufe am Namen vorbei
+# (helferref_eine_stelle_2146, lyxos_argc_2482), beide seit ihrer Entstehung
+# ungemeldet. Dieselbe Klasse wie die Schreibweisenliste in
+# lyxc_guard_coverage_test.sh: nicht eine zweite Stelle fehlte, sondern ein
+# Fall in einer Liste.
+vorbei=$(grep -rnE '(^|[;&|(]|\$\(|(^|[[:space:]])(if|then|else|elif|while|until|do|time|!)[[:space:]]+)[[:space:]]*("?\$ROOT/lyxc"?|"?\$REPO_ROOT/lyxc"?|\./lyxc)[[:space:]]' \
          tests/ --include='*.sh' \
          | grep -v "^$AUSNAHME:" \
          | grep -v "^tests/lyxc_umgebung_test.sh:" \

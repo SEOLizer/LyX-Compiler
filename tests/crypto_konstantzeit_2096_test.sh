@@ -135,6 +135,20 @@ BIND=""
 command -v taskset >/dev/null 2>&1 && BIND="taskset -c 2"
 
 P=0; F=0
+
+# #2666: Eine Zeitmessung urteilt nur auf einer ruhigen Maschine. Der
+# `make test`-Lauf erzeugt selbst die Last, gegen die dieser Test urteilt —
+# zwei Laeufe mit demselben Compiler ergaben zwei VERSCHIEDENE rote Tests,
+# einzeln auf ruhiger Maschine waren beide gruen. Ausgelassen wird MIT
+# GRUND und mit der gemessenen Zahl, nicht stillschweigend.
+_lw="$(dirname "$0")/lib/lastwache.sh"; [ -f "$_lw" ] || _lw="$(dirname "$0")/../lib/lastwache.sh"; . "$_lw"
+if ! lastwache_ruhig; then
+  echo "SKIP: $LASTWACHE_GRUND"
+  echo "--- 0 PASS, 0 FAIL"
+  echo "ALL PASS"
+  exit 0
+fi
+lastwache_bericht
 ok()  { echo "PASS $1"; P=$((P+1)); }
 bad() { echo "FAIL $1${2:+ -- $2}"; F=$((F+1)); }
 

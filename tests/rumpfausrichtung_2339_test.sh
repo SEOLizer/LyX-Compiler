@@ -37,6 +37,19 @@ _g="$(dirname "$0")/lib/lyxc_guard.sh"; [ -f "$_g" ] || _g="$(dirname "$0")/../l
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 ulimit -c 0
 PASS=0; FAIL=0
+
+# #2666: Eine Zeitmessung urteilt nur auf einer ruhigen Maschine. Der
+# `make test`-Lauf erzeugt selbst die Last, gegen die dieser Test urteilt —
+# zwei Laeufe mit demselben Compiler ergaben zwei VERSCHIEDENE rote Tests,
+# einzeln auf ruhiger Maschine waren beide gruen. Ausgelassen wird MIT
+# GRUND und mit der gemessenen Zahl, nicht stillschweigend.
+_lw="$(dirname "$0")/lib/lastwache.sh"; [ -f "$_lw" ] || _lw="$(dirname "$0")/../lib/lastwache.sh"; . "$_lw"
+if ! lastwache_ruhig; then
+  echo "SKIP: $LASTWACHE_GRUND"
+  echo "=== PASS=0 FAIL=0"
+  exit 0
+fi
+lastwache_bericht
 ok() { echo "PASS $1"; PASS=$((PASS+1)); }
 no() { echo "FAIL $1: $2"; FAIL=$((FAIL+1)); }
 

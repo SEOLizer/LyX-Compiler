@@ -18,6 +18,7 @@
 
 cd "$(dirname "$0")/.." || exit 1
 LYXC="${LYXC:-./lyxc}"
+_g="$(dirname "$0")/lib/lyxc_guard.sh"; [ -f "$_g" ] || _g="$(dirname "$0")/../lib/lyxc_guard.sh"; . "$_g"
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 PASS=0; FAIL=0
 

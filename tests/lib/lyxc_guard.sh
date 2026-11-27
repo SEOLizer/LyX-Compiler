@@ -29,7 +29,14 @@
 # nur — deshalb meldet der Wrapper den Grund auf stderr, bevor er den Code
 # weiterreicht.
 
-if [ -z "${_LYXC_GUARD_ACTIVE:-}" ]; then
+# #2678: Nur umhuellen, wenn es etwas zu umhuellen GIBT. Der Wrapper ist immer
+# vorhanden und ausfuehrbar; liegt gar kein Compiler da, machte er aus jedem
+# `[ -x "$LYXC" ]` nach dem Einbinden eine wahre Aussage. Gemessen: 20 Scripts
+# pruefen so, ob der Compiler existiert, und ihr SKIP-Zweig war damit tot --
+# statt einer Auslassungsmeldung kam ein undurchsichtiger Fehlschlag aus dem
+# ersten Aufruf. Fehlt der Compiler, bleibt LYXC deshalb unberuehrt: dann gibt
+# es auch keinen Lauf, den eine Grenze schuetzen muesste.
+if [ -z "${_LYXC_GUARD_ACTIVE:-}" ] && { [ -x "$LYXC" ] || command -v "$LYXC" >/dev/null 2>&1; }; then
   _LYXC_GUARD_ACTIVE=1
 
   _lyxc_guard_real="$LYXC"
