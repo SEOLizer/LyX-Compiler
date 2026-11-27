@@ -21,8 +21,8 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.50D
-VERSION_DATE := 2026-11-26
+VERSION   := 1.2.51A
+VERSION_DATE := 2026-11-27
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
 # #2499: Die Vorkompilate liegen je Architektur. Sobald eine .lyu Maschinencode
@@ -929,6 +929,7 @@ test: lyxc
 	@bash tests/vaes_ctr_2393_test.sh
 	@bash tests/evex_avx512_2404_test.sh
 	@bash tests/simd_asm_2521_test.sh
+	@bash tests/cpu_verteiler_2198_test.sh
 	@echo "--- #2637: Print/PrintLn mit f64 auf allen Zielen, gleiche Ausgabe ---"
 	@bash tests/print_f64_ir_2637_test.sh
 	@echo "--- Kernelnummern kommen aus der erzeugten Tabelle an (#2549) ---"

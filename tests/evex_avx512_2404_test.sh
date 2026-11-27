@@ -158,6 +158,57 @@ else
   fi
 fi
 
+# --------------------------------------------------------------- #2671
+# EVEX darf NIE in einem avx2-Erzeugnis stehen. Keine Feinheit: ein
+# EVEX-Befehl auf einer CPU ohne AVX-512 ist SIGILL.
+#
+# Diese Pruefung schliesst eine GEMERGTE Regression aus. #2404 gab
+# cg_emitAVX2BinOp einen dritten Parameter `mit512`, zog aber nur EINE der
+# ZWEI Aufrufstellen nach. Die andere rief weiter mit zwei Argumenten;
+# `mit512` bekam, was im Register stand, und jede ganzzahlige Vektorschleife
+# unter --target-cpu=avx2 trug einen EVEX-Vorlauf. Gemessen: mit dem Compiler
+# VOR #2404 (7d709d8c) lief dasselbe Programm richtig (s=97920), danach
+# rc 132 (SIGILL).
+#
+# Gemessen werden WIRKUNG und BYTES -- eins allein genuegt nicht: der Lauf
+# faellt auf einer AVX-512-CPU nicht auf, und die Bytes allein sagen nichts
+# ueber das Ergebnis. Dazu die Gegenrichtung (ymm MUSS da sein), sonst waere
+# die Pruefung auch von einem Erzeugnis erfuellt, das gar nicht vektorisiert.
+cat > "$TMP/ganz.lyx" <<'EOF'
+import src.std.io
+fn addiere(a: int64, b: int64, c: int64, n: int64) {
+  var i: int64 := 0;
+  while (i < n) { var o: int64 := i * 4; poke32(c + o, (peek32(a + o) + peek32(b + o)) & 0xFFFFFFFF); i += 1; }
+}
+fn main(): int64 {
+  var n: int64 := 256;
+  var a: int64 := alloc(n * 4); var b: int64 := alloc(n * 4); var c: int64 := alloc(n * 4);
+  var i: int64 := 0;
+  while (i < n) { var o: int64 := i * 4; poke32(a + o, i); poke32(b + o, i * 2); i += 1; }
+  addiere(a, b, c, n);
+  var s: int64 := 0; i := 0;
+  while (i < n) { s := s + (peek32(c + i * 4) & 0xFFFFFFFF); i += 1; }
+  PrintStr("s="c); PrintInt(s); PrintLn();
+  return 0;
+}
+EOF
+if "$LYXC" --std-path=. --target-cpu=avx2 "$TMP/ganz.lyx" -o "$TMP/ganz" >/dev/null 2>&1; then
+  GOUT="$( ulimit -v 4000000; timeout 120 "$TMP/ganz" 2>/dev/null )"; GRC=$?
+  if [ "$GOUT" = "s=97920" ]; then ok "#2671 avx2-Ganzzahlschleife rechnet richtig (97920)"
+  else no "#2671 avx2-Ganzzahlschleife" "'$GOUT' rc=$GRC (SIGILL ist 132)"; fi
+  GN=$(python3 -c "
+import re,sys; d=open(sys.argv[1],'rb').read()
+print(len([h for h in re.finditer(rb'\x62[\xf1\xf2\xf3]', d)]))" "$TMP/ganz")
+  if [ "$GN" = 0 ]; then ok "#2671 avx2-Erzeugnis traegt KEINEN EVEX-Befehl"
+  else no "#2671 avx2-Erzeugnis traegt EVEX" "$GN Praefix(e) -- SIGILL ohne AVX-512"; fi
+  GY=$(python3 -c "
+import sys; print(open(sys.argv[1],'rb').read().count(b'\xc5\xfe\x6f'))" "$TMP/ganz")
+  if [ "$GY" -gt 0 ]; then ok "#2671 avx2-Erzeugnis traegt ymm-Befehle ($GY)"
+  else no "#2671 avx2-Erzeugnis traegt kein ymm" "nicht vektorisiert, Pruefung waere blind"; fi
+else
+  no "#2671 avx2-Ganzzahlschleife" "uebersetzt nicht"
+fi
+
 echo ""
 echo "Ergebnis: $PASS PASS, $FAIL FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

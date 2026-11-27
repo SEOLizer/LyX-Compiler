@@ -200,14 +200,15 @@ fi
 #    hinter der letzten reservierten Zelle liegen. Ein neuer Platz dort, der
 #    hier nicht nachgezogen wird, liesse das Abbild seine EIGENE Kopie lesen
 #    -- und die liegt im nur lesbaren Codebereich.
-VS=$(grep -oE '^con CG_VEC_SUM: int64 := [0-9]+' src/codegen_x86.lyx | grep -oE '[0-9]+$')
+# #2198: letzte reservierte Zelle ist jetzt CG_CPU_STUFE, nicht CG_VEC_SUM.
+VS=$(grep -oE '^con CG_CPU_STUFE: int64 := [0-9]+' src/codegen_x86.lyx | grep -oE '[0-9]+$')
 RE=$(grep -oE '^con CG_RES_DATEN_ENDE: int64 := [0-9]+' src/codegen_x86.lyx | grep -oE '[0-9]+$')
 GROESSTE=$(grep -oE '^con CG_[A-Z_]+: int64 := [0-9]+;[[:space:]]*// data\[[0-9]+' src/codegen_x86.lyx \
            | grep -oE ':= [0-9]+' | grep -oE '[0-9]+' | sort -n | tail -1)
 if [ -n "$VS" ] && [ -n "$RE" ] && [ "$RE" -ge "$((GROESSTE + 8))" ] && [ "$RE" -eq "$((VS + 8))" ]; then
   pr ok "CG_RES_DATEN_ENDE=$RE deckt alle reservierten Zellen (groesste bei $GROESSTE)"
 else
-  pr no "CG_RES_DATEN_ENDE=$RE passt nicht zu CG_VEC_SUM=$VS / groesster Zelle $GROESSTE"
+  pr no "CG_RES_DATEN_ENDE=$RE passt nicht zu letzter Zelle=$VS / groesster Zelle $GROESSTE"
 fi
 
 echo "--- $PASS PASS, $FAIL FAIL"

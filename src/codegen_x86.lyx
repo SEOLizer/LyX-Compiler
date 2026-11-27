@@ -635,7 +635,14 @@ con CG_VEC_SUM: int64 := 144;  // data[144..151]: _lyx_vec_sum
 // eigener Kopie laese ein Abbild argc als 0 und wuerfe Ausnahmen an einem
 // Zustand, den niemand faengt. Ein neuer Platz hier erhoeht die Zahl.
 // tests/lyu_binder_2146_test.sh haelt sie gegen CG_VEC_SUM.
-con CG_RES_DATEN_ENDE: int64 := 152;
+// #2198: data[152..159]: _lyx_cpu_stufe. 0 = noch nicht erkannt, sonst
+// STUFE+1. Die Verschiebung um eins ist der ganze Trick: ein frischer
+// Datenbereich ist 0, und 0 muss "unbekannt" heissen -- waere 0 die Stufe
+// `baseline`, liefe jedes Programm dauerhaft auf der langsamsten Fassung,
+// ohne dass irgendetwas auffaellt. Ein stiller Default genau der Art, die
+// dieses Projekt schon 16 verworfene Opcodes gekostet hat.
+con CG_CPU_STUFE: int64 := 152;
+con CG_RES_DATEN_ENDE: int64 := 160;
 
 // #1971: Groesse eines Eintrags in `ress` (siehe Feld).
 pub con CG_RES_SZ: int64 := 56;
@@ -1644,6 +1651,19 @@ pub type Codegen = class {
   // und schlaegt das CLI-Flag; 0 = nicht gesetzt.
   scopeEnergyLevel:  int64;
   scopeCpuStufe:     int64;   // #2191: Stand aus `@cpu(stufe);`
+  // #2198: Maske der in `@cpu(...)` genannten Stufen (Bit n = Stufe n). Mehr
+  // als ein Bit heisst: diese Funktion wird MEHRFACH erzeugt und beim Aufruf
+  // ausgewaehlt.
+  scopeCpuMaske:     int64;
+  // #2198: erzwungene Stufe waehrend der Mehrfachemission (-1 = aus). Sie
+  // UEBERSTIMMT das CLI-Flag, und zwar in beide Richtungen: eine Fassung
+  // `baseline` muss baseline bleiben, auch wenn --target-cpu=avx2 gesetzt
+  // ist, sonst sind beide Fassungen gleich und der Verteiler waehlt zwischen
+  // zwei identischen Rumpfen.
+  cpuFestStufe:      int64;
+  // #2198: wurde ein Verteiler erzeugt? Nur dann kommt der Erkennungsblock
+  // ins Erzeugnis -- ein Programm ohne mehrstufige Funktion bleibt BYTEGLEICH.
+  cpuErkennAn:       int64;
   vecMarkeEnde:      int64;   // #2206: Rahmenplatz der END-Marke der Vektorarena
   vecMarkeSumme:     int64;   // #2253: Rahmenplatz des gesicherten CG_VEC_SUM
 
@@ -25282,8 +25302,11 @@ pub type Codegen = class {
       if (kind == 4) { self.optLevel             := val; }  // WP-AS-04
 
     } else if (k == CGN_AT_CPU) {  // #2191: @cpu(stufe); innerhalb eines Blocks
-      self.scopeCpuStufe := self.cg_nival(ni);
-      self.fnCpuStufe    := self.cg_nival(ni);
+      // #2198: untere acht Bit = Stufe, darueber die Maske. Ohne die
+      // Maskierung waere `@cpu(avx2)` hier die Stufe 1026.
+      self.scopeCpuStufe := self.cg_nival(ni) & 255;
+      self.fnCpuStufe    := self.cg_nival(ni) & 255;
+      self.scopeCpuMaske := (self.cg_nival(ni) >> 8) & 15;
     } else if (k == CGN_AT_ENERGY) {  // WP-EN-04: @energy(N); statement override
       self.fnEnergyLevel := self.cg_nival(ni);
 
@@ -26691,7 +26714,22 @@ pub type Codegen = class {
       self.cg_emitSSE2Kopie(breite);
     } else {
     var sonder: int64 := self.cg_sseGanzSonderweg(op, breite);
-    if (self.cg_cpuHat(2) != 0 && sonder == 0) { self.cg_emitAVX2BinOp(op, kennung); }
+    // #2404 BERICHTIGUNG (#2671): DIESELBE Rechnung wie an der anderen
+    // Aufrufstelle von cg_emitAVX2BinOp -- die beiden muessen uebereinstimmen.
+    //
+    // Bis 1.2.50D stand hier `cg_emitAVX2BinOp(op, kennung)` mit ZWEI
+    // Argumenten, obwohl #2404 einen dritten hinzugefuegt hatte. `mit512`
+    // bekam damit, was im Register stand, und das war oft ungleich 0: jede
+    // ganzzahlige Vektorschleife unter --target-cpu=avx2 trug einen
+    // EVEX-Vorlauf (`62 f1 fe 48 6f ...`) und starb auf jeder CPU ohne
+    // AVX-512 mit SIGILL. Gemessen gegen 7d709d8c (vor #2404): dort richtig.
+    var mit512b: int64 := 0;
+    if (self.cg_cpuHat(3) != 0) {
+      mit512b := 1;
+      if ((kennung & CG_SIMD_GANZ) != 0 && (kennung & CG_SIMD_BREITE) == 8
+          && self.cg_sseGanzOpcode(op, 8) > 255) { mit512b := 0; }   // VPMULLQ: erst DQ
+    }
+    if (self.cg_cpuHat(2) != 0 && sonder == 0) { self.cg_emitAVX2BinOp(op, kennung, mit512b); }
     else                                       { self.cg_emitSSE2BinOp(op, kennung); }
     }
 
@@ -29916,7 +29954,237 @@ pub type Codegen = class {
     self.cg_e8(0x0F); self.cg_e8(0x05);
   }
 
+  // #2198: Zahl der gesetzten Bits. Eine Maske mit einem Bit ist der
+  // Bestandsfall und darf KEIN zusaetzliches Byte kosten.
+  fn cg_bitZahl(m: int64): int64 {
+    var n: int64 := 0;
+    var i: int64 := 0;
+    while (i < 4) {
+      if ((m & (1 << i)) != 0) { n := n + 1; }
+      i := i + 1;
+    }
+    return n;
+  }
+
+  // #2198: Marke einer Fassung: `<name>.cpu<stufe>`. Der Punkt kann in keinem
+  // Lyx-Bezeichner stehen, die Marke kann also mit keiner echten Funktion
+  // kollidieren.
+  fn cg_cpuFassungMarke(fname: pchar, fnlen: int64, stufe: int64, lenBox: int64): pchar {
+    var b: int64 := alloc(fnlen + 8);
+    var i: int64 := 0;
+    while (i < fnlen) { poke8(b + i, peek8(fname as int64 + i)); i := i + 1; }
+    poke8(b + fnlen + 0, 46);                 // '.'
+    poke8(b + fnlen + 1, 99);                 // 'c'
+    poke8(b + fnlen + 2, 112);                // 'p'
+    poke8(b + fnlen + 3, 117);                // 'u'
+    poke8(b + fnlen + 4, 48 + stufe);         // '0'..'3'
+    poke64(lenBox, fnlen + 5);
+    return b as pchar;
+  }
+
+  // #2198: Laufzeitauswahl. Eine Funktion unter `@cpu(avx2, baseline)` wird
+  // MEHRFACH erzeugt -- je Stufe einmal -- und unter ihrem blanken Namen
+  // steht ein Verteiler, der die hoechste Stufe nimmt, die die CPU kann.
+  //
+  // Warum ein Verteiler und kein Funktionszeiger, der beim Start einmal
+  // gesetzt wird: ein Zeiger im Datenbereich macht aus jedem Aufruf einen
+  // INDIREKTEN Sprung. Das kostet bei jedem Aufruf, auch im haeufigen Fall,
+  // und es verhindert, dass der Aufruf spaeter eingebettet wird. Der
+  // Verteiler kostet beim ersten Aufruf die Erkennung und danach drei
+  // Befehle, die die Sprungvorhersage trifft.
+  //
+  // NICHT-x86-Ziele: dieser Durchlauf ist dort nur Diagnose (#2522), seine
+  // Bytes werden verworfen. Das Erzeugnis kommt aus ir_lower und traegt EINE
+  // Fassung -- richtig so, denn `sse4`/`avx2`/`avx512` sind x86-Namen und auf
+  // arm64 ohne Bedeutung.
   fn cg_genFuncDecl(ni: int64) {
+    var maske: int64 := self.scopeCpuMaske;
+    if (self.cg_bitZahl(maske) < 2) { self.cg_genFuncDeclEine(ni); return; }
+
+    // Blanken Namen bestimmen -- dieselbe Rechnung wie in Eine. Eine
+    // Spezialisierung (genOvLen > 0) traegt ihren eigenen Namen und wird
+    // NICHT verteilt: ihre Marke ist schon vergeben.
+    if (self.genOvLen > 0) { self.cg_genFuncDeclEine(ni); return; }
+    var nestI: int64 := self.cg_nestIdx(ni);
+    if (nestI >= 0) { self.cg_genFuncDeclEine(ni); return; }
+
+    var tlc: int64 := alloc(8);
+    var fname: pchar := self.cg_topFnLabel(ni, tlc);
+    var fnlen: int64 := peek64(tlc);
+    free(tlc, 8);
+
+    // Waehrend der Fassungen ist die Maske aus, sonst riefe sich das hier
+    // endlos selbst auf.
+    var savedMaske: int64 := self.scopeCpuMaske;
+    var savedFest:  int64 := self.cpuFestStufe;
+    self.scopeCpuMaske := 0;
+
+    // Fassungen von oben nach unten. Die Reihenfolge ist fuer die
+    // Richtigkeit gleichgueltig; sie haelt nur den Verteiler lesbar.
+    var st: int64 := 3;
+    while (st >= 0) {
+      if ((maske & (1 << st)) != 0) {
+        var lb: int64 := alloc(8);
+        var vn: pchar := self.cg_cpuFassungMarke(fname, fnlen, st, lb);
+        var vl: int64 := peek64(lb);
+        free(lb, 8);
+        self.genOvLbl := vn as int64;
+        self.genOvLen := vl;
+        self.cpuFestStufe := st;
+        self.cg_genFuncDeclEine(ni);
+      }
+      st := st - 1;
+    }
+    self.cpuFestStufe  := savedFest;
+    self.scopeCpuMaske := savedMaske;
+
+    self.cg_emitCpuVerteiler(fname, fnlen, maske, self.cg_lineOf(ni));
+  }
+
+  // #2198: der Verteiler. Er traegt den BLANKEN Namen, jede Aufrufstelle
+  // bleibt also unveraendert und braucht keine Kenntnis der Fassungen.
+  fn cg_emitCpuVerteiler(fname: pchar, fnlen: int64, maske: int64, zeile: int64) {
+    self.cg_addLabelFunc(fname, fnlen, zeile);
+    self.cg_cfi(CFI_FN, 0);
+    self.cpuErkennAn := 1;
+
+    // mov rax, [rip+CG_CPU_STUFE]
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x05);
+    var pL: int64 := self.codeLen; self.cg_e32(0);
+    self.cg_addPatch(pL, CG_CPU_STUFE, 0, CG_PATCH_STR);
+    // test rax, rax ; jnz +5 (ueber den call)
+    self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC0);
+    self.cg_e8(0x75); self.cg_e8(0x05);
+    // call __lyx_cpu_erkenn   (gibt STUFE+1 in rax)
+    self.cg_e8(0xE8);
+    var pC: int64 := self.codeLen; self.cg_e32(0);
+    self.cg_addPatch(pC, "__lyx_cpu_erkenn"c as int64, 16, CG_PATCH_CALL);
+
+    // Von oben nach unten: cmp rax, stufe+1 ; jge <fassung>
+    // Die UNTERSTE gesetzte Stufe bekommt einen unbedingten Sprung -- ohne
+    // ihn fiele der Verteiler bei einer CPU unterhalb aller Schwellen in den
+    // naechsten Befehl, und das ist der Rumpf der naechsten Funktion. Genau
+    // die Art stiller Durchfall, die hier schon Opcodes gekostet hat.
+    var unten: int64 := 0;
+    var i: int64 := 0;
+    while (i < 4) { if ((maske & (1 << i)) != 0) { unten := i; i := 4; } i := i + 1; }
+
+    var st: int64 := 3;
+    while (st >= 0) {
+      if ((maske & (1 << st)) != 0) {
+        var lb: int64 := alloc(8);
+        var vn: pchar := self.cg_cpuFassungMarke(fname, fnlen, st, lb);
+        var vl: int64 := peek64(lb);
+        free(lb, 8);
+        if (st == unten) {
+          self.cg_e8(0xE9);                                   // jmp rel32
+          var pU: int64 := self.codeLen; self.cg_e32(0);
+          self.cg_addPatch(pU, vn as int64, vl, CG_PATCH_CALL);
+        } else {
+          self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xF8); self.cg_e8(st + 1);  // cmp rax, st+1
+          self.cg_e8(0x0F); self.cg_e8(0x8D);                 // jge rel32
+          var pJ: int64 := self.codeLen; self.cg_e32(0);
+          self.cg_addPatch(pJ, vn as int64, vl, CG_PATCH_CALL);
+        }
+      }
+      st := st - 1;
+    }
+    self.cfiInFn := 0;
+  }
+
+  // #2198: Erkennungsblock, EINMAL je Erzeugnis und nur wenn ein Verteiler
+  // existiert. Er gibt STUFE+1 in rax und merkt den Wert im Datenbereich.
+  //
+  // Die Verschiebung um eins: ein frischer Datenbereich ist 0, und 0 muss
+  // "noch nicht erkannt" heissen. Waere 0 die Stufe `baseline`, liefe jedes
+  // Programm dauerhaft auf der langsamsten Fassung -- und zwar lautlos.
+  //
+  // Er sichert JEDES Argumentregister. Der Verteiler sitzt VOR dem Rumpf,
+  // die Argumente stehen also noch in rdi/rsi/rdx/rcx/r8/r9, und `cpuid`
+  // schreibt rax/rbx/rcx/rdx. Ohne die Sicherung bekaeme die Funktion beim
+  // ERSTEN Aufruf andere Argumente als bei jedem spaeteren -- ein Fehler,
+  // der sich als "jeder zweite Aufruf ist richtig" zeigt.
+  fn cg_emitCpuErkenn() {
+    if (self.cpuErkennAn == 0) { return; }
+    self.cg_addLabelFunc("__lyx_cpu_erkenn"c, 16, 0);
+    self.cg_cfi(CFI_FN, 0);
+
+    self.cg_e8(0x57); self.cg_e8(0x56); self.cg_e8(0x52); self.cg_e8(0x51);     // push rdi,rsi,rdx,rcx
+    self.cg_e8(0x41); self.cg_e8(0x50); self.cg_e8(0x41); self.cg_e8(0x51);     // push r8, r9
+    self.cg_e8(0x53);                                                           // push rbx
+    self.cg_e8(0x45); self.cg_e8(0x31); self.cg_e8(0xD2);                       // xor r10d, r10d
+
+    // --- CPUID Blatt 1: ecx tragt SSE4.2 (Bit 20) und OSXSAVE (Bit 27)
+    self.cg_e8(0xB8); self.cg_e32(1);                                           // mov eax, 1
+    self.cg_e8(0x31); self.cg_e8(0xC9);                                         // xor ecx, ecx
+    self.cg_e8(0x0F); self.cg_e8(0xA2);                                         // cpuid
+    self.cg_e8(0x41); self.cg_e8(0x89); self.cg_e8(0xCB);                       // mov r11d, ecx
+    self.cg_e8(0x41); self.cg_e8(0xF7); self.cg_e8(0xC3); self.cg_e32(1048576); // test r11d, 1<<20
+    self.cg_e8(0x74); self.cg_e8(0x06);                                         // jz +6
+    self.cg_e8(0x41); self.cg_e8(0xBA); self.cg_e32(1);                         // mov r10d, 1
+
+    // OSXSAVE: ohne es ist `xgetbv` ein ungueltiger Befehl (#UD), nicht
+    // einfach eine 0. Die Pruefung ist Pflicht, kein Feinschliff.
+    self.cg_e8(0x41); self.cg_e8(0xF7); self.cg_e8(0xC3); self.cg_e32(134217728); // test r11d, 1<<27
+    var jOs: int64 := self.codeLen;
+    self.cg_e8(0x0F); self.cg_e8(0x84); self.cg_e32(0);                         // jz -> fertig
+
+    self.cg_e8(0x31); self.cg_e8(0xC9);                                         // xor ecx, ecx
+    self.cg_e8(0x0F); self.cg_e8(0x01); self.cg_e8(0xD0);                       // xgetbv
+    self.cg_e8(0x41); self.cg_e8(0x89); self.cg_e8(0xC3);                       // mov r11d, eax (XCR0)
+
+    // --- CPUID Blatt 7.0: ebx tragt AVX2 (Bit 5) und AVX512F (Bit 16)
+    self.cg_e8(0xB8); self.cg_e32(7);                                           // mov eax, 7
+    self.cg_e8(0x31); self.cg_e8(0xC9);                                         // xor ecx, ecx
+    self.cg_e8(0x0F); self.cg_e8(0xA2);                                         // cpuid
+
+    // AVX2 braucht XCR0 Bit 1 (SSE) UND Bit 2 (YMM): die Faehigkeit der CPU
+    // ist nur die halbe Antwort, sichert das Betriebssystem den Zustand
+    // nicht, faultet der erste ymm-Befehl.
+    self.cg_e8(0xF7); self.cg_e8(0xC3); self.cg_e32(32);                        // test ebx, 1<<5
+    var jA2: int64 := self.codeLen;
+    self.cg_e8(0x0F); self.cg_e8(0x84); self.cg_e32(0);                         // jz -> fertig
+    self.cg_e8(0x44); self.cg_e8(0x89); self.cg_e8(0xD8);                       // mov eax, r11d
+    self.cg_e8(0x25); self.cg_e32(6);                                           // and eax, 6
+    self.cg_e8(0x3D); self.cg_e32(6);                                           // cmp eax, 6
+    var jA2b: int64 := self.codeLen;
+    self.cg_e8(0x0F); self.cg_e8(0x85); self.cg_e32(0);                         // jne -> fertig
+    self.cg_e8(0x41); self.cg_e8(0xBA); self.cg_e32(2);                         // mov r10d, 2
+
+    // AVX512F braucht zusaetzlich die Bits 5,6,7 (opmask, ZMM_hi256,
+    // Hi16_ZMM) -- 0xE6 prueft sie samt SSE und YMM in einem Schritt.
+    self.cg_e8(0xF7); self.cg_e8(0xC3); self.cg_e32(65536);                     // test ebx, 1<<16
+    var jA5: int64 := self.codeLen;
+    self.cg_e8(0x0F); self.cg_e8(0x84); self.cg_e32(0);                         // jz -> fertig
+    self.cg_e8(0x44); self.cg_e8(0x89); self.cg_e8(0xD8);                       // mov eax, r11d
+    self.cg_e8(0x25); self.cg_e32(230);                                         // and eax, 0xE6
+    self.cg_e8(0x3D); self.cg_e32(230);                                         // cmp eax, 0xE6
+    var jA5b: int64 := self.codeLen;
+    self.cg_e8(0x0F); self.cg_e8(0x85); self.cg_e32(0);                         // jne -> fertig
+    self.cg_e8(0x41); self.cg_e8(0xBA); self.cg_e32(3);                         // mov r10d, 3
+
+    // fertig:
+    var zF: int64 := self.codeLen;
+    poke32(self.code + jOs  + 2, zF - jOs  - 6);
+    poke32(self.code + jA2  + 2, zF - jA2  - 6);
+    poke32(self.code + jA2b + 2, zF - jA2b - 6);
+    poke32(self.code + jA5  + 2, zF - jA5  - 6);
+    poke32(self.code + jA5b + 2, zF - jA5b - 6);
+
+    self.cg_e8(0x44); self.cg_e8(0x89); self.cg_e8(0xD0);                       // mov eax, r10d
+    self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(0x01);                       // add eax, 1
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x05);                       // mov [rip+CG_CPU_STUFE], rax
+    var pS: int64 := self.codeLen; self.cg_e32(0);
+    self.cg_addPatch(pS, CG_CPU_STUFE, 0, CG_PATCH_STR);
+
+    self.cg_e8(0x5B);                                                           // pop rbx
+    self.cg_e8(0x41); self.cg_e8(0x59); self.cg_e8(0x41); self.cg_e8(0x58);     // pop r9, r8
+    self.cg_e8(0x59); self.cg_e8(0x5A); self.cg_e8(0x5E); self.cg_e8(0x5F);     // pop rcx,rdx,rsi,rdi
+    self.cg_e8(0xC3);                                                           // ret
+    self.cfiInFn := 0;
+  }
+
+  fn cg_genFuncDeclEine(ni: int64) {
     // Register label for this function
     var fname: pchar := self.cg_nsval(ni);
     var fnlen: int64 := self.cg_nslen(ni);
@@ -29989,7 +30257,13 @@ pub type Codegen = class {
     // unter die Zusage des Aufrufs fallen, deshalb wird nur nach oben
     // abgewichen.
     var savedCpu: int64 := self.fnCpuStufe;
-    if (self.scopeCpuStufe > self.cgCpuStufe) {
+    if (self.cpuFestStufe >= 0) {
+      // #2198: Mehrfachemission -- diese Fassung ist auf ihre Stufe
+      // festgelegt. Ohne diesen Vorrang nimmt die Rechnung unten das Maximum
+      // aus Bereich und CLI, und `@cpu(avx2, baseline)` unter
+      // --target-cpu=avx2 erzeugte zwei Fassungen mit DEMSELBEN Rumpf.
+      self.fnCpuStufe := self.cpuFestStufe;
+    } else if (self.scopeCpuStufe > self.cgCpuStufe) {
       self.fnCpuStufe := self.scopeCpuStufe;
     } else {
       self.fnCpuStufe := self.cgCpuStufe;
@@ -34214,8 +34488,9 @@ pub type Codegen = class {
         // Wie bei @energy ein BEREICHS-Stand: cg_genFuncDecl bestimmt die
         // Stufe je Funktion neu und wuerde einen nur hier gesetzten Wert
         // sonst zugunsten des CLI-Flags verwerfen.
-        self.scopeCpuStufe := self.cg_nival(cur);
-        self.fnCpuStufe    := self.cg_nival(cur);
+        self.scopeCpuStufe := self.cg_nival(cur) & 255;        // #2198
+        self.fnCpuStufe    := self.cg_nival(cur) & 255;
+        self.scopeCpuMaske := (self.cg_nival(cur) >> 8) & 15;
       } else if (k == CGN_AT_ENERGY) {  // WP-EN-04: top-level @energy(N)
         // #1162: als Quelltext-Stand vermerken, nicht nur als aktuelle Stufe —
         // genFunc bestimmt die Stufe je Funktion neu und verwarf den Wert
@@ -34272,7 +34547,7 @@ pub type Codegen = class {
     self.resCap      := 0;
     self.resTabOff   := 0 - 1;
     self.cgLesePfad  := 0;   // #1971
-    self.dataLen     := 152; // WP-18: 88 Byte reserviert, +8 CG_FC_NAME (#1140), +8 CG_ENVBLOCK (#1677), +16 Bump-Allokator (#1836), +8 CG_RESTAB (#1961), +16 Vektorarena (#2206), +8 Vektorarena-Summe (#2253)
+    self.dataLen     := 160; // #2198 +8 CPU-Stufe // WP-18: 88 Byte reserviert, +8 CG_FC_NAME (#1140), +8 CG_ENVBLOCK (#1677), +16 Bump-Allokator (#1836), +8 CG_RESTAB (#1961), +16 Vektorarena (#2206), +8 Vektorarena-Summe (#2253)
     self.dOrig := alloc(16 * 16);   // #2146 Stufe C2c
     self.dOrigCount := 0;
     self.dOrigCap := 16;
@@ -34485,6 +34760,9 @@ pub type Codegen = class {
     self.globalEnergyLevel := 0;
     self.cgCpuStufe        := 0;   // #2191: baseline
     self.fnCpuStufe        := 0;
+    self.scopeCpuMaske     := 0;      // #2198
+    self.cpuFestStufe      := 0 - 1;
+    self.cpuErkennAn       := 0;
     self.scopeEnergyLevel  := 0;   // #1162: kein Quelltext-Stand gesetzt
     self.scopeCpuStufe     := 0;   // #2191
     self.vecMarkeEnde      := 0;   // #2206
@@ -35702,6 +35980,18 @@ pub type Codegen = class {
       self.cg_soEmitHuellen(head);
       self.cg_soEmitInit();
     }
+    // #2198: Der Erkennungsblock ist CODE und muss deshalb VOR die
+    // Seitenauffuellung. Stand er danach, lag er hinter der Codeseite und
+    // damit im RW-Segment: die Seite wird NX abgebildet, und der `call` aus
+    // dem Verteiler endete in SIGSEGV an genau dieser Adresse (0x419000).
+    //
+    // Gemessen, und die Fehlspur gehoert dazu: zuerst sah es aus wie "ein
+    // verteilter Rumpf, der AUFRUFT, stuerzt; ein Blatt nicht" -- in
+    // Wahrheit entschied allein die Programmgroesse darueber, ob der Block
+    // noch in die letzte abgebildete Codeseite fiel. Erst die Absturzadresse
+    // aus gdb hat die Ursache gezeigt, nicht das Eingrenzen am Quelltext.
+    self.cg_emitCpuErkenn();
+
     // WP-6: Pad code to 4096-byte boundary so data starts on a page boundary.
     // This allows two PT_LOAD segments: RX (code) and RW (data), no overlap.
     // Padding must happen BEFORE cg_patchAll() so all disp32 patches use
