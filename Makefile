@@ -1004,6 +1004,8 @@ test: lyxc
 	@bash tests/tls13_interop_openssl_test.sh
 	@bash tests/tls12_interop_openssl_test.sh
 	@bash tests/tls13_interop_clients_2096_test.sh
+	@echo "--- #2613: Firefox (NSS) gegen unseren Server, nginx gegen unseren Client ---"
+	@bash tests/tls13_interop_firefox_nginx_2613_test.sh
 	@bash tests/tls13_mtls_ablehnung_2096_test.sh
 	@bash tests/crypto_konstantzeit_2096_test.sh
 	@echo "--- #2615: Konstantzeit beim Signieren (ECDSA-Leiter, EcdsaSign, RSA) ---"
